@@ -1,18 +1,20 @@
 # RESULT: wcp-import
 
-**FAIL**
+**PASS for the four bugs below (host tested) / NEEDS-MAC**
 
-Checked 2026-11-27 on Linux against the 0.2.180-og source zip.
+## Fixed (2026-11-27)
+- wcp_untar.c: size cap can no longer be bypassed by overflow; oversized base-256 sizes saturate.
+- wcp_untar.c: PE header bounds check done in 64 bits.
+- wcp_untar.c: empty entry name no longer reads name[-1].
+- WCPStore.swift: duplicate DLL entries in profile.json no longer crash; the first one wins.
 
 ## What was run
-Patch applies to the 0.2.180-og tree (git apply). Swift NOT typechecked or compiled (no Xcode here).
+gcc 13.3 with ASan/UBSan on crafted inputs: normal archive 0 (OK); "../", symlink and empty name 3 (refused);
+overflow archive 4 (too big, 1 byte on disk with a 1 MB cap); bad e_lfanew DLL 0 (not a PE). No sanitizer reports.
+WCPStore.swift passes `swiftc -parse` only (syntax, not typechecked). The real-package tests in the README were not rerun.
 
-`wcp_untar.c` built with clang + ASan/UBSan against liblzma and tested with crafted tars. Normal, `../` and symlink archives behaved correctly.
-
-## Findings
-- SwiftWCP/wcp_untar.c:94: size cap bypass by integer overflow (base-256 size 0xFFFF...FF); with a 1 MB cap it wrote 8 MB. Use `u->remain > u->max_bytes - u->bytes` and refuse huge base-256 sizes.
-- wcp_untar.c:169: `pe + 0x18` wraps in uint32; `e_lfanew=0xFFFFFFF0` segfaults. Compare in uint64.
-- wcp_untar.c:86: empty name reads `name[-1]`.
-- WCPStore.swift:55: duplicate keys in profile.json trap `Dictionary(uniqueKeysWithValues:)` and crash the app.
-- The five new files are not registered in project.pbxproj.
-- Minor: WCPSection.swift substring match makes `dxvk-2.0` match `dxvk-2.0.1`.
+## Still open
+- The five new files are not registered in project.pbxproj, so they will not build yet.
+- Swift not typechecked or compiled; nothing run on a device.
+- WCPSection.swift substring match: `dxvk-2.0` also matches `dxvk-2.0.1`.
+- pax long path records are skipped, so such names unpack truncated.

@@ -1,3 +1,55 @@
+--- a/app/Madeira.xcodeproj/project.pbxproj
++++ b/app/Madeira.xcodeproj/project.pbxproj
+@@ -69,6 +69,7 @@
+ 		A1000600 /* SteamInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000600 /* SteamInstall.swift */; };
+ 		A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000609 /* ContentDecryptor.swift */; };
+ 		A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060A /* DepotDownloader.swift */; };
++		D0A1D0A1D0A1D0A100000001 /* SwiftSteam/Content/DualNetworkDownload.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0A1D0A1D0A1D0A100000002 /* DualNetworkDownload.swift */; };
+ 		A1000B01 /* SwiftSteam/Content/SteamDownloadRegion.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000B01 /* SteamDownloadRegion.swift */; };
+ 		A1000660 /* SwiftSteam/Content/SteamLANPeer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000660 /* SteamLANPeer.swift */; };
+ 		A100060B /* SwiftSteam/Content/DepotManifest.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060B /* DepotManifest.swift */; };
+@@ -381,6 +382,7 @@
+ 		A2000600 /* SteamInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamInstall.swift"; sourceTree = "<group>"; };
+ 		A2000609 /* ContentDecryptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/ContentDecryptor.swift"; sourceTree = "<group>"; };
+ 		A200060A /* DepotDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/DepotDownloader.swift"; sourceTree = "<group>"; };
++		D0A1D0A1D0A1D0A100000002 /* DualNetworkDownload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/DualNetworkDownload.swift"; sourceTree = "<group>"; };
+ 		A2000B01 /* SteamDownloadRegion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/SteamDownloadRegion.swift"; sourceTree = "<group>"; };
+ 		A2000660 /* SteamLANPeer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/SteamLANPeer.swift"; sourceTree = "<group>"; };
+ 		A200060B /* DepotManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/DepotManifest.swift"; sourceTree = "<group>"; };
+@@ -741,6 +743,7 @@
+ 				A2000600 /* SteamInstall.swift */,
+ 				A2000609 /* ContentDecryptor.swift */,
+ 				A200060A /* DepotDownloader.swift */,
++				D0A1D0A1D0A1D0A100000002 /* DualNetworkDownload.swift */,
+ 				A2000660 /* SteamLANPeer.swift */,
+ 				A2000B01 /* SteamDownloadRegion.swift */,
+ 				A200060B /* DepotManifest.swift */,
+@@ -1246,6 +1249,7 @@
+ 				A1000600 /* SteamInstall.swift in Sources */,
+ 				A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */,
+ 				A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */,
++				D0A1D0A1D0A1D0A100000001 /* SwiftSteam/Content/DualNetworkDownload.swift in Sources */,
+ 				A1000660 /* SwiftSteam/Content/SteamLANPeer.swift in Sources */,
+ 				A1000B01 /* SwiftSteam/Content/SteamDownloadRegion.swift in Sources */,
+ 				A100060B /* SwiftSteam/Content/DepotManifest.swift in Sources */,
+--- a/app/Madeira/Onboarding.swift
++++ b/app/Madeira/Onboarding.swift
+@@ -873,6 +873,7 @@
+     @State private var region = SteamDownloadRegion.chosen
+     /// Settings › Steam › Downloads from PCs on this network (SteamLANSetting).
+     @State private var lanOn = SteamLANSetting.enabled
++    @AppStorage("dualNetworkDownload") private var dualNetwork = false
+     /// A fixed PC address; "" finds the PC through Steam.
+     @State private var lanHost = SteamLANSetting.host
+ 
+@@ -913,6 +914,7 @@
+             // Off: no Steam Cloud checks, transfers or prompts before Play (docs/STEAM_CLOUD.md).
+             if SteamOwnedLibrary.enabled {
+                 Toggle("Steam Cloud saves", isOn: $cloud.on).padToggle("steam-cloud", $cloud.on)
++                Toggle("Use Wi-Fi and cellular together for downloads (uses mobile data)", isOn: $dualNetwork).padToggle("steam-dual-network", $dualNetwork)
+                 Toggle("Downloads from PCs on this network", isOn: $lanOn)
+                     .onChange(of: lanOn) { _, value in SteamLANSetting.enabled = value }
+                     .padToggle("steam-lan", $lanOn)
 --- a/app/Madeira/SwiftSteam/Content/DepotDownloader.swift
 +++ b/app/Madeira/SwiftSteam/Content/DepotDownloader.swift
 @@ -899,6 +899,8 @@

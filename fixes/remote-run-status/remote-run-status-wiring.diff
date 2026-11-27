@@ -1,0 +1,34 @@
+--- a/app/Madeira/RunStatus.swift	2026-11-27 04:07:21.249615778 +0000
++++ b/app/Madeira/RunStatus.swift	2026-11-27 04:07:21.307467551 +0000
+@@ -156,6 +156,12 @@
+ enum RunStatusStore {
+     /// Read once, at first use. A missing or broken file: every game is Not tested yet.
+     static let file: RunStatusFile? = {
++        let bundled = bundledFile()
++        // (remote-run-status) signed newer ratings from the Get Help server, when kept and not older (RemoteRunStatus.swift)
++        return RemoteRunStatus.newerThan(bundled) ?? bundled
++    }()
++
++    private static func bundledFile() -> RunStatusFile? {
+         guard let url = Bundle.main.url(forResource: "run-status", withExtension: "json"),
+               let data = try? Data(contentsOf: url) else {
+             LogStore.shared.log("[run-badge] run-status.json missing: every game is Not tested yet")
+@@ -169,7 +175,7 @@
+             LogStore.shared.log("[run-badge] run-status.json unreadable: \(error)")
+             return nil
+         }
+-    }()
++    }
+ 
+     private static let index: [String: RunStatusFile.Game] = {
+         var map: [String: RunStatusFile.Game] = [:]
+--- a/app/Madeira/MadeiraApp.swift	2026-11-27 04:07:21.250597079 +0000
++++ b/app/Madeira/MadeiraApp.swift	2026-11-27 04:07:21.307674881 +0000
+@@ -78,6 +78,7 @@
+                     GetHelpUpload.resendLate()                    // (late-zip) Get Help zips Madeira closed before sending (GetHelpView.swift)
+                     SharedConfigs.refresh()                       // (shared-configs) approved settings from other players (SharedConfigs.swift)
+                     RemoteRecs.refresh()                          // (remote-recs) newest game lists from the Get Help server (RemoteRecs.swift)
++                    RemoteRunStatus.refresh()                     // (remote-run-status) newest "Will it run?" ratings (RemoteRunStatus.swift)
+                     KillList.refresh()                            // (kill-list) newest signed list of switches to keep off (KillList.swift)
+                     IPadTestHooks.exportAtStart()                 // (ipad-test-hooks) iPad test build only (SavesAndShortcuts.swift)
+                 }

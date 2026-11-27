@@ -1,0 +1,41 @@
+--- a/app/Madeira/Madeira-Bridging-Header.h
++++ b/app/Madeira/Madeira-Bridging-Header.h
+@@ -12,6 +12,8 @@
+ #import "SwiftSteam/lzma_shim.h"
+ // itch.io .7z downloads (ItchArchive.swift): a streaming 7z reader over liblzma and zlib.
+ #import "SwiftItch/itch_7z.h"
++// wcp-import: .wcp (xz tar) unpack and DLL kind (SwiftWCP/wcp_untar.c).
++#import "SwiftWCP/wcp_untar.h"
+ // On-device remote pairing for Built-in StikJIT (build/rppairing-ios, JITPairing.swift).
+ #import "MadeiraRPPairing.h"
+ // madeira-bcd: the bundled prefix template, read by the Dock's Reset (DockReset.swift).
+--- a/app/Madeira/ModsView.swift
++++ b/app/Madeira/ModsView.swift
+@@ -58,6 +58,7 @@
+             }
+             .disabled(!hasFolder)
+         }
++        WCPSection(game: game)   // wcp-import: hidden with env.MADEIRA_WCP_IMPORT = 0
+         Section {
+             if listed.isEmpty {
+                 Text("Mods add to or change a game's files. Add one below; you can turn it off or remove it at any time, and the game's own files come back.")
+--- a/build/tools/gen-config-catalog.py
++++ b/build/tools/gen-config-catalog.py
+@@ -913,6 +913,17 @@
+                       "are vkd3d-proton's (Direct3D 12 on Vulkan, the bundle's vulkan/ folder) and Vulkan is on (see "
+                       "vulkan). x64 programs only; read at session start; also from a game's own lines. Not "
+                       "device-tested. \"1\" (ml1095, developer) runs madeira-d3d12's shader converter canary at app start."},
++    "d3d11-package": {"category": "Vulkan routes", "title": "DXVK package for this game", "kind": "text",
++                      "note": "wcp-import: the name of an imported DXVK .wcp package (Mods page, Graphics packages). With d3d11 = dxvk "
++                              "this game's d3d11.dll, d3d10core.dll and dxgi.dll come from that package instead of the app's own. "
++                              "Unset, or a package that is missing, uses the app's. Per game; read at session start. Experimental."},
++    "d3d12-package": {"category": "Vulkan routes", "title": "vkd3d-proton package for this game", "kind": "text",
++                      "note": "wcp-import: the name of an imported vkd3d-proton .wcp package. With d3d12 = vkd3d (or d3d11 = dxvk) "
++                              "this game's d3d12.dll and d3d12core.dll come from that package instead of the app's own. Unset, or a "
++                              "package that is missing, uses the app's. Per game; read at session start. Experimental."},
++    "env.MADEIRA_WCP_IMPORT": {"category": "Vulkan routes", "title": "Import graphics packages (.wcp)", "kind": "bool", "default": "1",
++                               "note": "On (default): the Mods page can import DXVK / vkd3d-proton .wcp packages and a game's "
++                                       "d3d11-package / d3d12-package lines are used. 0: the section is hidden and the lines are ignored."},
+     "vulkan": {"category": "Vulkan routes", "title": "Vulkan library (x64)", "kind": "choice",
+                "choices": [("", "Off, MoltenVK with d3d12 = vkd3d or d3d11 = dxvk"), ("moltenvk", "MoltenVK"),
+                            ("kosmickrisp", "KosmicKrisp"), ("off", "Off")],

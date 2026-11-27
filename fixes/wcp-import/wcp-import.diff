@@ -1,0 +1,62 @@
+--- a/app/Madeira/WineProcessBridge.m
++++ b/app/Madeira/WineProcessBridge.m
+@@ -1455,6 +1455,30 @@
+     return [fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil] ? 1 : 0;
+ }
+ 
++/* wcp-import: a package a person imported for THIS game (WCPStore.swift) replaces the bundle's DLLs for one
++ * route. madeira.cfg / the game's own lines: d3d11-package = <name> (DXVK), d3d12-package = <name> (vkd3d-proton).
++ * Folder: <Application Support>/WCP/<name>/ with the DLLs named as in the bundle (dxvk-d3d11.dll, d3d12.dll...).
++ * Nothing in the prefix is written; the links are remade every session, so removing the folder is the undo.
++ * env.MADEIRA_WCP_IMPORT = 0 ignores the keys. Returns the bundle folder when unset, off, unsafe or incomplete. */
++static NSString *madeira_wcp_stack(NSString *key, NSArray<NSString *> *needed, NSString *fallback)
++{
++    char v[128] = "";
++    const char *off = getenv("MADEIRA_WCP_IMPORT");
++
++    if (off && !strcmp(off, "0")) return fallback;
++    if (!madeira_cfg_get(key.UTF8String, v, sizeof v) || !v[0]) return fallback;
++    if (strchr(v, '/') || strstr(v, "..")) return fallback;
++    NSString *base = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
++    NSString *dir = [[base stringByAppendingPathComponent:@"WCP"] stringByAppendingPathComponent:[NSString stringWithUTF8String:v]];
++    for (NSString *f in needed)
++        if (access([dir stringByAppendingPathComponent:f].fileSystemRepresentation, R_OK) != 0) {
++            dprintf(STDERR_FILENO, "[wcp] %s = %s: %s missing, bundle DLLs stay\n", key.UTF8String, v, f.UTF8String);
++            return fallback;
++        }
++    dprintf(STDERR_FILENO, "[wcp] %s = %s: using the imported package for this session\n", key.UTF8String, v);
++    return dir;
++}
++
+ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *bundle, BOOL use_arm64ec)
+ {
+     NSString *win = [prefix stringByAppendingPathComponent:@"drive_c/windows"];
+@@ -1504,10 +1528,12 @@
+     if (vkd3d) {
+         if (access([stack stringByAppendingPathComponent:@"d3d12.dll"].fileSystemRepresentation, R_OK) == 0 &&
+             access([stack stringByAppendingPathComponent:@"d3d12core.dll"].fileSystemRepresentation, R_OK) == 0) {
++            NSString *vkd3d_src = madeira_wcp_stack(@"d3d12-package", vkd3d_dlls, stack);
++
+             for (NSString *dir in dirs)
+                 for (NSString *dll in vkd3d_dlls)
+                     vkd3d_linked += madeira_link_vulkan_file(fm, [win stringByAppendingPathComponent:dir], dll,
+-                                                             [stack stringByAppendingPathComponent:dll]);
++                                                             [vkd3d_src stringByAppendingPathComponent:dll]);
+         } else {
+             dprintf(STDERR_FILENO, "[vulkan] d3d12 = vkd3d, but the bundle has no vulkan/arm64ec-windows/d3d12.dll and "
+                     "d3d12core.dll (build/vkd3d-proton/build.sh): madeira-d3d12 stays\n");
+@@ -1525,10 +1551,13 @@
+             char d3d12v[32] = "";
+             BOOL d3d12_set = madeira_cfg_get("d3d12", d3d12v, sizeof d3d12v) && d3d12v[0];
+ 
++            NSString *dxvk_src = madeira_wcp_stack(@"d3d11-package",
++                                                   @[@"dxvk-d3d11.dll", @"dxvk-d3d10core.dll", @"dxvk-dxgi.dll"], stack);
++
+             for (NSString *dir in dirs)
+                 for (NSString *dll in dxvk_dlls)
+                     dxvk_linked += madeira_link_vulkan_file(fm, [win stringByAppendingPathComponent:dir], dll,
+-                                                            [stack stringByAppendingPathComponent:
++                                                            [dxvk_src stringByAppendingPathComponent:
+                                                                 [@"dxvk-" stringByAppendingString:dll]]);
+             /* Under Wine DXVK logs through __wine_dbg_output (the session log),
+              * and writes no log file unless DXVK_LOG_PATH names a folder;

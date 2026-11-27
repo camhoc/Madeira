@@ -1,0 +1,17 @@
+--- a/madeira-d3d12/src/pe/madeira_d3d12.c	2026-11-27 19:07:03.646199461 +0000
++++ b/madeira-d3d12/src/pe/madeira_d3d12.c	2026-11-27 19:07:03.677613040 +0000
+@@ -15290,7 +15290,13 @@
+             }
+         }
+         if (!r->buffer) r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
+-        if (!r->buffer) { free(r); return mad_creation_failure(d, "newBuffer"); }
++        if (!r->buffer) {
++            /* cyberpunk-newbuffer-probe: say what was asked for (log only) */
++            d3d12_log("[madeira-d3d12] newBuffer asked: length=%llu heap_type=%u flags=%#x placed=%d options=%#x Metal currentAllocatedSize=%llu MB\n",
++                      (unsigned long long)info.length, (unsigned)heap_type, (unsigned)desc->Flags, ph ? 1 : 0, (unsigned)info.options,
++                      (unsigned long long)((LONG64)MTLDevice_currentAllocatedSize(d->mtl_device) >> 20));
++            free(r); return mad_creation_failure(d, "newBuffer");
++        }
+         if (!r->placed_heap) {
+             mad_acct(r, heap_type == D3D12_HEAP_TYPE_DEFAULT ? MAD_CAT_BUF_PRIVATE : MAD_CAT_BUF_SHARED, info.length, +1);   /* ml1057 */
+             mad_resident(d, r->buffer);

@@ -1,0 +1,101 @@
+--- a/Source/Windows/ARM64EC/Module.cpp	2026-11-25 19:35:08.607478629 +0000
++++ b/Source/Windows/ARM64EC/Module.cpp	2026-11-25 19:37:57.100840513 +0000
+@@ -616,12 +616,77 @@
+   uint64_t Redzone[2];
+ };
+ 
+-static bool HandleUnalignedAccess(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT& Context, bool IsJIT) {
++#ifdef FEX_IOS_HOST
++/* madeira [sigbus-diag] rev=sigbus-diag-1 (env MADEIRA_SIGBUS_DIAG = 0 turns it off). LOG ONLY, no behaviour change.
++ * FEXCore's HandleUnalignedAccess declines some instructions and logs only "Unhandled JIT SIGBUS: PC .. Instruction ..";
++ * the Requiem logs (Nov 25 2026) end that way on 0xad3948c0 (STP q0,q18,[x6,#-224]) with no fault address, so nobody can
++ * tell an alignment fault from a protection fault or a store that crosses into an unmapped page. When it declines, log
++ * the instruction and its neighbours, the effective address worked out from the registers (pairs; for other forms the
++ * base register), its alignment, whether it crosses a 64 byte line or a 16 KB host page, and Windows' view of the page(s).
++ * The first 32 declines, then every 1000th. Uses the registers in the context, never the faulting memory. */
++uint32_t IosSigbusDiag = 1; /* uint32_t, not bool: see IosFfsPeekFixup */
++static std::atomic<uint32_t> IosSigbusDiagCount[2] {0, 0}; /* [0] = the SIGBUS path, [1] = the SMC path (declines there are routine) */
++
++static void IosLogDeclinedUnaligned(const ARM64_NT_CONTEXT& Context, bool IsJIT, bool FromSmc) {
++  const uint32_t N = IosSigbusDiagCount[FromSmc ? 1 : 0].fetch_add(1, std::memory_order_relaxed) + 1;
++  if (!(N <= 32 || (N % 1000) == 0)) {
++    return;
++  }
++  const uint64_t Pc = Context.Pc;
++  if (!IsJIT) {
++    LogMan::Msg::EFmt("[sigbus-diag] rev=sigbus-diag-1 {} #{} declined pc={:X}: not in a code buffer, instruction not read", FromSmc ? "smc" : "sigbus", N, Pc);
++    return;
++  }
++  const uint32_t* P = reinterpret_cast<const uint32_t*>(Pc);
++  const uint32_t Insn = P[0];
++  /* neighbours only inside the same 4 KB page as the pc, so reading them cannot fault */
++  const bool HavePrev = (Pc & 0xfff) >= 4, HaveNext = (Pc & 0xfff) <= 0xff8;
++  const uint32_t Prev = HavePrev ? P[-1] : 0, Next = HaveNext ? P[1] : 0;
++  const uint32_t Rn = (Insn >> 5) & 0x1f;
++  const uint64_t Base = Rn == 31 ? Context.Sp : Context.X[Rn];
++  /* LDP/STP (GPR and SIMD&FP): bits 29:27 = 101, bit 25 = 0 */
++  const bool Pair = (Insn & 0x3A000000) == 0x28000000;
++  uint64_t Ea = Base, Size = 0;
++  const char* Kind = "other";
++  if (Pair) {
++    const uint32_t V = (Insn >> 26) & 1, Opc = Insn >> 30, Mode = (Insn >> 23) & 3;
++    const uint64_t Scale = V ? (4u << Opc) : (Opc == 2 ? 8u : 4u);
++    int64_t Imm7 = (Insn >> 15) & 0x7f;
++    if (Imm7 & 0x40) {
++      Imm7 -= 0x80;
++    }
++    Ea = Mode == 1 ? Base : Base + static_cast<uint64_t>(Imm7 * static_cast<int64_t>(Scale));
++    Size = Scale * 2;
++    Kind = ((Insn >> 22) & 1) ? "load-pair" : "store-pair";
++  }
++  const uint64_t Span = Size ? Size : 1;
++  MEMORY_BASIC_INFORMATION Mbi {}, Mbi2 {};
++  const bool Q1 = NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Ea), MemoryBasicInformation, &Mbi, sizeof(Mbi), nullptr) == 0;
++  const uint64_t Last = Ea + Span - 1;
++  const bool Second = (Last >> 12) != (Ea >> 12);
++  const bool Q2 = Second && NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Last), MemoryBasicInformation, &Mbi2, sizeof(Mbi2), nullptr) == 0;
++  LogMan::Msg::EFmt("[sigbus-diag] rev=sigbus-diag-1 {} #{} declined pc={:X} insn={:08X} prev={:08X}{} next={:08X}{} kind={} Rn={}{} base={:X} "
++                    "ea={:X}{} size={} align16={} crosses64={} crosses16K={} page1[{}]=state {:X} prot {:X} type {:X} base {:X} "
++                    "page2[{}]=state {:X} prot {:X} type {:X}",
++                    FromSmc ? "smc" : "sigbus", N, Pc, Insn, Prev, HavePrev ? "" : "(n/a)", Next, HaveNext ? "" : "(n/a)", Kind, Rn == 31 ? "sp" : "x", Rn == 31 ? 0u : Rn,
++                    Base, Ea, Pair ? "" : "(=base, not decoded)", Size, Ea & 15, Size && ((Ea & 63) + Size > 64), Size && ((Ea & 0x3fff) + Size > 0x4000),
++                    Q1 ? "ok" : "query failed", Q1 ? Mbi.State : 0, Q1 ? Mbi.Protect : 0, Q1 ? Mbi.Type : 0,
++                    Q1 ? reinterpret_cast<uint64_t>(Mbi.AllocationBase) : 0, Second ? (Q2 ? "ok" : "query failed") : "same page",
++                    Q2 ? Mbi2.State : 0, Q2 ? Mbi2.Protect : 0, Q2 ? Mbi2.Type : 0);
++}
++#endif
++
++static bool HandleUnalignedAccess(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT& Context, bool IsJIT, bool FromSmc = false) {
+   auto Thread = CPUArea.ThreadState();
+   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
+   const auto Result =
+     FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(Thread, HandlerConfig->GetUnalignedHandlerType(), Context.Pc, &Context.X0, IsJIT);
+   Context.Pc += Result.value_or(0);
++#ifdef FEX_IOS_HOST
++  if (!Result.has_value() && IosSigbusDiag) {
++    IosLogDeclinedUnaligned(Context, IsJIT, FromSmc);   /* Pc is unchanged when the handler declines */
++  }
++#endif
+   return Result.has_value();
+ }
+ 
+@@ -1974,6 +2039,10 @@
+     const char* SmcFastOpt = getenv("MADEIRA_FEX_SMC_FASTPATH");
+     IosSmcFastPath = !(SmcFastOpt && strcmp(SmcFastOpt, "0") == 0);
+     LogMan::Msg::IFmt("FEX: smc-store-fastpath-v1 madeira-bcd enabled={}", IosSmcFastPath);
++    /* madeira [sigbus-diag] rev=sigbus-diag-1: MADEIRA_SIGBUS_DIAG=0 turns the declined-SIGBUS log off. */
++    const char* SigbusDiagOpt = getenv("MADEIRA_SIGBUS_DIAG");
++    Exception::IosSigbusDiag = !(SigbusDiagOpt && strcmp(SigbusDiagOpt, "0") == 0);
++    LogMan::Msg::IFmt("FEX: sigbus-diag rev=sigbus-diag-1 madeira {}", Exception::IosSigbusDiag ? "on" : "off (MADEIRA_SIGBUS_DIAG=0)");
+   }
+ #endif
+   InvalidationTracker.emplace(*CTX, Threads);
+@@ -2272,7 +2341,7 @@
+           }
+         } else if (IosSmcStoreFastPath(Thread, *NativeContext)) {
+           /* madeira-bcd: smc-store-fastpath v1: decided without the backpatch lock */
+-        } else if (Exception::HandleUnalignedAccess(CPUArea, *NativeContext, CTX->IsAddressInCodeBuffer(Thread, SmcPc))) {
++        } else if (Exception::HandleUnalignedAccess(CPUArea, *NativeContext, CTX->IsAddressInCodeBuffer(Thread, SmcPc), true)) {
+           static unsigned SmcAtomicCount;
+           if (SmcAtomicCount < 16) {
+             LogMan::Msg::EFmt("[smc-atomic] ml657 #{} handled pc {:X} -> {:X} fault {:X}", ++SmcAtomicCount, SmcPc,

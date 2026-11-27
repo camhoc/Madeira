@@ -1,0 +1,37 @@
+--- na/build/ntdll-unix/signal_arm64_ios.c	2026-11-25 19:35:08.700189724 +0000
++++ nb/build/ntdll-unix/signal_arm64_ios.c	2026-11-25 19:37:32.958330289 +0000
+@@ -5554,6 +5554,34 @@
+                                         wb ? " (writeback)" : " (no writeback)");
+                             }
+                         }
++                        else
++                        {
++                            /* madeira [sigbus-diag] rev=sigbus-diag-1 (env MADEIRA_SIGBUS_DIAG = 0 turns it off).
++                             * LOG ONLY. The Q-pair store was NOT emulated: say why. A store the CPU faulted on whose
++                             * address the registers do not explain (fault outside [effective, effective+32)) or whose
++                             * alias write failed ends in FEX's "Unhandled JIT SIGBUS" with nothing else logged. */
++                            static volatile int sd_n;
++                            static int sd_on = -1;
++                            if (sd_on < 0)
++                            {
++                                const char *e = getenv( "MADEIRA_SIGBUS_DIAG" );
++                                sd_on = !(e && e[0] == '0' && !e[1]);
++                            }
++                            if (sd_on && sd_n < 16)
++                            {
++                                const int in_range = fault_addr >= effective && fault_addr - effective < sizeof(values);
++                                dprintf( STDERR_FILENO,
++                                         "[sigbus-diag] rev=sigbus-diag-1 #%d q-pair store NOT emulated insn=0x%08x pc=0x%llx "
++                                         "mode=%d Rn=%s%d base=0x%llx off=%+lld effective=0x%llx fault=0x%llx in_range=%d "
++                                         "alias_write=%s alias_fault=0x%llx honor_guest_prot=%d fault_mod16=%u crosses16K=%d\n",
++                                         ++sd_n, insn, (unsigned long long)fault_pc, mode, rn == 31 ? "s" : "x", rn,
++                                         (unsigned long long)base_old, (long long)off, (unsigned long long)effective,
++                                         (unsigned long long)fault_addr, in_range,
++                                         in_range ? "refused" : "not tried", (unsigned long long)alias_fault,
++                                         (int)honor_guest_prot, (unsigned)(effective & 15),
++                                         (int)(((effective & 0x3fffull) + sizeof(values)) > 0x4000ull) );
++                            }
++                        }
+                     }
+                     /* STR (immediate, unsigned offset, 64-bit): 1111 1001 00 imm12 Rn Rt */
+                     else if ((insn & 0xffc00000) == 0xf9000000)

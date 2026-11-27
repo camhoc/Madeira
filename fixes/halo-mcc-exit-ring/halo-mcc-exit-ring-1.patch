@@ -1,0 +1,17 @@
+diff -ruN a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+--- a/Source/Windows/ARM64EC/Module.cpp	2026-11-25 20:29:18.120885237 +0000
++++ b/Source/Windows/ARM64EC/Module.cpp	2026-11-25 20:29:18.137779119 +0000
+@@ -1679,7 +1679,12 @@
+   {
+     const char* CmOpt = getenv("MADEIRA_EC_CRASHMAILER_DUMP");
+     const char* RingOpt = getenv("MADEIRA_BLOCK_RING");
+-    FEXCore::Core::IosBlockRingForce = _stricmp(HistoryName.c_str(), "Overwatch.exe") == 0 && !(CmOpt && CmOpt[0] == '0') &&
++    /* madeira [halo-mcc-exit-ring] rev=halo-mcc-exit-ring-1 LOG ONLY: Halo MCC's MCC-Win64-Shipping.exe quits itself with
++     * exit code 1 before drawing a frame (0.2.101 iPad). Give it the same block ring, so the exit probe can show the last
++     * blocks before the exit. Off: env.MADEIRA_HALO_EXIT_RING = 0 (or MADEIRA_BLOCK_RING = 0 / MADEIRA_EC_CRASHMAILER_DUMP = 0). */
++    const char* HaloOpt = getenv("MADEIRA_HALO_EXIT_RING");
++    const bool HaloRing = _stricmp(HistoryName.c_str(), "MCC-Win64-Shipping.exe") == 0 && !(HaloOpt && HaloOpt[0] == '0' && HaloOpt[1] == '\0');
++    FEXCore::Core::IosBlockRingForce = (_stricmp(HistoryName.c_str(), "Overwatch.exe") == 0 || HaloRing) && !(CmOpt && CmOpt[0] == '0') &&
+                                        !(RingOpt && RingOpt[0] == '0');
+     if (FEXCore::Core::IosBlockRingForce) {
+       LogMan::Msg::IFmt("[crashmailer-dump] rev=crashmailer-dump-1 fex: block ring on for {} (MADEIRA_BLOCK_RING=0 turns it off)",

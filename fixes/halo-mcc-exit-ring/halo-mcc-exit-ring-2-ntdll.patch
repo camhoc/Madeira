@@ -1,0 +1,20 @@
+diff -ru pa/dlls/ntdll/signal_arm64ec.c pb/dlls/ntdll/signal_arm64ec.c
+--- pa/dlls/ntdll/signal_arm64ec.c	2026-11-25 20:31:49.341728021 +0000
++++ pb/dlls/ntdll/signal_arm64ec.c	2026-11-25 20:34:15.230487321 +0000
+@@ -4749,9 +4749,16 @@
+     if (!ios_xp_enter()) return;
+     if (!InterlockedExchange( &ios_xp_exit_done, 1 ))
+     {
++        ULONG_PTR main_ring = 0;
+         ERR( "[crashmailer-exit-probe] exit: %s, on thread %04lx (main thread %04lx)\n", why,
+              ios_cmd_tid(), ios_xp_main_teb ? HandleToULong( ios_xp_main_teb->ClientId.UniqueThread ) : 0 );
++        /* halo-mcc-exit-ring-1: ios_xp_main_teb is the first thread that read the switch, which is not always the
++         * thread that ends the game (Halo MCC: main thread 0000, exit on 0024). Keep the main-thread snapshot, and when
++         * a different thread ends the process and has a ring, snapshot that thread too (log only). */
+         ios_xp_blocks( why, ios_xp_main_teb );
++        if (ios_xp_main_teb != NtCurrentTeb() &&
++            ios_cmd_read( (ULONG_PTR)NtCurrentTeb() + 0x1710, &main_ring, sizeof(main_ring) ) == sizeof(main_ring) && main_ring)
++            ios_xp_blocks( "exiting thread", NtCurrentTeb() );
+     }
+     ios_xp_leave();
+ }

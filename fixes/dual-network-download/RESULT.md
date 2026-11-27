@@ -4,13 +4,13 @@
 
 Updated 2026-11-27 on the Linux laptop against 0.2.180-og.
 
-## Fixed and run
-- DepotDownloader.diff is now a real unified diff. Paths start with app/Madeira/; apply with `patch -p1` from the tree root and put DualNetworkDownload.swift in app/Madeira/SwiftSteam/Content/.
-- An empty or bad Content-Length now falls back instead of crashing (parser run on Linux with 8 header cases).
-- 30 s watchdog cancels a stalled transfer; 64 MB response cap; the request path stays percent-encoded.
-- Swift typecheck of the whole app: no new errors (only the existing Squeeze one). Timeout and networking behaviour not run.
+## Apply
+`patch -p1 < DepotDownloader.diff` from the tree root, and copy DualNetworkDownload.swift to app/Madeira/SwiftSteam/Content/.
+The diff now holds the download hook, the project.pbxproj entries and a Settings toggle (Onboarding.swift, next to LAN downloads; off by default).
+
+## Run
+Applies cleanly. Swift typecheck of the app: no new errors (only the existing Squeeze one). Header parser tested on Linux.
 
 ## Still open
-- New file not in project.pbxproj; Settings toggle not written.
-- Swift 6 warnings about NSLock in async code.
-- Whether iOS keeps a cellular route alongside Wi-Fi is unproven.
+- No Xcode build, so the project.pbxproj entries are unproven. Not run on a device.
+- Swift 6 NSLock warnings. Cellular alongside Wi-Fi is unproven.

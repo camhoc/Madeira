@@ -48,7 +48,7 @@ static int safe_name(const char *n)
 static uint64_t octal(const uint8_t *p, size_t n)
 {
     uint64_t v = 0;
-    if (p[0] & 0x80) { for (size_t i = 1; i < n; i++) v = (v << 8) | p[i]; return v; }   /* base-256 */
+    if (p[0] & 0x80) { for (size_t i = 1; i < n; i++) { if (v >> 56) return UINT64_MAX; v = (v << 8) | p[i]; } return v; }   /* base-256 */
     for (size_t i = 0; i < n && p[i] >= '0' && p[i] <= '7'; i++) v = (v << 3) | (uint64_t)(p[i] - '0');
     return v;
 }
@@ -83,7 +83,7 @@ static void begin_entry(untar *u)
     if (u->have_long) { snprintf(name, sizeof name, "%s", u->longname); u->have_long = 0; }
     if (u->type == 'L') { u->state = ST_LONGNAME; u->name_len = 0; if (u->remain > 1000) u->err = WCP_UNSAFE; return; }
     if (u->type == 'x' || u->type == 'g') { u->state = u->remain ? ST_SKIP : ST_HEADER; if (u->state == ST_SKIP) u->type = 'x'; return; }
-    if (u->type == '5' || (u->type == 0 && name[strlen(name) - 1] == '/')) {
+    if (u->type == '5' || (u->type == 0 && name[0] && name[strlen(name) - 1] == '/')) {
         size_t l = strlen(name); while (l && name[l - 1] == '/') name[--l] = 0;
         if (l && !safe_name(name)) { u->err = WCP_UNSAFE; return; }
         if (l && make_dirs(u->dest, name) == 0) { char p[2200]; snprintf(p, sizeof p, "%s/%s", u->dest, name); if (mkdir(p, 0755) && errno != EEXIST) u->err = WCP_IO; }
@@ -91,7 +91,7 @@ static void begin_entry(untar *u)
     }
     if (u->type == '0' || u->type == 0) {
         if (!safe_name(name)) { u->err = WCP_UNSAFE; return; }
-        if (++u->files > u->max_files || u->bytes + u->remain > u->max_bytes) { u->err = WCP_TOO_BIG; return; }
+        if (++u->files > u->max_files || u->remain > u->max_bytes - u->bytes) { u->err = WCP_TOO_BIG; return; }
         u->bytes += u->remain;
         char p[2200]; snprintf(p, sizeof p, "%s/%s", u->dest, name);
         if (make_dirs(u->dest, name)) { u->err = WCP_IO; return; }
@@ -166,7 +166,7 @@ int wcp_pe_kind(const char *path)
     #define U32(o) ((o) + 4 <= got ? (uint32_t)(d[o] | d[(o) + 1] << 8 | d[(o) + 2] << 16 | (uint32_t)d[(o) + 3] << 24) : 0)
     if (got > 0x40 && d[0] == 'M' && d[1] == 'Z') {
         uint32_t pe = U32(0x3c);
-        if (pe + 0x18 < got && !memcmp(d + pe, "PE\0\0", 4)) {
+        if ((uint64_t)pe + 0x18 < got && !memcmp(d + pe, "PE\0\0", 4)) {
             uint32_t machine = U16(pe + 4), nsec = U16(pe + 6), optsz = U16(pe + 20), opt = pe + 24, magic = U16(opt);
             if (machine == 0x14c) kind = WCP_PE_X86;
             else if (machine == 0xAA64) kind = WCP_PE_ARM64;

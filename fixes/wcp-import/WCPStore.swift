@@ -52,8 +52,9 @@ enum WCPStore {
         let tmp = root.appendingPathComponent(".new-" + UUID().uuidString, isDirectory: true)
         try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
         do {
-            let byName = Dictionary(uniqueKeysWithValues: profile.files.filter { $0.target.hasPrefix("${system32}/") }
-                .map { (($0.target as NSString).lastPathComponent.lowercased(), $0) })
+            let byName = Dictionary(profile.files.filter { $0.target.hasPrefix("${system32}/") }
+                .map { (($0.target as NSString).lastPathComponent.lowercased(), $0) },
+                uniquingKeysWith: { first, _ in first })
             for need in required(profile.type) {
                 guard let e = byName[need] else { throw Failure.missing(need) }
                 let src = work.appendingPathComponent(e.source)

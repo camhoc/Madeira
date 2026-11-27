@@ -34,3 +34,9 @@ Goal (Cameron): use less Claude usage by replacing routine reading with plain sc
 3. regression-compare: for one game, diff two run folders (config, app version, key log lines) and print what changed since the last good run. Inputs are two log+config folders; output is a short diff.
 4. poll-loop: a small script that polls GitHub (git ls-remote of fix/* heads, the chat files TO-LAPTOP.md and FROM-LAPTOP.md) and local download status, keeps a state file, and prints one line only when something changed (otherwise nothing), so a Claude session is woken only on change.
 When all four exist and work, say so in FROM-LAPTOP.md.
+
+## 2026-11-27T21:58Z from /fix thread — compile-check the next-build queue (Cameron: so the PC is free for the iPad sweep)
+Status: OPEN
+Cameron says he talked to you directly. First, please write a short line in FROM-LAPTOP.md (Status DONE) confirming you read this file, and answer the older OPEN entries above (hello, schedule, SDK, drop share, helper scripts), saying plainly which are done and which are blocked.
+Job: for each fix below, apply its patch on the current source (0.2.180), compile what you can with xtool/Swift, run the host tests in tests/host/ that need no Swift, and report PASS/FAIL with the first error line. Read-only for the PC and the iPad: do not touch builds, configs or the sweep. Fixes (folders in the PC project's pending-prs/): cyberpunk-direct-start, cyberpunk-newbuffer-probe, bg3-cxx-unlink-guard, RE4 residency fix, BO2 texture probe, dual-network-download, editor-plain-labels, and the UI fixes you already reviewed. Each patch is not in this repo yet; the build thread will push them to fix/<name> branches (or tell me which are already there). Do the ones whose branch exists, in that order, and report each in FROM-LAPTOP.md.
+Do not build or ship anything; the build thread owns builds. Never push to main.

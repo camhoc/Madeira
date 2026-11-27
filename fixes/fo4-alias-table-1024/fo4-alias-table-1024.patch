@@ -1,0 +1,105 @@
+diff -ruN a/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp b/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp
+--- a/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp	2026-11-26 01:31:42.440307692 +0000
++++ b/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp	2026-11-26 01:31:42.442234877 +0000
+@@ -32,7 +32,12 @@
+   uint64_t Size;
+   uint64_t _Padding;  // Keeps the struct 32-byte to make array stride a power of 2.
+ };
+-constexpr int kMaxEntries = 256;
++/* fo4-alias-table-1024: was 256. Fallout 4 loads ~380 images and the 256 cap
++ * silently refused the rest (log: alias-table=256/256 refused=121), so d3d11.dll's
++ * pool copy was unknown to FEX and the first call into it died with NoExec.
++ * kMaxEntries is the array size; the cap actually used is IosAliasCap, default
++ * kMaxEntries, set to 256 by env.MADEIRA_ALIAS_TABLE_MAX = 256 (the old behaviour). */
++constexpr int kMaxEntries = 1024;
+ 
+ // extern "C" storage (not anonymous-namespace) so Module.S's ExitFunctionEC
+ // can reach the table via adrp/:lo12: — it translates the branch target
+@@ -41,6 +46,7 @@
+ extern "C" {
+ IosAliasEntry IosAliasEntries[kMaxEntries];
+ volatile int IosAliasCount = 0;
++volatile int IosAliasCap = kMaxEntries;  // fo4-alias-table-1024: runtime cap, Module.cpp ProcessInit
+ 
+ // 2026-09-23 LAST-HIT CACHE. Index of the entry that satisfied the most recent
+ // lookup, probed by Module.S BEFORE the linear scan.
+@@ -52,8 +58,8 @@
+ // retired index simply misses and falls into the scan. No generation counter, no
+ // barrier, and nothing a wrong value can do beyond costing one extra compare.
+ //
+-// Module.S masks the value with 0xFF instead of range-checking it, so kMaxEntries
+-// must stay a power of two no larger than 256.
++// Module.S masks the value with 0x3FF instead of range-checking it, so kMaxEntries
++// must stay a power of two no larger than 1024.
+ volatile int IosAliasHot = 0;
+ 
+ // [0] = calls whose target was translated to its JIT-pool copy inline,
+@@ -135,7 +141,7 @@
+ IosAliasEntry* volatile IosAliasLast = nullptr;
+ }
+ 
+-static_assert(kMaxEntries == 256, "Module.S bounds IosAliasHot with `and #0xff`");
++static_assert(kMaxEntries == 1024, "Module.S bounds IosAliasHot with `and #0x3ff`");
+ 
+ namespace {
+ IosAliasEntry* const g_Entries = IosAliasEntries;
+@@ -618,7 +624,7 @@
+     }
+   }
+ 
+-  if (count >= kMaxEntries) {
++  if (count >= IosAliasCap) {
+     /* ml1106: a silent refusal here means ExitFunctionEC never translates this
+      * image, so EVERY x64->EC call into it pays a Mach exec-fault redirect
+      * (ph-rdr59: 69k of every 100k redirects were one kernelbase export). */
+diff -ruN a/FEX/Source/Windows/ARM64EC/Module.S b/FEX/Source/Windows/ARM64EC/Module.S
+--- a/FEX/Source/Windows/ARM64EC/Module.S	2026-11-26 01:31:42.440357328 +0000
++++ b/FEX/Source/Windows/ARM64EC/Module.S	2026-11-26 01:31:42.442274944 +0000
+@@ -508,7 +508,7 @@
+   add x16, x16, #:lo12:IosAliasEntries
+   adrp x17, IosAliasHot
+   ldr w17, [x17, #:lo12:IosAliasHot]
+-  and x17, x17, #0xff   // kMaxEntries is 256 (static_assert in IosJitAlias.cpp)
++  and x17, x17, #0x3ff  // kMaxEntries is 1024 (static_assert in IosJitAlias.cpp)
+   add x4, x16, x17, lsl #5
+   ldr x23, [x4]         // Entry.PeBase
+   sub x23, x9, x23
+diff -ruN a/FEX/Source/Windows/ARM64EC/Module.cpp b/FEX/Source/Windows/ARM64EC/Module.cpp
+--- a/FEX/Source/Windows/ARM64EC/Module.cpp	2026-11-26 01:31:42.440395875 +0000
++++ b/FEX/Source/Windows/ARM64EC/Module.cpp	2026-11-26 01:31:42.442308006 +0000
+@@ -125,6 +125,7 @@
+  * ExitFunctionEC by keeping IosAliasJitSpan zero. Same namespace-scope reason
+  * as IosFfsBypassEnable above. */
+ extern "C" volatile int IosEcPoolFastOut;
++extern "C" volatile int IosAliasCap;  // fo4-alias-table-1024
+ 
+ /* Raw TSD byte offset (from TPIDRRO_EL0 & ~7) of the slot holding the TEB.
+  * Discovered and published by wine's ntdll-unix; imported in ProcessInit.
+@@ -1434,10 +1435,10 @@
+         int AliasCount = 0, AliasLive = 0;
+         uint64_t AliasRefused = 0, AliasLastRefused = 0, JitLow = 0, JitHigh = 0;
+         IosJitAliasStats(&AliasCount, &AliasLive, &AliasRefused, &AliasLastRefused, &JitLow, &JitHigh);
+-        LogMan::Msg::EFmt("[iOS-xquery] MISS tracker={} addr={:#x} rev={:#x} alias-table={}/256 live={} refused={} "
++        LogMan::Msg::EFmt("[iOS-xquery] MISS tracker={} addr={:#x} rev={:#x} alias-table={}/{} live={} refused={} "
+                           "last-refused-jit={:#x} jit-bounds=[{:#x},{:#x}) probe=fo4-alias-miss-probe",
+                           static_cast<void*>(&*InvalidationTracker), Address, IosJitReverseTranslate(Address),
+-                          AliasCount, AliasLive, AliasRefused, AliasLastRefused, JitLow, JitHigh);
++                          AliasCount, static_cast<int>(IosAliasCap), AliasLive, AliasRefused, AliasLastRefused, JitLow, JitHigh);
+       }
+     }
+ #endif
+@@ -1772,6 +1773,14 @@
+     if (PoolOut && PoolOut[0] == '0') {
+       IosEcPoolFastOut = 0;
+     }
++    /* fo4-alias-table-1024: MADEIRA_ALIAS_TABLE_MAX=<n> caps the alias table (default 1024,
++     * =256 restores the old size). Clamped to 1..1024; set before the first registration. */
++    if (const char* AliasMax = getenv("MADEIRA_ALIAS_TABLE_MAX")) {
++      const int N = atoi(AliasMax);
++      if (N >= 1 && N <= 1024) {
++        IosAliasCap = N;
++      }
++    }
+     const char* PfAf = getenv("MADEIRA_EC_PFAF_KEEP"); // madeira [pfaf-keep]
+     if (PfAf && PfAf[0] == '0') {
+       Exception::IosPfAfKeep = 0;

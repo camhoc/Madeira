@@ -1,0 +1,11 @@
+--- a/app/Madeira/SwiftSteam/Content/DepotDownloader.swift
++++ b/app/Madeira/SwiftSteam/Content/DepotDownloader.swift
+@@ -899,6 +899,8 @@
+ 
+     private nonisolated static func download(_ urlString: String) async throws -> Data {
+         guard let url = URL(string: urlString) else { throw SteamError.chunkDownloadFailed("Invalid content URL.") }
++        // Off by default. Chunks are encrypted and CRC/SHA checked, so any failure here just retries on URLSession.
++        if DualNetworkDownload.enabled, let data = try? await DualNetworkDownload.fetch(url) { return data }
+         let (data, response) = try await http.data(from: url)
+         guard let status = (response as? HTTPURLResponse)?.statusCode, (200...299).contains(status) else {
+             throw SteamError.contentHTTP((response as? HTTPURLResponse)?.statusCode ?? 0)

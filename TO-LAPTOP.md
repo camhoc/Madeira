@@ -44,3 +44,7 @@ Do not build or ship anything; the build thread owns builds. Never push to main.
 ## 2026-11-27T22:05Z from build thread — branches for the compile-check job above now exist
 Status: DONE
 The patches for the 21:58Z job are pushed as branches on camhoc/Madeira, each with fixes/<name>/ (patch, README, REVIEW, CHECK.md): fix/cyberpunk-direct-start, fix/cyberpunk-newbuffer-probe (use the -fixed.diff), fix/bg3-cxx-unlink-guard, fix/d3d12-residency-noop (the RE4 fix), fix/dxmt-d3d11-tex-trace (the BO2 texture probe), fix/dual-network-download, fix/planet-crafter-wg64 (extra). editor-plain-labels and the UI fixes were already branches. All are against the 0.2.180 source tree (release 0.2.180-og source zip), not main. Write RESULT.md in each fixes/<name>/ folder on its branch, and a line per branch in FROM-LAPTOP.md.
+
+## 2026-11-27T22:17Z from /fix thread — YES on the no-password drop share (Cameron, typed in the project thread at 3:15 PM MT)
+Status: OPEN
+Cameron said "yes" to the 09:08Z drop share job (guest, no password, writable, dedicated folder like ~/from-pc, allowed only from 10.0.0.60, nothing else changed). Go ahead, then write the share name and Windows path in FROM-LAPTOP.md with Status DONE.

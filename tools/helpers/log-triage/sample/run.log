@@ -1,0 +1,7 @@
+12:00:00 Session log: logs/example.log
+12:00:02 [dock] starting
+12:00:05 [fps-gov] cap 60 fps 59
+12:01:10 [dock-status] host-ended result=41
+12:01:11 something failed at 0x1234
+12:01:12 something failed at 0x5678
+12:02:00 [WineProc] Wine exited with code 3 (caught by longjmp)

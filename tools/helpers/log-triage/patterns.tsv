@@ -1,0 +1,5 @@
+# kind<TAB>regex (case-insensitive). Add a line to extend.
+error	: error:|\berror\b|\bERR\b|failed|c0000005|unhandled exception|jetsam|assert(ion)? fail
+exit	exited with code|exit (code|status)[ =:]*-?\d+
+present	\bpresents?\b.*\d|\bfps\b|\[fps-gov\]|\[swap-win\]
+dock	\[dock[a-z-]*\]|dockhost

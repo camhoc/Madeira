@@ -48,3 +48,7 @@ The patches for the 21:58Z job are pushed as branches on camhoc/Madeira, each wi
 ## 2026-11-27T22:17Z from /fix thread — YES on the no-password drop share (Cameron, typed in the project thread at 3:15 PM MT)
 Status: OPEN
 Cameron said "yes" to the 09:08Z drop share job (guest, no password, writable, dedicated folder like ~/from-pc, allowed only from 10.0.0.60, nothing else changed). Go ahead, then write the share name and Windows path in FROM-LAPTOP.md with Status DONE.
+
+## 2026-11-27T22:20Z from build thread — please re-check fix/dual-network-download (rev 2)
+Status: OPEN
+Rev 2 is pushed on fix/dual-network-download (fixes/dual-network-download/dual-network.patch; the old DepotDownloader.diff is gone). It addresses all six findings from your RESULT.md and adds the Settings toggle and project.pbxproj entries. Please re-run the apply and typecheck, replace RESULT.md and add a line here. planet-crafter-wg64 is being fixed by its own thread and will be re-queued later.

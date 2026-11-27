@@ -1,0 +1,47 @@
+--- a/src/launch.c	2026-11-25 21:40:50.575618277 +0000
++++ b/src/launch.c	2026-11-25 22:16:52.577527983 +0000
+@@ -282,13 +282,37 @@
+     static char actual_utf8[32768];
+     static wchar_t actual[32768], expected[32768], normalized[32768];
+     DWORD length = GetEnvironmentVariableW(L"MADEIRA_STEAM_HOST_EXPECTED_INSTALL", expected, 32768);
+-    if (!length || length >= 32768) return 41;
+-    int32_t got = ((install_dir_fn)(*(void ***)manager)[5])(manager, appid, actual_utf8, sizeof(actual_utf8));
+-    if (got <= 0 || got >= (int32_t)sizeof(actual_utf8) ||
+-        !memchr(actual_utf8, 0, sizeof(actual_utf8)) ||
+-        !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, actual_utf8, -1, actual, 32768)) return 41;
+-    length = GetFullPathNameW(actual, 32768, normalized, NULL);
+-    if (!length || length >= 32768 || _wcsicmp(normalized, expected)) {
++    if (!length || length >= 32768) {
++        o->event("launch-expected-install-missing", (int32_t)length);
++        return 41;
++    }
++    /* dock-install-dir-wait: on a first launch after Madeira opens, Valve's client
++     * can still answer with another path while it reads its library list (cause
++     * unproven: every code 41 so far was the first play after the app opened, a plain
++     * retry always worked). Ask again for up to 10 s (500 ms steps) before code 41.
++     * MADEIRA_DOCK_INSTALL_DIR_WAIT=0 restores the single check. */
++    wchar_t wait_value[4] = {0};
++    bool wait_off = GetEnvironmentVariableW(L"MADEIRA_DOCK_INSTALL_DIR_WAIT", wait_value, 4) == 1 && wait_value[0] == L'0';
++    int attempts = wait_off ? 1 : 20;
++    bool matched = false;
++    for (int attempt = 0; attempt < attempts && !matched; attempt++) {
++        if (attempt) Sleep(500);
++        int32_t got = ((install_dir_fn)(*(void ***)manager)[5])(manager, appid, actual_utf8, sizeof(actual_utf8));
++        if (got <= 0 || got >= (int32_t)sizeof(actual_utf8) ||
++            !memchr(actual_utf8, 0, sizeof(actual_utf8)) ||
++            !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, actual_utf8, -1, actual, 32768)) {
++            o->event("launch-install-directory-query-failed", attempt);
++            continue;
++        }
++        length = GetFullPathNameW(actual, 32768, normalized, NULL);
++        if (length && length < 32768 && !_wcsicmp(normalized, expected)) {
++            matched = true;
++            if (attempt) o->event("launch-install-directory-attempts", attempt + 1);
++        }
++    }
++    if (!matched) {
++        /* Path text only (a game folder, no account data), so the next report shows the mismatch. */
++        fprintf(stderr, "[dock] install-dir mismatch: steam=%s expected=%ls\n", actual_utf8, expected);
+         o->event("launch-install-directory-mismatch", 1);
+         return 41;
+     }

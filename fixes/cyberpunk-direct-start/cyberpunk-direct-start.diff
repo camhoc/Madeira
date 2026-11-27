@@ -1,0 +1,125 @@
+--- a/app/Madeira/GameRecommendations.swift	2026-11-27 01:42:07.150971000 +0000
++++ b/app/Madeira/GameRecommendations.swift	2026-11-27 19:04:48.190700410 +0000
+@@ -1569,7 +1569,7 @@
+             // (cyberpunk-oversize-2gb) Cyberpunk 2077 started through its launcher (the GOG library entries in
+             // the reports): only when the game's program is under it; The Witcher 3 ships a REDprelauncher.exe too.
+             let folder = path.lastIndex(of: "\\").map { String(path[..<$0]) } ?? ""
+-            return fileExists(folder + "\\bin\\x64\\Cyberpunk2077.exe") ? cyberpunk2077 : nil
++            return fileExists(folder + "\\bin\\x64\\Cyberpunk2077.exe") ? cyberpunk2077GOG : nil
+         default:
+             if let list = steamTitles.first(where: { $0.programs.contains(last) || (inSteam && $0.steamPrograms.contains(last)) })?.list {
+                 return list
+@@ -1766,6 +1766,8 @@
+         // (cyberpunk-oversize-2gb) By program too, for copies outside Steam; its launcher is matched in `match`.
+         SteamTitle(appIDs: [1091500], folders: ["cyberpunk 2077"],
+                    programs: ["cyberpunk2077.exe"], steamPrograms: [], list: cyberpunk2077),
++        // (cyberpunk-direct-start) The launcher's list, matched in `match` only; here so `all` holds it (Reset to Recommended).
++        SteamTitle(appIDs: [], folders: [], programs: [], steamPrograms: [], list: cyberpunk2077GOG),
+     ]
+ 
+     /// [cyberpunk-oversize-2gb] Cyberpunk 2077 (Steam App ID 1091500, Cyberpunk2077.exe; also the GOG copy). Our own list,
+@@ -1777,13 +1779,36 @@
+     /// after the memory step is NOT known, so this list is one step, not a working game. The standard line plus the two
+     /// lines that run had; no other game gets them (Bodycam, BIGFOOT, GTA V and .NET games ask for such a reservation,
+     /// are refused, and carry on with a smaller one). To switch it off, delete the two lines. NOT device-tested.
++    /// (cyberpunk-direct-start) Version 2, Nov 27 2026, iPad16,8 sweep retests: the launcher stub redprelauncher.exe
++    /// faults inside PocoFoundation.dll when pool-split + MADEIRA_X64_IMAGE_NOCOPY are on ([crash-report] module
++    /// PocoFoundation.dll, [child-end] redprelauncher.exe status=0xc0000005 lived=2.21s), and without them the game
++    /// exhausts the JIT pool ([jit-pool] EXHAUSTED ... FAILING the load). So the game's own program starts directly
++    /// (Steam > Start with "The game") with both lines: it then renders (1940 draws) and stops on a failed Metal
++    /// newBuffer, a separate wall. Off: env.MADEIRA_REC_STEAM_DIRECT = 0 in madeira.cfg, or delete the two lines.
++    /// GOG copies (library entry REDprelauncher.exe) get the lines but the launcher still runs: NOT checked.
+     static let cyberpunk2077 = GameRecommendation(
+-        id: "cyberpunk-2077", title: "Cyberpunk 2077", version: 1,
++        id: "cyberpunk-2077", title: "Cyberpunk 2077", version: 2,
+         config: """
+         # Madeira's recommended settings for Cyberpunk 2077.
+         # Reset to Recommended, at the bottom of the game's settings, brings them back.
+         env.MADEIRA_EC_HOOK_TRACE = 0
+         oversize-reserve = 1
++        oversize-reserve-mb = 2048
++        pool-split = 1
++        env.MADEIRA_X64_IMAGE_NOCOPY = 1
++        """,
++        steamDirectProgram: "bin/x64/Cyberpunk2077.exe")
++
++    /// (cyberpunk-direct-start) Cyberpunk 2077 started through its launcher (GOG library entry REDprelauncher.exe): the
++    /// version 1 lines, WITHOUT pool-split / MADEIRA_X64_IMAGE_NOCOPY, because the launcher faults inside
++    /// PocoFoundation.dll with them (iPad16,8 retests, Nov 27 2026). NOT device-tested on a GOG copy.
++    static let cyberpunk2077GOG = GameRecommendation(
++        id: "cyberpunk-2077-gog", title: "Cyberpunk 2077 (GOG launcher)", version: 1,
++        config: """
++        # Madeira's recommended settings for Cyberpunk 2077 started through its launcher.
++        # Reset to Recommended, at the bottom of the game's settings, brings them back.
++        env.MADEIRA_EC_HOOK_TRACE = 0
++        oversize-reserve = 1
+         oversize-reserve-mb = 2048
+         """)
+ 
+--- a/tests/host/check-game-recommendations.py	2026-11-27 01:44:15.132766000 +0000
++++ b/tests/host/check-game-recommendations.py	2026-11-27 19:04:50.895886801 +0000
+@@ -79,7 +79,7 @@
+                         'ghost-of-tsushima', 'god-of-war', 'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart',
+                         'crysis-remastered', 'crysis-2-remastered', 'crysis-3-remastered', 'rockstar-launcher', 'rockstar-launcher-setup',
+                         'battle-net', 'battle-net-setup', 'steam-big-picture', 'dark-souls-remastered', 'dark-souls-iii', 'fallout-new-vegas', 'fallout-3', 'black-ops-1', 'black-ops-2', 'borderlands-2',
+-                        'standard', 'melonloader', 'avicii-invector', 'final-fantasy-resonance', 'sonic-generations', 'detroit-become-human'} | MERGED, \
++                        'standard', 'melonloader', 'avicii-invector', 'final-fantasy-resonance', 'sonic-generations', 'detroit-become-human', 'cyberpunk-2077-gog'} | MERGED, \
+     sorted(presets)
+ assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta5LegacyOther, gta4Steam,\n'
+         '                      ghostOfTsushima, godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered,\n'
+@@ -134,7 +134,7 @@
+ for ident in MERGED | {'avicii-invector'}:
+     assert titles_src.count('list: %s)' % presets[ident]['name']) == 1, ident
+ assert titles_src.count('list: finalFantasyResonance)') == 1
+-assert titles_src.count('SteamTitle(') == len(MERGED) + 4   # AVICII Invector, FINAL FANTASY RESONANCE, Sonic Generations, Detroit: Become Human
++assert titles_src.count('SteamTitle(') == len(MERGED) + 5   # AVICII Invector, FINAL FANTASY RESONANCE, Sonic Generations, Detroit: Become Human
+ # ml2021: the Big Picture entry (C:\big-picture.bat) is recognised by its batch name and gets the Steam Big Picture list
+ assert 'if last == "big-picture.bat" { return steamBigPicture }' in lists_src
+ assert 'static var bigPictureEntry: LibraryEntry' in library and 'relativePath: "big-picture.bat"' in library \
+@@ -193,7 +193,7 @@
+         continue
+     # These lists were tested without madeira-bcd's defaults.
+     if ident in ('standard', 'fallout-new-vegas', 'fallout-3', 'black-ops-1', 'black-ops-2', 'borderlands-2', 'persona-3-reload', 'avicii-invector',
+-                  'satisfactory-steam', 'melonloader', 'final-fantasy-resonance', 'metaphor-refantazio', 'dying-light-2', 'baldurs-gate-3', 'blue-prince', 'the-forest', 'steep', 'just-cause-2', 'sonic-generations', 'detroit-become-human', 'cyberpunk-2077', 'football-manager-27'):
++                  'satisfactory-steam', 'melonloader', 'final-fantasy-resonance', 'metaphor-refantazio', 'dying-light-2', 'baldurs-gate-3', 'blue-prince', 'the-forest', 'steep', 'just-cause-2', 'sonic-generations', 'detroit-become-human', 'cyberpunk-2077', 'cyberpunk-2077-gog', 'football-manager-27'):
+         # steep-epic-launcher-wait: Steep's own fix IS the wait-for-children rule, not the community defaults
+         own_fix = {'env.MADEIRA_WAIT_CHILDREN = 1'} if ident == 'steep' else set()
+         assert not (set(FORK_DEFAULTS) - own_fix) & set(p['lines']), (ident, "the standard list has none of madeira-bcd's defaults")
+@@ -497,18 +497,19 @@
+ # variant or app-side switches, and no MADEIRA_SPAWN_SWAP (its engine code is not in this tree).
+ for ident in MERGED:
+     p = presets[ident]
+-    assert p['version'] == (4 if ident == 'baldurs-gate-3' else 2 if ident in ('batman-arkham-city-goty', 'counter-strike-2', 'beamng-drive', 'metaphor-refantazio', 'goals', 'dotnet-large-heap', 'project-zomboid', 'slay-the-spire-2', 'the-escapists-2', 'subnautica-2', 'resident-evil-requiem', 'grounded') else 1), ident
++    assert p['version'] == (4 if ident == 'baldurs-gate-3' else 2 if ident in ('batman-arkham-city-goty', 'counter-strike-2', 'beamng-drive', 'metaphor-refantazio', 'goals', 'dotnet-large-heap', 'cyberpunk-2077', 'project-zomboid', 'slay-the-spire-2', 'the-escapists-2', 'subnautica-2', 'resident-evil-requiem', 'grounded') else 1), ident
+     assert not any(line.startswith(('env.MADEIRA_WINTYPES', 'env.MADEIRA_OPTIN_DLLS', 'env.MADEIRA_D3D8 ',
+                                     'env.MADEIRA_STEAM_IDENTITY', 'env.MADEIRA_MFC_DOCK', 'pool-split-retry'))
+                    for line in p['lines']), (ident, p['lines'])
+ assert [ident for ident, p in presets.items() if any(line.startswith('env.MADEIRA_SPAWN_SWAP') for line in p['lines'])] == []
+ # cyberpunk-oversize-2gb: Cyberpunk 2077 is the standard line plus a 2 GB real part for its 64 GB reservation (the
+ # 8 GB real part of the first reports left no room for its later 4 GB one). No other list sets the size.
+-assert presets['cyberpunk-2077']['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0', 'oversize-reserve = 1', 'oversize-reserve-mb = 2048'] \
+-    and presets['cyberpunk-2077']['switches'] == '', presets['cyberpunk-2077']
+-assert [i for i, p in presets.items() if any(l.startswith('oversize-reserve-mb') for l in p['lines'])] == ['cyberpunk-2077']
++assert presets['cyberpunk-2077']['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0', 'oversize-reserve = 1', 'oversize-reserve-mb = 2048',
++                                                'pool-split = 1', 'env.MADEIRA_X64_IMAGE_NOCOPY = 1'] \
++    and 'steamDirectProgram: "bin/x64/Cyberpunk2077.exe"' in lists_src, presets['cyberpunk-2077']
++assert [i for i, p in presets.items() if any(l.startswith('oversize-reserve-mb') for l in p['lines'])] == ['cyberpunk-2077', 'cyberpunk-2077-gog']
+ assert ('        case "redprelauncher.exe":\n' in lists_src
+-        and 'return fileExists(folder + "\\\\bin\\\\x64\\\\Cyberpunk2077.exe") ? cyberpunk2077 : nil\n' in lists_src)
++        and 'return fileExists(folder + "\\\\bin\\\\x64\\\\Cyberpunk2077.exe") ? cyberpunk2077GOG : nil\n' in lists_src)
+ assert presets['beamng-drive']['tested'][-4:] == [
+     'env.MADEIRA_SC_PA_POOLS = 2', 'env.MADEIRA_CEF_PA_EXES = BeamNG.drive.x64.exe',
+     'env.MADEIRA_CHILD_ARGS = BeamNG.drive.x64.exe --single-process --js-flags=--jitless '
+@@ -954,10 +955,10 @@
+          files: [#"C:\Program Files\Epic Games\InnerSpace\version.dll"#, #"C:\Program Files\Epic Games\InnerSpace\MelonLoader"#]) == "innerspace",
+       "a game's own list wins over the MelonLoader list")
+ check(R.melonLoader.fileText.contains("\noversize-reserve = 1\n"), "the MelonLoader list serves large reservations in part")
+-check(R.steamTitles.count == 74 && R.all.count == 103, "74 titles in the Steam table, 103 lists (+ Football Manager 27, GOALS, Portal, .NET program, The Forest, Steep, Just Cause 2, Sonic Generations, Detroit, Hades II, L.A. Noire, Cyberpunk 2077; The Witcher 3 dropped)")
++check(R.steamTitles.count == 75 && R.all.count == 104, "75 titles in the Steam table, 104 lists (+ Football Manager 27, GOALS, Portal, .NET program, The Forest, Steep, Just Cause 2, Sonic Generations, Detroit, Hades II, L.A. Noire, Cyberpunk 2077; The Witcher 3 dropped)")
+ check(id(steam + #"\Cyberpunk 2077"#, 1091500) == "cyberpunk-2077" && id(steam + #"\Cyberpunk 2077"#) == "cyberpunk-2077"
+       && id(#"C:\GOG Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe"#) == "cyberpunk-2077"
+-      && id(#"C:\GOG Games\Cyberpunk 2077\REDprelauncher.exe"#, files: [#"C:\GOG Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe"#]) == "cyberpunk-2077"
++      && id(#"C:\GOG Games\Cyberpunk 2077\REDprelauncher.exe"#, files: [#"C:\GOG Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe"#]) == "cyberpunk-2077-gog"
+       && id(#"C:\GOG Games\The Witcher 3 Wild Hunt\REDprelauncher.exe"#,
+             files: [#"C:\GOG Games\The Witcher 3 Wild Hunt\bin\x64\witcher3.exe"#]) == "none",
+       "Cyberpunk 2077 by App ID, folder, program and its launcher (GOG); another game's REDprelauncher gets nothing (cyberpunk-oversize-2gb)")

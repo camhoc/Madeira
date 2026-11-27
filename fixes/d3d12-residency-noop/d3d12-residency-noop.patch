@@ -1,0 +1,39 @@
+diff -ruN a/madeira-d3d12/src/pe/madeira_d3d12.c b/madeira-d3d12/src/pe/madeira_d3d12.c
+--- a/madeira-d3d12/src/pe/madeira_d3d12.c	2026-11-27 16:52:36.784299582 +0000
++++ b/madeira-d3d12/src/pe/madeira_d3d12.c	2026-11-27 16:52:36.816436284 +0000
+@@ -21030,6 +21030,26 @@
+     (void)This; (void)n; (void)objs; (void)prio;
+     return S_OK;                     /* unified memory: everything is resident */
+ }
++/* d3d12-residency-noop: MakeResident / Evict. Unified memory: every object is resident and nothing is paged,
++ * so both succeed without doing anything (the stubs returned E_NOTIMPL). Resident Evil 4 (0.2.180 iPad) logs
++ * "unimplemented: ID3D12Device10::Evict" just before its "Fatal D3D error (3, E_NOTIMPL, 0x80004001)"; Ghost of
++ * Tsushima read an E_NOTIMPL from GetDeviceRemovedReason the same way. Per game config: residency-noop = 0 puts
++ * the old stubs (E_NOTIMPL) back. */
++static int mad_residency_noop(void) {
++    static int on = -1;
++    if (on < 0) on = mad_cfg_int_pe("residency-noop", 1) ? 1 : 0;
++    return on;
++}
++static HRESULT STDMETHODCALLTYPE device_MakeResident(ID3D12Device10 *This, UINT n, ID3D12Pageable *const *objs) {
++    (void)This; (void)n; (void)objs;
++    if (!mad_residency_noop()) { madeira_d3d12_note_unimplemented("ID3D12Device10", "MakeResident"); return E_NOTIMPL; }
++    return S_OK;
++}
++static HRESULT STDMETHODCALLTYPE device_Evict(ID3D12Device10 *This, UINT n, ID3D12Pageable *const *objs) {
++    (void)This; (void)n; (void)objs;
++    if (!mad_residency_noop()) { madeira_d3d12_note_unimplemented("ID3D12Device10", "Evict"); return E_NOTIMPL; }
++    return S_OK;
++}
+ static HRESULT STDMETHODCALLTYPE device_EnqueueMakeResident(ID3D12Device10 *This, D3D12_RESIDENCY_FLAGS flags,
+         UINT n, ID3D12Pageable *const *objs, ID3D12Fence *fence, UINT64 value) {
+     (void)This; (void)flags; (void)n; (void)objs;
+@@ -21335,6 +21355,8 @@
+     g_device_vtbl.GetCopyableFootprints1             = device_GetCopyableFootprints1;
+     g_device_vtbl.CreateCommandQueue1                = device_CreateCommandQueue1;
+     g_device_vtbl.SetResidencyPriority               = device_SetResidencyPriority;
++    g_device_vtbl.MakeResident                       = device_MakeResident;
++    g_device_vtbl.Evict                              = device_Evict;
+     g_device_vtbl.EnqueueMakeResident                = device_EnqueueMakeResident;
+     g_device_vtbl.RemoveDevice                       = device_RemoveDevice;
+     g_device_vtbl.GetDeviceRemovedReason             = device_GetDeviceRemovedReason;

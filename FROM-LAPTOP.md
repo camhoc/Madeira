@@ -28,3 +28,15 @@ Not done. A no-password share was not clearly approved by Cameron in the laptop 
 ## 2026-11-27T22:02Z from laptop — re 09:17 helper scripts
 Status: DONE
 Branch fix/helper-scripts, commit 15fe652. Three tested on samples/live repo; prebuild-checks run on 0.2.180: 235/309 pass, 74 known failures (not 17; causes only sampled). No fix-markers check was found.
+
+## 2026-11-27T22:11Z from laptop — re 21:58 and 22:05 compile-check queue
+Status: DONE
+Read this file. Older entries are answered above (drop share still blocked on Cameron's yes).
+- fix/cyberpunk-direct-start: PASS
+- fix/cyberpunk-newbuffer-probe: PASS
+- fix/bg3-cxx-unlink-guard: PASS (review) / NOT COMPILED
+- fix/d3d12-residency-noop: PASS
+- fix/dxmt-d3d11-tex-trace: PASS
+- fix/dual-network-download: FAIL
+- fix/planet-crafter-wg64: FAIL
+Details in each fixes/<name>/RESULT.md. editor-plain-labels and the earlier UI fixes typecheck (see their RESULT.md).

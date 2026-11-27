@@ -50,3 +50,6 @@ Off switch: `env.MADEIRA_WG_64BIT = 0` in the game's config (parser refused agai
 
 ## Madeira log of the passing run (PC session, Nov 27 ~16:46Z)
 @45384 "[wg-parser] ml1990 mp4/mov enabled: video on videotoolbox, aac on audiotoolbox, native video format bgra"; @45430 "connect container=mp4 codec=h264 backend=videotoolbox 1920x1080 fps=60 out=bgra duration=11216ms"; @45431 "codec=aac rate=48000 channels=2 backend=audiotoolbox". No 0xc00d or [vconv] hits in the first matches. So the video is an H.264 MP4 decoded by VideoToolbox, output BGRA; no converter needed. (Run header's "last step Wine finished +29.0 s" looks stale.)
+
+## Update Nov 27 ~22:30Z: host test updated
+Laptop check (fix/planet-crafter-wg64 RESULT.md): patch applied and typechecked, but tests/host/check-game-recommendations.py failed (preset id set, title count). planet-crafter-wg64.patch now also edits that test (paths relative to the Madeira root): add 'planet-crafter' to the expected id set, to the "recognised once" loop, to the "tested without madeira-bcd defaults" tuple, and SteamTitle count len(MERGED)+4 -> +5. Not run here (no swiftc in this session); needs a laptop re-run.

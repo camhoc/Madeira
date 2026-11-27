@@ -39,16 +39,20 @@
                          'crysis-remastered', 'crysis-2-remastered', 'crysis-3-remastered', 'rockstar-launcher', 'rockstar-launcher-setup',
                          'battle-net', 'battle-net-setup', 'steam-big-picture', 'dark-souls-remastered', 'dark-souls-iii', 'fallout-new-vegas', 'fallout-3', 'black-ops-1', 'black-ops-2', 'borderlands-2',
 -                        'standard', 'melonloader', 'avicii-invector', 'final-fantasy-resonance', 'sonic-generations', 'detroit-become-human'} | MERGED, \
-+                        'standard', 'melonloader', 'avicii-invector', 'final-fantasy-resonance', 'sonic-generations', 'detroit-become-human', 'planet-crafter'} | MERGED, \
++                        'standard', 'melonloader', 'avicii-invector', 'planet-crafter', 'final-fantasy-resonance', 'sonic-generations', 'detroit-become-human'} | MERGED, \
      sorted(presets)
  assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta5LegacyOther, gta4Steam,\n'
          '                      ghostOfTsushima, godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered,\n'
-@@ -134,7 +134,7 @@
- for ident in MERGED | {'avicii-invector'}:
+@@ -131,10 +131,10 @@
+ assert 'if let on = rec.startServices { entry.startServices = on ? true : nil }' in apply_src
+ # Each list in the Steam title table is recognised once.
+ titles_src = block(lists_src, '    static let steamTitles: [SteamTitle] = [', '\n    ]\n')
+-for ident in MERGED | {'avicii-invector'}:
++for ident in MERGED | {'avicii-invector', 'planet-crafter'}:
      assert titles_src.count('list: %s)' % presets[ident]['name']) == 1, ident
  assert titles_src.count('list: finalFantasyResonance)') == 1
 -assert titles_src.count('SteamTitle(') == len(MERGED) + 4   # AVICII Invector, FINAL FANTASY RESONANCE, Sonic Generations, Detroit: Become Human
-+assert titles_src.count('SteamTitle(') == len(MERGED) + 5   # AVICII Invector, FINAL FANTASY RESONANCE, Sonic Generations, Detroit: Become Human, The Planet Crafter
++assert titles_src.count('SteamTitle(') == len(MERGED) + 5   # AVICII Invector, The Planet Crafter, FINAL FANTASY RESONANCE, Sonic Generations, Detroit: Become Human
  # ml2021: the Big Picture entry (C:\big-picture.bat) is recognised by its batch name and gets the Steam Big Picture list
  assert 'if last == "big-picture.bat" { return steamBigPicture }' in lists_src
  assert 'static var bigPictureEntry: LibraryEntry' in library and 'relativePath: "big-picture.bat"' in library \
@@ -57,16 +61,7 @@
          continue
      # These lists were tested without madeira-bcd's defaults.
 -    if ident in ('standard', 'fallout-new-vegas', 'fallout-3', 'black-ops-1', 'black-ops-2', 'borderlands-2', 'persona-3-reload', 'avicii-invector',
-+    if ident in ('planet-crafter', 'standard', 'fallout-new-vegas', 'fallout-3', 'black-ops-1', 'black-ops-2', 'borderlands-2', 'persona-3-reload', 'avicii-invector',
++    if ident in ('standard', 'fallout-new-vegas', 'fallout-3', 'black-ops-1', 'black-ops-2', 'borderlands-2', 'persona-3-reload', 'avicii-invector', 'planet-crafter',
                    'satisfactory-steam', 'melonloader', 'final-fantasy-resonance', 'metaphor-refantazio', 'dying-light-2', 'baldurs-gate-3', 'blue-prince', 'the-forest', 'steep', 'just-cause-2', 'sonic-generations', 'detroit-become-human', 'cyberpunk-2077', 'football-manager-27'):
          # steep-epic-launcher-wait: Steep's own fix IS the wait-for-children rule, not the community defaults
          own_fix = {'env.MADEIRA_WAIT_CHILDREN = 1'} if ident == 'steep' else set()
-@@ -954,7 +954,7 @@
-          files: [#"C:\Program Files\Epic Games\InnerSpace\version.dll"#, #"C:\Program Files\Epic Games\InnerSpace\MelonLoader"#]) == "innerspace",
-       "a game's own list wins over the MelonLoader list")
- check(R.melonLoader.fileText.contains("\noversize-reserve = 1\n"), "the MelonLoader list serves large reservations in part")
--check(R.steamTitles.count == 74 && R.all.count == 103, "74 titles in the Steam table, 103 lists (+ Football Manager 27, GOALS, Portal, .NET program, The Forest, Steep, Just Cause 2, Sonic Generations, Detroit, Hades II, L.A. Noire, Cyberpunk 2077; The Witcher 3 dropped)")
-+check(R.steamTitles.count == 75 && R.all.count == 104, "75 titles in the Steam table, 104 lists (+ Football Manager 27, GOALS, Portal, .NET program, The Forest, Steep, Just Cause 2, Sonic Generations, Detroit, Hades II, L.A. Noire, Cyberpunk 2077; The Witcher 3 dropped)")
- check(id(steam + #"\Cyberpunk 2077"#, 1091500) == "cyberpunk-2077" && id(steam + #"\Cyberpunk 2077"#) == "cyberpunk-2077"
-       && id(#"C:\GOG Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe"#) == "cyberpunk-2077"
-       && id(#"C:\GOG Games\Cyberpunk 2077\REDprelauncher.exe"#, files: [#"C:\GOG Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe"#]) == "cyberpunk-2077"

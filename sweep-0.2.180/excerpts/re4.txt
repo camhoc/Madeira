@@ -1,0 +1,21 @@
+# re4.exe-2026-11-27_07-10-57.txt (selected lines, trimmed)
+4: Previous run: Madeira closed while Borderlands 2 was running (started 06:57:14): a crash or iOS ending it for memory (it never got back to the library); steps: play 0.0 · JIT on 1.4 · Dock host 6.2 · session 6.2 · Wine sequence 7.9 · JIT pool ready 24.0 · wineserver ready 24.1 · Wine started 24.1 · game shown (game-window) 34.7 · Steam screen ended (game-window) 34.7
+8:      its config: d3d12-tiled-resources = 1; env.MADEIRA_EC_HOOK_TRACE = 0; env.MADEIRA_WG_64BIT = 1; pool-low = 1; pool-low-margin = 16
+28: [07:09:08.995] [ERR] [last-run] Madeira closed while Borderlands 2 was running (started 06:57:14): a crash or iOS ending it for memory (it never got back to the library); steps: play 0.0 · JIT on 1.4 · Dock host 6.2 · session 6.2 · Wine sequence 7.9 · JIT pool ready 24.0 · wineserver ready 24.1 · Wine started 24.1 · game shown (game-window) 34.7 · Steam screen ended (game-window) 34.7
+29: [07:09:08.999] [INFO] [log-trail] on: [pad] [focus] [screen] [tap] [app] [step] [game-start] [game-end] lines (env.MADEIRA_LOG_TRAIL = 0 turns them off)
+155: [07:10:52.251] [INFO] [steam-launch-view] hold app=2050650 auto-reveal=1
+15470: [07:11:09.753] [INFO] [steam-launch-view] scene=game shown=1 window=1926x1112 owner=other pid=f8 t=17s
+15471: [07:11:09.753] [INFO] [steam-launch-view] end reason=game-window scene=game revealed=0 t=17s
+15474: [07:11:09.753] [INFO] [step] Resident Evil 4 +22.89s game shown (game-window)
+18521: 0130:err:seh:ios_exc_dump_str [exc] ml812   OutputDebugStringA: "[madeira-d3d12] unimplemented: ID3D12Resource2::GetHeapProperties."
+18522: [madeira-d3d12] unimplemented: ID3D12Resource2::GetHeapProperties
+27303: [wg-parser] ml1990 mp4/mov enabled (MADEIRA_WG_VIDEO=0 disables): video on videotoolbox, aac on audiotoolbox, native video format nv12
+27359: [wg-parser] ml1990 connect container=mp4 codec=aac layer=0 rate=48000 channels=2 mask=0x3 out=f32 duration=4971ms bitrate=381375 compressed_out=0 stream=0 backend=audiotoolbox
+27360: [wg-parser] ml1990 connect container=mp4 stream=1 video codec=h264 backend=videotoolbox 3840x2160 fps=30000/1001 out=nv12 duration=4971ms bitrate=42536005 profile=0 level=0
+27507: [wg-parser] ml1990 connect container=mp4 stream=0 video codec=h264 backend=videotoolbox 1920x1080 fps=4500000/149149 out=nv12 duration=4971ms bitrate=12383743 profile=0 level=0
+27508: [wg-parser] ml1990 connect container=mp4 codec=aac layer=0 rate=48000 channels=2 mask=0x3 out=f32 duration=5034ms bitrate=380141 compressed_out=0 stream=1 backend=audiotoolbox
+34831: [wg-parser] ml1990 connect container=mp4 stream=0 video codec=h264 backend=videotoolbox 1920x1080 fps=4500000/149149 out=nv12 duration=4971ms bitrate=12383743 profile=0 level=0 (repeat #2)
+34832: [wg-parser] ml1990 connect container=mp4 codec=aac layer=0 rate=48000 channels=2 mask=0x3 out=f32 duration=5034ms bitrate=380141 compressed_out=0 stream=1 backend=audiotoolbox (repeat #2)
+382312: [wg-parser] ml1990 connect container=mp4 stream=0 video codec=h264 backend=videotoolbox 1920x1080 fps=30000/1001 out=nv12 duration=60960ms bitrate=11873864 profile=0 level=0
+382381: [madeira-d3d12] unimplemented: ID3D12Device10::Evict
+382603: [madeira-d3d12] Queue::Wait: fence 00000070DD45FCF0 never reached 34655 in 5 s (at 34654); continuing

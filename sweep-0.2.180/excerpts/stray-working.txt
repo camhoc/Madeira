@@ -1,0 +1,7 @@
+# retest-stray-works.txt (selected lines, trimmed)
+7:      its config: env.MADEIRA_EC_HOOK_TRACE = 0
+25: [10:36:46.555] [INFO] [log-trail] on: [pad] [focus] [screen] [tap] [app] [step] [game-start] [game-end] lines (env.MADEIRA_LOG_TRAIL = 0 turns them off)
+162: [10:38:15.662] [INFO] [steam-launch-view] hold app=1332010 auto-reveal=1
+19098: [10:38:31.663] [INFO] [steam-launch-view] scene=game shown=1 window=1152x800 owner=other pid=108 t=16s
+19099: [10:38:31.663] [INFO] [steam-launch-view] end reason=game-window scene=game revealed=0 t=16s
+19102: [10:38:31.663] [INFO] [step] Stray +20.74s game shown (game-window)

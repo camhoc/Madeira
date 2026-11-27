@@ -1,0 +1,16 @@
+# retest-gmod.exe-2026-11-27_08-29-28.txt (selected lines, trimmed)
+5:   1. Garry's Mod (Steam 4000), started 08:29:17: running, last step game shown (game-window) +14.8 s
+7:      its config: env.MADEIRA_CTX_CPU_AREA = 2; env.MADEIRA_EC_HOOK_TRACE = 0; env.MADEIRA_FILE_TRACE = 1; env.MADEIRA_FREE_DELAY_MS = 2000; env.MADEIRA_JIT_DUMP = 0; env.MADEIRA_PLAIN_DIR_LINKS = 1; env.MADEIRA_WAIT_CHILDREN = 1; env.MADEIRA_X64_IMAGE_NOCOPY = 1; pool = 896; pool-split = 1
+25: [08:27:57.658] [INFO] [log-trail] on: [pad] [focus] [screen] [tap] [app] [step] [game-start] [game-end] lines (env.MADEIRA_LOG_TRAIL = 0 turns them off)
+146: [08:29:22.267] [INFO] [steam-launch-view] hold app=4000 auto-reveal=1
+18100: [08:29:32.268] [INFO] [steam-launch-view] scene=game shown=1 window=1152x800 owner=other pid=fc t=10s
+18101: [08:29:32.268] [INFO] [steam-launch-view] end reason=game-window scene=game revealed=0 t=10s
+18104: [08:29:32.268] [INFO] [step] Garry's Mod +14.84s game shown (game-window)
+18503: [guest-data] c0000005 tid=0100 WRITE of 0x713d5703b4: READ-ONLY FOR WINDOWS TOO (the program or a DLL protected it: a real guest fault) | wine view 0x713d570000+0x1e000 vprot=0x25 protect=0x27 | host 0x713d570000-0x713d574000 prot=1/7 | pc=1758e13ac
+21871: [guest-data] c0000005 tid=01c0 READ of 0x1: NOTHING THERE (freed or never allocated: a stale or wild pointer) | wine no view 0x0+0 vprot=0 protect=0 | host unmapped, next 0x102894000-0x105f48000 prot=0/0 | pc=15ddca810
+22072: [exc-disp]   OutputDebugStringA: "[1127/152939.150:WARNING:gpu_process_host.cc(1262)] The GPU process has crashed 1 time(s)
+22074: [guest-log] #2 tid=019c [1127/152939.150:WARNING:gpu_process_host.cc(1262)] The GPU process has crashed 1 time(s)
+22360: [exc-disp]   OutputDebugStringA: "[1127/152939.400:WARNING:gpu_process_host.cc(1262)] The GPU process has crashed 2 time(s)
+22362: [guest-log] #3 tid=019c [1127/152939.400:WARNING:gpu_process_host.cc(1262)] The GPU process has crashed 2 time(s)
+22709: [exc-disp]   OutputDebugStringA: "[1127/152939.668:WARNING:gpu_process_host.cc(1262)] The GPU process has crashed 3 time(s)
+22711: [guest-log] #4 tid=019c [1127/152939.668:WARNING:gpu_process_host.cc(1262)] The GPU process has crashed 3 time(s)

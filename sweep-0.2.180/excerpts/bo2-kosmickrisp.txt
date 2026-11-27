@@ -1,0 +1,8 @@
+# retest-bo2b-madeira-last-game-log.txt (selected lines, trimmed)
+7:      its config: env.MADEIRA_AUDIO_LEAD_MS = 150; env.MADEIRA_EC_HOOK_TRACE = 0; gl-vulkan = kosmickrisp
+25: [09:21:37.571] [INFO] [log-trail] on: [pad] [focus] [screen] [tap] [app] [step] [game-start] [game-end] lines (env.MADEIRA_LOG_TRAIL = 0 turns them off)
+144: [09:23:03.319] [INFO] [steam-launch-view] hold app=212910 auto-reveal=1
+14896: [09:23:12.320] [INFO] [steam-launch-view] scene=game shown=1 window=800x600 owner=other pid=f8 t=9s
+14897: [09:23:12.320] [INFO] [steam-launch-view] end reason=game-window scene=game revealed=0 t=9s
+14900: [09:23:12.320] [INFO] [step] Call of Duty: Black Ops II - Zombies +12.48s game shown (game-window)
+15391: 0138:err:wgl:zink_init [winios-gl] ml1344 zink Vulkan library: libvulkan_kosmickrisp.dylib

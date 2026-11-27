@@ -1,0 +1,12 @@
+# LariLauncher.exe-2026-11-27_05-52-39.txt (selected lines, trimmed)
+7:      its config: env.MADEIRA_CEF_CMDLINE = 1; env.MADEIRA_CHILD_ARGS = LariLauncher.exe --single-process --js-flags=--jitless --disable-features=PartitionAllocBackupRefPtr; env.MADEIRA_EC_HOOK_TRACE = 0; env.MADEIRA_X64_IMAGE_NOCOPY = 1; pool-split = 1
+27: [05:50:49.973] [INFO] [log-trail] on: [pad] [focus] [screen] [tap] [app] [step] [game-start] [game-end] lines (env.MADEIRA_LOG_TRAIL = 0 turns them off)
+150: [05:52:34.382] [INFO] [steam-launch-view] hold app=1086940 auto-reveal=1
+16631: [05:52:50.884] [INFO] [steam-launch-view] scene=game shown=1 window=1152x800 owner=other pid=f8 t=16s
+16632: [05:52:50.884] [INFO] [steam-launch-view] end reason=game-window scene=game revealed=0 t=16s
+16635: [05:52:50.884] [INFO] [step] Baldur's Gate 3 +29.99s game shown (game-window)
+37086: [guest-data] c0000005 tid=0188 READ of 0x8: NOTHING THERE (freed or never allocated: a stale or wild pointer) | wine no view 0x0+0 vprot=0 protect=0 | host unmapped, next 0x1003b0000-0x103a64000 prot=0/0 | pc=151557144
+37113: 0188:err:seh:ios_xr_dump [exc-ring] process exit exit_code=ffff7001: last 1 of 1 exceptions (+0 page-decrypt faults not listed), oldest first rev=exc-ring-2
+37114: 0188:err:seh:ios_xr_dump [exc-ring] #0 -2ms tid=0188 code=c0000005 addr=00000071F246F144 p0=0000000000000000 p1=0000000000000008 sp=00000070DD7A8D50 x1
+37188: 0188:err:process:ios_child_slot_note_exit [child-end] larilauncher.exe status=0xffff7001 lived=280.62s
+37882: [05:57:28.405] [ERR] [game-end] Baldur's Gate 3: it closed by itself; Windows error 0xFFFF7001 (larilauncher.exe, a program the game started) | memory 5000 MB now, peak 5844 MB, 0 iOS memory warning(s) | JIT pool 881 MB, 256 MB used | 308 s in all: play 0.0 · JIT on 1.6 · session 13.5 · Dock host 13.5 · Wine sequence 13.5 · JIT pool ready 14.7 · wineserver ready 14.7 · Wine started 14.7 · game sho

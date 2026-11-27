@@ -1,0 +1,12 @@
+# redprelauncher.exe-2026-11-27_02-29-12.txt (selected lines, trimmed)
+4: Previous run: Madeira closed while Deep Rock Galactic was running (started 02:20:17): a crash or iOS ending it for memory (it never got back to the library); steps: play 0.0 · JIT on 1.9 · Dock host 3.7 · session 3.7 · Wine sequence 3.8 · JIT pool ready 4.9 · wineserver ready 5.0 · Wine started 5.0 · game shown (game-window) 17.7 · Steam screen ended (game-window) 17.7
+8:      its config: env.MADEIRA_EC_HOOK_TRACE = 0; env.MADEIRA_X64_IMAGE_NOCOPY = 1; oversize-reserve = 1; oversize-reserve-mb = 2048; pool-split = 1
+28: [02:27:25.600] [ERR] [last-run] Madeira closed while Deep Rock Galactic was running (started 02:20:17): a crash or iOS ending it for memory (it never got back to the library); steps: play 0.0 · JIT on 1.9 · Dock host 3.7 · session 3.7 · Wine sequence 3.8 · JIT pool ready 4.9 · wineserver ready 5.0 · Wine started 5.0 · game shown (game-window) 17.7 · Steam screen ended (game-window) 17.7
+29: [02:27:25.602] [INFO] [log-trail] on: [pad] [focus] [screen] [tap] [app] [step] [game-start] [game-end] lines (env.MADEIRA_LOG_TRAIL = 0 turns them off)
+161: [02:29:06.799] [INFO] [steam-launch-view] hold app=1091500 auto-reveal=1
+14092: [guest-data] c0000005 tid=00fc READ of 0x4: NOTHING THERE (freed or never allocated: a stale or wild pointer) | wine no view 0x0+0 vprot=0 protect=0 | host unmapped, next 0x10031c000-0x1039d0000 prot=0/0 | pc=17d5dc200
+14190: wine: Unhandled page fault on read access to 0000000000000004 at address 00000071F1DF7CFE (thread 00fc), starting debugger...
+14195: 00fc:err:seh:ios_xr_dump [exc-ring] process exit exit_code=c0000005: last 2 of 2 exceptions (+0 page-decrypt faults not listed), oldest first rev=exc-ring-2
+14196: 00fc:err:seh:ios_xr_dump [exc-ring] #0 -6ms tid=00fc code=c0000005 addr=000000017D5DC200 p0=0000000000000000 p1=0000000000000004 sp=00000071F2000000 x2
+14197: 00fc:err:seh:ios_xr_dump [exc-ring] #1 -5ms tid=00fc code=c0000005 addr=00000071F1DF7CFE p0=0000000000000000 p1=0000000000000004 sp=0000007056F2F5E0 x2
+14221: 00fc:err:process:ios_child_slot_note_exit [child-end] redprelauncher.exe status=0xc0000005 lived=2.21s

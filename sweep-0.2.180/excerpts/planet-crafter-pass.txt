@@ -1,0 +1,15 @@
+# retest2-pc-lastgame.txt (selected lines, trimmed)
+7:      its config: env.MADEIRA_D3D11_NO_VIDEO_DEVICE = 1; env.MADEIRA_EC_HOOK_TRACE = 0; env.MADEIRA_WG_64BIT = 1; env.MADEIRA_WG_VIDEO_FORMAT = argb32
+25: [09:36:20.204] [INFO] [log-trail] on: [pad] [focus] [screen] [tap] [app] [step] [game-start] [game-end] lines (env.MADEIRA_LOG_TRAIL = 0 turns them off)
+4665: [guest-data] c0000005 tid=0024 WRITE of 0x704c5c0de0: READ-ONLY FOR WINDOWS TOO (the program or a DLL protected it: a real guest fault) | wine view 0x704c5c0000+0x10000 vprot=0x25 protect=0x27 | host 0x704c5c0000-0x704c5c4000 prot=1/7 | pc=17e51dd14
+4742: [guest-data] c0000005 tid=0024 WRITE of 0x704c5c0e50: READ-ONLY FOR WINDOWS TOO (the program or a DLL protected it: a real guest fault) | wine view 0x704c5c0000+0x10000 vprot=0x25 protect=0x27 | host 0x704c5c0000-0x704c5c4000 prot=1/7 | pc=17e51dd14
+4815: [guest-data] c0000005 tid=0024 WRITE of 0x704c5c106b: READ-ONLY FOR WINDOWS TOO (the program or a DLL protected it: a real guest fault) | wine view 0x704c5c0000+0x10000 vprot=0x25 protect=0x27 | host 0x704c5c0000-0x704c5c4000 prot=1/7 | pc=17e63556c
+4877: [guest-data] c0000005 tid=0024 WRITE of 0x704c5c1185: READ-ONLY FOR WINDOWS TOO (the program or a DLL protected it: a real guest fault) | wine view 0x704c5c0000+0x10000 vprot=0x25 protect=0x27 | host 0x704c5c0000-0x704c5c4000 prot=1/7 | pc=17e63556c
+4932: [guest-data] c0000005 tid=0024 WRITE of 0x704c5c11f0: READ-ONLY FOR WINDOWS TOO (the program or a DLL protected it: a real guest fault) | wine view 0x704c5c0000+0x10000 vprot=0x25 protect=0x27 | host 0x704c5c0000-0x704c5c4000 prot=1/7 | pc=17e4edf40
+4985: [guest-data] c0000005 tid=0024 WRITE of 0x704c5c0df8: READ-ONLY FOR WINDOWS TOO (the program or a DLL protected it: a real guest fault) | wine view 0x704c5c0000+0x10000 vprot=0x25 protect=0x27 | host 0x704c5c0000-0x704c5c4000 prot=1/7 | pc=17e7a2e04
+5033: [guest-data] c0000005 tid=0024 WRITE of 0x704c5c12e0: READ-ONLY FOR WINDOWS TOO (the program or a DLL protected it: a real guest fault) | wine view 0x704c5c0000+0x10000 vprot=0x25 protect=0x27 | host 0x704c5c0000-0x704c5c4000 prot=1/7 | pc=17e749d64
+5080: [guest-data] c0000005 tid=0024 WRITE of 0x704c5c1338: READ-ONLY FOR WINDOWS TOO (the program or a DLL protected it: a real guest fault) | wine view 0x704c5c0000+0x10000 vprot=0x25 protect=0x27 | host 0x704c5c0000-0x704c5c4000 prot=1/7 | pc=1482c568c
+32054: [09:37:57.017] [INFO] [step] The Planet Crafter +14.53s game shown (present)
+45384: [wg-parser] ml1990 mp4/mov enabled (MADEIRA_WG_VIDEO=0 disables): video on videotoolbox, aac on audiotoolbox, native video format bgra
+45430: [wg-parser] ml1990 connect container=mp4 stream=0 video codec=h264 backend=videotoolbox 1920x1080 fps=60/1 out=bgra duration=11216ms bitrate=7250679 profile=0 level=0
+45431: [wg-parser] ml1990 connect container=mp4 codec=aac layer=0 rate=48000 channels=2 mask=0x3 out=f32 duration=11221ms bitrate=192153 compressed_out=0 stream=1 backend=audiotoolbox

@@ -1,0 +1,11 @@
+# fail-Fallout4.txt (selected lines, trimmed)
+49: [08:13:49.111] [INFO] [steam-launch-view] hold app=377160 auto-reveal=1
+12457: [08:13:58.113] [INFO] [steam-launch-view] scene=game shown=1 window=835x400 owner=other pid=f4 t=9s
+12458: [08:13:58.113] [INFO] [steam-launch-view] end reason=game-window scene=game revealed=0 t=9s
+12461: [08:13:58.113] [INFO] [step] Fallout 4 +12.05s game shown (game-window)
+19176: [guest-data] c0000005 tid=0138 READ of 0x20: NOTHING THERE (freed or never allocated: a stale or wild pointer) | wine no view 0x0+0 vprot=0 protect=0 | host unmapped, next 0x104e88000-0x10853c000 prot=0/0 | pc=17c5fa7c0
+19204: 0138:err:seh:ios_xr_dump [exc-ring] process exit exit_code=c0000005: last 2 of 2 exceptions (+0 page-decrypt faults not listed), oldest first rev=exc-ring-2
+19205: 0138:err:seh:ios_xr_dump [exc-ring] #0 -1ms tid=0138 code=c0000005 addr=000000017C5FA7C0 p0=0000000000000000 p1=0000000000000020 sp=00000070FFFA0000 x1
+19206: 0138:err:seh:ios_xr_dump [exc-ring] #1 -1ms tid=0138 code=c0000005 addr=000000706164A595 p0=0000000000000000 p1=0000000000000020 sp=000000704B99FB80 x1
+19253: 0138:err:process:ios_child_slot_note_exit [child-end] fallout4.exe status=0xc0000005 lived=6.80s
+19702: [08:15:00.626] [ERR] [game-end] Fallout 4: it closed by itself; Windows error 0xC0000005 (fallout4.exe, a program the game started) | memory 2482 MB now, peak 2578 MB, 0 iOS memory warning(s) | JIT pool 887 MB, 661 MB used | 75 s in all: play 0.0 · JIT on 1.6 · Dock host 3.0 · session 3.0 · Wine sequence 3.1 · JIT pool ready 4.1 · wineserver ready 4.3 · Wine started 4.3 · game shown (game-window) 

@@ -1,11 +1,13 @@
 # RESULT: planet-crafter-wg64
 
-**FAIL**
+**PASS / NEEDS-DEVICE**
 
-Checked 2026-11-27 on the Linux laptop against 0.2.180-og.
+Updated 2026-11-27 on the Linux laptop against 0.2.180-og.
 
-## What was run
-Applies with `patch -p1`. Swift typecheck of all app files with the patch (Linux, Swift 6.4.3 + iOS SDK, target ios17.0): no new errors. The one error (ContentView.swift:1046, Squeeze needs iOS 17.5) is also in the unpatched app. Not linked or run. check-game-recommendations.py: exit 1.
+## Fixed and run
+The patch now also updates check-game-recommendations.py (new ID, title count 75, list count 104, and planet-crafter added to the lists exempt from the fork defaults). Applies with `patch -p1`; the host test exits 0; the app Swift is unchanged from the version that typechecked with no new errors.
 
-## Findings
-- First error: AssertionError listing the preset IDs. The test's expected ID set does not include `planet-crafter`; update it (and its title counts).
+## Still open
+- The test's Swift fixture (75/104 counts) did not run here.
+- Combining with cyberpunk-direct-start will conflict in the test counts and ID list.
+- Not run on a device; second review of the settings still pending.

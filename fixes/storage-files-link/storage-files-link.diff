@@ -1,0 +1,341 @@
+diff -ruN a/app/Madeira/StorageManager.swift b/app/Madeira/StorageManager.swift
+--- a/app/Madeira/StorageManager.swift	2026-11-27 04:27:51.761359309 +0000
++++ b/app/Madeira/StorageManager.swift	2026-11-27 05:12:05.983921536 +0000
+@@ -29,13 +29,18 @@
+ //
+ 
+ import SwiftUI
++import UIKit
+ 
+ enum StorageUsage {
+     static var enabled: Bool { MadeiraConfig.flag("MADEIRA_STORAGE_SCREEN") }
+     static var deleteEnabled: Bool { MadeiraConfig.flag("MADEIRA_STORAGE_DELETE") }
+     static var removeFilesEnabled: Bool { MadeiraConfig.flag("MADEIRA_REMOVE_FILES_TOGGLE") }
++    /// Rows open their folder in the Files app (shareddocuments://) when it is under Documents. 0: as before (info rows did nothing).
++    static var filesLinkEnabled: Bool { MadeiraConfig.flag("MADEIRA_STORAGE_FILES_LINK") }
+     /// Leftover install folders can be deleted only with env.MADEIRA_STORAGE_ORPHAN_DELETE = 1 (default off: shown, not deletable),
+     /// because a game another launcher installed in a store's folder looks the same to Madeira.
++    /// The two "Recently Deleted / recycle bin" rows can be emptied. 0: they only show in Everything on this device.
++    static var trashRowsEnabled: Bool { MadeiraConfig.flag("MADEIRA_STORAGE_TRASH_ROWS") }
+     static var orphanDeleteEnabled: Bool { MadeiraConfig.flag("MADEIRA_STORAGE_ORPHAN_DELETE", fallback: false) }
+ }
+ 
+@@ -65,6 +70,9 @@
+     /// Folder names a game's saves are likely to be under (matched exactly, never loosely).
+     var names: [String] = []
+     var external = false
++    /// The folder's path under Documents ("wine/drive_c/Games/Foo"), what the Files app shows it as; nil when the
++    /// folder is not in Documents (Application Support, Caches, tmp, an external drive: Files cannot show those).
++    var filesPath: String?
+ 
+     var deletable: Bool { if case .info = kind { return false }; return true }
+     var isGame: Bool {
+@@ -101,6 +109,16 @@
+         return (free, Int64(total))
+     }
+ 
++    /// `url`'s path under Documents ("wine/drive_c/Games"), or nil when it is not inside Documents.
++    static func documentsPath(_ url: URL, documents: URL) -> String? {
++        let u = url.resolvingSymlinksInPath().standardizedFileURL.path
++        let d = documents.resolvingSymlinksInPath().standardizedFileURL.path
++        guard u.hasPrefix(d + "/"), u.count > d.count + 1 else { return nil }
++        let rel = String(u.dropFirst(d.count + 1))
++        if rel.split(separator: "/").contains(where: { $0.hasPrefix(".") }) { return nil }   // hidden folders (.Trash) are not shown by Files
++        return rel
++    }
++
+     static func children(of url: URL) -> [URL] {
+         (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: [])) ?? []
+     }
+@@ -160,6 +178,7 @@
+     static func removeChildren(of dir: URL, drive: URL) -> Int {
+         let fm = FileManager.default
+         var count = 0
++        if isLink(dir) { return 0 }   // never empty a folder that is a link (it could point at something else)
+         for child in children(of: dir) where allowed(child, drive: drive) {
+             let isFolder = (try? child.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+             if isFolder {
+@@ -335,6 +354,13 @@
+ 
+     private static func last(_ folder: String) -> String { (folder as NSString).lastPathComponent }
+ 
++    /// Files path of a drive-relative folder, or nil for one on an external drive (a link Files does not follow).
++    private static func driveFiles(_ relative: String) -> String? {
++        let clean = relative.replacingOccurrences(of: "\\", with: "/")
++        if clean.lowercased().hasPrefix("external/") || clean.hasPrefix("/") { return nil }
++        return "wine/drive_c/" + clean
++    }
++
+     private func memoryRows() -> ([StorageRow], [StorageRow]) {
+         let entries = LibraryModel.shared.entries
+         var games: [StorageRow] = []
+@@ -344,23 +370,23 @@
+             games.append(StorageRow(id: "steam-\(g.id)", title: g.name,
+                                     detail: managed ? L("Steam") : L("Steam. Installed by Steam, remove it in Steam."),
+                                     bytes: (known ?? 0) > 0 ? known : nil, kind: managed ? .steam(g.id) : .info,
+-                                    names: [g.name, g.installDir]))
++                                    names: [g.name, g.installDir], filesPath: Self.driveFiles(g.library + "/common/" + g.installDir)))
+         }
+         for (key, g) in EpicLibrary.shared.installed {
+             games.append(StorageRow(id: "epic-\(key)", title: g.title, detail: L("Epic Games"), bytes: g.installBytes > 0 ? g.installBytes : nil,
+-                                    kind: .epic(key), names: [g.title, Self.last(g.folder)]))
++                                    kind: .epic(key), names: [g.title, Self.last(g.folder)], filesPath: Self.driveFiles(g.folder)))
+         }
+         for (key, g) in GOGLibrary.shared.installed {
+             games.append(StorageRow(id: "gog-\(key)", title: g.title, detail: "GOG", bytes: g.installBytes > 0 ? g.installBytes : nil,
+-                                    kind: .gog(key), names: [g.title, Self.last(g.folder)]))
++                                    kind: .gog(key), names: [g.title, Self.last(g.folder)], filesPath: Self.driveFiles(g.folder)))
+         }
+         for (key, g) in EALibrary.shared.installed {
+             games.append(StorageRow(id: "ea-\(key)", title: g.title, detail: L("EA app"), bytes: g.installBytes > 0 ? g.installBytes : nil,
+-                                    kind: .ea(key), names: [g.title, Self.last(g.folder)]))
++                                    kind: .ea(key), names: [g.title, Self.last(g.folder)], filesPath: Self.driveFiles(g.folder)))
+         }
+         for (key, g) in ItchLibrary.shared.installed {
+             games.append(StorageRow(id: "itch-\(key)", title: g.title, detail: "itch.io", bytes: g.installBytes > 0 ? g.installBytes : nil,
+-                                    kind: .itch(key), names: [g.title, Self.last(g.folder)]))
++                                    kind: .itch(key), names: [g.title, Self.last(g.folder)], filesPath: Self.driveFiles(g.folder)))
+         }
+         var programs: [StorageRow] = []
+         for e in entries where e.desktop != true && e.steamAppID == nil && e.gogProductID == nil && e.itchGameID == nil
+@@ -370,7 +396,7 @@
+             programs.append(StorageRow(id: "program-\(e.id.uuidString)", title: e.title,
+                                        detail: folder.isEmpty ? L("Added program") : folder,
+                                        bytes: (e.folderBytes ?? 0) > 0 ? e.folderBytes : nil, kind: .program(e.id),
+-                                       names: [e.title, Self.last(folder), exe]))
++                                       names: [e.title, Self.last(folder), exe], filesPath: folder.isEmpty ? nil : Self.driveFiles(folder)))
+         }
+         return (games, programs)
+     }
+@@ -406,6 +432,7 @@
+         var deviceTotal: Int64 = 0
+         var externalTotal: Int64 = 0
+         var capacity: Capacity?
++        var driveExternal = false
+     }
+ 
+     private func scanInput(games: [StorageRow], programs: [StorageRow]) -> ScanInput {
+@@ -458,12 +485,14 @@
+         }
+         let docsResolved = docs.resolvingSymlinksInPath().path
+         let driveExternal = !drive.path.hasPrefix(docsResolved + "/")
+-        let friendlyDocs: [String: String] = ["logs": L("Logs"), "madeira-art": L("Cover art")]
++        out.driveExternal = driveExternal
++        let friendlyDocs: [String: String] = ["logs": L("Logs"), "madeira-art": L("Cover art"),
++                                              ".trash": L("Recently Deleted (files deleted from Madeira's folder in Files)")]
+         for c in StorageScan.children(of: docs) {
+             let name = c.lastPathComponent
+             if name == "wine" {
+                 for w in StorageScan.children(of: c) where w.lastPathComponent != "drive_c" {
+-                    add(L("Wine prefix: ") + w.lastPathComponent, w)
++                    add(w.lastPathComponent == ".Trash" ? L("Windows recycle bin (files deleted inside a game or Windows program)") : L("Wine prefix: ") + w.lastPathComponent, w)
+                 }
+                 continue
+             }
+@@ -502,7 +531,8 @@
+             if item.external { out.externalTotal += bytes } else { out.deviceTotal += bytes }
+             if bytes < 1_000_000 { small += item.external ? 0 : bytes; smallCount += item.external ? 0 : 1; continue }
+             out.everything.append(StorageRow(id: "all-" + item.url.path, title: item.title, detail: item.external ? L("On an external drive") : "",
+-                                             bytes: bytes, kind: .info, external: item.external))
++                                             bytes: bytes, kind: .info, external: item.external,
++                                             filesPath: item.external ? nil : StorageScan.documentsPath(item.url, documents: docs)))
+         }
+         if smallCount > 0 {
+             out.everything.append(StorageRow(id: "all-small", title: String(format: L("%d smaller items"), smallCount), detail: "", bytes: small, kind: .info))
+@@ -512,7 +542,20 @@
+         func clearRow(_ id: String, _ title: String, _ detail: String, _ dir: URL?) {
+             guard let dir, fm.fileExists(atPath: dir.path) else { return }
+             let bytes = StorageScan.size(of: dir)
+-            if bytes > 0 { out.cleanable.append(StorageRow(id: id, title: title, detail: detail, bytes: bytes, kind: .clear([dir]))) }
++            if bytes > 0 {
++                out.cleanable.append(StorageRow(id: id, title: title, detail: detail, bytes: bytes, kind: .clear([dir]),
++                                                filesPath: StorageScan.documentsPath(dir, documents: docs)))
++            }
++        }
++        // Hidden folders: iOS Files' "Recently Deleted" for this app (Documents/.Trash) and Wine's recycle bin
++        // (wine/.Trash). Both hold things already deleted, and neither shows in Files > On My iPhone > Madeira.
++        if StorageUsage.trashRowsEnabled {
++            clearRow("clear-files-trash", L("Recently Deleted (from Files)"),
++                     L("Things you deleted from Madeira's folder in the Files app go here, and stay until emptied. In Files they are under Browse > Recently Deleted. Emptying is permanent."),
++                     docs.appendingPathComponent(".Trash", isDirectory: true))
++            clearRow("clear-wine-trash", L("Windows recycle bin"),
++                     L("Files deleted from inside Windows programs and games. Emptying is permanent."),
++                     docs.appendingPathComponent("wine/.Trash", isDirectory: true))
+         }
+         clearRow("clear-logs", L("Logs"), L("Past game logs."), docs.appendingPathComponent("logs", isDirectory: true))
+         clearRow("clear-crash", L("Crash reports"), L("Reports from earlier crashes."), support?.appendingPathComponent("CrashReports", isDirectory: true))
+@@ -563,6 +606,10 @@
+         }
+         games = fill(games)
+         programs = fill(programs)
++        if result.driveExternal {   // the Windows drive is not in Documents: its folders have no Files path
++            games = games.map { var r = $0; r.filesPath = nil; return r }
++            programs = programs.map { var r = $0; r.filesPath = nil; return r }
++        }
+         cleanable = result.cleanable
+         everything = result.everything
+         deviceTotal = result.deviceTotal
+@@ -833,40 +880,83 @@
+         } header: { Text("Last cleanup") }
+     }
+ 
+-    private func rowView(_ row: StorageRow) -> some View {
+-        Button {
+-            if model.selecting { model.toggle(row) }
+-            else if row.deletable && StorageUsage.deleteEnabled && !model.running { if model.ask([row]) { open(.storageDelete) } }
+-        } label: {
+-            HStack(spacing: 10) {
+-                if model.selecting && row.deletable {
+-                    Image(systemName: model.selected.contains(row.id) ? "checkmark.circle.fill" : "circle")
+-                        .foregroundStyle(model.selected.contains(row.id) ? Color.accentColor : Color.secondary)
+-                }
+-                VStack(alignment: .leading, spacing: 2) {
+-                    Text(row.title).foregroundStyle(.primary)
+-                    if !row.detail.isEmpty { Text(row.detail).font(.footnote).foregroundStyle(.secondary).lineLimit(2) }
+-                }
+-                Spacer(minLength: 8)
+-                if let bytes = row.bytes {
+-                    Text(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)).foregroundStyle(.secondary)
+-                } else if model.scanning {
+-                    ProgressView()
+-                } else {
+-                    Text("–").foregroundStyle(.secondary)
+-                }
+-            }
+-            .contentShape(Rectangle())
+-        }
+-        .buttonStyle(.plain)
+-        .swipeActions(edge: .trailing) {
+-            if row.deletable && StorageUsage.deleteEnabled && !model.running && !model.selecting {
+-                Button(role: .destructive) { if model.ask([row]) { open(.storageDelete) } } label: { Label("Delete", systemImage: "trash") }
+-            }
+-        }
+-        .padRow("st-" + row.id) {
+-            if model.selecting { model.toggle(row) }
+-            else if row.deletable && StorageUsage.deleteEnabled && !model.running { if model.ask([row]) { open(.storageDelete) } }
++    /// Where Files shows this row's folder, or nil.
++    private func filesURL(_ row: StorageRow) -> URL? {
++        guard StorageUsage.filesLinkEnabled, !row.external, let rel = row.filesPath else { return nil }
++        let full = LibraryModel.documents.path + "/" + rel
++        guard let encoded = full.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else { return nil }
++        return URL(string: "shareddocuments://" + encoded)
++    }
++
++    private func openInFiles(_ row: StorageRow) {
++        guard let url = filesURL(row) else { return }
++        LogStore.shared.log("[storage] open in Files: \(row.filesPath ?? "")")
++        UIApplication.shared.open(url, options: [:]) { opened in
++            if !opened { LogStore.shared.log("[storage] Files did not open \(row.filesPath ?? "")") }
++        }
++    }
++
++    private func tap(_ row: StorageRow) {
++        if model.selecting { model.toggle(row) }
++        else if row.deletable && StorageUsage.deleteEnabled && !model.running { if model.ask([row]) { open(.storageDelete) } }
++        else if filesURL(row) != nil { openInFiles(row) }
++    }
++
++    /// A row does something on tap when it is selectable, deletable, or has a folder to show in Files.
++    private func tappable(_ row: StorageRow) -> Bool {
++        (model.selecting && row.deletable) || (row.deletable && StorageUsage.deleteEnabled) || filesURL(row) != nil
++    }
++
++    private func rowLabel(_ row: StorageRow) -> some View {
++        HStack(spacing: 10) {
++            if model.selecting && row.deletable {
++                Image(systemName: model.selected.contains(row.id) ? "checkmark.circle.fill" : "circle")
++                    .foregroundStyle(model.selected.contains(row.id) ? Color.accentColor : Color.secondary)
++            }
++            VStack(alignment: .leading, spacing: 2) {
++                Text(row.title).foregroundStyle(.primary)
++                if !row.detail.isEmpty { Text(row.detail).font(.footnote).foregroundStyle(.secondary).lineLimit(2) }
++            }
++            Spacer(minLength: 8)
++            if let bytes = row.bytes {
++                Text(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)).foregroundStyle(.secondary)
++            } else if model.scanning {
++                ProgressView()
++            } else {
++                Text("–").foregroundStyle(.secondary)
++            }
++            // A row that only opens Files says so; one that deletes keeps Files on its swipe and long press.
++            if !row.deletable && filesURL(row) != nil && !model.selecting {
++                Image(systemName: "arrow.up.forward.app").font(.footnote).foregroundStyle(.secondary)
++            }
++        }
++        .contentShape(Rectangle())
++    }
++
++    @ViewBuilder private func rowView(_ row: StorageRow) -> some View {
++        if StorageUsage.filesLinkEnabled && !tappable(row) {
++            // Nothing to do on tap (not deletable, not in Documents): a plain row, not a button.
++            rowLabel(row)
++        } else {
++            Button { tap(row) } label: { rowLabel(row) }
++                .buttonStyle(.plain)
++                .swipeActions(edge: .trailing) {
++                    if row.deletable && StorageUsage.deleteEnabled && !model.running && !model.selecting {
++                        Button(role: .destructive) { if model.ask([row]) { open(.storageDelete) } } label: { Label("Delete", systemImage: "trash") }
++                    }
++                }
++                .swipeActions(edge: .leading) {
++                    if filesURL(row) != nil && !model.selecting {
++                        Button { openInFiles(row) } label: { Label("Files", systemImage: "folder") }.tint(.blue)
++                    }
++                }
++                .contextMenu {
++                    if filesURL(row) != nil {
++                        Button { openInFiles(row) } label: { Label("Show in Files", systemImage: "folder") }
++                        Button { UIPasteboard.general.string = ((Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ?? "Madeira") + "/" + (row.filesPath ?? "") } label: { Label("Copy Files path", systemImage: "doc.on.doc") }
++                    }
++                }
++                .padRow("st-" + row.id) { tap(row) }
+         }
+     }
+ }
+@@ -893,8 +983,12 @@
+             Form {
+                 Section {
+                     ForEach(rows) { row in
+-                        HStack {
+-                            Text(row.title)
++                        HStack(alignment: .top) {
++                            VStack(alignment: .leading, spacing: 2) {
++                                Text(row.title)
++                                // What the row is, in full (the list cuts it to two lines).
++                                if !row.detail.isEmpty && !row.isGame { Text(row.detail).font(.footnote).foregroundStyle(.secondary) }
++                            }
+                             Spacer()
+                             if let bytes = row.bytes { Text(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)).foregroundStyle(.secondary) }
+                         }
+@@ -902,7 +996,7 @@
+                 } header: {
+                     Text(rows.count == 1 ? L("Delete this?") : String(format: L("Delete these %d?"), rows.count))
+                 } footer: {
+-                    Text(String(format: L("Frees about %@."), total))
++                    Text(String(format: L("Frees about %@."), total) + " " + L("Deleted here is gone for good: it does not go to Recently Deleted."))
+                 }
+                 if hasPrograms {
+                     Section {
+diff -ruN a/tests/host/check-storage-files-link.py b/tests/host/check-storage-files-link.py
+--- a/tests/host/check-storage-files-link.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/host/check-storage-files-link.py	2026-11-27 05:10:55.236937329 +0000
+@@ -0,0 +1,18 @@
++#!/usr/bin/env python3
++# storage-files-link (Nov 27 2026): source checks only.
++from pathlib import Path
++import sys
++src = (Path(__file__).resolve().parents[2] / 'app' / 'Madeira' / 'StorageManager.swift').read_text(encoding='utf-8')
++failed = False
++def check(ok, what):
++    global failed
++    print(('PASS: ' if ok else 'FAIL: ') + what); failed |= not ok
++check('MADEIRA_STORAGE_FILES_LINK' in src, 'off switch')
++check('"shareddocuments://"' in src, 'opens Files')
++check('hasPrefix("external/")' in src, 'no Files link for external drives')
++check('!tappable(row)' in src, 'a row with nothing to do is not a button')
++check('Show in Files' in src and 'Copy Files path' in src, 'long press: show in Files and copy path')
++check('else if filesURL(row) != nil { openInFiles(row) }' in src, 'delete-first rows keep their tap')
++check('MADEIRA_STORAGE_TRASH_ROWS' in src and 'clear-files-trash' in src and 'clear-wine-trash' in src, 'trash rows with their own switch')
++check('hasPrefix(".")' in src, 'hidden folders get no Files link')
++print('check-storage-files-link: ' + ('FAIL' if failed else 'OK')); sys.exit(1 if failed else 0)

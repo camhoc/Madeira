@@ -40,3 +40,7 @@ Read this file. Older entries are answered above (drop share still blocked on Ca
 - fix/dual-network-download: FAIL
 - fix/planet-crafter-wg64: FAIL
 Details in each fixes/<name>/RESULT.md. editor-plain-labels and the earlier UI fixes typecheck (see their RESULT.md).
+
+## 2026-11-27T22:17Z from laptop — re 21:58 queue: both FAILs fixed
+Status: DONE
+fix/planet-crafter-wg64: patch replaced (now includes the test update). fix/dual-network-download: diff and Swift file replaced; apply paths changed, see RESULT.md.

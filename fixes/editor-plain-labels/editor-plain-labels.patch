@@ -1,0 +1,73 @@
+--- a/app/Madeira/GestureZones.swift	2026-11-26 20:48:20.001142796 +0000
++++ b/app/Madeira/GestureZones.swift	2026-11-26 20:48:20.049914902 +0000
+@@ -510,16 +510,21 @@
+             }.pickerStyle(.segmented)
+             switch zone.kind {
+             case .stick:
+-                row("Output", stickMenu)
++                row("Stick acts as", stickMenu)
++                if zone.mouseStick == true {
++                    hint("Moves the pointer or camera like a mouse. Push further to go faster.")
++                }
+                 if GestureZoneView.thresholdEnabled {
+-                    row("Far push", menu(Binding(get: { zone.thresholdAction ?? .none },
++                    row("When pushed far", menu(Binding(get: { zone.thresholdAction ?? .none },
+                                                  set: { v in if let i { z.zones[i].thresholdAction = v == .none ? nil : v } }),
+                                          Self.pressChoices))
++                    hint("Also presses this when the stick is pushed all the way. For example Shift to sprint.")
+                     if zone.thresholdAction != nil {
+                         HStack {
+                             Text("Push point").font(.subheadline)
+                             Slider(value: Binding(get: { zone.thresholdAt ?? 0.9 },
+                                                   set: { v in if let i { z.zones[i].thresholdAt = v } }), in: 0.5...1)
++                            percent(zone.thresholdAt ?? 0.9)
+                         }
+                     }
+                 }
+@@ -528,6 +533,7 @@
+                         Text("Mouse speed").font(.subheadline)
+                         Slider(value: Binding(get: { zone.mouseStickSpeed ?? 1 },
+                                               set: { v in if let i { z.zones[i].mouseStickSpeed = v } }), in: 0.25...3)
++                        percent(zone.mouseStickSpeed ?? 1)
+                     }
+                     Toggle("Invert X", isOn: Binding(get: { zone.mouseInvertX ?? false },
+                                                      set: { v in if let i { z.zones[i].mouseInvertX = v ? true : nil } }))
+@@ -548,10 +554,11 @@
+                 row("Tap", menu(binding(\.tap), Self.pressChoices))
+             }
+             LayerButtons { mv in if let i { mv.apply(&z.zones, i) } }
+-            Text("Zones always sit under buttons.").font(.caption).foregroundStyle(.white.opacity(0.6))
++            hint("Draw order: zones always sit under buttons.")
+             HStack {
+                 Text(zone.kind == .swipe ? "Swipe length" : "Sensitivity").font(.subheadline)
+                 Slider(value: binding(\.sensitivity), in: 0.25...3)
++                percent(zone.sensitivity)
+             }
+         }
+         .padding(14)
+@@ -589,6 +596,16 @@
+         }
+     }
+ 
++    /// One line of plain-words help under a setting.
++    private func hint(_ text: String) -> some View {
++        Text(text).font(.caption).foregroundStyle(.white.opacity(0.6))
++            .fixedSize(horizontal: false, vertical: true)
++    }
++    private func percent(_ v: Double) -> some View {
++        Text("\(Int((v * 100).rounded()))%").font(.caption.monospacedDigit())
++            .foregroundStyle(.white.opacity(0.7)).frame(width: 44, alignment: .trailing)
++    }
++
+     private func row(_ title: String, _ content: some View) -> some View {
+         HStack { Text(title).font(.subheadline); Spacer(); content }
+     }
+@@ -664,7 +681,7 @@
+     let move: (LayerMove) -> Void
+     var body: some View {
+         HStack(spacing: 0) {
+-            Text("Layer").font(.subheadline).foregroundStyle(.white.opacity(0.7))
++            Text("Draw order").font(.subheadline).foregroundStyle(.white.opacity(0.7))
+             Spacer()
+             ForEach(LayerMove.allCases, id: \.self) { m in
+                 Button { move(m) } label: {

@@ -1,0 +1,42 @@
+diff -ruN a/dlls/msvcrt/except.c b/dlls/msvcrt/except.c
+--- a/dlls/msvcrt/except.c	2026-11-27 14:31:45.611657976 +0000
++++ b/dlls/msvcrt/except.c	2026-11-27 14:31:53.064777175 +0000
+@@ -909,6 +909,13 @@
+     return fi;
+ }
+ 
++/* madeira (bg3-cxx-unlink-guard): env.MADEIRA_CXX_UNLINK_GUARD = 0 turns the guards below off. */
++static BOOL cxx_unlink_guard_off(void)
++{
++    const char *v = getenv( "MADEIRA_CXX_UNLINK_GUARD" );
++    return v && v[0] == '0' && !v[1];
++}
++
+ /*********************************************************************
+  * _FindAndUnlinkFrame (MSVCR80.@)
+  */
+@@ -919,6 +926,15 @@
+ 
+     TRACE("(%p)\n", fi);
+ 
++    /* madeira (bg3-cxx-unlink-guard): the thread's frame list is empty although a catch block is
++     * ending (BG3 0.2.180 New Game: ucrtbase+0x1f144 read of 0x8, x8 = frame_info_head = NULL).
++     * Native crashes here too; return instead. env.MADEIRA_CXX_UNLINK_GUARD = 0 restores the crash. */
++    if (!cur && !cxx_unlink_guard_off())
++    {
++        ERR("[cxx-unlink-guard] frame %p not registered on this thread (list empty); skipped\n", fi);
++        return;
++    }
++
+     if (cur == fi)
+     {
+         data->frame_info_head = cur->next;
+@@ -1013,7 +1029,7 @@
+         return;
+ 
+     _FindAndUnlinkFrame(&frame_info->frame_info);
+-    if(data->exc_record->ExceptionCode == CXX_EXCEPTION && !in_use
++    if(data->exc_record && data->exc_record->ExceptionCode == CXX_EXCEPTION && !in_use
+             && _IsExceptionObjectToBeDestroyed((void*)data->exc_record->ExceptionInformation[1]))
+         __DestructExceptionObject(data->exc_record);
+     data->exc_record = frame_info->rec;

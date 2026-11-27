@@ -10,6 +10,11 @@ enum DualNetworkDownload {
         return ProcessInfo.processInfo.environment["MADEIRA_DUAL_NETWORK_DOWNLOAD"] == "1"
     }
 
+    /// A depot chunk is at most a few MB; anything larger is not a chunk.
+    private static let maxBody = 32 * 1024 * 1024
+    /// A connection that delivers nothing for this long is cancelled (the caller then falls back).
+    private static let stallSeconds = 20.0
+
     private final class Stats: @unchecked Sendable {
         let lock = NSLock()
         var inflight: [NWInterface.InterfaceType: Int] = [.wifi: 0, .cellular: 0]
@@ -54,19 +59,25 @@ enum DualNetworkDownload {
         defer { conn.cancel() }
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
             var done = false
+            let connectGuard = DispatchWorkItem { conn.cancel() }
             conn.stateUpdateHandler = { s in
                 guard !done else { return }
+                if case .preparing = s {} else if case .setup = s {} else { connectGuard.cancel() }
                 switch s {
                 case .ready: done = true; c.resume()
                 case .failed(let e): done = true; c.resume(throwing: e)
                 case .waiting(let e): done = true; c.resume(throwing: e) // e.g. no cellular route
+                case .cancelled: done = true; c.resume(throwing: URLError(.cancelled))
                 default: break
                 }
             }
             conn.start(queue: .global(qos: .userInitiated))
+            // .ready or .waiting normally arrive at once; cap the connect too.
+            DispatchQueue.global().asyncAfter(deadline: .now() + stallSeconds, execute: connectGuard)
         }
-        var path = url.path.isEmpty ? "/" : url.path
-        if let q = url.query { path += "?" + q }
+        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { throw URLError(.badURL) }
+        var path = comps.percentEncodedPath.isEmpty ? "/" : comps.percentEncodedPath
+        if let q = comps.percentEncodedQuery { path += "?" + q }
         let req = "GET \(path) HTTP/1.1\r\nHost: \(host)\r\nConnection: close\r\nAccept: */*\r\n\r\n"
         try await send(conn, Data(req.utf8))
         var buf = Data()
@@ -82,10 +93,13 @@ enum DualNetworkDownload {
                 guard (200...299).contains(status) else { throw SteamError.contentHTTP(status) }
                 if lines.contains(where: { $0.lowercased().hasPrefix("transfer-encoding") }) { throw URLError(.cannotParseResponse) }
                 for l in lines where l.lowercased().hasPrefix("content-length:") {
-                    length = Int(l.split(separator: ":")[1].trimmingCharacters(in: .whitespaces)) ?? -1
+                    let value = l.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)
+                    length = Int(value) ?? -1
                 }
+                guard length >= 0, length <= maxBody else { throw URLError(.dataLengthExceedsMaximum) }
                 bodyStart = r.upperBound
             }
+            if buf.count > maxBody + 16 * 1024 { throw URLError(.dataLengthExceedsMaximum) }
             if let s = bodyStart, length >= 0, buf.count - s >= length { return buf.subdata(in: s..<(s + length)) }
             if eof { throw URLError(.networkConnectionLost) }
         }
@@ -98,7 +112,11 @@ enum DualNetworkDownload {
     }
     private static func receive(_ c: NWConnection) async throws -> (Data, Bool) {
         try await withCheckedThrowingContinuation { k in
+            // Stall guard: cancelling makes the pending receive complete with an error.
+            let guardItem = DispatchWorkItem { c.cancel() }
+            DispatchQueue.global().asyncAfter(deadline: .now() + stallSeconds, execute: guardItem)
             c.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { data, _, isComplete, e in
+                guardItem.cancel()
                 if let e { k.resume(throwing: e) } else { k.resume(returning: (data ?? Data(), isComplete && (data ?? Data()).isEmpty)) }
             }
         }

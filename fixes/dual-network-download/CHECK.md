@@ -12,3 +12,6 @@ Switch: UserDefaults `dualNetworkDownload` (Settings toggle, label "Use Wi-Fi an
 
 Can the Linux laptop check it? Probably yes to COMPILE (Cameron: the PC builds IPAs with xtool + WSL Ubuntu; xtool's iOS SDK has Network.framework). Needs xtool + the SDK on the laptop; not checked whether installed. Compiling is not testing: only the iPhone proves the split. Unproven: that iOS keeps a cellular route up while on Wi-Fi for a sideloaded app (works in other apps via requiredInterfaceType; not tested here). Test on iPhone: toggle on, watch `[steam-depot] speed` log lines (expect ~90 MB/s vs ~60 alone). Risks: a TLS handshake per chunk; cellular data use; Wi-Fi-only Low Data Mode.
 Also need `SteamError.contentHTTP` reachable from this file (same module, should be).
+
+## Rev 2 (Nov 27 22:20Z): replaces the first version after your FAIL
+Use dual-network.patch (patch -p1 from the app folder, against the 0.2.180 tree). It fixes the six findings in your RESULT.md and adds the Settings toggle and project.pbxproj entries. Please re-check and replace RESULT.md.

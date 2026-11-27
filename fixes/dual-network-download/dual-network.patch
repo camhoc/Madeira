@@ -1,0 +1,197 @@
+diff -ruN a/Madeira/Onboarding.swift b/Madeira/Onboarding.swift
+--- a/Madeira/Onboarding.swift	2026-11-27 22:16:07.751590133 +0000
++++ b/Madeira/Onboarding.swift	2026-11-27 22:16:07.805001871 +0000
+@@ -873,6 +873,7 @@
+     @State private var region = SteamDownloadRegion.chosen
+     /// Settings › Steam › Downloads from PCs on this network (SteamLANSetting).
+     @State private var lanOn = SteamLANSetting.enabled
++    @State private var dualNetOn = DualNetworkDownload.enabled
+     /// A fixed PC address; "" finds the PC through Steam.
+     @State private var lanHost = SteamLANSetting.host
+ 
+@@ -916,6 +917,10 @@
+                 Toggle("Downloads from PCs on this network", isOn: $lanOn)
+                     .onChange(of: lanOn) { _, value in SteamLANSetting.enabled = value }
+                     .padToggle("steam-lan", $lanOn)
++                Toggle("Use Wi-Fi and cellular together", isOn: $dualNetOn)
++                    .onChange(of: dualNetOn) { _, value in UserDefaults.standard.set(value, forKey: "dualNetworkDownload") }
++                    .padToggle("steam-dual-network", $dualNetOn)
++                Text("Downloads use mobile data as well as Wi-Fi.").font(.footnote).foregroundStyle(.secondary)
+                 if lanOn {
+                     LabeledContent("PC address") {
+                         TextField("Automatic", text: $lanHost)
+diff -ruN a/Madeira/SwiftSteam/Content/DepotDownloader.swift b/Madeira/SwiftSteam/Content/DepotDownloader.swift
+--- a/Madeira/SwiftSteam/Content/DepotDownloader.swift	2026-11-27 22:16:07.747493207 +0000
++++ b/Madeira/SwiftSteam/Content/DepotDownloader.swift	2026-11-27 22:16:07.804740680 +0000
+@@ -899,6 +899,8 @@
+ 
+     private nonisolated static func download(_ urlString: String) async throws -> Data {
+         guard let url = URL(string: urlString) else { throw SteamError.chunkDownloadFailed("Invalid content URL.") }
++        // Off by default. Any failure falls back to URLSession below; the caller still verifies every chunk.
++        if DualNetworkDownload.enabled, let data = try? await DualNetworkDownload.fetch(url) { return data }
+         let (data, response) = try await http.data(from: url)
+         guard let status = (response as? HTTPURLResponse)?.statusCode, (200...299).contains(status) else {
+             throw SteamError.contentHTTP((response as? HTTPURLResponse)?.statusCode ?? 0)
+diff -ruN a/Madeira/SwiftSteam/Content/DualNetworkDownload.swift b/Madeira/SwiftSteam/Content/DualNetworkDownload.swift
+--- a/Madeira/SwiftSteam/Content/DualNetworkDownload.swift	1970-01-01 00:00:00.000000000 +0000
++++ b/Madeira/SwiftSteam/Content/DualNetworkDownload.swift	2026-11-27 22:16:15.807452243 +0000
+@@ -0,0 +1,124 @@
++import Foundation
++import Network
++
++/// Fetches one URL over a chosen interface (Wi-Fi or cellular) with Network.framework,
++/// so depot chunks can be split across both links. URLSession cannot pin an interface.
++/// OFF by default (uses cellular data): Settings key "dualNetworkDownload" or env MADEIRA_DUAL_NETWORK_DOWNLOAD=1.
++enum DualNetworkDownload {
++    static var enabled: Bool {
++        if UserDefaults.standard.bool(forKey: "dualNetworkDownload") { return true }
++        return ProcessInfo.processInfo.environment["MADEIRA_DUAL_NETWORK_DOWNLOAD"] == "1"
++    }
++
++    /// A depot chunk is at most a few MB; anything larger is not a chunk.
++    private static let maxBody = 32 * 1024 * 1024
++    /// A connection that delivers nothing for this long is cancelled (the caller then falls back).
++    private static let stallSeconds = 20.0
++
++    private final class Stats: @unchecked Sendable {
++        let lock = NSLock()
++        var inflight: [NWInterface.InterfaceType: Int] = [.wifi: 0, .cellular: 0]
++        var speed: [NWInterface.InterfaceType: Double] = [.wifi: 1, .cellular: 1] // bytes/s EMA
++        var cellularFailures = 0
++    }
++    private static let stats = Stats()
++
++    /// Picks the link with the lowest (inflight+1)/speed, so the faster link gets more chunks.
++    private static func pick() -> NWInterface.InterfaceType {
++        stats.lock.lock(); defer { stats.lock.unlock() }
++        if stats.cellularFailures >= 5 { return .wifi }   // cellular unusable: stop trying
++        let w = Double(stats.inflight[.wifi]! + 1) / stats.speed[.wifi]!
++        let c = Double(stats.inflight[.cellular]! + 1) / stats.speed[.cellular]!
++        return w <= c ? .wifi : .cellular
++    }
++
++    /// Throws on any problem; the caller falls back to the normal URLSession path.
++    static func fetch(_ url: URL) async throws -> Data {
++        let link = pick()
++        stats.lock.lock(); stats.inflight[link]! += 1; stats.lock.unlock()
++        let start = Date()
++        defer { stats.lock.lock(); stats.inflight[link]! -= 1; stats.lock.unlock() }
++        do {
++            let data = try await get(url, over: link)
++            let rate = Double(data.count) / max(0.05, Date().timeIntervalSince(start))
++            stats.lock.lock(); stats.speed[link] = stats.speed[link]! * 0.8 + rate * 0.2; stats.lock.unlock()
++            return data
++        } catch {
++            if link == .cellular { stats.lock.lock(); stats.cellularFailures += 1; stats.lock.unlock() }
++            throw error
++        }
++    }
++
++    private static func get(_ url: URL, over link: NWInterface.InterfaceType) async throws -> Data {
++        guard let host = url.host else { throw URLError(.badURL) }
++        let tls = url.scheme == "https"
++        let port = NWEndpoint.Port(rawValue: UInt16(url.port ?? (tls ? 443 : 80)))!
++        let params = tls ? NWParameters(tls: .init(), tcp: .init()) : NWParameters.tcp
++        params.requiredInterfaceType = link
++        let conn = NWConnection(host: NWEndpoint.Host(host), port: port, using: params)
++        defer { conn.cancel() }
++        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
++            var done = false
++            let connectGuard = DispatchWorkItem { conn.cancel() }
++            conn.stateUpdateHandler = { s in
++                guard !done else { return }
++                if case .preparing = s {} else if case .setup = s {} else { connectGuard.cancel() }
++                switch s {
++                case .ready: done = true; c.resume()
++                case .failed(let e): done = true; c.resume(throwing: e)
++                case .waiting(let e): done = true; c.resume(throwing: e) // e.g. no cellular route
++                case .cancelled: done = true; c.resume(throwing: URLError(.cancelled))
++                default: break
++                }
++            }
++            conn.start(queue: .global(qos: .userInitiated))
++            // .ready or .waiting normally arrive at once; cap the connect too.
++            DispatchQueue.global().asyncAfter(deadline: .now() + stallSeconds, execute: connectGuard)
++        }
++        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { throw URLError(.badURL) }
++        var path = comps.percentEncodedPath.isEmpty ? "/" : comps.percentEncodedPath
++        if let q = comps.percentEncodedQuery { path += "?" + q }
++        let req = "GET \(path) HTTP/1.1\r\nHost: \(host)\r\nConnection: close\r\nAccept: */*\r\n\r\n"
++        try await send(conn, Data(req.utf8))
++        var buf = Data()
++        var bodyStart: Int?
++        var length = -1
++        while true {
++            let (chunk, eof) = try await receive(conn)
++            buf.append(chunk)
++            if bodyStart == nil, let r = buf.range(of: Data("\r\n\r\n".utf8)) {
++                let head = String(decoding: buf[..<r.lowerBound], as: UTF8.self)
++                let lines = head.components(separatedBy: "\r\n")
++                let status = Int(lines[0].split(separator: " ").dropFirst().first ?? "") ?? 0
++                guard (200...299).contains(status) else { throw SteamError.contentHTTP(status) }
++                if lines.contains(where: { $0.lowercased().hasPrefix("transfer-encoding") }) { throw URLError(.cannotParseResponse) }
++                for l in lines where l.lowercased().hasPrefix("content-length:") {
++                    let value = l.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)
++                    length = Int(value) ?? -1
++                }
++                guard length >= 0, length <= maxBody else { throw URLError(.dataLengthExceedsMaximum) }
++                bodyStart = r.upperBound
++            }
++            if buf.count > maxBody + 16 * 1024 { throw URLError(.dataLengthExceedsMaximum) }
++            if let s = bodyStart, length >= 0, buf.count - s >= length { return buf.subdata(in: s..<(s + length)) }
++            if eof { throw URLError(.networkConnectionLost) }
++        }
++    }
++
++    private static func send(_ c: NWConnection, _ d: Data) async throws {
++        try await withCheckedThrowingContinuation { (k: CheckedContinuation<Void, Error>) in
++            c.send(content: d, completion: .contentProcessed { e in e == nil ? k.resume() : k.resume(throwing: e!) })
++        }
++    }
++    private static func receive(_ c: NWConnection) async throws -> (Data, Bool) {
++        try await withCheckedThrowingContinuation { k in
++            // Stall guard: cancelling makes the pending receive complete with an error.
++            let guardItem = DispatchWorkItem { c.cancel() }
++            DispatchQueue.global().asyncAfter(deadline: .now() + stallSeconds, execute: guardItem)
++            c.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { data, _, isComplete, e in
++                guardItem.cancel()
++                if let e { k.resume(throwing: e) } else { k.resume(returning: (data ?? Data(), isComplete && (data ?? Data()).isEmpty)) }
++            }
++        }
++    }
++}
+diff -ruN a/Madeira.xcodeproj/project.pbxproj b/Madeira.xcodeproj/project.pbxproj
+--- a/Madeira.xcodeproj/project.pbxproj	2026-11-27 22:16:07.792079709 +0000
++++ b/Madeira.xcodeproj/project.pbxproj	2026-11-27 22:16:07.805234596 +0000
+@@ -68,6 +68,7 @@
+ 		A1008B01 /* BackgroundRun.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2008B01 /* BackgroundRun.swift */; };
+ 		A1000600 /* SteamInstall.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000600 /* SteamInstall.swift */; };
+ 		A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000609 /* ContentDecryptor.swift */; };
++		A1DN0001 /* DualNetworkDownload.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2DN0001 /* DualNetworkDownload.swift */; };
+ 		A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A200060A /* DepotDownloader.swift */; };
+ 		A1000B01 /* SwiftSteam/Content/SteamDownloadRegion.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000B01 /* SteamDownloadRegion.swift */; };
+ 		A1000660 /* SwiftSteam/Content/SteamLANPeer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000660 /* SteamLANPeer.swift */; };
+@@ -380,6 +381,7 @@
+ 		A2008B01 /* BackgroundRun.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundRun.swift; sourceTree = "<group>"; };
+ 		A2000600 /* SteamInstall.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SteamInstall.swift"; sourceTree = "<group>"; };
+ 		A2000609 /* ContentDecryptor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/ContentDecryptor.swift"; sourceTree = "<group>"; };
++		A2DN0001 /* DualNetworkDownload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/DualNetworkDownload.swift"; sourceTree = "<group>"; };
+ 		A200060A /* DepotDownloader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/DepotDownloader.swift"; sourceTree = "<group>"; };
+ 		A2000B01 /* SteamDownloadRegion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/SteamDownloadRegion.swift"; sourceTree = "<group>"; };
+ 		A2000660 /* SteamLANPeer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "SwiftSteam/Content/SteamLANPeer.swift"; sourceTree = "<group>"; };
+@@ -740,6 +742,7 @@
+ 				A2008B01 /* BackgroundRun.swift */,
+ 				A2000600 /* SteamInstall.swift */,
+ 				A2000609 /* ContentDecryptor.swift */,
++				A2DN0001 /* DualNetworkDownload.swift */,
+ 				A200060A /* DepotDownloader.swift */,
+ 				A2000660 /* SteamLANPeer.swift */,
+ 				A2000B01 /* SteamDownloadRegion.swift */,
+@@ -1245,6 +1248,7 @@
+ 				A1008B01 /* BackgroundRun.swift in Sources */,
+ 				A1000600 /* SteamInstall.swift in Sources */,
+ 				A1000609 /* SwiftSteam/Content/ContentDecryptor.swift in Sources */,
++				A1DN0001 /* DualNetworkDownload.swift in Sources */,
+ 				A100060A /* SwiftSteam/Content/DepotDownloader.swift in Sources */,
+ 				A1000660 /* SwiftSteam/Content/SteamLANPeer.swift in Sources */,
+ 				A1000B01 /* SwiftSteam/Content/SteamDownloadRegion.swift in Sources */,

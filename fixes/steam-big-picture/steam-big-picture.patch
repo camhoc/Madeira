@@ -1,0 +1,130 @@
+--- a/app/Madeira/Library.swift
++++ b/app/Madeira/Library.swift
+@@ -735,17 +735,19 @@
+         let prefix = documents.appendingPathComponent("wine").path
+         return ("C:\\Program Files\\Steam Big Picture", "\(prefix)/drive_c/Program Files/Steam Big Picture")
+     }
+-    /// Big Picture is unfinished: the button beside Desktop and a Big Picture card in the library
+-    /// exist only in a build compiled with the Swift condition MADEIRA_BIG_PICTURE_UI (for example
+-    /// xcodebuild SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) MADEIRA_BIG_PICTURE_UI').
+-    /// No IPA build sets it, so release IPAs have neither; the launch code is compiled either way.
+-#if MADEIRA_BIG_PICTURE_UI
+-    static let bigPictureShown = true
+-#else
+-    static let bigPictureShown = false
+-#endif
++    /// ml2260: the Big Picture button (Stores tab, beside Windows Desktop) and its library card.
++    /// On by default; Settings > Appearance > "Steam Big Picture" (UserDefaults key bigPictureShown)
++    /// takes both away. The old compile flag MADEIRA_BIG_PICTURE_UI is no longer needed.
++    static let bigPictureKey = "bigPictureShown"
++    static var bigPictureShown: Bool {
++        UserDefaults.standard.object(forKey: bigPictureKey) as? Bool ?? true
++    }
+     /// Whether the library lists this entry: a Big Picture entry only while Big Picture is shown.
+     var listedInLibrary: Bool { bigPicture != true || Self.bigPictureShown }
++    /// The Big Picture entry to open: the saved one if the library has it, else the built-in.
++    @MainActor static func bigPictureTarget(in entries: [LibraryEntry]) -> LibraryEntry {
++        entries.first(where: { $0.bigPicture == true }) ?? .bigPictureEntry
++    }
+     /// The button is offered when Big Picture's folder has a client, or the Dock's steam.exe
+     /// can seed one.
+     static var steamClientInstalled: Bool {
+@@ -6870,10 +6872,12 @@
+                     // The console look's rail of stores beside the picked store's page, or the list
+                     // (FluxScreens.swift); each sets the page's title.
+                     FluxStoresRoot(title: item.title, top: lookTop[.stores, default: 0], open: { selected = $0 }, add: { browser = true },
+-                                   desktop: { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry }) {
++                                   desktop: { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry },
++                              bigPicture: { selected = LibraryEntry.bigPictureTarget(in: model.entries) }) {
+                         NewLookStoresPage(top: lookTop[.stores, default: 0],
+                                           open: { storesPath.append(NewLookRoute.store($0)) },
+-                                          desktop: { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry })
++                                          desktop: { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry },
++                              bigPicture: { selected = LibraryEntry.bigPictureTarget(in: model.entries) })
+                     }
+                         .navigationDestination(for: NewLookRoute.self) { lookRoute($0) }
+                     }
+@@ -7009,7 +7013,8 @@
+             // (stock-apple-stage3) The Stores page as it was (every store, signed in or not, and the
+             // Windows desktop), pushed from the Store list's Accounts button.
+             NewLookStoresPage(open: { storesPath.append(NewLookRoute.store($0)) },
+-                              desktop: { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry })
++                              desktop: { selected = model.entries.first(where: { $0.desktop == true }) ?? .desktopEntry },
++                              bigPicture: { selected = LibraryEntry.bigPictureTarget(in: model.entries) })
+                 .navigationTitle(L("Accounts"))
+                 .navigationBarTitleDisplayMode(.large)
+                 .modifier(StockAccountsLayer())
+--- a/app/Madeira/NewLook.swift
++++ b/app/Madeira/NewLook.swift
+@@ -1022,6 +1022,8 @@
+     var top = 0
+     let open: (NewLookStore) -> Void
+     let desktop: () -> Void
++    /// ml2260: opens Steam Big Picture's page; nil leaves the row out.
++    var bigPicture: (() -> Void)? = nil
+     @ObservedObject private var steam = SteamOwnedLibrary.shared
+     @ObservedObject private var epic = EpicLibrary.shared
+     @ObservedObject private var gog = GOGLibrary.shared
+@@ -1053,6 +1055,13 @@
+                                action: desktop) {
+                     NewLookBadge(symbol: "desktopcomputer", color: Color(uiColor: .systemGray))
+                 }
++                // ml2260: Valve's client in Big Picture (gamepad UI) inside the Wine desktop.
++                if let bigPicture, LibraryEntry.bigPictureShown, LibraryEntry.steamClientInstalled {
++                    NewLookLinkRow(id: "st-big-picture", title: L("Steam Big Picture"), note: L("Valve's gamepad screen: your Steam library, friends and settings."),
++                                   action: bigPicture) {
++                        NewLookBadge(symbol: "gamecontroller", color: Color(uiColor: .systemBlue))
++                    }
++                }
+             }
+         }
+     }
+--- a/app/Madeira/FluxScreens.swift
++++ b/app/Madeira/FluxScreens.swift
+@@ -118,6 +118,8 @@
+     let open: (LibraryEntry) -> Void
+     let add: () -> Void
+     let desktop: () -> Void
++    /// ml2260: opens Steam Big Picture's page; nil leaves the row out.
++    var bigPicture: (() -> Void)? = nil
+     @ViewBuilder var classic: () -> Classic
+     @AppStorage(FluxLook.key) private var consoleLook = true
+     /// The store on the stage, kept between visits. Empty or a store that is off: the first one.
+@@ -172,6 +174,13 @@
+                         picked: false, action: desktop) {
+                 NewLookBadge(symbol: "desktopcomputer", color: Color(uiColor: .systemGray))
+             }
++            // ml2260: Steam Big Picture beside the desktop.
++            if let bigPicture, LibraryEntry.bigPictureShown, LibraryEntry.steamClientInstalled {
++                FluxRailRow(id: "fx-st-big-picture", title: L("Steam Big Picture"), note: L("Valve's gamepad screen: your Steam library, friends and settings."),
++                            picked: false, action: bigPicture) {
++                    NewLookBadge(symbol: "gamecontroller", color: Color(uiColor: .systemBlue))
++                }
++            }
+         } stage: {
+             if let picked {
+                 NewLookScrollPage(refresh: { await SteamGamesSection.refresh() }, top: top) { inner in
+--- a/app/Madeira/SettingsPages.swift
++++ b/app/Madeira/SettingsPages.swift
+@@ -150,6 +150,7 @@
+     @AppStorage(NewLook.zoomHapticsKey) private var zoomHaptics = true
+     /// Appearance › Console look (FluxLook.swift).
+     @AppStorage(FluxLook.key) private var consoleLook = true
++    @AppStorage(LibraryEntry.bigPictureKey) private var bigPictureShown = true   // ml2260
+     @AppStorage(NewLook.coverWidthKey) private var coverWidth: Double = 104
+     @AppStorage(StockApple.artKey) private var artBehind = true
+     @AppStorage(TouchControlStyle.key) private var controlStyle = "glass"
+@@ -272,6 +273,13 @@
+     @ViewBuilder private var appearance: some View {
+         // The Library as a rail of covers and the picked game over the whole page (FluxLook.swift).
+         // env.MADEIRA_FLUX_LOOK = 0 takes the look and this row away.
++        // ml2260: the Stores tab's Steam Big Picture row; on by default.
++        Section {
++            Toggle("Steam Big Picture", isOn: $bigPictureShown)
++                .padItem("ap-big-picture", cornerRadius: 12) { bigPictureShown.toggle() }
++        } footer: {
++            Text("Shows Steam Big Picture on the Stores tab, next to Windows Desktop. It runs Valve's Steam client in a Wine window and is still slow to start.")
++        }
+         if FluxLook.allowed {
+             Section {
+                 Toggle("Console look", isOn: $consoleLook)

@@ -1,0 +1,50 @@
+--- a/Madeira/wine/dlls/ntdll/unix/file.c	2026-11-26 02:18:50.363642009 +0000
++++ b/Madeira/wine/dlls/ntdll/unix/file.c	2026-11-26 02:20:05.367177971 +0000
+@@ -1893,6 +1893,19 @@
+ static unsigned int server_get_unix_name( HANDLE handle, char **unix_name );
+ 
+ 
++/* env.MADEIRA_PLAIN_DIR_LINKS = 1: do not report directory symlinks / mount points as
++ * reparse points. Chromium's sandbox refuses file rules for paths crossing a reparse point. Default off. */
++static BOOL madeira_plain_dir_links(void)
++{
++    static int cached = -1;
++    if (cached < 0)
++    {
++        const char *e = getenv( "MADEIRA_PLAIN_DIR_LINKS" );
++        cached = (e && e[0] == '1');
++    }
++    return cached;
++}
++
+ /* get the stat info and file attributes for a file (by file descriptor) */
+ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
+                              struct stat *st, ULONG *attr, ULONG *reparse_tag )
+@@ -1909,7 +1922,7 @@
+     /* consider mount points to be reparse points (IO_REPARSE_TAG_MOUNT_POINT) */
+     if (options & FILE_OPEN_REPARSE_POINT)
+     {
+-        if (fd_is_mount_point( fd, st ))
++        if (fd_is_mount_point( fd, st ) && !madeira_plain_dir_links())
+         {
+             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_MOUNT_POINT;
+@@ -2009,7 +2022,7 @@
+         ret = stat( path, st );
+         if (ret == -1) return ret;
+         /* is a symbolic link and a directory, consider these "reparse points" */
+-        if (S_ISDIR( st->st_mode ))
++        if (S_ISDIR( st->st_mode ) && !madeira_plain_dir_links())
+         {
+             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_LX_SYMLINK;
+@@ -2023,7 +2036,8 @@
+         strcpy( parent_path, path );
+         strcat( parent_path, "/.." );
+         if (!stat( parent_path, &parent_st )
+-                && (st->st_dev != parent_st.st_dev || st->st_ino == parent_st.st_ino))
++                && (st->st_dev != parent_st.st_dev || st->st_ino == parent_st.st_ino)
++                && !madeira_plain_dir_links())
+         {
+             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
+             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_MOUNT_POINT;

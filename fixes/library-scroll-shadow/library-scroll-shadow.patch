@@ -1,0 +1,29 @@
+--- a/NewLook.swift	2026-11-27 06:50:49.238064393 +0000
++++ b/NewLook.swift	2026-11-27 06:50:49.298158865 +0000
+@@ -1608,6 +1608,8 @@
+ }
+ 
+ /// A cover, the game's name, and its store and when it was played.
++enum LibraryScrollShadow { static let on = MadeiraConfig.flag("MADEIRA_LIBRARY_SCROLL_SHADOW") }
++
+ struct NewLookCover: View {
+     let game: LibraryReadyGame
+     @Environment(\.libraryCardPressed) private var pressed
+@@ -1616,7 +1618,16 @@
+             LibraryArtwork(entry: game.entry).aspectRatio(2.0 / 3.0, contentMode: .fit)
+                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                 .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5))
+-                .shadow(color: .black.opacity(0.3), radius: 9, y: 6)
++                // (library-scroll-shadow) The shadow comes from a plain rounded rectangle behind the cover, not from the
++                // clipped picture: the blur is then of a simple shape the GPU can cache, not of every cover's pixels each frame.
++                // env.MADEIRA_LIBRARY_SCROLL_SHADOW = 0: the shadow on the picture itself, as in 0.2.180. Read once.
++                .background {
++                    if LibraryScrollShadow.on {
++                        RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.black)
++                            .shadow(color: .black.opacity(0.3), radius: 9, y: 6)
++                    }
++                }
++                .shadow(color: .black.opacity(LibraryScrollShadow.on ? 0 : 0.3), radius: LibraryScrollShadow.on ? 0 : 9, y: LibraryScrollShadow.on ? 0 : 6)
+                 .scaleEffect(pressed ? 0.95 : 1)
+                 .animation(.spring(response: 0.3, dampingFraction: 0.7), value: pressed)
+             Text(game.entry.title).font(.subheadline.weight(.semibold)).lineLimit(2).foregroundStyle(.primary)

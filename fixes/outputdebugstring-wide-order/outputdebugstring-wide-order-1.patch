@@ -1,0 +1,33 @@
+diff -ru pa/dlls/ntdll/signal_arm64ec.c pb/dlls/ntdll/signal_arm64ec.c
+--- pa/dlls/ntdll/signal_arm64ec.c	2026-11-25 23:45:23.099882265 +0000
++++ pb/dlls/ntdll/signal_arm64ec.c	2026-11-25 23:46:59.976283840 +0000
+@@ -6488,7 +6488,10 @@
+                 slot = seen_n++;
+                 seen_code[slot] = (LONG)rec->ExceptionCode;
+             }
+-            if (slot >= 0 && ++seen_hits[slot] <= 4)
++            /* outputdebugstring-wide-order-1: the game's own debug text is the log we need (Halo MCC quits itself, its last
++             * lines were cut by the 4-per-code limit). OutputDebugString codes (0x40010006 / 0x4001000a) get 600 hits per
++             * run; every other code keeps 4. */
++            if (slot >= 0 && ++seen_hits[slot] <= ((rec->ExceptionCode == 0x40010006 || rec->ExceptionCode == 0x4001000a) ? 600 : 4))
+             {
+                 ERR( "[exc] ml811 code=%08x addr=%p flags=%x nparams=%u tid=%04x hit=%d\n",
+                      (int)rec->ExceptionCode, rec->ExceptionAddress, (int)rec->ExceptionFlags,
+@@ -6512,10 +6515,13 @@
+                 }
+                 if (rec->ExceptionCode == 0x4001000a && rec->NumberParameters >= 4)
+                 {
+-                    ios_exc_dump_str( "OutputDebugStringA", rec->ExceptionInformation[1],
+-                                      rec->ExceptionInformation[0], 0 );
+-                    ios_exc_dump_str( "OutputDebugStringW", rec->ExceptionInformation[3],
+-                                      rec->ExceptionInformation[2], 1 );
++                    /* outputdebugstring-wide-order-1 (LOG ONLY): for DBG_PRINTEXCEPTION_WIDE_C the parameters are
++                     * (wide length, wide pointer, ANSI length, ANSI pointer). The old code read them the other way round,
++                     * so the text showed as "D" and "......" (Halo MCC, 0.2.101 run 3). Ntdll-level log fix only. */
++                    ios_exc_dump_str( "OutputDebugStringW", rec->ExceptionInformation[1],
++                                      rec->ExceptionInformation[0], 1 );
++                    ios_exc_dump_str( "OutputDebugStringA", rec->ExceptionInformation[3],
++                                      rec->ExceptionInformation[2], 0 );
+                 }
+                 /* ml812: the game's own software-report codes. Its reporter reads
+                  * the single parameter as a pointer to { const WCHAR *msg; int

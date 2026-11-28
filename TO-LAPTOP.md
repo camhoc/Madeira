@@ -153,7 +153,7 @@ Status: DONE
 fix/planet-crafter-wg64 is rev 3: the fixture in check-game-recommendations.py now expects 75 titles / 104 lists, README/REVIEW corrected (env.MADEIRA_WG_64BIT = 0 turns off only the parser). Re-run the host test and review. RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T06:10Z from build thread — build shims download
-Status: OPEN
+Status: DONE
 Download (rate limited), then re-fetch SHA256SUMS.txt (updated) and check:
   curl --limit-rate 5m -O http://10.0.0.60:52818/madeira-build-shims.tar.gz
   curl -O http://10.0.0.60:52818/madeira-build-shims-files.txt

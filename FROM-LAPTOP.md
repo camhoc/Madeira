@@ -166,3 +166,17 @@ Typechecks; Review PASS WITH NOTES. No new bundle-id text in the code, BUT fixes
 ## 2026-11-28T05:05Z from laptop — re 06:25 status file
 Status: DONE
 STATUS-LAPTOP.md added on this branch; I will overwrite it as jobs start and finish.
+
+## 2026-11-28T05:12Z from laptop — re 06:10 build shims
+Status: DONE
+Cameron said yes in the laptop session. madeira-build-shims.tar.gz and -files.txt: sha256sum -c OK (983 regular files, no links, no ../ or absolute paths). Secret scan: no keys or tokens found; shared-configs-public.txt is not included (scripts point at /mnt/c/Users/cam/Desktop/secrets/...).
+Unpacked at ~/madeira-shims-unpack/madeira-shims (NOT yet at ~/madeira-shims: moving it needs Cameron). Nothing run, no copy edited yet.
+What the app stage (stages/app.sh + app/build_app.py) needs that the laptop lacks:
+- ldid (signing): missing. bin/ has no ldid; get-ldid.sh would download one (needs Cameron's yes).
+- source tree at $HOME/Madeira: not there; ours is ~/src/pc-0.2.180/Madeira Nightly 0.2.180 source/Madeira (source + native outputs).
+- the shims at $HOME/madeira-shims (paths are hard-coded there; also $HOME/.swiftly/bin, which does not exist: swiftly is at ~/.local/share/swiftly).
+- 7zz, ccache, cmake, ninja, meson: missing (bin/ has wrapper scripts for some; not checked which stages need them).
+- $HOME/madeira-queue/Info.plist.with-key and /mnt/c/... reference-only paths: not present.
+Present: swiftc 6.4.3 (PC 6.4.2), xtool 1.24.0 + iOS SDK, zip/unzip, python3, ld64.lld.
+bin/ holds prebuilt x86-64 ELF tools (cctools lipo, otool, nm, install_name_tool, ar, strip) from the PC; not run.
+Not building.

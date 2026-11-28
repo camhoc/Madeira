@@ -1,0 +1,64 @@
+diff -ru a/app/Madeira/BackgroundRun.swift b/app/Madeira/BackgroundRun.swift
+--- a/app/Madeira/BackgroundRun.swift	2026-11-28 04:23:30.436640829 +0000
++++ b/app/Madeira/BackgroundRun.swift	2026-11-28 04:23:30.463610902 +0000
+@@ -99,6 +99,8 @@
+         started = true
+         // No command buffer leaves a game thread while Madeira is away (Winios/MetalBackgroundGate.m).
+         if MadeiraConfig.get("background-gpu-gate") != "0" {
++            // env.MADEIRA_METAL_GATE_SKIP_SYSTEM = 0: hold Apple's own render thread too (0.2.180 behaviour).
++            madeira_metal_gate_skip_system(MadeiraConfig.flag("MADEIRA_METAL_GATE_SKIP_SYSTEM") ? 1 : 0)
+             log("Metal background gate: \(madeira_metal_gate_install()) command buffer class(es)")
+         }
+         let nc = NotificationCenter.default
+diff -ru a/app/Madeira/Madeira-Bridging-Header.h b/app/Madeira/Madeira-Bridging-Header.h
+--- a/app/Madeira/Madeira-Bridging-Header.h	2026-11-28 04:23:30.440981232 +0000
++++ b/app/Madeira/Madeira-Bridging-Header.h	2026-11-28 04:23:30.463489304 +0000
+@@ -47,6 +47,7 @@
+ // Metal command buffers off the main thread wait while Madeira is inactive
+ // (Winios/MetalBackgroundGate.m). Returns the number of classes wrapped.
+ int madeira_metal_gate_install(void);
++void madeira_metal_gate_skip_system(int on);
+ 
+ // DXMT present counter (winemetal_unix.c) — for SwiftUI FPS overlay
+ #include <stdint.h>
+diff -ru a/app/Madeira/Winios/MetalBackgroundGate.m b/app/Madeira/Winios/MetalBackgroundGate.m
+--- a/app/Madeira/Winios/MetalBackgroundGate.m	2026-11-28 04:23:30.431099683 +0000
++++ b/app/Madeira/Winios/MetalBackgroundGate.m	2026-11-28 04:23:30.463270173 +0000
+@@ -26,7 +26,9 @@
+ #import <Metal/Metal.h>
+ #import <objc/runtime.h>
+ 
++#include <dlfcn.h>
+ #include <pthread.h>
++#include <string.h>
+ #include <stdio.h>
+ #include <time.h>
+ 
+@@ -36,6 +38,18 @@
+ static pthread_cond_t mbg_cond = PTHREAD_COND_INITIALIZER;
+ static int mbg_inactive;
+ static unsigned mbg_logged;
++/* 1 (default): a commit whose caller is an Apple system image (RenderBox: SwiftUI's own render
++ * thread) is never held. Held, it left the main thread waiting on RenderBox in the scene-update
++ * watchdog (10 s) when Madeira went to the background: 0x8BADF00D, SIGKILL 31W. 0 = old behaviour. */
++static int mbg_skip_system = 1;
++
++void madeira_metal_gate_skip_system(int on) { mbg_skip_system = on; }
++
++static int mbg_caller_is_system(void *ra) {
++    Dl_info info;
++    if (!ra || !dladdr(ra, &info) || !info.dli_fname) return 0;
++    return strncmp(info.dli_fname, "/System/", 8) == 0 || strncmp(info.dli_fname, "/usr/lib/", 9) == 0;
++}
+ 
+ static Class mbg_class[MBG_CLASSES];
+ static IMP mbg_orig[MBG_CLASSES];
+@@ -70,7 +84,7 @@
+     for (Class c = object_getClass(self); c && !orig; c = class_getSuperclass(c))
+         for (int i = 0; i < mbg_count; i++)
+             if (mbg_class[i] == c) { orig = mbg_orig[i]; break; }
+-    if (![NSThread isMainThread]) mbg_wait();
++    if (![NSThread isMainThread] && !(mbg_skip_system && mbg_caller_is_system(__builtin_return_address(0)))) mbg_wait();
+     if (orig) ((void (*)(id, SEL))orig)(self, cmd);
+ }
+ 

@@ -1,0 +1,55 @@
+--- a/app/Madeira/GameRecommendations.swift	2026-11-27 01:42:07.150971000 +0000
++++ b/app/Madeira/GameRecommendations.swift	2026-11-28 08:17:38.674704278 +0000
+@@ -1777,14 +1777,29 @@
+     /// after the memory step is NOT known, so this list is one step, not a working game. The standard line plus the two
+     /// lines that run had; no other game gets them (Bodycam, BIGFOOT, GTA V and .NET games ask for such a reservation,
+     /// are refused, and carry on with a smaller one). To switch it off, delete the two lines. NOT device-tested.
++    /// (cyberpunk-pool-arena) Version 2, Nov 28 2026, iPad16,8 sweep retests of 0.2.180. pool-split + MADEIRA_X64_IMAGE_NOCOPY
++    /// (what jit-pool-auto writes) crashes the launcher (redprelauncher.exe in PocoFoundation.dll, status 0xc0000005,
++    /// 2.21 s); without them the JIT pool runs out ("[jit-pool] EXHAUSTED"). The fork arabdogwater/Madeira (6307d9f28, GPL-3.0)
++    /// uses pool-low and its image switches instead; with those the pool did not run out and the game's 4 GB reserve then failed
++    /// ("Out of Memory! Failed to allocate 4294967296 bytes", int3); a 4 GB emulator arena (arena-mb = 4096, grow on) freed the
++    /// room: no OOM, no EXHAUSTED, the game reached its title/consent screen at 60 FPS (run 5c). MADEIRA_JIT_POOL_AUTO = 0 keeps
++    /// jit-pool-auto from adding NOCOPY later. Not past the consent screen; not a verified playable game. Off: delete the lines.
+     static let cyberpunk2077 = GameRecommendation(
+-        id: "cyberpunk-2077", title: "Cyberpunk 2077", version: 1,
++        id: "cyberpunk-2077", title: "Cyberpunk 2077", version: 2,
+         config: """
+         # Madeira's recommended settings for Cyberpunk 2077.
+         # Reset to Recommended, at the bottom of the game's settings, brings them back.
+         env.MADEIRA_EC_HOOK_TRACE = 0
+         oversize-reserve = 1
+         oversize-reserve-mb = 2048
++        pool-split = 1
++        pool-low = 1
++        pool-page-fit = 1
++        env.MADEIRA_POOL_LOW_IMAGES = 1
++        env.MADEIRA_POOL_RECYCLE_IMAGES = 1
++        arena-mb = 4096
++        env.MADEIRA_FEX_ARENA_GROW = 1
++        env.MADEIRA_JIT_POOL_AUTO = 0
+         """)
+ 
+     /// Microsoft Flight Simulator 2024 (Steam App ID 2537590). Ported on 2026-10-26 from thebcd69's (BCD) tested list
+--- a/tests/host/check-game-recommendations.py	2026-11-27 01:44:15.132766000 +0000
++++ b/tests/host/check-game-recommendations.py	2026-11-28 08:17:38.680208747 +0000
+@@ -497,14 +497,17 @@
+ # variant or app-side switches, and no MADEIRA_SPAWN_SWAP (its engine code is not in this tree).
+ for ident in MERGED:
+     p = presets[ident]
+-    assert p['version'] == (4 if ident == 'baldurs-gate-3' else 2 if ident in ('batman-arkham-city-goty', 'counter-strike-2', 'beamng-drive', 'metaphor-refantazio', 'goals', 'dotnet-large-heap', 'project-zomboid', 'slay-the-spire-2', 'the-escapists-2', 'subnautica-2', 'resident-evil-requiem', 'grounded') else 1), ident
++    assert p['version'] == (4 if ident == 'baldurs-gate-3' else 2 if ident in ('batman-arkham-city-goty', 'counter-strike-2', 'beamng-drive', 'metaphor-refantazio', 'goals', 'dotnet-large-heap', 'cyberpunk-2077', 'project-zomboid', 'slay-the-spire-2', 'the-escapists-2', 'subnautica-2', 'resident-evil-requiem', 'grounded') else 1), ident
+     assert not any(line.startswith(('env.MADEIRA_WINTYPES', 'env.MADEIRA_OPTIN_DLLS', 'env.MADEIRA_D3D8 ',
+                                     'env.MADEIRA_STEAM_IDENTITY', 'env.MADEIRA_MFC_DOCK', 'pool-split-retry'))
+                    for line in p['lines']), (ident, p['lines'])
+ assert [ident for ident, p in presets.items() if any(line.startswith('env.MADEIRA_SPAWN_SWAP') for line in p['lines'])] == []
+ # cyberpunk-oversize-2gb: Cyberpunk 2077 is the standard line plus a 2 GB real part for its 64 GB reservation (the
+ # 8 GB real part of the first reports left no room for its later 4 GB one). No other list sets the size.
+-assert presets['cyberpunk-2077']['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0', 'oversize-reserve = 1', 'oversize-reserve-mb = 2048'] \
++assert presets['cyberpunk-2077']['tested'] == ['env.MADEIRA_EC_HOOK_TRACE = 0', 'oversize-reserve = 1', 'oversize-reserve-mb = 2048',
++                                                'pool-split = 1', 'pool-low = 1', 'pool-page-fit = 1', 'env.MADEIRA_POOL_LOW_IMAGES = 1',
++                                                'env.MADEIRA_POOL_RECYCLE_IMAGES = 1', 'arena-mb = 4096', 'env.MADEIRA_FEX_ARENA_GROW = 1',
++                                                'env.MADEIRA_JIT_POOL_AUTO = 0'] \
+     and presets['cyberpunk-2077']['switches'] == '', presets['cyberpunk-2077']
+ assert [i for i, p in presets.items() if any(l.startswith('oversize-reserve-mb') for l in p['lines'])] == ['cyberpunk-2077']
+ assert ('        case "redprelauncher.exe":\n' in lists_src

@@ -261,3 +261,7 @@ Cameron said yes. fix/fork-scan-data pushed at 06:10Z (laptop clock, UTC): out/w
 ## 2026-11-28T06:24Z from laptop — re 08:10 repo-backbuffer-probe-v2
 Status: DONE
 Review PASS: signature identical, staging texture is CPU-readable, syntax check OK; no overlap with dxmt-d3d11-tex-trace (different files).
+
+## 2026-11-28T07:26Z from laptop — re 08:20 kk-position-float4
+Status: DONE
+Pushed fix/kk-position-float4 (fixes/kk-position-float4/: kosmickrisp-ios-0011-position-float4.patch, CHECK.md, REVIEW.md). VertexOut's position member is declared float4 (msl_iomap.c vs_output_block) and a 32-bit integer store to it is wrapped in as_type<floatN>(...) (nir_to_msl.c store_output). Off: MADEIRA_KK_POS_FLOAT = 0. NOT compiled (no meson/mako). Applies on our 9 patches, and after kk-playport-pack rev 2 and kk-archive-cap: no collision. Needs a second review.

@@ -262,7 +262,7 @@ Status: DONE
 New branch (CHECK.md): DXMT present probe fix, diagnostic only, off unless env.MADEIRA_PRESENT_PROBE = 1. Also check overlap with dxmt-d3d11-tex-trace (DXMT). RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T08:20Z from build thread — write a fix: fix/kk-position-float4 (KosmicKrisp, not upstream)
-Status: OPEN
+Status: DONE
 Elden Ring and Deep Rock (DX12 via KosmicKrisp + vkd3d) fail with the same proven MSL compile error:
   Failed to create MTLLibrary: program_source:5:22: error: type 'uint4' (vector of 4 'unsigned int' values) is not valid for attribute 'position'
   then: invalid return type 'VertexOut' for vertex function, vr -1000012000.

@@ -1,0 +1,40 @@
+--- a/tests/host/check-game-recommendations.py
++++ b/tests/host/check-game-recommendations.py
+@@ -74,7 +74,7 @@
+           'batman-arkham-city-goty', 'trails-in-the-sky-1st-chapter', 'subnautica-2', 'rdr1-steam', 'resident-evil-requiem', 'resident-evil-requiem-demo',
+           'life-is-strange-remastered', 'life-is-strange-2', 'project-zomboid', 'spiderheck', 'rounds', 'plateup',
+           'final-fantasy-tactics-ivalice-chronicles', 'jetboard-joust', 'dead-as-disco', 'tung', 'sekiro-shadows-die-twice', 'stardew-valley', 'slay-the-spire-2',
+-          'glyphica-typing-survival', 'football-manager-27', 'the-adventures-of-elliot', 'the-escapists-2', 'garrys-mod', 'persona-3-reload', 'grounded', 'innerspace', 'satisfactory-steam', 'blue-prince', 'the-forest', 'steep', 'just-cause-2', 'goals', 'dotnet-large-heap', 'cyberpunk-2077'}
++          'glyphica-typing-survival', 'football-manager-27', 'the-adventures-of-elliot', 'the-escapists-2', 'garrys-mod', 'persona-3-reload', 'grounded', 'innerspace', 'satisfactory-steam', 'blue-prince', 'the-forest', 'steep', 'just-cause-2', 'goals', 'dotnet-large-heap', 'cyberpunk-2077', 'resident-evil-5', 'euro-truck-simulator-2'}
+ assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'gta5l-steam', 'gta5l-other', 'gta4-steam',
+                         'ghost-of-tsushima', 'god-of-war', 'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart',
+                         'crysis-remastered', 'crysis-2-remastered', 'crysis-3-remastered', 'rockstar-launcher', 'rockstar-launcher-setup',
+@@ -193,7 +193,7 @@
+         continue
+     # These lists were tested without madeira-bcd's defaults.
+     if ident in ('standard', 'fallout-new-vegas', 'fallout-3', 'black-ops-1', 'black-ops-2', 'borderlands-2', 'persona-3-reload', 'avicii-invector',
+-                  'satisfactory-steam', 'melonloader', 'final-fantasy-resonance', 'metaphor-refantazio', 'dying-light-2', 'baldurs-gate-3', 'blue-prince', 'the-forest', 'steep', 'just-cause-2', 'sonic-generations', 'detroit-become-human', 'cyberpunk-2077', 'football-manager-27'):
++                  'satisfactory-steam', 'melonloader', 'final-fantasy-resonance', 'metaphor-refantazio', 'dying-light-2', 'baldurs-gate-3', 'blue-prince', 'the-forest', 'steep', 'resident-evil-5', 'euro-truck-simulator-2', 'just-cause-2', 'sonic-generations', 'detroit-become-human', 'cyberpunk-2077', 'football-manager-27'):
+         # steep-epic-launcher-wait: Steep's own fix IS the wait-for-children rule, not the community defaults
+         own_fix = {'env.MADEIRA_WAIT_CHILDREN = 1'} if ident == 'steep' else set()
+         assert not (set(FORK_DEFAULTS) - own_fix) & set(p['lines']), (ident, "the standard list has none of madeira-bcd's defaults")
+@@ -932,6 +932,10 @@
+       "the first Black Ops' multiplayer shares the folder and has no list")
+ check(id(steam + #"\The Escapists 2"#, 641990) == "the-escapists-2" && id(steam + #"\The Escapists 2\TheEscapists2.exe"#) == "the-escapists-2",
+       "The Escapists 2 by App ID, folder and program")
++check(id(steam + #"\Resident Evil 5"#) == "resident-evil-5" && id(steam + #"\Resident Evil 5\re5dx9.exe"#) == "resident-evil-5",
++      "Resident Evil 5 by folder and program (no App ID)")
++check(id(steam + #"\Euro Truck Simulator 2"#) == "euro-truck-simulator-2" && id(steam + #"\Euro Truck Simulator 2\bin\win_x64\eurotrucks2.exe"#) == "euro-truck-simulator-2",
++      "Euro Truck Simulator 2 by folder and program (no App ID)")
+ check(id(steam + #"\GarrysMod"#, 4000) == "garrys-mod" && id(steam + #"\GarrysMod\bin\win64\gmod.exe"#) == "garrys-mod",
+       "Garry's Mod by App ID and folder (either branch) and by its 64-bit program")
+ check(id(steam + #"\P3R"#, 2161700) == "persona-3-reload" && id(steam + #"\P3R\P3R\Binaries\Win64\P3R.exe"#) == "persona-3-reload",
+@@ -954,7 +958,7 @@
+          files: [#"C:\Program Files\Epic Games\InnerSpace\version.dll"#, #"C:\Program Files\Epic Games\InnerSpace\MelonLoader"#]) == "innerspace",
+       "a game's own list wins over the MelonLoader list")
+ check(R.melonLoader.fileText.contains("\noversize-reserve = 1\n"), "the MelonLoader list serves large reservations in part")
+-check(R.steamTitles.count == 74 && R.all.count == 103, "74 titles in the Steam table, 103 lists (+ Football Manager 27, GOALS, Portal, .NET program, The Forest, Steep, Just Cause 2, Sonic Generations, Detroit, Hades II, L.A. Noire, Cyberpunk 2077; The Witcher 3 dropped)")
++check(R.steamTitles.count == 76 && R.all.count == 105, "76 titles in the Steam table, 105 lists (+ Resident Evil 5, Euro Truck Simulator 2, Football Manager 27, GOALS, Portal, .NET program, The Forest, Steep, Just Cause 2, Sonic Generations, Detroit, Hades II, L.A. Noire, Cyberpunk 2077; The Witcher 3 dropped)")
+ check(id(steam + #"\Cyberpunk 2077"#, 1091500) == "cyberpunk-2077" && id(steam + #"\Cyberpunk 2077"#) == "cyberpunk-2077"
+       && id(#"C:\GOG Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe"#) == "cyberpunk-2077"
+       && id(#"C:\GOG Games\Cyberpunk 2077\REDprelauncher.exe"#, files: [#"C:\GOG Games\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe"#]) == "cyberpunk-2077"

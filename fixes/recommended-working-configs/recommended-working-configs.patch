@@ -1,0 +1,50 @@
+--- a/app/Madeira/GameRecommendations.swift
++++ b/app/Madeira/GameRecommendations.swift
+@@ -1666,6 +1666,10 @@
+                    programs: ["norestforthewicked.exe"], steamPrograms: [], list: noRestForTheWicked),
+         SteamTitle(appIDs: [641990], folders: ["the escapists 2"],
+                    programs: ["theescapists2.exe"], steamPrograms: [], list: escapists2),
++        SteamTitle(appIDs: [], folders: ["resident evil 5"],
++                   programs: ["re5dx9.exe"], steamPrograms: [], list: residentEvil5),
++        SteamTitle(appIDs: [], folders: ["euro truck simulator 2"],
++                   programs: ["eurotrucks2.exe"], steamPrograms: [], list: eurotruckSimulator2),
+         SteamTitle(appIDs: [4000], folders: ["garrysmod"],
+                    programs: ["gmod.exe"], steamPrograms: [], list: garrysMod),
+         SteamTitle(appIDs: [2161700], folders: ["p3r"],
+@@ -2258,6 +2262,36 @@
+         env.MADEIRA_WAIT_CHILDREN = 1
+         """)
+ 
++    /// Resident Evil 5 (re5dx9.exe; Steam folder "Resident Evil 5"). Sweep 0.2.101, 2026-11-25 (thread "Fix Resident Evil 5 launch
++    /// crash"): it crashed at launch; with env.MADEIRA_SMC_HOT_PAGE = 0 in its own config the game ran and played its intro video
++    /// (the same line that fixed The Escapists 2). Cause of the original crash unproven. Costs a slow start: the window appeared
++    /// at +189.96 s (a fault loop on 4 pages, 0x72055d0000 264 times), a separate open problem (not fixed by this list).
++    /// Not re-tested on 0.2.180. Off switch: delete the line (or Reset to Recommended after removing this entry).
++    static let residentEvil5 = GameRecommendation(
++        id: "resident-evil-5", title: "Resident Evil 5", version: 1,
++        config: """
++        # Madeira's recommended settings for Resident Evil 5.
++        # Reset to Recommended, at the bottom of the game's settings, brings them back.
++        env.MADEIRA_EC_HOOK_TRACE = 0
++        env.MADEIRA_SMC_HOT_PAGE = 0
++        """)
++
++    /// Euro Truck Simulator 2 (eurotrucks2.exe; Steam folder "Euro Truck Simulator 2"). Sentry/Get Help log on 0.2.26 (iPad17,1),
++    /// thread "Fix Euro Truck Simulator 2 JIT pool", 2026-11-17: the first launch ran out of JIT memory ("[jit-pool] EXHAUSTED
++    /// (image ... want=0x430000)" six times, peak 414 of 446 MB); Madeira then wrote pool-split = 1 and env.MADEIRA_X64_IMAGE_NOCOPY = 1
++    /// into the game's config itself and the relaunch ran (pool 444 MB, peak 206 MB, exit code 0 after 2 minutes). This list
++    /// gives the first launch those two lines. Not re-tested on 0.2.180 (pool-split is automatic there, so that line may be
++    /// redundant). Off switch: delete the two lines (or Reset to Recommended after removing this entry).
++    static let eurotruckSimulator2 = GameRecommendation(
++        id: "euro-truck-simulator-2", title: "Euro Truck Simulator 2", version: 1,
++        config: """
++        # Madeira's recommended settings for Euro Truck Simulator 2.
++        # Reset to Recommended, at the bottom of the game's settings, brings them back.
++        env.MADEIRA_EC_HOOK_TRACE = 0
++        pool-split = 1
++        env.MADEIRA_X64_IMAGE_NOCOPY = 1
++        """)
++
+     /// The Forest (Steam 242760, Unity): its ~400 short-lived threads each load and unload avrt.dll, and
+     /// every load takes JIT pool space that comes back only when the game exits (~146 MB over a run), so the
+     /// pool runs out (a community fork's report; idea only). avrt.dll is optional for Unity (it only asks

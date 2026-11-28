@@ -1,16 +1,17 @@
 diff -ruN orig/app/Madeira/SavesAndShortcuts.swift mod/app/Madeira/SavesAndShortcuts.swift
 --- orig/app/Madeira/SavesAndShortcuts.swift	2026-11-28 05:00:47.921223428 +0000
-+++ mod/app/Madeira/SavesAndShortcuts.swift	2026-11-28 05:00:54.767222311 +0000
-@@ -53,6 +53,8 @@
++++ mod/app/Madeira/SavesAndShortcuts.swift	2026-11-28 05:16:33.685034456 +0000
+@@ -53,6 +53,9 @@
  /// restamps one binary for iPhone, iPad and public, so everyone ships this code but it returns at once
  /// unless the bundle id is the iPad test id AND env.MADEIRA_IPAD_TEST_HOOKS = 1 in madeira.cfg (off by default).
  ///  1. madeira://launch?steam=<appid> starts that library game like Play (after JIT).
++///  4. The same hooks from a file, Documents/test-hooks/command.txt (startCommandFile).
 +///  3. madeira://status writes Documents/test-hooks/status.json; madeira://quit[?force=1]; madeira://relaunch?steam=<appid>;
 +///     previous run logs kept in Documents/test-hooks/runs/ (see the functions below).
  ///  2. The game's own log files (the same ones Get Help shares: GameOwnLogs, LogsView.swift), including games on an
  ///     external drive, are copied to Documents/test-hooks/own-logs/<program>/ where the PC reads them over AFC
  ///     (house_arrest, UIFileSharingEnabled). Done at every app start for the last game played, and on
-@@ -69,13 +71,24 @@
+@@ -69,13 +72,24 @@
      /// true when the link is one of ours (so no other handler sees it), whether or not the hooks are on.
      static func handle(_ url: URL) -> Bool {
          guard url.scheme?.lowercased() == "madeira", let host = url.host?.lowercased(),
@@ -36,12 +37,13 @@ diff -ruN orig/app/Madeira/SavesAndShortcuts.swift mod/app/Madeira/SavesAndShort
          if host == "launch" {
              guard let app, app > 0, app <= Int(UInt32.max) else {
                  LogStore.shared.log("[ipad-hooks] launch needs steam=<appid>", level: .error); return true
-@@ -91,7 +104,119 @@
+@@ -91,7 +105,173 @@
      /// At app start: the last game's logs, after the external drives mounted.
      static func exportAtStart() {
          guard enabled else { return }
 -        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { export(steam: nil) }
 +        keepPreviousRunLog()
++        startCommandFile()
 +        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { export(steam: nil); writeStatus() }
 +    }
 +
@@ -136,6 +138,59 @@ diff -ruN orig/app/Madeira/SavesAndShortcuts.swift mod/app/Madeira/SavesAndShort
 +            }
 +            closeWhenDone(20)
 +        }
++    }
++
++    // MARK: command file (no links needed)
++
++    private static var commandTimer: DispatchSourceTimer?
++
++    /// The PC cannot always open madeira:// links on the iPad, so the same hooks run from a file: it writes
++    /// Documents/test-hooks/command.txt over AFC (house_arrest), one command on the first line:
++    ///   launch <appid> | quit | quit force | relaunch <appid> | status | export-logs [appid]
++    /// Polled every 2 s on a background timer (so it works while a game runs); the file is deleted when read and the
++    /// outcome is written to Documents/test-hooks/command-result.txt ("<time> <command>: done" or an error).
++    /// A file older than 120 s is deleted unread. launch while a game is running is a relaunch (one game per app run).
++    /// Same gate as the links (iPad ID + env.MADEIRA_IPAD_TEST_HOOKS = 1): startCommandFile returns at once otherwise.
++    static func startCommandFile() {
++        guard enabled, commandTimer == nil, let dir = testDir else { return }
++        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
++        let file = dir.appendingPathComponent("command.txt"), result = dir.appendingPathComponent("command-result.txt")
++        let t = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
++        t.schedule(deadline: .now() + 3, repeating: 2)
++        t.setEventHandler {
++            let fm = FileManager.default
++            guard fm.fileExists(atPath: file.path) else { return }
++            let age = ((try? fm.attributesOfItem(atPath: file.path)[.modificationDate] as? Date) ?? Date()).timeIntervalSinceNow
++            let text = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
++            try? fm.removeItem(at: file)
++            let line = (text.split(whereSeparator: \.isNewline).first.map(String.init) ?? "").trimmingCharacters(in: .whitespaces)
++            let words = line.split(separator: " ").map(String.init)
++            func report(_ m: String) {
++                LogStore.shared.log("[ipad-hooks] command file: \(line): \(m)")
++                try? "\(ISO8601DateFormatter().string(from: Date())) \(line): \(m)\n".write(to: result, atomically: true, encoding: .utf8)
++            }
++            if age < -120 { report("ignored, file older than 120 s"); return }
++            var link: String?
++            switch (words.first?.lowercased(), words.count) {
++            case ("launch", 2), ("relaunch", 2): if let a = Int(words[1]), a > 0 { link = "relaunch?steam=\(a)" }
++            case ("quit", 1): link = "quit"
++            case ("quit", 2) where words[1].lowercased() == "force": link = "quit?force=1"
++            case ("status", 1): link = "status"
++            case ("export-logs", 1): link = "export-logs"
++            case ("export-logs", 2): if let a = Int(words[1]), a > 0 { link = "export-logs?steam=\(a)" }
++            default: break
++            }
++            guard var host = link else { report("not understood"); return }
++            DispatchQueue.main.async {
++                // launch: a plain launch link when no game runs, else the relaunch path (a second game needs a new app run).
++                if words[0].lowercased() == "launch", LibraryModel.shared.current == nil { host = "launch?steam=\(words[1])" }
++                if let url = URL(string: "madeira://" + host) { _ = handle(url) }
++                report("done")
++            }
++        }
++        t.resume()
++        commandTimer = t
++        LogStore.shared.log("[ipad-hooks] command file armed: Documents/test-hooks/command.txt")
 +    }
 +
 +    /// Per-run logs: Documents/logs/ already keeps the newest 40 session logs (LogStore.startSessionLog). At every app start

@@ -9,6 +9,12 @@ Extends ipad-test-hooks (0.2.180 already has launch + export-logs). Test-only, o
 3. `madeira://relaunch?steam=<appid>` -> queues the game (NextSteamApp), asks the game to close, waits up to 20 s, exit(0). iOS cannot reopen an app that exited: the PC opens Madeira again and the queued game starts on its own (30 min window).
 4. Run logs: Documents/logs/ already keeps 40 session logs (LogStore.startSessionLog). New: at every app start madeira-log.prev.txt is copied to test-hooks/runs/<time>-prev.txt, newest 20 kept.
 
+## File trigger (added Nov 28 05:20Z, because the PC cannot open madeira:// links on the iPad)
+Same hooks, same gate, no links. The PC writes `Documents/test-hooks/command.txt` over AFC (pymobiledevice3 house_arrest, app.andromeda203.garnet9008), first line = one command:
+`launch <appid>` | `quit` | `quit force` | `relaunch <appid>` | `status` | `export-logs [appid]`.
+The app polls every 2 s on a background timer (so it also runs while a game is running), deletes the file when read, and writes `command-result.txt` ("<time> <command>: done" or "not understood"/"ignored"). A file older than 120 s is deleted unread. `launch` while a game runs becomes `relaunch` (one game per app run: Madeira closes and the PC reopens it, the game starts by itself). Armed at app start, same place as the log export. When Madeira is not running nothing can read the file: the PC must open the app first (queued relaunch still works from NextSteamApp).
+Unproven: "works while a game is running" is by design only (background timer, no main-thread wait); needs an iPad run. Also unproven: that the PC can write into Documents/test-hooks over AFC (the existing own-logs export already reads there).
+
 ## Files
 `test-hooks.patch` (-p1, one file: app/Madeira/SavesAndShortcuts.swift; no pbxproj change). Applies cleanly to the 0.2.180 source (patch --dry-run checked). NOT compiled: no Swift compiler here; laptop compile check wanted. Things to look at in review: `presentFPS.map { $0 as Any } ?? NSNull()` in a [String: Any] literal, LibraryModel.current / activeEntry / requestQuit access (all non-private in 0.2.180), nested recursive func closeWhenDone.
 Not included (asked to skip): in-app screenshot link.

@@ -240,3 +240,7 @@ Cameron's call: the laptop builds the IPAs so the PC never pauses the iPad. Step
 3. Dry run the app-only stage on the unpacked 0.2.180 source and native outputs: xtool build to an UNSIGNED IPA. Compare to the PC's 0.2.180 (file list, Info.plist, fix-markers). Report differences.
 4. Signing and uploads stay manual and are NOT done on the laptop; no signing keys, certificates, provisioning profiles or tokens are copied to the laptop unless Cameron sets that up himself.
 Report each step in FROM-LAPTOP.md. This is higher priority than the apply-all test, lower than open reviews.
+
+## 2026-11-28T07:50Z from build thread — test-hooks updated again (rev 3)
+Status: OPEN
+fix/test-hooks head changed: the command file now also takes key, tap and config commands (all behind the same gate: iPad ID + env.MADEIRA_IPAD_TEST_HOOKS = 1). Review the latest head. Check the winios_post_key / winios_post_touch_* calls exist with those signatures, the GameProfile(windowsPath:).text use, that config edits back up the file first, and that nothing outside the gate can write the command file or edit a config.

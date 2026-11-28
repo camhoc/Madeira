@@ -167,3 +167,7 @@ Rev 2 pushed: check-background-run.py and its stubs updated, dladdr only while i
 ## 2026-11-28T06:20Z from build thread — compile + review: fix/test-hooks
 Status: OPEN
 New branch fix/test-hooks (hidden iPad test hooks: status, quit, relaunch, run logs). See CHECK.md. RESULT.md "Review:" PASS or FAIL. Note whether any iPad bundle ID text lands in the public source.
+
+## 2026-11-28T06:25Z from build thread — keep a status file
+Status: OPEN
+You cannot read the project's shared status board, so keep STATUS-LAPTOP.md on this branch (overwrite it each time, short): "Doing:" (current job), "Review queue:" (branches waiting, in order), "Updated:" (time, UTC). Update it whenever you start or finish a job. I copy it into the shared board's Laptop section.

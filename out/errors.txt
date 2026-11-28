@@ -1,0 +1,6 @@
+mave12/wine	unreachable
+AllanVester/wine-forza-motorsport	unreachable
+MrPhryaNikFrosty/Winlator-Frost	unreachable
+openlyst/WinlatorXR-pvr	unreachable
+gmhzxy/dxvk	unreachable
+mesa3d/mesa	unreachable

@@ -1,0 +1,11 @@
+--- a/tests/host/check-game-recommendations.py	2026-11-28 14:29:16.700853922 +0000
++++ b/tests/host/check-game-recommendations.py	2026-11-28 14:29:16.725702723 +0000
+@@ -497,7 +497,7 @@
+ # variant or app-side switches, and no MADEIRA_SPAWN_SWAP (its engine code is not in this tree).
+ for ident in MERGED:
+     p = presets[ident]
+-    assert p['version'] == (4 if ident == 'baldurs-gate-3' else 2 if ident in ('batman-arkham-city-goty', 'counter-strike-2', 'beamng-drive', 'metaphor-refantazio', 'goals', 'dotnet-large-heap', 'project-zomboid', 'slay-the-spire-2', 'the-escapists-2', 'subnautica-2', 'resident-evil-requiem', 'grounded') else 1), ident
++    assert p['version'] == (4 if ident == 'baldurs-gate-3' else 3 if ident == 'project-zomboid' else 2 if ident in ('batman-arkham-city-goty', 'counter-strike-2', 'beamng-drive', 'metaphor-refantazio', 'goals', 'dotnet-large-heap', 'project-zomboid', 'slay-the-spire-2', 'the-escapists-2', 'subnautica-2', 'resident-evil-requiem', 'grounded') else 1), ident
+     assert not any(line.startswith(('env.MADEIRA_WINTYPES', 'env.MADEIRA_OPTIN_DLLS', 'env.MADEIRA_D3D8 ',
+                                     'env.MADEIRA_STEAM_IDENTITY', 'env.MADEIRA_MFC_DOCK', 'pool-split-retry'))
+                    for line in p['lines']), (ident, p['lines'])

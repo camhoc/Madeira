@@ -1,0 +1,2 @@
+# CHECK: project-zomboid-rec-v3
+Data-only Project Zomboid recommended list v2 -> v3 (replaces the shipped v2 that crashes at 194 s). Same two files as the other game-list patches (GameRecommendations.swift, check-game-recommendations.py): fixture counts in the apply-all merge. Host checker passes per the author; Swift step not run. Check that v3 is a version bump of the existing Zomboid entry (not a second entry), that old v2 configs get replaced as intended, and that no config key appears twice. RESULT.md "Compile:" and "Review:" PASS or FAIL.

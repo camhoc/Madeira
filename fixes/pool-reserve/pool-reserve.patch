@@ -1,0 +1,94 @@
+--- a/app/Madeira/JITAllocator.h
++++ b/app/Madeira/JITAllocator.h
+@@ -128,6 +128,10 @@
+  * can. Both are written once by the constructor before main and are constant
+  * thereafter, so no synchronisation is implied or needed. */
+ void madeira_early_pool_placeholder(unsigned long *base, unsigned long *size);
++/* [pool-reserve] the exec-time reservation still held below the executable window (0 when off or not
++ * obtained), and the call that gives it back just before the pool census. */
++extern unsigned long madeira_pool_reserve_lo, madeira_pool_reserve_hi;
++unsigned long madeira_pool_reserve_release(unsigned long *lo);
+ void madeira_early_pool_intruder(unsigned long *base, unsigned long *size, unsigned *tag);
+ 
+ /* [main-stack-move] (opt-in, madeira.cfg main-stack-move = 1): run `fn` on a new main-thread stack
+--- a/app/Madeira/JITAllocator.c
++++ b/app/Madeira/JITAllocator.c
+@@ -932,6 +932,60 @@
+     if (tag)  *tag  = madeira_early_intruder_tag;
+ }
+ 
++/* [pool-reserve] An exec-time reservation for the JIT pool (idea from Playport's wine_host.c,
++ * `host_pool_reserve`, GPL-3.0-or-later; written here from its description, not copied).
++ *
++ * The constructor below runs after dyld, libmalloc and iOS have mapped their own regions, and logs
++ * show them landing in the range the pool needs: a VM tag 1 malloc region at +0x1d00000 inside a
++ * 128MB block (0x141d00000 FFVII, 0x151d00000 Requiem, 0x14bd00000 Sentry 8A, 0x15dd00000 ph-rdr90),
++ * iOS Skywalk reservations (tag 87, 63-71MB), a ~103MB read-only mapping. A zero-filled static array
++ * is mapped with the executable image itself, before any of them, so it holds the range from exec.
++ * Untouched it costs no footprint (Playport measured the same on a phone).
++ *
++ * It starts where the image ends (the slide moves it: 0x1023..0x10a.. seen in our logs) and is
++ * sized to reach past the end of a 576MB window at 0x140000000 (0x164000000) at the highest slide
++ * yet stay under the lowest main-thread stack seen (0x16af64000).
++ *
++ * What this does with it:
++ *  - constructor(100) gives back [0x140000000, end) at once, so constructor(101) claims the window and
++ *    the run above it exactly as before (an array that covers 0x140000000 would make that claim fail);
++ *  - the part BELOW 0x140000000 stays held until StikJITHelper asks for it back, immediately before the
++ *    hole census (madeira_pool_reserve_release), when the census then finds it as one free run;
++ *  - with `pool-reserve = 0` (madeira.cfg) or `env.MADEIRA_POOL_RESERVE = 0`, the whole array is given
++ *    back in constructor(100): the old behaviour, so a build with this change can be A/B tested.
++ * Default: ON for the first device test only if the build thread decides so; see DEFAULT below. */
++#define MADEIRA_POOL_RESERVE_BYTES (1440ull << 20)
++static char madeira_pool_reserve[MADEIRA_POOL_RESERVE_BYTES] __attribute__((aligned(0x4000), used));
++unsigned long madeira_pool_reserve_lo, madeira_pool_reserve_hi;
++#define MADEIRA_POOL_RESERVE_DEFAULT 0   /* 0: off unless `pool-reserve = 1`; the A/B test turns it on */
++
++__attribute__((constructor(100), used)) static void madeira_pool_reserve_claim(void)
++{
++    const vm_address_t lo = (vm_address_t)madeira_pool_reserve, hi = lo + MADEIRA_POOL_RESERVE_BYTES;
++    const vm_address_t win = 0x140000000ul;
++    const char *e = getenv("MADEIRA_POOL_RESERVE");
++    int on = e ? !(e[0] == '0' && !e[1]) : madeira_cfg_bool("pool-reserve", MADEIRA_POOL_RESERVE_DEFAULT);
++    if (!on || lo >= win) {                       /* off, or the image sits too high: all of it back */
++        vm_deallocate(mach_task_self(), lo, MADEIRA_POOL_RESERVE_BYTES);
++        return;
++    }
++    if (hi > win)                                 /* the window and everything above it: back now */
++        vm_deallocate(mach_task_self(), win, hi - win);
++    madeira_pool_reserve_lo = lo;
++    madeira_pool_reserve_hi = hi > win ? win : hi;
++}
++
++/* Gives the held low part back (once). Returns its size, 0 when nothing was held; *lo gets its start. */
++unsigned long madeira_pool_reserve_release(unsigned long *lo)
++{
++    unsigned long a = madeira_pool_reserve_lo, n = madeira_pool_reserve_hi - madeira_pool_reserve_lo;
++    if (!a || !n) return 0;
++    if (lo) *lo = a;
++    madeira_pool_reserve_lo = madeira_pool_reserve_hi = 0;
++    vm_deallocate(mach_task_self(), a, n);
++    return n;
++}
++
+ __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
+ {
+     const vm_address_t win = 0x140000000ul, winsz = 0x8000000ul;       /* 128MB, see ml1037 */
+--- a/app/Madeira/StikJITHelper.swift
++++ b/app/Madeira/StikJITHelper.swift
+@@ -542,6 +542,15 @@
+         // [main-stack-move] what the startup stack move did (JITAllocator.c); "off" when not asked for.
+         let msmNote = String(cString: madeira_stack_move_note())
+         if msmNote != "off" { LogStore.shared.log("[main-stack-move] \(msmNote)", level: msmNote.hasPrefix("moved") ? .success : .error) }
++        // [pool-reserve] give back the exec-time reservation below the window (JITAllocator.c), right
++        // before the census, so the census finds it as one free run. Nothing happens when it was not
++        // obtained (`pool-reserve = 0` / env.MADEIRA_POOL_RESERVE = 0, the default for now).
++        var reserveLo: UInt = 0
++        let reserveBytes = madeira_pool_reserve_release(&reserveLo)
++        if reserveBytes != 0 {
++            LogStore.shared.log(String(format: "[pool-reserve] released 0x%lx+%luMB held since exec for the pool census (pool-reserve = 0 turns this off)",
++                                       Int(reserveLo), Int(reserveBytes >> 20)), level: .success)
++        }
+         let goodLow = 0x119000000
+         let guestLo = 0x7000000000
+         let guestHi = 0x8000000000

@@ -1,0 +1,68 @@
+From aaa3ae145111c848a52199867e89c2df4cf4d609 Mon Sep 17 00:00:00 2001
+From: Russell Barton <barton5russell@gmail.com>
+Date: Mon, 9 Nov 2026 21:15:03 +0000
+Subject: [PATCH 3/3] dxdiagn: a missing DirectShow device enumerator leaves
+ its section empty instead of failing Initialize
+
+Madeira ships Wine's dxdiagn.dll for 64-bit programs but not devenum.dll.
+Far Cry 4's hardware detection (Ubisoft's systemdetection64.dll) creates
+the provider and calls IDxDiagProvider::Initialize, which failed:
+
+    err:module:load_dll [dll-missing] ... L"C:\\windows\\system32\\devenum.dll" status=c0000135
+    err:ole:com_get_class_object no class object {62be5d10-60eb-11d0-bd3b-00a0c911ce86} could be created
+    OutputDebugStringA: "[Gear::SystemDetection::Hardware] ERROR: Can't init the IDxDiagProvider.."
+
+and the game then read a null pointer, as it does with no provider at
+all. build_information_tree fills ten sections in turn and gives up on
+the first that fails; the DirectShow filters section starts with
+CoCreateInstance(CLSID_SystemDeviceEnum), which needs devenum.dll. Every
+other section copes with a missing component (display devices fall back
+when Direct3D 9 cannot start, sound devices are listed only when there
+are some); this one ended the whole tree.
+
+The DirectShow section now behaves like the others: when the device
+enumerator cannot be created, or the filter enumeration fails, the
+section stays empty (what it found so far is kept), Initialize goes on
+to the next section, and one ERR line says so. Nothing else changes.
+
+Device-tested on BCD (a fork of Madeira), Far Cry 4: Initialize
+succeeds and the detection reads the display and sound sections.
+
+Signed-off-by: Russell Barton <barton5russell@gmail.com>
+---
+ dlls/dxdiagn/provider.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/dxdiagn/provider.c b/dlls/dxdiagn/provider.c
+index 88011ac..db1eae9 100644
+--- a/dlls/dxdiagn/provider.c
++++ b/dlls/dxdiagn/provider.c
+@@ -1738,7 +1738,12 @@ static HRESULT build_directshowfilters_tree(IDxDiagContainerImpl_Container *node
+     hr = CoCreateInstance(&CLSID_SystemDeviceEnum, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_ICreateDevEnum, (void **)&pCreateDevEnum);
+     if (FAILED(hr))
+-        return hr;
++    {
++        /* Madeira: devenum.dll is not in the 64-bit set; like the other sections, this one stays
++         * empty without its component instead of failing Initialize. */
++        ERR("[dxdiagn] no DirectShow device enumerator (%#lx); the DirectShow filters section stays empty\n", hr);
++        return S_OK;
++    }
+ 
+     hr = ICreateDevEnum_CreateClassEnumerator(pCreateDevEnum, &CLSID_ActiveMovieCategories, &pEmCat, 0);
+     if (hr != S_OK)
+@@ -1843,6 +1848,11 @@ static HRESULT build_directshowfilters_tree(IDxDiagContainerImpl_Container *node
+ cleanup:
+     if (pEmCat) IEnumMoniker_Release(pEmCat);
+     ICreateDevEnum_Release(pCreateDevEnum);
++    if (FAILED(hr))
++    {
++        ERR("[dxdiagn] DirectShow filter enumeration failed (%#lx); the section keeps what it found\n", hr);
++        return S_OK;
++    }
+     return hr;
+ }
+ 
+-- 
+2.43.0
+

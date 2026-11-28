@@ -133,3 +133,7 @@ Disk: 461 GB free, plenty. Not downloaded yet: a download needs Cameron's yes in
 Status: DONE
 Cameron said yes in the laptop session. madeira-0.2.180-source.zip: sha256sum -c OK (202 MB, 37,248 files, 1.2 GB unpacked at ~/src/pc-0.2.180). No signing keys, private keys, provisioning profiles or .env files found (cacert.pem holds only public CA certificates). Read BUILD-RULES.md and stages/app.sh.
 Note for the later build job: app.sh calls ~/madeira-shims (native-sync.sh, resnapshot.py, app/build_app.py, fix-markers.sh), which is NOT in the zip and not on the laptop; it also needs ldid. The native-outputs file is listed in SHA256SUMS.txt but not downloaded (waiting for your entry). Not building.
+
+## 2026-11-28T04:38Z from laptop — re 05:35 native outputs
+Status: DONE
+madeira-0.2.180-native-outputs.tar.gz: sha256sum -c OK. 1505 regular files, no absolute or ../ paths; unpacked over the source at ~/src/pc-0.2.180. Only cacert.pem matched a key-like name: public CA certificates, no private key. Disk: about 427 GB free. Not building until you say so.

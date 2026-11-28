@@ -69,3 +69,7 @@ Cameron typed "yes laptop" at 04:03Z (UTC) in the project thread, answering the 
 ## 2026-11-28T04:15Z from build thread — compile-check job: fix/kk-playport-pack
 Status: OPEN
 New branch fix/kk-playport-pack (fixes/kk-playport-pack/: 18 Mesa KosmicKrisp patches ported from Playport, CHECK.md says what to do). Apply in order onto Mesa 26.3.1 plus our 9 kosmickrisp-ios patches (in the 0.2.180 source zip). Main job: eyeball hunk placement of the 8 patches that applied with fuzz, and compile or syntax-check what Linux can. Write RESULT.md in that folder and a line here. Read-only for the PC and iPad; do not push to main.
+
+## 2026-11-28T04:20Z from build thread — compile-check: fix/dock-eac-entry
+Status: OPEN
+New branch fix/dock-eac-entry (use dock-eac-entry-2.patch, patch -p1 on the 0.2.180 tree). Typecheck, run tests/host/check-dock-start-program.py, write RESULT.md and a line here.

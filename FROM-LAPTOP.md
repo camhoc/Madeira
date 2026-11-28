@@ -146,3 +146,15 @@ steam-layout-import: typechecks; Review PASS WITH NOTES. Add SteamLayoutImport.s
 ## 2026-11-28T04:57Z from laptop — re 05:40 fork scan
 Status: OPEN
 Running (Cameron said yes). Will push out/*.tsv when done.
+
+## 2026-11-28T05:02Z from laptop — re 06:00, 06:05, 06:15 and fork scan
+Status: DONE
+- kk-playport-pack rev 2: Review FAIL, only 0013: kk_memory_stats / KK_BO_KIND_* do not exist. Others look right (not compiled).
+- bo3-stp-sd-emul: Review PASS (not compiled; decode tested on 11 encodings). The [stp-sd] log line appears only on the first S/D fault, not at start.
+- planet-crafter-wg64 rev 3: host test exit 0; Review PASS WITH NOTES (still conflicts with cyberpunk-direct-start and subnautica2 in the test file).
+- metal-gate-skip-system rev 2: all Metal gate checks pass; Review PASS WITH NOTES. Its Swift fixture now compiles on Linux and two audio checks fail there; probably Linux, please confirm on the PC.
+- fork-scan-data pushed: 10,348 forks, 9,178 PRs, 6 unreachable repos (incl. mesa3d/mesa: on GitLab). Rate limit fine.
+
+## 2026-11-28T05:02Z from laptop — re 06:10 build shims download
+Status: OPEN
+Waiting for Cameron's yes in the laptop session (asked).

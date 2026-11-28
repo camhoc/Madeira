@@ -136,7 +136,7 @@ Also download (rate limited):
 249 MB, 1.04 GB unpacked, 1505 files, paths as in the Madeira tree. Its sha256 is in the same SHA256SUMS.txt. Unpack it over the unpacked source. No signing files or credentials are inside. Report disk space, downloads and sha256 results in FROM-LAPTOP.md. Do not build until I say so.
 
 ## 2026-11-28T05:40Z from build thread — LOW PRIORITY (after build work): fork scan
-Status: OPEN
+Status: DONE
 Check out branch fix/fork-scan-data, read fork-scan.py (read-only gh api GETs: fork lists incl. forks of forks, and PR lists), run it with your gh login, commit out/*.tsv to that branch and push. Follow CHECK.md there. No review or compile needed. Rate-limit friendly, no writes to GitHub. Note it in FROM-LAPTOP.md when done.
 
 ## 2026-11-28T05:55Z from build thread — compile + review: fix/pool-reserve and fix/steam-layout-import
@@ -144,12 +144,12 @@ Status: DONE
 Two new branches (see CHECK.md). pool-reserve: native C, off by default, JIT pool address reservation; careful review (could it raise footprint on iPhone?). steam-layout-import: Swift, Library.swift, rebased on 0.2.180 per the Controllers thread, pbxproj may be touched. RESULT.md "Review:" PASS or FAIL for each.
 
 ## 2026-11-28T06:00Z from build thread — re-check kk-playport-pack rev 2, compile + review bo3-stp-sd-emul
-Status: OPEN
+Status: DONE
 1. fix/kk-playport-pack is now revision 2 (14 patches, 0001-0014; pipeline-stats, "four fixes", linear-image and geometry-heap dropped; unroll-hint redone). Re-check: do they all apply in order to Mesa 26.3.1 plus our 9 patches, hunk positions right, no missing symbols. RESULT.md "Review:" PASS or FAIL.
 2. New fix/bo3-stp-sd-emul (ntdll unix signal_arm64_ios.c, one file). Compile if possible, careful review (see CHECK.md). BO3 exit hang fix. RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T06:05Z from build thread — re-check planet-crafter-wg64 rev 3
-Status: OPEN
+Status: DONE
 fix/planet-crafter-wg64 is rev 3: the fixture in check-game-recommendations.py now expects 75 titles / 104 lists, README/REVIEW corrected (env.MADEIRA_WG_64BIT = 0 turns off only the parser). Re-run the host test and review. RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T06:10Z from build thread — build shims download
@@ -161,7 +161,7 @@ Download (rate limited), then re-fetch SHA256SUMS.txt (updated) and check:
 1.9 MB, 983 files: madeira-shims/ (native-sync.sh, resnapshot.py, fix-markers.sh, stages, bin, app/build_app.py, project.json, ui-sim). Put it at ~/madeira-shims. The scripts have PC paths; edit a copy for the laptop, do not guess secrets: stages name the path of shared-configs-public.txt (file not included); skip anything that needs it. Report sha256, then list what each stage needs that is missing (ldid etc.). Do not build yet; I'll say when. Same download needs Cameron's yes in your session.
 
 ## 2026-11-28T06:15Z from build thread — re-check metal-gate-skip-system rev 2
-Status: OPEN
+Status: DONE
 Rev 2 pushed: check-background-run.py and its stubs updated, dladdr only while inactive, match narrowed to RenderBox.framework only. Run check-background-run.py if you can, re-review. RESULT.md "Review:" PASS or FAIL. The ConfigCatalog entry is mine, later.
 
 ## 2026-11-28T06:20Z from build thread — compile + review: fix/test-hooks

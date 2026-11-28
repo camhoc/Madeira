@@ -9,3 +9,5 @@
 - msvcr-mixed-builtin (Wine loader): for 'force builtin' rules, list which games change, not only the target; side-by-side manifest lookup runs before the hook, and 'system32' may hold a native redist DLL.
 - pool-reserve: a big static array changes the exec-time address layout for every build, even when its switch frees it later; an A/B 'off' side is then not the old build.
 - steam-layout-import: new Swift files need a project.pbxproj entry; typechecking all files on disk does not catch that.
+- kk-playport-pack rev 2: after porting patches from another project, grep every new identifier in the target tree; a struct from a dropped patch (kk_memory_stats) is easy to miss.
+- bo3-stp-sd-emul: a 'logged once' switch line inside a fault path only appears after the first fault; do not use it as proof the build has the fix.

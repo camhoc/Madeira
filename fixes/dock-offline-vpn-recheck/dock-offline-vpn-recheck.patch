@@ -1,0 +1,30 @@
+--- a/Madeira/app/Madeira/MadeiraDock.swift	2026-11-28 05:43:17.519106394 +0000
++++ b/Madeira/app/Madeira/MadeiraDock.swift	2026-11-28 05:43:17.543755670 +0000
+@@ -605,7 +605,14 @@
+         monitor.start(queue: DispatchQueue(label: "madeira.dock-offline.path"))
+     }
+     /// No usable network path right now. False until the monitor has started.
+-    static var networkDown: Bool { started && monitor.currentPath.status != .satisfied }
++    /// env.MADEIRA_DOCK_OFFLINE_CELLULAR_WAIT = 0 keeps the old check.
++    static let cellularWait = SteamSignIn.flag("MADEIRA_DOCK_OFFLINE_CELLULAR_WAIT", default: true)
++    static var networkDown: Bool {
++        guard started, monitor.currentPath.status != .satisfied else { return false }
++        // The JIT shortcut turned Cellular Data off and has not turned it back on yet: not really offline.
++        if cellularWait, MainActor.assumeIsolated({ JITNetworkShortcut.shared.cellularOffOnPurpose }) { return false }
++        return true
++    }
+ 
+     private static let key = "madeiraDockOfflineVerified", accountKey = "madeiraDockOfflineAccount"
+     /// When Valve's client last reported, in an online start, that it can log this
+--- a/Madeira/app/Madeira/JITNetwork.swift	2026-11-28 05:43:17.523690075 +0000
++++ b/Madeira/app/Madeira/JITNetwork.swift	2026-11-28 05:43:17.543307515 +0000
+@@ -244,6 +244,9 @@
+         get { UserDefaults.standard.string(forKey: Self.pendingKey) }
+         set { UserDefaults.standard.set(newValue, forKey: Self.pendingKey) }
+     }
++    /// True while "start cellular" ran and its "done" has not: Cellular Data is off on purpose,
++    /// so the network being down is not the player's situation (DockOffline).
++    var cellularOffOnPurpose: Bool { pending?.hasPrefix("done cellular") == true }
+     private var waiting: ((Outcome) -> Void)?
+     private var timeout: Timer?
+ 

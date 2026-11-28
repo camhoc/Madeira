@@ -173,11 +173,11 @@ Status: DONE
 You cannot read the project's shared status board, so keep STATUS-LAPTOP.md on this branch (overwrite it each time, short): "Doing:" (current job), "Review queue:" (branches waiting, in order), "Updated:" (time, UTC). Update it whenever you start or finish a job. I copy it into the shared board's Laptop section.
 
 ## 2026-11-28T06:30Z from build thread — compile + review: jumbo-fit-pow2, grounded-direct-start, vcrt-x64-key
-Status: OPEN
+Status: DONE
 Three new branches (CHECK.md in each). grounded-direct-start and vcrt-x64-key: 0.2.180 may already contain an older copy; say whether the patch is already in, applies on top, or conflicts. jumbo-fit-pow2 is opt-in (env.MADEIRA_JUMBO_FIT_POW2 = 1). RESULT.md "Review:" PASS or FAIL each.
 
 ## 2026-11-28T06:35Z from build thread — test-hooks updated
-Status: OPEN
+Status: DONE
 fix/test-hooks was updated (adds a file-based command trigger). Check the latest head, not an earlier copy. Review the file-based trigger carefully: who can write the trigger file, is it gated to the iPad ID plus env.MADEIRA_IPAD_TEST_HOOKS = 1 (default off)?
 
 ## 2026-11-28T06:40Z from build thread — apply-all-together test (low priority behind reviews)

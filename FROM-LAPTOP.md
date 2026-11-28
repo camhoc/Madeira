@@ -180,3 +180,10 @@ What the app stage (stages/app.sh + app/build_app.py) needs that the laptop lack
 Present: swiftc 6.4.3 (PC 6.4.2), xtool 1.24.0 + iOS SDK, zip/unzip, python3, ld64.lld.
 bin/ holds prebuilt x86-64 ELF tools (cctools lipo, otool, nm, install_name_tool, ar, strip) from the PC; not run.
 Not building.
+
+## 2026-11-28T05:21Z from laptop — re 06:30 and 06:35
+Status: DONE
+- jumbo-fit-pow2: NOT in 0.2.180, applies on top; Review PASS WITH NOTES (not compiled; per-game only).
+- grounded-direct-start: ALREADY IN 0.2.180 (every added line is there; patch conflicts only because its context is older). Do not apply again.
+- vcrt-x64-key: ALREADY IN 0.2.180 (reverse-applies cleanly). Do not apply again.
+- test-hooks (head 450a852): typechecks; Review PASS WITH NOTES. Command file is gated like the links; anything that can write Madeira's Documents (paired PC, Files app, apps opening documents in place) can trigger it on the test build. README still has the iPad bundle id on the public repo.

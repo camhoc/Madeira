@@ -1,0 +1,130 @@
+# ntdll: Keep the SEH handlers that only asm refers to under LTO
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12512 state=opened
+# The unwind info for the exception code names nested_exception_handler, unwind_exception_handler, user_callback_handler and call_unhandled_exception_handler from .seh_handler directives in module level asm. The compiler does not count that as a use, so when the PE modules are built with clang and LTO the functions are removed as dead and ntdll fails to link with undefined symbols. Marking them used fixes it. signal_arm64ec.c already uses __attribute__((used)) for functions that only asm calls
+
+I tested this on x86_64 with clang and thin LTO, where ntdll now links with no files excluded from LTO. The Arm and Arm64 changes are the same edit and I have not built them
+--- dlls/ntdll/exception.c
++++ dlls/ntdll/exception.c
+@@ -311,8 +311,8 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
+  *
+  * Exception handler for KiUserCallbackDispatcher.
+  */
+-EXCEPTION_DISPOSITION WINAPI user_callback_handler( EXCEPTION_RECORD *record, void *frame,
+-                                                    CONTEXT *context, void *dispatch )
++EXCEPTION_DISPOSITION WINAPI __attribute__((used)) user_callback_handler( EXCEPTION_RECORD *record, void *frame,
++                                                                          CONTEXT *context, void *dispatch )
+ {
+     if (!(record->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)))
+     {
+@@ -447,8 +447,8 @@ LONG WINAPI call_unhandled_exception_filter( PEXCEPTION_POINTERS eptr )
+ /*******************************************************************
+  *         call_unhandled_exception_handler
+  */
+-EXCEPTION_DISPOSITION WINAPI call_unhandled_exception_handler( EXCEPTION_RECORD *rec, void *frame,
+-                                                               CONTEXT *context, void *dispatch )
++EXCEPTION_DISPOSITION WINAPI __attribute__((used)) call_unhandled_exception_handler( EXCEPTION_RECORD *rec, void *frame,
++                                                                                     CONTEXT *context, void *dispatch )
+ {
+     EXCEPTION_POINTERS ep = { rec, context };
+ 
+
+--- dlls/ntdll/signal_arm.c
++++ dlls/ntdll/signal_arm.c
+@@ -124,8 +124,8 @@ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEX
+  *
+  * Handler for exceptions happening while calling an unwind handler.
+  */
+-EXCEPTION_DISPOSITION WINAPI unwind_exception_handler( EXCEPTION_RECORD *record, void *frame,
+-                                                       CONTEXT *context, DISPATCHER_CONTEXT *dispatch )
++EXCEPTION_DISPOSITION WINAPI __attribute__((used)) unwind_exception_handler( EXCEPTION_RECORD *record, void *frame,
++                                                                             CONTEXT *context, DISPATCHER_CONTEXT *dispatch )
+ {
+     DISPATCHER_CONTEXT *orig_dispatch = ((DISPATCHER_CONTEXT **)frame)[-2];
+ 
+@@ -150,8 +150,8 @@ EXCEPTION_DISPOSITION WINAPI unwind_exception_handler( EXCEPTION_RECORD *record,
+ /*******************************************************************
+  *         nested_exception_handler
+  */
+-EXCEPTION_DISPOSITION WINAPI nested_exception_handler( EXCEPTION_RECORD *rec, void *frame,
+-                                                       CONTEXT *context, void *dispatch )
++EXCEPTION_DISPOSITION WINAPI __attribute__((used)) nested_exception_handler( EXCEPTION_RECORD *rec, void *frame,
++                                                                             CONTEXT *context, void *dispatch )
+ {
+     if (rec->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)) return ExceptionContinueSearch;
+     return ExceptionNestedException;
+
+--- dlls/ntdll/signal_arm64.c
++++ dlls/ntdll/signal_arm64.c
+@@ -142,8 +142,8 @@ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEX
+  *
+  * Handler for exceptions happening while calling an unwind handler.
+  */
+-EXCEPTION_DISPOSITION WINAPI unwind_exception_handler( EXCEPTION_RECORD *record, void *frame,
+-                                                       CONTEXT *context, DISPATCHER_CONTEXT *dispatch )
++EXCEPTION_DISPOSITION WINAPI __attribute__((used)) unwind_exception_handler( EXCEPTION_RECORD *record, void *frame,
++                                                                             CONTEXT *context, DISPATCHER_CONTEXT *dispatch )
+ {
+     DISPATCHER_CONTEXT *orig_dispatch = ((DISPATCHER_CONTEXT **)frame)[-2];
+ 
+@@ -186,8 +186,8 @@ __ASM_GLOBAL_FUNC( call_unwind_handler,
+ /*******************************************************************
+  *         nested_exception_handler
+  */
+-EXCEPTION_DISPOSITION WINAPI nested_exception_handler( EXCEPTION_RECORD *rec, void *frame,
+-                                                       CONTEXT *context, void *dispatch )
++EXCEPTION_DISPOSITION WINAPI __attribute__((used)) nested_exception_handler( EXCEPTION_RECORD *rec, void *frame,
++                                                                             CONTEXT *context, void *dispatch )
+ {
+     if (rec->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)) return ExceptionContinueSearch;
+     return ExceptionNestedException;
+
+--- dlls/ntdll/signal_arm64ec.c
++++ dlls/ntdll/signal_arm64ec.c
+@@ -1070,8 +1070,8 @@ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT_ARM64EC *dispatch
+  *
+  * Handler for exceptions happening while calling an unwind handler.
+  */
+-EXCEPTION_DISPOSITION WINAPI unwind_exception_handler( EXCEPTION_RECORD *record, void *frame,
+-                                                       CONTEXT *context, DISPATCHER_CONTEXT_ARM64EC *dispatch )
++EXCEPTION_DISPOSITION WINAPI __attribute__((used)) unwind_exception_handler( EXCEPTION_RECORD *record, void *frame,
++                                                                             CONTEXT *context, DISPATCHER_CONTEXT_ARM64EC *dispatch )
+ {
+     DISPATCHER_CONTEXT_ARM64EC *orig_dispatch = ((DISPATCHER_CONTEXT_ARM64EC **)frame)[-2];
+ 
+@@ -1121,8 +1121,8 @@ static DWORD __attribute__((naked)) call_unwind_handler( EXCEPTION_RECORD *rec,
+ /*******************************************************************
+  *         nested_exception_handler
+  */
+-EXCEPTION_DISPOSITION WINAPI nested_exception_handler( EXCEPTION_RECORD *rec, void *frame,
+-                                                       CONTEXT *context, void *dispatch )
++EXCEPTION_DISPOSITION WINAPI __attribute__((used)) nested_exception_handler( EXCEPTION_RECORD *rec, void *frame,
++                                                                             CONTEXT *context, void *dispatch )
+ {
+     if (rec->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)) return ExceptionContinueSearch;
+     return ExceptionNestedException;
+
+--- dlls/ntdll/signal_x86_64.c
++++ dlls/ntdll/signal_x86_64.c
+@@ -249,8 +249,8 @@ C_ASSERT( offsetof(struct unwind_exception_frame, dispatch) == 0x20 );
+ /*******************************************************************
+  *         nested_exception_handler
+  */
+-EXCEPTION_DISPOSITION WINAPI nested_exception_handler( EXCEPTION_RECORD *rec, void *frame,
+-                                                       CONTEXT *context, DISPATCHER_CONTEXT *dispatch )
++EXCEPTION_DISPOSITION WINAPI __attribute__((used)) nested_exception_handler( EXCEPTION_RECORD *rec, void *frame,
++                                                                             CONTEXT *context, DISPATCHER_CONTEXT *dispatch )
+ {
+     struct unwind_exception_frame *unwind_frame = (struct unwind_exception_frame *)frame;
+ 
+@@ -528,8 +528,8 @@ BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
+  *
+  * Handler for exceptions happening while calling an unwind handler.
+  */
+-DWORD __cdecl unwind_exception_handler( EXCEPTION_RECORD *rec, EXCEPTION_REGISTRATION_RECORD *frame,
+-                                        CONTEXT *context, EXCEPTION_REGISTRATION_RECORD **dispatcher )
++DWORD __cdecl __attribute__((used)) unwind_exception_handler( EXCEPTION_RECORD *rec, EXCEPTION_REGISTRATION_RECORD *frame,
++                                                              CONTEXT *context, EXCEPTION_REGISTRATION_RECORD **dispatcher )
+ {
+     struct unwind_exception_frame *unwind_frame = (struct unwind_exception_frame *)frame;
+     DISPATCHER_CONTEXT *dispatch = (DISPATCHER_CONTEXT *)dispatcher;
+

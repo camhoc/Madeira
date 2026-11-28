@@ -1,0 +1,44 @@
+# server: Keep low priority threads out of the Mach background band.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12304 state=opened
+# On an M1 Pro, Wine threads at effective NT priorities 1 and 2 can run substantially slower than normal-priority threads even without deliberate CPU contention.
+
+get_mach_importance() maps these priorities to -31 and -27, placing them in Mach's background priority band. This change maps NT priority 1 to -26 and priority 2 to -25, keeping them distinct and preserving the existing formula for priorities 3 and above.
+
+Measurements
+
+Tested with Wine git, x86_64 under Rosetta 2, on an M1 Pro (6P+2E). A worker counts loop iterations for three seconds, normalized against normal-priority runs immediately before and after it.
+
+Across three interleaved runs, median throughput changed as follows:
+
+* NT priority 1: 32% to 96% of normal.
+* NT priority 2: 45% to 92% of normal.
+
+A further alternating comparison gave 51% (33–55%) on master and 95% (80–102%) with this change for NT priority 1. The machine remained in use during testing. proc_pidinfo reported Mach priority 0 before the change and 5 afterwards.
+
+With all CPUs occupied by normal-priority workers, the modified build gave the low-priority worker 0.4–0.5%, so it still yielded in this scenario.
+
+Application context
+
+This investigation started with slow Elden Ring loading in HyperBridge, a downstream Wine/FEX-based build. With three competing normal-priority workers, loading took 214 and 87 seconds, versus 45 and 56 seconds with a broader scheduling workaround. That workaround treated below-normal threads as normal, so these game results do not validate this specific patch. On a quiet machine, the loading difference disappeared.
+--- server/thread.c
++++ server/thread.c
+@@ -237,6 +237,18 @@ void init_threading(void)
+ static int get_mach_importance( int effective_priority )
+ {
+     int min = -31, max = 32, range = max - min;
++
++    /*
++     * Mach priorities 0-4 are the XNU background band (MAXPRI_THROTTLE).
++     * On Apple Silicon such threads stay on efficiency cores,
++     * so the two lowest priorities are placed right above it.
++     */
++    switch (effective_priority)
++    {
++    case 1: return -26;
++    case 2: return -25;
++    }
++
+     return min + (effective_priority - 1) * range / 14;
+ }
+ 
+

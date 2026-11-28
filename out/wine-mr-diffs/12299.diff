@@ -1,0 +1,31 @@
+# ntdll: Report privileged instruction exceptions for rdmsr and wrmsr.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12299 state=opened
+# Wine reports rdmsr and wrmsr executed in user mode as an access violation instead of STATUS_PRIVILEGED_INSTRUCTION, because is_privileged_instr() does not recognize these instructions. This was observed with Wine on macOS under Rosetta 2.
+
+Report STATUS_PRIVILEGED_INSTRUCTION for these instructions and add regression tests. This matches the behavior observed on Windows Server 2022 and Windows Server 2025.
+--- dlls/ntdll/tests/exception.c
++++ dlls/ntdll/tests/exception.c
+@@ -2995,6 +2995,10 @@ static const struct exception
+         0xc3 },                                /* ret */
+       0, 0, STATUS_ACCESS_VIOLATION, 2, { EXCEPTION_EXECUTE_FAULT },
+       0, 0, { 0 }, PAGE_READONLY },
++    { { 0x0f, 0x32, 0xc3 },  /* rdmsr; ret */
++      0, 2, STATUS_PRIVILEGED_INSTRUCTION, 0 },
++    { { 0x0f, 0x30, 0xc3 },  /* wrmsr; ret */
++      0, 2, STATUS_PRIVILEGED_INSTRUCTION, 0 },
+ };
+ 
+ static int got_exception;
+
+--- dlls/ntdll/unix/signal_x86_64.c
++++ dlls/ntdll/unix/signal_x86_64.c
+@@ -1864,6 +1864,8 @@ static inline DWORD is_privileged_instr( CONTEXT *context )
+         case 0x21: /* mov drX, reg */
+         case 0x22: /* mov reg, crX */
+         case 0x23: /* mov reg drX */
++        case 0x30: /* wrmsr */
++        case 0x32: /* rdmsr */
+             return EXCEPTION_PRIV_INSTRUCTION;
+         }
+         return 0;
+

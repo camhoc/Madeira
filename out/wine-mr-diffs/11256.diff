@@ -1,0 +1,2148 @@
+# winewayland.drv/win32u/winevulkan: Wayland + Vulkan support for Steam/CEF
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11256 state=closed
+# This is a very large merge request, so I think it needs some background:
+
+For a long time (the last 2-3 years), I used frogging Wine built with ntsync, wayland, and vulkan in wow64 mode. At some point, I noticed that the vulkan and gstreamer patches often broke and were very difficult to fix. Another big problem was that, although Wine was built with wayland support, it was practically impossible to use wayland – many windows were black, white, or rendered in the wrong places.
+
+I tried switching to a clean build of Wine from master, and that was a positive experience, but it was still impossible to work in wayland mode. Besides the black windows, which were fixed by disabling GPU rendering in the Chrome embedded framework, the most annoying thing was that the tray icons stuck out like windows in the middle of the screen, literally interfering with games. It so happened that the first patch was for support for the standard KDE tray (which is essentially the standard GNOME tray). This turned out to be fairly simple, although during testing (and actual use), there were several deadlocks that had to be fixed.
+
+The next step was that after the last few updates, disabling the GPU stopped helping with black screens in CEF applications. At that point, I had to create the first version of сomposer, which correctly distributed content on the screen, but had issues and also didn't work with the GPU enabled. Starting with this version, several of my friends also used my version of Wine as unpaid testers.
+
+Finally, I recently found myself laid off, and for the past few weeks I've been actively working on GPU support and updating composer, as well as fixing bugs in popular games like Gothic 1 Remake, for which I had to add EDID generation, and Dota, which constantly wanted to open incorrectly placed on the screen and did not accepted raw keys input. Now it's ready. This set of patches has now been tested by me and several of my friends on computers running KDE and GNOME, and it w
+--- dlls/secur32/tests/schannel.c
++++ dlls/secur32/tests/schannel.c
+@@ -536,7 +536,7 @@ static void test_remote_cert(PCCERT_CONTEXT remote_cert)
+         cert_cnt++;
+     }
+ 
+-    ok(cert_cnt == 2, "cert_cnt = %u\n", cert_cnt);
++    ok(cert_cnt >= 2, "cert_cnt = %u\n", cert_cnt);
+     ok(incl_remote, "context does not contain cert itself\n");
+ }
+ 
+
+--- dlls/win32u/dce.c
++++ dlls/win32u/dce.c
+
+--- dlls/win32u/driver.c
++++ dlls/win32u/driver.c
+@@ -685,6 +685,11 @@ static BOOL nulldrv_SetIMECompositionRect( HWND hwnd, RECT rect )
+     return FALSE;
+ }
+ 
++static BOOL nulldrv_SetIMEEnabled( HWND hwnd, BOOL enabled )
++{
++    return FALSE;
++}
++
+ static LRESULT nulldrv_DesktopWindowProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
+ {
+     return default_window_proc( hwnd, msg, wparam, lparam, FALSE );
+@@ -948,6 +953,26 @@ static void nulldrv_ThreadDetach( void )
+ {
+ }
+ 
++static BOOL nulldrv_WantsCrossProcessSurfaces(void)
++{
++    return FALSE;
++}
++
++static void nulldrv_FlushRemoteSurface( HWND hwnd, const RECT *dirty, const void *bits,
++                                        UINT stride, UINT width, UINT height )
++{
++}
++
++static void nulldrv_FlushRemoteSurfaceDMABUF( HWND hwnd, HANDLE handle, UINT64 modifier,
++                                              UINT width, UINT height, UINT stride )
++{
++}
++
++static BOOL nulldrv_NeedsPaintOverlay( HWND hwnd )
++{
++    return FALSE;
++}
++
+ static const WCHAR guid_key_prefixW[] =
+ {
+     '\\','R','e','g','i','s','t','r','y',
+@@ -1142,6 +1167,11 @@ static BOOL loaderdrv_SetIMECompositionRect( HWND hwnd, RECT rect )
+     return load_driver()->pSetIMECompositionRect( hwnd, rect );
+ }
+ 
++static BOOL loaderdrv_SetIMEEnabled( HWND hwnd, BOOL enabled )
++{
++    return load_driver()->pSetIMEEnabled( hwnd, enabled );
++}
++
+ static LONG loaderdrv_ChangeDisplaySettings( LPDEVMODEW displays, LPCWSTR primary_name, HWND hwnd,
+                                              DWORD flags, LPVOID lparam )
+ {
+@@ -1287,6 +1317,7 @@ static const struct user_driver_funcs lazy_load_driver =
+     loaderdrv_ImeToAsciiEx,
+     loaderdrv_NotifyIMEStatus,
+     loaderdrv_SetIMECompositionRect,
++    loaderdrv_SetIMEEnabled,
+     /* cursor/icon functions */
+     nulldrv_DestroyCursorIcon,
+     loaderdrv_SetCursor,
+@@ -1346,6 +1377,11 @@ static const struct user_driver_funcs lazy_load_driver =
+     loaderdrv_OpenGLInit,
+     /* thread management */
+     nulldrv_ThreadDetach,
++    /* cross-process rendering */
++    nulldrv_WantsCrossProcessSurfaces,
++    nulldrv_FlushRemoteSurface,
++    nulldrv_FlushRemoteSurfaceDMABUF,
++    nulldrv_NeedsPaintOverlay,
+ };
+ 
+ const struct user_driver_funcs *user_driver = &lazy_load_driver;
+@@ -1392,6 +1428,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
+     SET_USER_FUNC(ImeToAsciiEx);
+     SET_USER_FUNC(NotifyIMEStatus);
+     SET_USER_FUNC(SetIMECompositionRect);
++    SET_USER_FUNC(SetIMEEnabled);
+     SET_USER_FUNC(DestroyCursorIcon);
+     SET_USER_FUNC(SetCursor);
+     SET_USER_FUNC(GetCursorPos);
+@@ -1441,6 +1478,10 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
+     SET_USER_FUNC(VulkanInit);
+     SET_USER_FUNC(OpenGLInit);
+     SET_USER_FUNC(ThreadDetach);
++    SET_USER_FUNC(WantsCrossProcessSurfaces);
++    SET_USER_FUNC(FlushRemoteSurface);
++    SET_USER_FUNC(FlushRemoteSurfaceDMABUF);
++    SET_USER_FUNC(NeedsPaintOverlay);
+ #undef SET_USER_FUNC
+ 
+     prev = InterlockedCompareExchangePointer( (void **)&user_driver, driver, (void *)&lazy_load_driver );
+
+--- dlls/win32u/imm.c
++++ dlls/win32u/imm.c
+@@ -185,6 +185,7 @@ UINT WINAPI NtUserAssociateInputContext( HWND hwnd, HIMC ctx, ULONG flags )
+ {
+     WND *win;
+     UINT ret = AICR_OK;
++    BOOL ime_enabled;
+ 
+     TRACE( "%p %p %x\n", hwnd, ctx, flags );
+ 
+@@ -218,8 +219,20 @@ UINT WINAPI NtUserAssociateInputContext( HWND hwnd, HIMC ctx, ULONG flags )
+         if (win->imc != ctx && get_focus() == hwnd) ret = AICR_FOCUS_CHANGED;
+         win->imc = ctx;
+     }
++    ime_enabled = win->imc != NULL;
+ 
+     release_win_ptr( win );
++
++    /* Tell the driver this window's IME got activated or deactivated, so a driver
++     * (e.g. winewayland) can enable/disable compositor text input live -- not only
++     * on a Wayland focus change. Unconditional so the driver can track every child
++     * window's IME state and aggregate per toplevel (an app may associate the
++     * context on a child control, not the toplevel). Reports the window's resulting
++     * context state, which an IACE_IGNORENOCONTEXT call may leave unchanged rather
++     * than the requested ctx. Done after release_win_ptr so the call does not run
++     * under the window lock. */
++    user_driver->pSetIMEEnabled( hwnd, ime_enabled );
++
+     return ret;
+ }
+ 
+
+--- dlls/win32u/message.c
++++ dlls/win32u/message.c
+@@ -2266,6 +2266,8 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
+     case WM_WINE_SETPIXELFORMAT:
+         set_window_pixel_format( hwnd, wparam, lparam );
+         return 0;
++    case WM_WINE_FLUSH_REMOTE_SURFACE:
++        return flush_remote_surface( hwnd, wparam, lparam );
+     case WM_WINE_TRACKMOUSEEVENT:
+     {
+         TRACKMOUSEEVENT info;
+
+--- dlls/win32u/ntuser_private.h
++++ dlls/win32u/ntuser_private.h
+@@ -203,6 +203,8 @@ HICON alloc_cursoricon_handle( BOOL is_icon );
+ /* dce.c */
+ extern void free_dce( struct dce *dce, HWND hwnd, struct list *drawables );
+ extern void invalidate_dce( WND *win, const RECT *old_rect );
++extern LRESULT flush_remote_surface( HWND hwnd, WPARAM wparam, LPARAM lparam );
++extern void evict_remote_surfaces( HWND hwnd );
+ extern BOOL is_cache_dc( HDC hdc );
+ 
+ /* message.c */
+
+--- dlls/win32u/spy.c
++++ dlls/win32u/spy.c
+@@ -1127,7 +1127,7 @@ static const char * const CCMMessageTypeNames[SPY_MAX_CCMMSGNUM + 1] =
+     "CCM_SETNOTIFYWINDOW"
+ };
+ 
+-#define SPY_MAX_WINEMSGNUM   (WM_WINE_SETPIXELFORMAT - WM_WINE_DESTROYWINDOW)
++#define SPY_MAX_WINEMSGNUM   (WM_WINE_FLUSH_REMOTE_SURFACE - WM_WINE_DESTROYWINDOW)
+ static const char * const WINEMessageTypeNames[SPY_MAX_WINEMSGNUM + 1] =
+ {
+     "WM_WINE_DESTROYWINDOW",
+@@ -1144,6 +1144,7 @@ static const char * const WINEMessageTypeNames[SPY_MAX_WINEMSGNUM + 1] =
+     "WM_WINE_UPDATEWINDOWSTATE",
+     "WM_WINE_TRACKMOUSEEVENT",
+     "WM_WINE_SETPIXELFORMAT",
++    "WM_WINE_FLUSH_REMOTE_SURFACE",
+ };
+ 
+ #define SPY_MAX_WINE_DRIVER_MSGNUM (WM_WINE_SETCURSOR - WM_WINE_CLIPCURSOR)
+
+--- dlls/win32u/sysparams.c
++++ dlls/win32u/sysparams.c
+
+--- dlls/win32u/vulkan.c
++++ dlls/win32u/vulkan.c
+@@ -545,6 +545,16 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
+     ALL_VK_CLIENT_DEVICE_EXTS
+ #undef USE_VK_EXT
+ 
++    if (user_driver->pWantsCrossProcessSurfaces())
++    {
++        client_physical_device->extensions.has_VK_NV_low_latency2 = 0;
++        client_physical_device->extensions.has_VK_NV_low_latency = 0;
++        client_physical_device->extensions.has_VK_KHR_present_wait = 0;
++        client_physical_device->extensions.has_VK_KHR_present_wait2 = 0;
++        client_physical_device->extensions.has_VK_KHR_present_id = 0;
++        client_physical_device->extensions.has_VK_KHR_present_id2 = 0;
++    }
++
+ done:
+     free( properties );
+     return res;
+@@ -724,6 +734,21 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
+     ALL_VK_DEVICE_EXTS
+ #undef USE_VK_EXT
+ 
++    /* The client-side (DMABUF) WSI needs this on every device; only relevant for
++     * drivers presenting through the remote-surface paths (winewayland).
++     * The ALL_VK_DEVICE_EXTS loop above already emits this when the app enabled
++     * it; only add it here if it isn't already in the list, otherwise vkCreateDevice
++     * rejects the duplicate extension string. physical_device->extensions is the
++     * host support set cached at init_physical_device time. */
++    if (user_driver->pWantsCrossProcessSurfaces() &&
++        !device->extensions.has_VK_EXT_image_drm_format_modifier &&
++        physical_device->extensions.has_VK_EXT_image_drm_format_modifier)
++    {
++        extensions[count++] = "VK_EXT_image_drm_format_modifier";
++        /* Keep the in-memory extension state consistent with what we enabled. */
++        device->extensions.has_VK_EXT_image_drm_format_modifier = 1;
++    }
++
+     TRACE( "Enabling %u host device extensions\n", count );
+     for (const char **extension = extensions, **end = extension + count; extension < end; extension++)
+         TRACE( "  - %s\n", debugstr_a(*extension) );
+@@ -1946,6 +1971,26 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
+     return res;
+ }
+ 
++static void win32u_vkFlushRemoteSurfaceDMABUF( HWND hwnd, HANDLE handle, UINT64 modifier, UINT width, UINT height, UINT stride )
++{
++    TRACE( "hwnd %p, handle %p, modifier %s, width %u, height %u, stride %u\n", hwnd, handle, wine_dbgstr_longlong(modifier), width, height, stride );
++    user_driver->pFlushRemoteSurfaceDMABUF( hwnd, handle, modifier, width, height, stride );
++}
++
++static void win32u_vkFlushRemoteSurface( HWND hwnd, const RECT *dirty, const void *bits, UINT stride, UINT width, UINT height )
++{
++    TRACE( "hwnd %p, dirty %s, bits %p, stride %u, width %u, height %u\n", hwnd, wine_dbgstr_rect( dirty ), bits, stride, width, height );
++    user_driver->pFlushRemoteSurface( hwnd, dirty, bits, stride, width, height );
++}
++
++static BOOL win32u_client_wsi_supported(void)
++{
++    /* winevulkan's client-side WSI presents through the remote-surface driver
++     * entry points; a driver without them (winex11, nulldrv) keeps its native
++     * host WSI, so winevulkan must route WSI calls back through win32u. */
++    return user_driver->pWantsCrossProcessSurfaces();
++}
++
+ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
+ {
+     VkPresentInfoKHR *present_info = (VkPresentInfoKHR *)client_present_info; /* cast away const, it has been copied in the thunks */
+@@ -2965,6 +3010,9 @@ static struct vulkan_funcs vulkan_funcs =
+     .p_vkQueueSubmit2KHR = win32u_vkQueueSubmit2KHR,
+     .p_vkUnmapMemory = win32u_vkUnmapMemory,
+     .p_vkUnmapMemory2KHR = win32u_vkUnmapMemory2KHR,
++    .p_vkFlushRemoteSurfaceDMABUF = win32u_vkFlushRemoteSurfaceDMABUF,
++    .p_vkFlushRemoteSurface = win32u_vkFlushRemoteSurface,
++    .p_client_wsi_supported = win32u_client_wsi_supported,
+ };
+ 
+ static VkResult nulldrv_vulkan_surface_create( struct client_surface *client, const struct vulkan_instance *instance, VkSurfaceKHR *surface )
+
+--- dlls/win32u/win32u_private.h
++++ dlls/win32u/win32u_private.h
+@@ -189,6 +189,7 @@ extern struct window_rects map_dpi_window_rects( struct window_rects rects, stru
+ extern RECT map_rect_raw_to_virt( RECT rect, struct ratio dpi_to );
+ extern RECT map_rect_virt_to_raw( RECT rect, struct ratio dpi_from );
+ extern struct window_rects map_window_rects_virt_to_raw( struct window_rects rects, struct ratio dpi_from );
++extern BOOL process_has_mode_overrides(void);
+ extern POINT point_phys_to_win_dpi( HWND hwnd, POINT pt );
+ extern POINT point_thread_to_win_dpi( HWND hwnd, POINT pt );
+ extern RECT rect_thread_to_win_dpi( HWND hwnd, RECT rect );
+
+--- dlls/win32u/window.c
++++ dlls/win32u/window.c
+@@ -2232,13 +2232,13 @@ static BOOL is_fullscreen( const MONITORINFO *info, const RECT *rect )
+ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, struct window_surface *new_surface,
+                               const struct window_rects *new_rects, const RECT *valid_rects )
+ {
+-    struct window_rects monitor_rects;
++    struct window_rects monitor_rects, server_rects;
+     WND *win;
+     HWND owner_hint, surface_win = 0, toplevel;
+     struct ratio raw_dpi, dpi = get_thread_dpi();
+-    BOOL ret, is_layered, is_child, need_icons = FALSE;
++    BOOL ret, is_layered, is_child, has_override, need_icons = FALSE;
+     struct window_rects old_rects;
+-    RECT extra_rects[3];
++    RECT extra_rects[3], server_valid_rect;
+     struct window_surface *old_surface;
+     HICON icon, icon_small;
+     ICONINFO ii, ii_small;
+@@ -2250,8 +2250,30 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+     if (is_child) get_win_monitor_dpi( toplevel, &raw_dpi );
+     else monitor_dpi_from_rect( new_rects->window, dpi, &raw_dpi );
+ 
++    /* The wineserver, the drivers and other processes always work with native
++     * coordinates. When this process has a per-process emulated display mode,
++     * map the rects out of its scaled view before sending them to the server
++     * (a no-op otherwise, the spaces are then identical). */
++    server_rects = *new_rects;
++    if (valid_rects) server_valid_rect = valid_rects[0];
++    else SetRectEmpty( &server_valid_rect );
++    if ((has_override = process_has_mode_overrides()))
++    {
++        if (is_child)
++        {
++            struct ratio from_dpi = dpi.num ? dpi : raw_dpi;
++            server_rects = map_dpi_window_rects( *new_rects, from_dpi, raw_dpi );
++            if (valid_rects) server_valid_rect = map_dpi_rect( valid_rects[0], from_dpi, raw_dpi );
++        }
++        else
++        {
++            server_rects = map_window_rects_virt_to_raw( *new_rects, dpi );
++            if (valid_rects) server_valid_rect = map_rect_virt_to_raw( valid_rects[0], dpi );
++        }
++    }
++
+     get_window_rects( hwnd, COORDS_PARENT, &old_rects, dpi );
+-    if (IsRectEmpty( &valid_rects[0] ) || is_layered) valid_rects = NULL;
++    if (!valid_rects || IsRectEmpty( &valid_rects[0] ) || is_layered) valid_rects = NULL;
+ 
+     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+     old_surface = win->surface;
+@@ -2269,17 +2291,26 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+         req->handle        = wine_server_user_handle( hwnd );
+         req->previous      = wine_server_user_handle( insert_after );
+         req->swp_flags     = swp_flags;
+-        req->window        = wine_server_rectangle( new_rects->window );
+-        req->client        = wine_server_rectangle( new_rects->client );
+-        if (!EqualRect( &new_rects->window, &new_rects->visible ) || new_surface || valid_rects)
++        req->window        = wine_server_rectangle( server_rects.window );
++        req->client        = wine_server_rectangle( server_rects.client );
++        if (!EqualRect( &server_rects.window, &server_rects.visible ) || new_surface || valid_rects)
+         {
+-            extra_rects[0] = extra_rects[1] = new_rects->visible;
++            extra_rects[0] = extra_rects[1] = server_rects.visible;
+             if (new_surface)
+             {
+-                extra_rects[1] = is_layered ? dummy_surface.rect : new_surface->rect;
+-                OffsetRect( &extra_rects[1], new_rects->visible.left, new_rects->visible.top );
++                struct window_surface *surface = new_surface;
++                /* under a mode override the driver surface describes the native-space pixels */
++                if (has_override && !is_layered)
++                {
++                    struct window_surface *driver_surface = get_driver_window_surface( new_surface, raw_dpi );
++                    /* a transient dpi mismatch yields the 1x1 dummy_surface; keep the real
++                     * surface rect rather than recording a degenerate 1x1 visible rect. */
++                    if (driver_surface && driver_surface != &dummy_surface) surface = driver_surface;
++                }
++                extra_rects[1] = is_layered ? dummy_surface.rect : surface->rect;
++                OffsetRect( &extra_rects[1], server_rects.visible.left, server_rects.visible.top );
+             }
+-            if (valid_rects) extra_rects[2] = valid_rects[0];
++            if (valid_rects) extra_rects[2] = server_valid_rect;
+             else SetRectEmpty( &extra_rects[2] );
+             wine_server_add_data( req, extra_rects, sizeof(extra_rects) );
+         }
+@@ -5362,6 +5393,7 @@ LRESULT destroy_window( HWND hwnd )
+     }
+ 
+     detach_client_surfaces( hwnd );
++    evict_remote_surfaces( hwnd );
+     if (win->current_drawable) opengl_drawable_release( win->current_drawable );
+     if (win->unused_drawable) opengl_drawable_release( win->unused_drawable );
+     user_driver->pDestroyWindow( hwnd );
+@@ -5526,6 +5558,7 @@ void destroy_thread_windows(void)
+         if (entry->handle == capture) user_driver->pSetCapture( NULL, 0, toplevel );
+ 
+         detach_client_surfaces( entry->handle );
++        evict_remote_surfaces( entry->handle );
+         user_driver->pDestroyWindow( entry->handle );
+         if (entry->current_drawable) opengl_drawable_release( entry->current_drawable );
+         if (entry->unused_drawable) opengl_drawable_release( entry->unused_drawable );
+
+--- dlls/windows.storage/classes.idl
++++ dlls/windows.storage/classes.idl
+@@ -31,4 +31,5 @@ import "windows.storage.idl";
+ 
+ namespace Windows.Storage.Streams {
+     runtimeclass RandomAccessStreamReference;
++    runtimeclass InMemoryRandomAccessStream;
+ }
+
+--- dlls/winevulkan/Makefile.in
++++ dlls/winevulkan/Makefile.in
+@@ -7,8 +7,10 @@ UNIX_LIBS = -lwin32u $(PTHREAD_LIBS)
+ VER_FILEDESCRIPTION_STR = "Wine Vulkan ICD"
+ 
+ SOURCES = \
++	layer.c \
+ 	loader.c \
+ 	loader_thunks.c \
+ 	vulkan.c \
+ 	vulkan_thunks.c \
++	wsi.c \
+ 	winevulkan.rc
+
+--- dlls/winevulkan/layer.c
++++ dlls/winevulkan/layer.c
+
+--- dlls/winevulkan/loader.c
++++ dlls/winevulkan/loader.c
+
+--- dlls/winevulkan/make_vulkan
++++ dlls/winevulkan/make_vulkan
+@@ -271,6 +271,31 @@ MANUAL_UNIX_THUNKS = {
+     "vkGetPhysicalDeviceExternalFenceProperties",
+     "vkGetPhysicalDeviceExternalFencePropertiesKHR",
+     "vkGetSwapchainTimeDomainPropertiesEXT",
++    "vkCreateWin32SurfaceKHR",
++    "vkDestroySurfaceKHR",
++    "vkGetPhysicalDeviceSurfaceSupportKHR",
++    "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
++    "vkGetPhysicalDeviceSurfaceCapabilities2KHR",
++    "vkGetPhysicalDeviceSurfaceFormatsKHR",
++    "vkGetPhysicalDeviceSurfaceFormats2KHR",
++    "vkGetPhysicalDeviceSurfacePresentModesKHR",
++    "vkCreateSwapchainKHR",
++    "vkDestroySwapchainKHR",
++    "vkGetSwapchainImagesKHR",
++    "vkAcquireNextImageKHR",
++    "vkAcquireNextImage2KHR",
++    "vkQueuePresentKHR",
++    "vkCreateDevice",
++    "vkGetDeviceGroupSurfacePresentModesKHR",
++    "vkGetPhysicalDevicePresentRectanglesKHR",
++    "vkGetLatencyTimingsNV",
++    "vkGetSwapchainTimingPropertiesEXT",
++    "vkLatencySleepNV",
++    "vkSetLatencyMarkerNV",
++    "vkSetLatencySleepModeNV",
++    "vkSetSwapchainPresentTimingQueueSizeEXT",
++    "vkWaitForPresent2KHR",
++    "vkWaitForPresentKHR",
+ }
+ 
+ # loader functions which are entirely manually implemented
+
+--- dlls/winevulkan/vk_layer.h
++++ dlls/winevulkan/vk_layer.h
+@@ -0,0 +1,119 @@
++/* Wine Vulkan loader/layer interface structures
++ *
++ * These structures are vendored from the Khronos Vulkan-Loader project
++ * (vulkan/vk_layer.h, MIT licensed). They describe the ABI used between the
++ * Vulkan loader and an installed layer when chaining vkCreateInstance and
++ * vkCreateDevice. winevulkan needs them to insert Windows PE implicit layers
++ * (e.g. SteamOverlayVulkanLayer64.dll) into the instance/device call chain.
++ *
++ * Only the subset required by winevulkan is reproduced here. Field order and
++ * layout MUST match the upstream Khronos definition: layer DLLs read these
++ * structures directly by ABI.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef __WINE_VK_LAYER_H
++#define __WINE_VK_LAYER_H
++
++#include "wine/vulkan.h"
++
++/* PFN_GetPhysicalDeviceProcAddr is the ICD-private physical-device proc-addr
++ * resolver used to chain VK_EXT physical-device functions through layers. */
++typedef PFN_vkVoidFunction (VKAPI_PTR *PFN_GetPhysicalDeviceProcAddr)(VkInstance instance, const char *pName);
++
++/* Loader data callbacks - winevulkan does not implement loader data tagging,
++ * but the prototypes are needed for the create-info union below. */
++typedef VkResult (VKAPI_PTR *PFN_vkSetInstanceLoaderData)(VkInstance instance, void *object);
++typedef VkResult (VKAPI_PTR *PFN_vkSetDeviceLoaderData)(VkDevice device, void *object);
++
++/* Layer device creation callbacks (loaderFeatures >= LAYER_CREATE_DEVICE). */
++typedef VkResult (VKAPI_PTR *PFN_vkLayerCreateDevice)(VkInstance instance, VkPhysicalDevice physicalDevice,
++        const VkDeviceCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkDevice *pDevice,
++        PFN_vkGetInstanceProcAddr layerGIPA, PFN_vkGetDeviceProcAddr *nextGDPA);
++typedef void (VKAPI_PTR *PFN_vkLayerDestroyDevice)(VkDevice physicalDevice, const VkAllocationCallbacks *pAllocator,
++        PFN_vkDestroyDevice destroyFunction);
++
++typedef enum VkLayerFunction_
++{
++    VK_LAYER_LINK_INFO = 0,
++    VK_LOADER_DATA_CALLBACK = 1,
++    VK_LOADER_LAYER_CREATE_DEVICE_CALLBACK = 2,
++    VK_LOADER_FEATURES = 3,
++} VkLayerFunction;
++
++typedef enum VkLoaderFeastureFlagBits
++{
++    VK_LOADER_FEATURE_PHYSICAL_DEVICE_SORTING = 0x00000001,
++} VkLoaderFeatureFlagBits;
++typedef VkFlags VkLoaderFeatureFlags;
++
++/* ---- Instance chain ---- */
++
++typedef struct VkLayerInstanceLink_
++{
++    struct VkLayerInstanceLink_ *pNext;
++    PFN_vkGetInstanceProcAddr pfnNextGetInstanceProcAddr;
++    PFN_GetPhysicalDeviceProcAddr pfnNextGetPhysicalDeviceProcAddr;
++} VkLayerInstanceLink;
++
++typedef struct
++{
++    VkStructureType sType; /* VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO */
++    const void *pNext;
++    VkLayerFunction function;
++    union
++    {
++        VkLayerInstanceLink *pLayerInfo;
++        PFN_vkSetInstanceLoaderData pfnSetInstanceLoaderData;
++        struct
++        {
++            PFN_vkLayerCreateDevice pfnLayerCreateDevice;
++            PFN_vkLayerDestroyDevice pfnLayerDestroyDevice;
++        } layerDevice;
++        VkLoaderFeatureFlags loaderFeatures;
++    } u;
++} VkLayerInstanceCreateInfo;
++
++/* ---- Device chain ---- */
++
++typedef struct VkLayerDeviceLink_
++{
++    struct VkLayerDeviceLink_ *pNext;
++    PFN_vkGetInstanceProcAddr pfnNextGetInstanceProcAddr;
++    PFN_vkGetDeviceProcAddr pfnNextGetDeviceProcAddr;
++} VkLayerDeviceLink;
++
++typedef struct
++{
++    VkStructureType sType; /* VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO */
++    const void *pNext;
++    VkLayerFunction function;
++    union
++    {
++        VkLayerDeviceLink *pLayerInfo;
++        PFN_vkSetDeviceLoaderData pfnSetDeviceLoaderData;
++    } u;
++} VkLayerDeviceCreateInfo;
++
++/* ---- Negotiation interface (loader interface version 2) ---- */
++
++typedef enum VkNegotiateLayerStructType
++{
++    LAYER_NEGOTIATE_UNINTIALIZED = 0,
++    LAYER_NEGOTIATE_INTERFACE_STRUCT = 1,
++} VkNegotiateLayerStructType;
++
++typedef struct VkNegotiateLayerInterface_
++{
++    VkNegotiateLayerStructType sType;
++    void *pNext;
++    uint32_t loaderLayerInterfaceVersion;
++    PFN_vkGetInstanceProcAddr pfnGetInstanceProcAddr;
++    PFN_vkGetDeviceProcAddr pfnGetDeviceProcAddr;
++    PFN_GetPhysicalDeviceProcAddr pfnGetPhysicalDeviceProcAddr;
++} VkNegotiateLayerInterface;
++
++typedef VkResult (VKAPI_PTR *PFN_vkNegotiateLoaderLayerInterfaceVersion)(VkNegotiateLayerInterface *pVersionStruct);
++
++#endif /* __WINE_VK_LAYER_H */
+
+--- dlls/winevulkan/vulkan_loader.h
++++ dlls/winevulkan/vulkan_loader.h
+@@ -38,6 +38,26 @@
+ /* Magic value defined by Vulkan ICD / Loader spec */
+ #define VULKAN_ICD_MAGIC_VALUE 0x01CDC0DE
+ 
++/* Maximum number of Windows implicit Vulkan layers chained at once. */
++#define WINE_VK_MAX_LAYERS 8
++
++/* A dispatchable object is "layered" iff its loader_magic was overwritten from
++ * the ICD sentinel to a per-handle dispatch key when it was created through an
++ * active implicit layer. loader_magic is the first field of every dispatchable
++ * (vulkan_client_object) and is write-only inside Wine, so it doubles as a
++ * per-handle "routed through the layer" marker; children inherit the parent's
++ * key. Routing destroys / proc-addr / device creation on this (rather than the
++ * process-global layer set) keeps handles that bypassed the layer out of
++ * it, even when another handle in the same process did engage it.
++ * The key is (uintptr_t)instance/device; on i386 a handle could in theory equal
++ * VULKAN_ICD_MAGIC_VALUE (~29MB) and be misread as non-layered, but a heap
++ * dispatchable living at exactly that address is not realistic, so the marker is
++ * left as the raw pointer rather than reserving a high bit across all stamp sites. */
++static inline BOOL vulkan_client_object_is_layered(const void *dispatchable)
++{
++    return *(const UINT64 *)dispatchable != VULKAN_ICD_MAGIC_VALUE;
++}
++
+ struct vk_command_pool
+ {
+     struct vulkan_client_object obj;
+
+--- dlls/winevulkan/vulkan_thunks.c
++++ dlls/winevulkan/vulkan_thunks.c
+
+--- dlls/winevulkan/vulkan_thunks.h
++++ dlls/winevulkan/vulkan_thunks.h
+
+--- dlls/winevulkan/wsi.c
++++ dlls/winevulkan/wsi.c
+
+--- dlls/winevulkan/wsi_private.h
++++ dlls/winevulkan/wsi_private.h
+@@ -0,0 +1,37 @@
++#ifndef __WINE_VULKAN_WSI_PRIVATE_H
++#define __WINE_VULKAN_WSI_PRIVATE_H
++
++#include "wine/vulkan.h"
++
++struct wine_wsi_image
++{
++    VkImage image;
++    VkDeviceMemory memory;
++    /* Exported dmabuf of `memory`, kept open for the swapchain's lifetime:
++     * every present imports a render-finished sync_file into its reservation
++     * object as a write fence (see wsi_sync_dmabuf_frame). -1 when the image
++     * is a software-fallback image. */
++    int dmabuf_fd;
++    uint64_t drm_modifier;
++    HANDLE win32_handle;
++    /* Persistent CPU mapping used by the software present fallback (when the
++     * swapchain could not be backed by a DMABUF). NULL for the normal
++     * (DMABUF-exported) images. For the LINEAR sub-path it maps `memory`
++     * directly; for the OPTIMAL+copy sub-path it maps `staging_memory`. */
++    void *mapped;
++    /* OPTIMAL+copy software sub-path only: a host-visible buffer that `image`
++     * is copied into on present (used when the format cannot be a LINEAR
++     * renderable image). Zero/VK_NULL_HANDLE otherwise. */
++    VkBuffer staging_buffer;
++    VkDeviceMemory staging_memory;
++    VkCommandBuffer copy_cmd;
++    uint32_t stride;
++    /* Back-pressure fence: signaled when the queue has finished the work up to
++     * this image's last present. vkAcquireNextImageKHR waits on it before
++     * handing the image back, so the app can't start rendering into an image
++     * whose previous frame the GPU is still processing. */
++    VkFence present_fence;
++    BOOL present_pending; /* present_fence submitted and not yet waited on */
++};
++
++#endif /* __WINE_VULKAN_WSI_PRIVATE_H */
+
+--- dlls/winewayland.drv/Makefile.in
++++ dlls/winewayland.drv/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE = winewayland.drv
+ UNIXLIB = winewayland.so
+-UNIX_CFLAGS = $(EGL_CFLAGS) $(WAYLAND_CLIENT_CFLAGS) $(WAYLAND_EGL_CFLAGS) $(XKBCOMMON_CFLAGS) $(XKBREGISTRY_CFLAGS)
++UNIX_CFLAGS = $(DBUS_CFLAGS) $(EGL_CFLAGS) $(WAYLAND_CLIENT_CFLAGS) $(WAYLAND_EGL_CFLAGS) $(XKBCOMMON_CFLAGS) $(XKBREGISTRY_CFLAGS)
+ UNIX_LIBS = -lwin32u $(WAYLAND_CLIENT_LIBS) $(WAYLAND_EGL_LIBS) $(XKBCOMMON_LIBS) $(XKBREGISTRY_LIBS) $(PTHREAD_LIBS) -lm
+ IMPORTS = user32 win32u
+ 
+@@ -12,10 +12,12 @@ SOURCES = \
+ 	display.c \
+ 	dllmain.c \
+ 	fractional-scale-v1.xml \
++	linux-dmabuf-unstable-v1.xml \
+ 	opengl.c \
+ 	pointer-constraints-unstable-v1.xml \
+ 	pointer-warp-v1.xml \
+ 	relative-pointer-unstable-v1.xml \
++	systray.c \
+ 	text-input-unstable-v3.xml \
+ 	viewporter.xml \
+ 	vulkan.c \
+
+--- dlls/winewayland.drv/display.c
++++ dlls/winewayland.drv/display.c
+@@ -185,6 +185,44 @@ static void output_info_array_arrange_physical_coords(struct wl_array *output_in
+           output_info_cmp_primary_x_y);
+ }
+ 
++/* Build the list of outputs with their assigned physical-pixel positions and
++ * record the position on each output state, so the rest of the driver (e.g.
++ * per-window scale selection) can map a window in physical coordinates to the
++ * output it sits on. Requires the output lock. */
++static void output_info_array_build(struct wl_array *output_info_array)
++{
++    struct wayland_output *output;
++    struct output_info *output_info;
++
++    wl_list_for_each(output, &process_wayland.output_list, link)
++    {
++        if (!output->current.current_mode) continue;
++        output_info = wl_array_add(output_info_array, sizeof(*output_info));
++        if (output_info) output_info->output = &output->current;
++        else ERR("Failed to allocate space for output_info\n");
++    }
++
++    output_info_array_arrange_physical_coords(output_info_array);
++
++    wl_array_for_each(output_info, output_info_array)
++    {
++        output_info->output->phys_x = output_info->x;
++        output_info->output->phys_y = output_info->y;
++    }
++}
++
++/* Recompute the outputs' physical positions outside a full display-device
++ * update: every process needs them for per-window scale selection, but only
++ * the desktop process runs UpdateDisplayDevices. Requires the output lock. */
++void wayland_update_outputs_physical_coords(void)
++{
++    struct wl_array output_info_array;
++
++    wl_array_init(&output_info_array);
++    output_info_array_build(&output_info_array);
++    wl_array_release(&output_info_array);
++}
++
+ static void wayland_add_device_gpu(const struct gdi_device_manager *device_manager,
+                                    void *param)
+ {
+@@ -204,11 +242,57 @@ static void wayland_add_device_source(const struct gdi_device_manager *device_ma
+     device_manager->add_source(output_info->output->name, state_flags, dpi, param);
+ }
+ 
++/* Wayland exposes no EDID; fill the parsed monitor info so win32u can synthesize
++ * a minimal valid EDID 1.3 and derive a monitor id / name / preferred mode.
++ * Without it the monitor is a "Generic Non-PnP Monitor" with no identifier, and
++ * some games (Unreal Engine titles like Gothic 1 Remake) then fail to identify
++ * any output and present an empty display/resolution list. The actual EDID byte
++ * assembly now lives once in win32u (build_edid_from_info). */
++static void wayland_fill_edid_info(struct output_info *output_info, struct edid_monitor_info *info)
++{
++    struct wayland_output_mode *mode = output_info->output->current_mode;
++    int phys_w_mm = output_info->output->physical_width;
++    int phys_h_mm = output_info->output->physical_height;
++    const char *name = output_info->output->name;
++    unsigned int hash = 2166136261u; /* FNV-1a */
++    const char *src;
++    int i;
++
++    memset(info, 0, sizeof(*info));
++
++    /* manufacturer id "WAY" (5-bit packed, big endian) */
++    info->manufacturer = ((('W' - 'A' + 1) & 0x1F) << 10) |
++                         ((('A' - 'A' + 1) & 0x1F) << 5) |
++                         (('Y' - 'A' + 1) & 0x1F);
++    /* Derive a per-output product code and serial from the connector name
++     * (e.g. "eDP-1", "DP-2") so multiple monitors get distinct EDID ids
++     * (WAY0001, WAY0002, ...) instead of colliding on a fixed one. */
++    if (name) for (i = 0; name[i]; i++) { hash ^= (unsigned char)name[i]; hash *= 16777619u; }
++    info->product_code = (hash & 0x7FFF) + 1;       /* 1..0x8000, never 0 */
++    info->serial_number = hash;
++
++    /* fall back to a generic ~24" 16:10 panel when the compositor reports no
++     * physical size (virtual outputs, some headless setups) */
++    if (phys_w_mm <= 0 || phys_h_mm <= 0) { phys_w_mm = 520; phys_h_mm = 320; }
++    info->width_mm = phys_w_mm;
++    info->height_mm = phys_h_mm;
++
++    info->preferred_width = mode ? mode->width : 1024;
++    info->preferred_height = mode ? mode->height : 768;
++    info->preferred_refresh = mode ? mode->refresh : 60000; /* wl_output refresh is in mHz */
++
++    /* monitor name = connector name (ASCII), up to 13 chars */
++    src = name ? name : "Wine Monitor";
++    for (i = 0; i < 13 && src[i]; i++) info->monitor_name[i] = (unsigned char)src[i];
++    info->monitor_name[i] = 0;
++}
++
+ static void wayland_add_device_monitor(const struct gdi_device_manager *device_manager,
+                                        void *param, struct output_info *output_info,
+                                        struct output_info *primary)
+ {
+     struct gdi_monitor monitor = {0};
++    struct edid_monitor_info edid_info;
+ 
+     SetRect(&monitor.rc_monitor, output_info->x, output_info->y,
+             output_info->x + output_info->output->current_mode->width,
+@@ -218,6 +302,9 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
+     /* We don't have a direct way to get the work area in Wayland. */
+     monitor.rc_work = monitor.rc_monitor;
+ 
++    wayland_fill_edid_info(output_info, &edid_info);
++    monitor.edid_info = &edid_info;
++
+     TRACE("name=%s rc_monitor=rc_work=%s\n",
+           output_info->output->name, wine_dbgstr_rect(&monitor.rc_monitor));
+ 
+@@ -270,7 +357,6 @@ static void wayland_add_device_modes(const struct gdi_device_manager *device_man
+  */
+ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manager, void *param)
+ {
+-    struct wayland_output *output;
+     DWORD state_flags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE;
+     struct output_info *primary = NULL, *output_info;
+     struct wl_array output_info_array;
+@@ -281,15 +367,7 @@ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manage
+ 
+     pthread_mutex_lock(&process_wayland.output_mutex);
+ 
+-    wl_list_for_each(output, &process_wayland.output_list, link)
+-    {
+-        if (!output->current.current_mode) continue;
+-        output_info = wl_array_add(&output_info_array, sizeof(*output_info));
+-        if (output_info) output_info->output = &output->current;
+-        else ERR("Failed to allocate space for output_info\n");
+-    }
+-
+-    output_info_array_arrange_physical_coords(&output_info_array);
++    output_info_array_build(&output_info_array);
+ 
+     /* Populate GDI devices. */
+     wayland_add_device_gpu(device_manager, param);
+
+--- dlls/winewayland.drv/dllmain.c
++++ dlls/winewayland.drv/dllmain.c
+@@ -38,6 +38,15 @@ static DWORD WINAPI wayland_read_events_thread(void *arg)
+     return 0;
+ }
+ 
++static DWORD WINAPI wayland_tray_dispatch_thread(void *arg)
++{
++    /* Parks in the unix lib until tray icons need a D-Bus dispatch loop;
++     * runs as a proper win32 thread so the unix side can deliver
++     * notification messages to icon owner windows. */
++    WAYLANDDRV_UNIX_CALL(tray_dispatch, NULL);
++    return 0;
++}
++
+ static LRESULT CALLBACK clipboard_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     switch (msg)
+@@ -93,6 +102,17 @@ static DWORD WINAPI clipboard_thread(void *arg)
+     return 0;
+ }
+ 
++/* Only explorer.exe drives the system tray (it owns Shell_TrayWnd), so the
++ * D-Bus dispatch thread is pointless overhead in every other GUI process. */
++static BOOL is_tray_host_process(void)
++{
++    WCHAR path[MAX_PATH], *name;
++    if (!GetModuleFileNameW(NULL, path, ARRAY_SIZE(path))) return FALSE;
++    for (name = path + lstrlenW(path); name > path; name--)
++        if (name[-1] == '\\' || name[-1] == '/') break;
++    return !lstrcmpiW(name, L"explorer.exe");
++}
++
+ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
+ {
+     DWORD tid;
+@@ -107,6 +127,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
+ 
+     /* Read wayland events from a dedicated thread. */
+     CloseHandle(CreateThread(NULL, 0, wayland_read_events_thread, NULL, 0, &tid));
++    /* Dispatch D-Bus tray icon events from a dedicated thread (explorer only). */
++    if (is_tray_host_process())
++        CloseHandle(CreateThread(NULL, 0, wayland_tray_dispatch_thread, NULL, 0, &tid));
+     /* Handle clipboard events in a dedicated thread, if needed. */
+     if (!WAYLANDDRV_UNIX_CALL(init_clipboard, NULL))
+         CloseHandle(CreateThread(NULL, 0, clipboard_thread, NULL, 0, &tid));
+
+--- dlls/winewayland.drv/linux-dmabuf-unstable-v1.xml
++++ dlls/winewayland.drv/linux-dmabuf-unstable-v1.xml
+
+--- dlls/winewayland.drv/systray.c
++++ dlls/winewayland.drv/systray.c
+
+--- dlls/winewayland.drv/unixlib.h
++++ dlls/winewayland.drv/unixlib.h
+@@ -28,6 +28,7 @@ enum waylanddrv_unix_func
+     waylanddrv_unix_func_init,
+     waylanddrv_unix_func_read_events,
+     waylanddrv_unix_func_init_clipboard,
++    waylanddrv_unix_func_tray_dispatch,
+     waylanddrv_unix_func_count,
+ };
+ 
+
+--- dlls/winewayland.drv/wayland.c
++++ dlls/winewayland.drv/wayland.c
+@@ -215,6 +215,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+         process_wayland.wp_fractional_scale_manager_v1 =
+             wl_registry_bind(registry, id, &wp_fractional_scale_manager_v1_interface, 1);
+     }
++    else if (strcmp(interface, "zwp_linux_dmabuf_v1") == 0)
++    {
++        process_wayland.zwp_linux_dmabuf_v1 =
++            wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 3);
++    }
+ }
+ 
+ static void registry_handle_global_remove(void *data, struct wl_registry *registry,
+
+--- dlls/winewayland.drv/wayland_output.c
++++ dlls/winewayland.drv/wayland_output.c
+@@ -39,6 +39,8 @@ static uint32_t next_output_id = 0;
+ #define WAYLAND_OUTPUT_CHANGED_NAME       0x02
+ #define WAYLAND_OUTPUT_CHANGED_LOGICAL_XY 0x04
+ #define WAYLAND_OUTPUT_CHANGED_LOGICAL_WH 0x08
++#define WAYLAND_OUTPUT_CHANGED_GEOMETRY   0x10
++#define WAYLAND_OUTPUT_CHANGED_SCALE      0x20
+ 
+ /**********************************************************************
+  *          Output handling
+@@ -128,6 +130,21 @@ static void wayland_output_mode_free_rb(struct rb_entry *entry, void *ctx)
+     free(RB_ENTRY_VALUE(entry, struct wayland_output_mode, entry));
+ }
+ 
++/* A 90/270 (optionally flipped) rotation swaps an output's width and height. */
++static BOOL wayland_transform_swaps_dimensions(int32_t transform)
++{
++    switch (transform)
++    {
++    case WL_OUTPUT_TRANSFORM_90:
++    case WL_OUTPUT_TRANSFORM_270:
++    case WL_OUTPUT_TRANSFORM_FLIPPED_90:
++    case WL_OUTPUT_TRANSFORM_FLIPPED_270:
++        return TRUE;
++    default:
++        return FALSE;
++    }
++}
++
+ static void wayland_output_done(struct wayland_output *output)
+ {
+     struct wayland_output_mode *mode;
+@@ -165,17 +182,66 @@ static void wayland_output_done(struct wayland_output *output)
+     {
+         output->current.logical_w = output->pending.logical_w;
+         output->current.logical_h = output->pending.logical_h;
++        output->current.has_xdg_logical_size = TRUE;
+     }
+ 
++    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_GEOMETRY)
++    {
++        output->current.transform = output->pending.transform;
++        output->current.physical_width = output->pending.physical_width;
++        output->current.physical_height = output->pending.physical_height;
++    }
++
++    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_SCALE)
++        output->current.scale = output->pending.scale;
++
+     output->pending_flags = 0;
+ 
+-    /* Ensure the logical dimensions have sane values. */
+-    if ((!output->current.logical_w || !output->current.logical_h) &&
+-        output->current.current_mode)
++    /* When xdg_output has never reported a logical size (e.g. a compositor
++     * without the protocol), default the logical size to the physical mode size
++     * for the display layout, but don't treat it as a reliable compositor scale:
++     * a stale default must not masquerade as a real logical size on a later
++     * wl_output.done that carries no new logical size. */
++    if (!output->current.has_xdg_logical_size && output->current.current_mode)
+     {
+         output->current.logical_w = output->current.current_mode->width;
+         output->current.logical_h = output->current.current_mode->height;
+     }
++    output->current.has_logical_size = output->current.has_xdg_logical_size &&
++                                       output->current.logical_w && output->current.logical_h;
++
++    /* The compositor scale is the ratio of the output's physical mode size to
++     * its logical (post-scaling) size. Wine renders surfaces in physical pixels
++     * and maps them to logical Wayland coordinates by this factor, so it tracks
++     * the real output scale (including fractional scaling) rather than Wine's
++     * configured DPI. wl_output modes are pre-transform while the xdg_output
++     * logical size is post-transform, so for a 90/270 rotation the logical width
++     * maps to the mode's height. 0.0 means "unknown" -> callers fall back to the
++     * configured DPI. */
++    if (output->current.has_logical_size && output->current.current_mode)
++    {
++        int mode_w = output->current.current_mode->width;
++        if (wayland_transform_swaps_dimensions(output->current.transform))
++            mode_w = output->current.current_mode->height;
++        output->current.compositor_scale = (double)mode_w / output->current.logical_w;
++    }
++    else if (output->current.scale > 0)
++    {
++        /* No xdg_output logical size: fall back to the wl_output.scale event.
++         * Compositors without xdg_output (e.g. gamescope, which sends scale 1
++         * and expects clients to render at the advertised mode size) still
++         * declare their intended scale this way. */
++        output->current.compositor_scale = output->current.scale;
++    }
++    else
++    {
++        output->current.compositor_scale = 0.0;
++    }
++
++    /* Keep the physical positions in sync in every process: only the desktop
++     * process runs a full display-device update, but per-window scale selection
++     * needs them everywhere. */
++    wayland_update_outputs_physical_coords();
+ 
+     pthread_mutex_unlock(&process_wayland.output_mutex);
+ 
+@@ -200,6 +266,14 @@ static void output_handle_geometry(void *data, struct wl_output *wl_output,
+                                    const char *make, const char *model,
+                                    int32_t output_transform)
+ {
++    struct wayland_output *output = data;
++    TRACE("transform=%d physical=%dx%d mm make=%s model=%s\n",
++          output_transform, physical_width, physical_height,
++          debugstr_a(make), debugstr_a(model));
++    output->pending.transform = output_transform;
++    output->pending.physical_width = physical_width;
++    output->pending.physical_height = physical_height;
++    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_GEOMETRY;
+ }
+ 
+ static void output_handle_mode(void *data, struct wl_output *wl_output,
+@@ -231,6 +305,10 @@ static void output_handle_done(void *data, struct wl_output *wl_output)
+ static void output_handle_scale(void *data, struct wl_output *wl_output,
+                                 int32_t scale)
+ {
++    struct wayland_output *output = data;
++    TRACE("scale=%d\n", scale);
++    output->pending.scale = scale;
++    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_SCALE;
+ }
+ 
+ static const struct wl_output_listener output_listener = {
+@@ -369,6 +447,8 @@ void wayland_output_destroy(struct wayland_output *output)
+ {
+     pthread_mutex_lock(&process_wayland.output_mutex);
+     wl_list_remove(&output->link);
++    /* the layout of the remaining outputs may shift */
++    wayland_update_outputs_physical_coords();
+     pthread_mutex_unlock(&process_wayland.output_mutex);
+ 
+     wayland_output_state_deinit(&output->pending);
+@@ -394,3 +474,59 @@ void wayland_output_use_xdg_extension(struct wayland_output *output)
+     zxdg_output_v1_add_listener(output->zxdg_output_v1, &zxdg_output_v1_listener,
+                                 output);
+ }
++
++/**********************************************************************
++ *          wayland_output_scale_for_rect
++ *
++ * Returns the compositor scale (physical/logical ratio) of the output that
++ * contains the center of the given physical-pixel rectangle, so a window can
++ * be rendered and have its pointer mapped at the correct scale for the monitor
++ * it is on. Returns 0.0 when it can't be reliably determined (no xdg_output
++ * logical-size info, or the rect isn't on any known output), in which case the
++ * caller should fall back to the configured DPI.
++ */
++double wayland_output_scale_for_rect(const RECT *rect)
++{
++    struct wayland_output *output, *best = NULL;
++    double scale = 0.0;
++    int cx = (rect->left + rect->right) / 2;
++    int cy = (rect->top + rect->bottom) / 2;
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++
++    wl_list_for_each(output, &process_wayland.output_list, link)
++    {
++        struct wayland_output_state *os = &output->current;
++        int ext_w, ext_h;
++
++        if (!os->current_mode || os->compositor_scale <= 0.0) continue;
++
++        /* wl_output modes are pre-transform, so for a 90/270 rotation the on-screen
++         * extent swaps width and height. */
++        ext_w = os->current_mode->width;
++        ext_h = os->current_mode->height;
++        if (wayland_transform_swaps_dimensions(os->transform))
++        {
++            ext_w = os->current_mode->height;
++            ext_h = os->current_mode->width;
++        }
++
++        /* Prefer the output whose physical area contains the rect center. */
++        if (cx >= os->phys_x && cx < os->phys_x + ext_w &&
++            cy >= os->phys_y && cy < os->phys_y + ext_h)
++        {
++            scale = os->compositor_scale;
++            break;
++        }
++
++        /* Otherwise remember a usable output (preferring the primary one at the
++         * origin) as a fallback for windows that aren't on any output yet. */
++        if (!best || (os->phys_x == 0 && os->phys_y == 0)) best = output;
++    }
++
++    if (scale == 0.0 && best) scale = best->current.compositor_scale;
++
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++
++    return scale;
++}
+
+--- dlls/winewayland.drv/wayland_pointer.c
++++ dlls/winewayland.drv/wayland_pointer.c
+@@ -121,6 +121,12 @@ static HWND wayland_pointer_get_focused_hwnd(void)
+     return hwnd;
+ }
+ 
++static void pointer_send_to_toplevel(HWND hwnd, INPUT *input)
++{
++    HWND top = NtUserGetAncestor(hwnd, GA_ROOT);
++    NtUserSendHardwareInput(top ? top : hwnd, 0, input, 0);
++}
++
+ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+ {
+     INPUT input = {0};
+@@ -141,14 +147,25 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+     window_rect = &surface->window.rect;
+ 
+     screen = map_point_from_surface(surface, screen);
+-    screen.x += window_rect->left;
+-    screen.y += window_rect->top;
+-    /* Sometimes, due to rounding, we may end up with pointer coordinates
+-     * slightly outside the target window, so bring them within bounds. */
+-    if (screen.x >= window_rect->right) screen.x = window_rect->right - 1;
+-    else if (screen.x < window_rect->left) screen.x = window_rect->left;
+-    if (screen.y >= window_rect->bottom) screen.y = window_rect->bottom - 1;
+-    else if (screen.y < window_rect->top) screen.y = window_rect->top;
++
++    if (surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
++    {
++        /* CEF/Chromium GPU content lives in subsurface child windows; map the
++         * surface-local point through the child to absolute screen coords so the
++         * hit test reaches the right window. */
++        NtUserMapWindowPoints(hwnd, 0, &screen, 1, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++    }
++    else
++    {
++        screen.x += window_rect->left;
++        screen.y += window_rect->top;
++        /* Sometimes, due to rounding, we may end up with pointer coordinates
++         * slightly outside the target window, so bring them within bounds. */
++        if (screen.x >= window_rect->right) screen.x = window_rect->right - 1;
++        else if (screen.x < window_rect->left) screen.x = window_rect->left;
++        if (screen.y >= window_rect->bottom) screen.y = window_rect->bottom - 1;
++        else if (screen.y < window_rect->top) screen.y = window_rect->top;
++    }
+ 
+     wayland_win_data_release(data);
+ 
+@@ -161,7 +178,13 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+           hwnd, wl_fixed_to_double(sx), wl_fixed_to_double(sy),
+           screen.x, screen.y);
+ 
+-    NtUserSendHardwareInput(hwnd, 0, &input, 0);
++    /* Deliver scoped to the toplevel (like the X11 driver and pointer_handle_button)
++     * so win32u's window_from_point descends the whole tree. With GPU CEF the
++     * content lives in subsurface child windows; scoping to the focused child
++     * confines the hit test to that subtree and a hover never reaches the menu
++     * bar items in the toplevel, so hover-to-open menus don't work (they do with
++     * GPU disabled, where content is on the main surface). */
++    pointer_send_to_toplevel(hwnd, &input);
+ }
+ 
+ static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
+@@ -266,7 +289,7 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
+ 
+     TRACE("hwnd=%p button=%#x state=%u\n", hwnd, button, state);
+ 
+-    NtUserSendHardwareInput(hwnd, 0, &input, 0);
++    pointer_send_to_toplevel(hwnd, &input);
+ }
+ 
+ static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
+@@ -315,7 +338,9 @@ static void pointer_handle_axis_value120(void *data, struct wl_pointer *wl_point
+ 
+     TRACE("hwnd=%p axis=%u value120=%d\n", hwnd, axis, value120);
+ 
+-    NtUserSendHardwareInput(hwnd, 0, &input, 0);
++    /* Deliver scoped to the toplevel (like pointer_handle_motion/button) so wheel
++     * events over a child subsurface (e.g. CEF content) hit-test correctly. */
++    pointer_send_to_toplevel(hwnd, &input);
+ }
+ 
+ static void pointer_handle_axis_discrete(void *data, struct wl_pointer *wl_pointer,
+@@ -367,6 +392,11 @@ static void relative_pointer_v1_relative_motion(void *private,
+ 
+     if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
+     if (!(data = wayland_win_data_get(hwnd))) return;
++    if (!data->wayland_surface)
++    {
++        wayland_win_data_release(data);
++        return;
++    }
+ 
+     wayland_motion_delta_to_window(data->wayland_surface,
+                                    wl_fixed_to_double(dx),
+@@ -466,7 +496,7 @@ void wayland_pointer_deinit(void)
+  *
+  * Adapted from wineandroid.drv code.
+  */
+-static struct wayland_shm_buffer *create_mono_cursor_buffer(HBITMAP bmp)
++struct wayland_shm_buffer *create_mono_cursor_buffer(HBITMAP bmp)
+ {
+     struct wayland_shm_buffer *shm_buffer = NULL;
+     BITMAP bm;
+@@ -507,11 +537,11 @@ done:
+ }
+ 
+ /***********************************************************************
+- *           get_icon_info
++ *           wayland_get_icon_info
+  *
+  * Local GetIconInfoExW helper implementation.
+  */
+-static BOOL get_icon_info(HICON handle, ICONINFOEXW *ret)
++BOOL wayland_get_icon_info(HICON handle, ICONINFOEXW *ret)
+ {
+     UNICODE_STRING module, res_name;
+     ICONINFO info;
+@@ -543,6 +573,15 @@ static BOOL cursor_buffer_is_transparent(struct wayland_shm_buffer *shm_buffer)
+     return TRUE;
+ }
+ 
++static void cursor_drop_shm_buffer(struct wayland_cursor *cursor)
++{
++    if (cursor->shm_buffer)
++    {
++        wayland_shm_buffer_unref(cursor->shm_buffer);
++        cursor->shm_buffer = NULL;
++    }
++}
++
+ static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
+ {
+     struct wayland_cursor *cursor = &process_wayland.pointer.cursor;
+@@ -551,13 +590,9 @@ static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
+     if (!hcursor) goto clear_cursor;
+ 
+     /* Create a new buffer for the specified cursor. */
+-    if (cursor->shm_buffer)
+-    {
+-        wayland_shm_buffer_unref(cursor->shm_buffer);
+-        cursor->shm_buffer = NULL;
+-    }
++    cursor_drop_shm_buffer(cursor);
+ 
+-    if (!get_icon_info(hcursor, &info))
++    if (!wayland_get_icon_info(hcursor, &info))
+     {
+         ERR("Failed to get icon info for cursor=%p\n", hcursor);
+         goto clear_cursor;
+@@ -604,11 +639,7 @@ static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
+     return;
+ 
+ clear_cursor:
+-    if (cursor->shm_buffer)
+-    {
+-        wayland_shm_buffer_unref(cursor->shm_buffer);
+-        cursor->shm_buffer = NULL;
+-    }
++    cursor_drop_shm_buffer(cursor);
+ }
+ 
+ static void wayland_pointer_clear_cursor_surface(void)
+@@ -625,11 +656,7 @@ static void wayland_pointer_clear_cursor_surface(void)
+         wl_surface_destroy(cursor->wl_surface);
+         cursor->wl_surface = NULL;
+     }
+-    if (cursor->shm_buffer)
+-    {
+-        wayland_shm_buffer_unref(cursor->shm_buffer);
+-        cursor->shm_buffer = NULL;
+-    }
++    cursor_drop_shm_buffer(cursor);
+ }
+ 
+ static void wayland_pointer_update_cursor_surface(double scale)
+@@ -649,7 +676,7 @@ static void wayland_pointer_update_cursor_surface(double scale)
+         }
+     }
+ 
+-    if (!cursor->wp_viewport)
++    if (!cursor->wp_viewport && process_wayland.wp_viewporter)
+     {
+         cursor->wp_viewport =
+             wp_viewporter_get_viewport(process_wayland.wp_viewporter,
+@@ -672,9 +699,10 @@ static void wayland_pointer_update_cursor_surface(double scale)
+      * scale. Note that setting the viewport destination overrides
+      * the buffer scale, so it's fine to set both. */
+     wl_surface_set_buffer_scale(cursor->wl_surface, round(scale));
+-    wp_viewport_set_destination(cursor->wp_viewport,
+-                                round(cursor->shm_buffer->width / scale),
+-                                round(cursor->shm_buffer->height / scale));
++    if (cursor->wp_viewport)
++        wp_viewport_set_destination(cursor->wp_viewport,
++                                    round(cursor->shm_buffer->width / scale),
++                                    round(cursor->shm_buffer->height / scale));
+     wl_surface_commit(cursor->wl_surface);
+ 
+     return;
+@@ -731,7 +759,7 @@ static BOOL wayland_pointer_set_cursor_shape(HCURSOR hcursor)
+ 
+     if (!process_wayland.wp_cursor_shape_manager_v1) return FALSE;
+     if (!hcursor) return FALSE;
+-    if (!get_icon_info(hcursor, &info)) return FALSE;
++    if (!wayland_get_icon_info(hcursor, &info)) return FALSE;
+     proto_version = wp_cursor_shape_manager_v1_get_version(
+         process_wayland.wp_cursor_shape_manager_v1);
+     shape = cursor_shape_from_info(&info, proto_version);
+@@ -773,6 +801,15 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+     struct wayland_win_data *data;
+     double scale;
+     BOOL reapply_clip = FALSE;
++    HWND hwnd_root, focused;
++
++    /* Resolve the toplevel up front, BEFORE taking win_data_mutex (and
++     * pointer->mutex): NtUserGetAncestor takes win32u's user_lock, while the
++     * window-surface flush path holds user_lock and then acquires win_data_mutex
++     * (apply_window_pos -> wayland_window_surface_flush -> wayland_win_data_get).
++     * Calling NtUserGetAncestor while holding win_data_mutex would invert those
++     * two locks against the flush path and deadlock. */
++    hwnd_root = NtUserGetAncestor(hwnd, GA_ROOT);
+ 
+     if ((data = wayland_win_data_get(hwnd)))
+     {
+@@ -783,7 +820,29 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+         }
+         scale = surface->window.scale;
+         if (use_hcursor) surface->hcursor = hcursor;
+-        else hcursor = surface->hcursor;
++        else
++        {
++            hcursor = surface->hcursor;
++            /* A child surface (e.g. CEF/Chromium GPU content presented as a
++             * subsurface) may have no cursor of its own, so a plain enter would
++             * clear the pointer cursor. With input delivered scoped to the
++             * toplevel the cursor is set on the toplevel, so inherit it here:
++             * otherwise the empty cursor makes wayland_pointer_update_constraint
++             * treat a screen-sized window as a cursor-hiding fullscreen client
++             * and lock (hide) the pointer. */
++            if (!hcursor && hwnd_root && hwnd_root != hwnd)
++            {
++                struct wayland_win_data *top_data;
++                /* hwnd_root resolved above; nested get/release under the held
++                 * (recursive) win_data_mutex, top_data stays valid meanwhile. */
++                if ((top_data = wayland_win_data_get(hwnd_root)))
++                {
++                    if (top_data->wayland_surface)
++                        hcursor = top_data->wayland_surface->hcursor;
++                    wayland_win_data_release(top_data);
++                }
++            }
++        }
+         use_hcursor = TRUE;
+         wayland_win_data_release(data);
+     }
+@@ -792,9 +851,23 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+         scale = 1.0;
+     }
+ 
++    /* Snapshot the pointer focus under pointer->mutex; hwnd_root was resolved
++     * above, outside all locks (NtUserGetAncestor takes user_lock and must not
++     * run under pointer->mutex or win_data_mutex). A focus change racing the
++     * snapshot is benign -- a stray cursor set for a just-unfocused window is
++     * corrected by the next enter/SetCursor. */
+     pthread_mutex_lock(&pointer->mutex);
+-    if (pointer->focused_hwnd == hwnd)
++    focused = pointer->focused_hwnd;
++    pthread_mutex_unlock(&pointer->mutex);
++
++    /* Accept a SetCursor for any window in the same toplevel as the pointer focus,
++     * not just the exact focused window: input is delivered scoped to the toplevel,
++     * so WM_SETCURSOR may target the toplevel or a sibling child of the focused
++     * subsurface. There is a single pointer cursor per focus, so this is safe and
++     * keeps the cursor visible. */
++    if (focused && (focused == hwnd || NtUserGetAncestor(focused, GA_ROOT) == hwnd_root))
+     {
++        pthread_mutex_lock(&pointer->mutex);
+         if ((!use_hcursor && pointer->wp_cursor_shape_device_v1) ||
+             (use_hcursor && hcursor && wayland_pointer_set_cursor_shape(hcursor)))
+         {
+@@ -813,8 +886,8 @@ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+         }
+         wl_display_flush(process_wayland.wl_display);
+         reapply_clip = TRUE;
++        pthread_mutex_unlock(&pointer->mutex);
+     }
+-    pthread_mutex_unlock(&pointer->mutex);
+ 
+     /* Reapply cursor clip since cursor visibility affects pointer constraint
+      * behavior. */
+@@ -1088,9 +1161,15 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
+                 wl_fixed_from_int(warp.y));
+         pthread_mutex_unlock(&pointer->mutex);
+ 
+-        data = wayland_win_data_get(hwnd);
+-        wl_surface_commit(wl_surface);
+-        wayland_win_data_release(data);
++        /* The foreground window may have been torn down since we cached
++         * wl_surface; only commit while its win data (and thus the surface) is
++         * still alive, and never release a NULL data — that would unlock
++         * win_data_mutex without holding it. */
++        if ((data = wayland_win_data_get(hwnd)))
++        {
++            wl_surface_commit(wl_surface);
++            wayland_win_data_release(data);
++        }
+         TRACE("position hint hwnd=%p wayland_xy=%s screen_xy=%s\n",
+                 hwnd, wine_dbgstr_point(&warp), wine_dbgstr_point(&cursor_pos));
+         pthread_mutex_lock(&pointer->mutex);
+
+--- dlls/winewayland.drv/wayland_surface.c
++++ dlls/winewayland.drv/wayland_surface.c
+
+--- dlls/winewayland.drv/wayland_text_input.c
++++ dlls/winewayland.drv/wayland_text_input.c
+@@ -77,10 +77,42 @@ static void wayland_text_input_reset_all_state(struct wayland_text_input *text_i
+     wayland_text_input_reset_pending_state(text_input);
+ }
+ 
++/* Enable / disable the compositor text-input (zwp_text_input_v3) for the focused
++ * window. text-input is the only keyboard path under Wayland, and enabling it
++ * lets the input method (KWin's built-in dead-key/accent composition, fcitx5,
++ * ibus, ...) grab and reinterpret keystrokes -- correct for editable fields, but
++ * wrong for 3D games and other windows that want raw keyboard (held keys would
++ * open the accent picker and the window would receive nothing). We therefore
++ * only enable it while the application keeps an input context associated with the
++ * window tree (driven by ImmAssociateContext -> WAYLAND_SetIMEEnabled, aggregated
++ * per toplevel via num_ime_children). Both helpers must run under text_input->mutex
++ * and are idempotent via text_input->enabled. */
++static void wayland_text_input_ime_enable(struct wayland_text_input *text_input)
++{
++    if (text_input->enabled) return;
++    zwp_text_input_v3_enable(text_input->zwp_text_input_v3);
++    zwp_text_input_v3_set_content_type(text_input->zwp_text_input_v3,
++            ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE,
++            ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
++    zwp_text_input_v3_set_cursor_rectangle(text_input->zwp_text_input_v3, 0, 0, 0, 0);
++    zwp_text_input_v3_commit(text_input->zwp_text_input_v3);
++    text_input->enabled = TRUE;
++}
++
++static void wayland_text_input_ime_disable(struct wayland_text_input *text_input)
++{
++    if (!text_input->enabled) return;
++    zwp_text_input_v3_disable(text_input->zwp_text_input_v3);
++    zwp_text_input_v3_commit(text_input->zwp_text_input_v3);
++    wayland_text_input_reset_all_state(text_input);
++    text_input->enabled = FALSE;
++}
++
+ static void text_input_enter(void *data, struct zwp_text_input_v3 *zwp_text_input_v3,
+         struct wl_surface *surface)
+ {
+     struct wayland_text_input *text_input = data;
++    struct wayland_win_data *win;
+     HWND hwnd;
+ 
+     if (!surface) return;
+@@ -88,16 +120,19 @@ static void text_input_enter(void *data, struct zwp_text_input_v3 *zwp_text_inpu
+     hwnd = wl_surface_get_user_data(surface);
+     TRACE("data %p, text_input %p, hwnd %p.\n", data, zwp_text_input_v3, hwnd);
+ 
++    /* Take win_data_mutex (OUTER) then text_input->mutex (INNER), the driver's
++     * lock order. Enable IME only if some window in this toplevel's tree wants it
++     * (num_ime_children), kept current by WAYLAND_SetIMEEnabled. */
++    if (!(win = wayland_win_data_get(hwnd))) return;
++
+     pthread_mutex_lock(&text_input->mutex);
+     text_input->focused_hwnd = hwnd;
+-    zwp_text_input_v3_enable(text_input->zwp_text_input_v3);
+-    zwp_text_input_v3_set_content_type(text_input->zwp_text_input_v3,
+-            ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE,
+-            ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
+-    zwp_text_input_v3_set_cursor_rectangle(text_input->zwp_text_input_v3, 0, 0, 0, 0);
+-    zwp_text_input_v3_commit(text_input->zwp_text_input_v3);
++    if (win->num_ime_children)
++        wayland_text_input_ime_enable(text_input);
+     pthread_mutex_unlock(&text_input->mutex);
+ 
++    wayland_win_data_release(win);
++
+     activate_keyboard_hkl(hwnd, TRUE);
+ }
+ 
+@@ -108,14 +143,12 @@ static void text_input_leave(void *data, struct zwp_text_input_v3 *zwp_text_inpu
+     TRACE("data %p, text_input %p.\n", data, zwp_text_input_v3);
+ 
+     pthread_mutex_lock(&text_input->mutex);
+-    zwp_text_input_v3_disable(text_input->zwp_text_input_v3);
+-    zwp_text_input_v3_commit(text_input->zwp_text_input_v3);
++    wayland_text_input_ime_disable(text_input);
+     if (text_input->focused_hwnd)
+     {
+         post_ime_update(text_input->focused_hwnd, 0, NULL, NULL);
+         text_input->focused_hwnd = NULL;
+     }
+-    wayland_text_input_reset_all_state(text_input);
+     pthread_mutex_unlock(&text_input->mutex);
+ }
+ 
+@@ -170,7 +203,7 @@ static void text_input_done(void *data, struct zwp_text_input_v3 *zwp_text_input
+      * the focus state of the text input. This behavior is arguably out of spec,
+      * but otherwise harmless, so just ignore the new state in such cases.
+      * Additionally ignore done events that don't actually modify the state. */
+-    if (text_input->focused_hwnd &&
++    if (text_input->focused_hwnd && text_input->enabled &&
+         (text_input->commit_string ||
+          text_input->preedit.cursor_pos != text_input->current_preedit.cursor_pos ||
+          !!text_input->preedit.string != !!text_input->current_preedit.string ||
+@@ -205,6 +238,9 @@ void wayland_text_input_init(void)
+     text_input->zwp_text_input_v3 = zwp_text_input_manager_v3_get_text_input(
+             process_wayland.zwp_text_input_manager_v3, process_wayland.seat.wl_seat);
+     zwp_text_input_v3_add_listener(text_input->zwp_text_input_v3, &text_input_listener, text_input);
++    /* A freshly created zwp_text_input_v3 is disabled per protocol; keep the flag
++     * in sync (also covers a seat replug where the struct persists). */
++    text_input->enabled = FALSE;
+     pthread_mutex_unlock(&text_input->mutex);
+ };
+ 
+@@ -216,6 +252,10 @@ void wayland_text_input_deinit(void)
+     zwp_text_input_v3_destroy(text_input->zwp_text_input_v3);
+     text_input->zwp_text_input_v3 = NULL;
+     text_input->focused_hwnd = NULL;
++    /* Keep the invariant that enabled is only TRUE while a live object exists, so
++     * a re-created object (seat replug) isn't left thinking it is already enabled
++     * and skipping zwp_text_input_v3_enable on the next focus. */
++    text_input->enabled = FALSE;
+     wayland_text_input_reset_all_state(text_input);
+     pthread_mutex_unlock(&text_input->mutex);
+ };
+@@ -232,27 +272,35 @@ BOOL WAYLAND_SetIMECompositionRect(HWND hwnd, RECT rect)
+ 
+     TRACE("hwnd %p, rect %s.\n", hwnd, wine_dbgstr_rect(&rect));
+ 
+-    pthread_mutex_lock(&text_input->mutex);
+-
+-    if (!text_input->zwp_text_input_v3 || hwnd != text_input->focused_hwnd)
+-        goto err;
+-
++    /* Map the rect to surface coordinates under win_data_mutex, then release it
++     * before touching text_input state. The driver's lock order is win_data_mutex
++     * (outer) -> the per-subsystem mutexes (inner): wayland_surface_destroy()
++     * clears text_input.focused_hwnd while a caller holds win_data_mutex. Taking
++     * text_input->mutex first and then wayland_win_data_get() (as upstream still
++     * does) inverts that order and can deadlock; acquiring the two locks
++     * sequentially (never nested) sidesteps it entirely. */
+     if (!(data = wayland_win_data_get(hwnd)))
+-        goto err;
++        return FALSE;
+ 
+-    if (!(surface = data->wayland_surface))
++    if (!(surface = data->wayland_surface) || !data->num_ime_children)
+     {
+         wayland_win_data_release(data);
+-        goto err;
++        return FALSE;
+     }
+ 
+-
+     OffsetRect(&rect, -surface->window.rect.left, -surface->window.rect.top);
+     surface_rect = map_rect_to_surface(surface, rect);
+     wayland_win_data_release(data);
+ 
++    pthread_mutex_lock(&text_input->mutex);
++
++    if (!text_input->zwp_text_input_v3 || !text_input->enabled || hwnd != text_input->focused_hwnd)
++        goto err;
++
++    /* set_cursor_rectangle takes (x, y, width, height): y is surface_rect.top,
++     * not .right (the latter was a typo introduced by the RECT/POINT refactor). */
+     zwp_text_input_v3_set_cursor_rectangle(text_input->zwp_text_input_v3,
+-            surface_rect.left, surface_rect.right, surface_rect.right - surface_rect.left,
++            surface_rect.left, surface_rect.top, surface_rect.right - surface_rect.left,
+             surface_rect.bottom - surface_rect.top);
+     zwp_text_input_v3_commit(text_input->zwp_text_input_v3);
+ 
+@@ -263,3 +311,66 @@ err:
+     pthread_mutex_unlock(&text_input->mutex);
+     return FALSE;
+ }
++
++/***********************************************************************
++ *      SetIMEEnabled (WAYLANDDRV.@)
++ *
++ * Live IME enable/disable. win32u calls this from NtUserAssociateInputContext for
++ * every window whose input context is associated (enabled=TRUE) or cleared via
++ * ImmDisableIME/ImmAssociateContext(NULL) (enabled=FALSE) -- including child
++ * controls, so the count is aggregated on the GA_ROOT toplevel and IME stays on
++ * while any window in the tree wants it. Without this the compositor text-input
++ * state would only be (re)evaluated on a Wayland focus change, so an app toggling
++ * IME while staying focused (e.g. a game between its chat box and gameplay) would
++ * keep the stale state -- text input grabbing the keys meant for gameplay until a
++ * refocus.
++ */
++BOOL WAYLAND_SetIMEEnabled(HWND hwnd, BOOL enabled)
++{
++    struct wayland_win_data *hwnd_data, *toplevel_data;
++    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
++    int num_ime_children = 0;
++    BOOL tracked = FALSE;
++
++    TRACE("hwnd %p, toplevel %p, enabled %u.\n", hwnd, toplevel, enabled);
++
++    /* Phase 1: maintain the per-toplevel IME-children count under win_data_mutex
++     * (the driver's OUTER lock). text_input->mutex (INNER) must NOT be held here:
++     * taking win_data_mutex under text_input->mutex would invert the order
++     * wayland_surface_destroy relies on and can deadlock (cf. SetIMECompositionRect). */
++    if ((hwnd_data = wayland_win_data_get(hwnd)))
++    {
++        if ((toplevel_data = wayland_win_data_get(toplevel)))
++        {
++            if (!hwnd_data->ime_enabled && enabled) toplevel_data->num_ime_children++;
++            else if (hwnd_data->ime_enabled && !enabled && toplevel_data->num_ime_children > 0)
++                toplevel_data->num_ime_children--;
++            hwnd_data->ime_enabled = enabled;
++            num_ime_children = toplevel_data->num_ime_children;
++            tracked = TRUE;
++            wayland_win_data_release(toplevel_data);
++        }
++        wayland_win_data_release(hwnd_data);
++    }
++    if (!tracked) return FALSE;
++
++    /* Phase 2: if that toplevel currently holds text-input focus, apply the
++     * aggregated state. Only text_input->mutex here; no win32u/win_data under it. */
++    wayland_text_input_update_ime_state(toplevel, num_ime_children);
++    return TRUE;
++}
++
++void wayland_text_input_update_ime_state(HWND toplevel, int num_ime_children)
++{
++    struct wayland_text_input *text_input = &process_wayland.text_input;
++
++    pthread_mutex_lock(&text_input->mutex);
++    if (text_input->zwp_text_input_v3 && text_input->focused_hwnd == toplevel)
++    {
++        if (num_ime_children)
++            wayland_text_input_ime_enable(text_input);
++        else
++            wayland_text_input_ime_disable(text_input);
++    }
++    pthread_mutex_unlock(&text_input->mutex);
++}
+
+--- dlls/winewayland.drv/waylanddrv.h
++++ dlls/winewayland.drv/waylanddrv.h
+@@ -41,6 +41,7 @@
+ #include "pointer-warp-v1-client-protocol.h"
+ #include "alpha-modifier-v1-client-protocol.h"
+ #include "fractional-scale-v1-client-protocol.h"
++#include "linux-dmabuf-unstable-v1-client-protocol.h"
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -70,6 +71,7 @@ enum wayland_window_message
+     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
+     WM_WAYLAND_CONFIGURE,
+     WM_WAYLAND_SET_FOREGROUND,
++    WM_WAYLAND_FLUSH_REMOTE_SURFACE_DMABUF,
+ };
+ 
+ enum wayland_surface_config_state
+@@ -133,6 +135,7 @@ struct wayland_text_input
+     } preedit, current_preedit;
+     WCHAR *commit_string;
+     HWND focused_hwnd;
++    BOOL enabled;
+     pthread_mutex_t mutex;
+ };
+ 
+@@ -185,6 +188,7 @@ struct wayland
+     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
+     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
+     struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
++    struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1;
+     struct wayland_seat seat;
+     struct wayland_keyboard keyboard;
+     struct wayland_pointer pointer;
+@@ -212,6 +216,26 @@ struct wayland_output_state
+     char *name;
+     int logical_x, logical_y;
+     int logical_w, logical_h;
++    /* Physical-pixel position assigned by the display layout (see display.c).
++     * Lets the rest of the driver map a window (in physical coords) to the
++     * output it sits on. */
++    int phys_x, phys_y;
++    /* Ratio of the physical mode size to the logical (post-scaling) size, i.e.
++     * the real compositor output scale (1.0, 2.0, 1.5, ...). Valid only when
++     * has_logical_size is TRUE, otherwise 0.0. */
++    double compositor_scale;
++    /* Whether logical_w/logical_h came from xdg_output (reliable). */
++    BOOL has_logical_size;
++    /* Whether xdg_output has ever reported a logical size for this output; used
++     * to keep a stale defaulted logical size from masquerading as reliable. */
++    BOOL has_xdg_logical_size;
++    /* wl_output.geometry: rotation and physical size in millimetres (0 if the
++     * compositor doesn't report it, e.g. virtual outputs). */
++    int transform;
++    int physical_width, physical_height;
++    /* wl_output.scale event value (0 if never received). Fallback scale source
++     * for compositors without xdg_output (e.g. gamescope, which sends 1). */
++    int32_t scale;
+ };
+ 
+ struct wayland_output
+@@ -237,6 +261,9 @@ struct wayland_window_config
+ {
+     RECT rect;
+     RECT client_rect;
++    /* Monitor rectangle containing the window, cached at config time so the
++     * flush-path reconfigure can clamp an oversized window without a win32u call. */
++    RECT monitor_rect;
+     enum wayland_surface_config_state state;
+     /* The scale (i.e., normalized dpi) the window is rendering at. */
+     double scale;
+@@ -271,6 +298,21 @@ struct wayland_shm_buffer
+     HRGN damage_region;
+ };
+ 
++#define WAYLAND_DMABUF_CACHE_SIZE 8
++
++struct wayland_dmabuf_buffer
++{
++    uint64_t ino;
++    uint64_t modifier;
++    struct wl_buffer *wl_buffer;
++    uint32_t width;
++    uint32_t height;
++    uint32_t format;
++    uint32_t last_used;
++    uint64_t st_size;
++    uint32_t stride;
++};
++
+ struct wayland_surface
+ {
+     HWND hwnd;
+@@ -303,6 +345,31 @@ struct wayland_surface
+     struct wayland_window_config window;
+     int content_width, content_height;
+     HCURSOR hcursor;
++
++    struct wayland_dmabuf_buffer dmabuf_buffers[WAYLAND_DMABUF_CACHE_SIZE];
++    uint32_t dmabuf_cache_clock;
++    /* TRUE when the subsurface has been unmapped because its window became
++     * (hierarchically) invisible; reset when real content is attached again, so
++     * the next present remaps it. Set by wayland_unmap_invisible_subtree(). */
++    BOOL content_hidden;
++    /* Cached subsurface placement: skip the per-present set_position and parent
++     * commit while this window's position didn't change since the last present. */
++    int last_sub_x, last_sub_y;
++    /* On a TOPLEVEL surface: the z-order epoch (subsurface restack serial) its
++     * subsurface stack was last rebuilt for. The rebuild is a single walk over
++     * all of the toplevel's subsurfaces, so the first presenting subsurface of
++     * an epoch does it and the rest skip. Unused on subsurfaces. */
++    LONG last_restack_serial;
++    BOOL subsurface_placed;
++    /* Monotonic identity, never reused (unlike the wl_surface proxy address,
++     * which libwayland recycles after destroy). A subsurface records its
++     * parent's serial; if the parent window's current surface has a different
++     * serial the parent was destroyed/recreated and this subsurface is orphaned
++     * — issuing any wl_subsurface request on it would raise a fatal
++     * "bad_surface" protocol error. Also used to confirm true siblings before a
++     * place_above/below. */
++    unsigned int serial;
++    unsigned int parent_serial;
+ };
+ 
+ /**********************************************************************
+@@ -318,6 +385,8 @@ BOOL wayland_process_init(void);
+ BOOL wayland_output_create(uint32_t id, uint32_t version);
+ void wayland_output_destroy(struct wayland_output *output);
+ void wayland_output_use_xdg_extension(struct wayland_output *output);
++double wayland_output_scale_for_rect(const RECT *rect);
++void wayland_update_outputs_physical_coords(void);
+ 
+ /**********************************************************************
+  *          Wayland surface
+@@ -332,7 +401,13 @@ void wayland_surface_clear_role(struct wayland_surface *surface);
+ void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                 struct wayland_shm_buffer *shm_buffer,
+                                 HRGN surface_damage_region);
+-BOOL wayland_surface_reconfigure(struct wayland_surface *surface);
++BOOL wayland_surface_reconfigure(struct wayland_surface *surface, BOOL from_flush);
++void wayland_unmap_invisible_subtree(HWND hwnd);
++
++/* Mark that a window's position, z-order or visibility may have changed, so
++ * subsurfaces re-evaluate their stacking on the next present instead of walking
++ * the whole window list on every frame. */
++void wayland_invalidate_subsurface_zorder(void);
+ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf, RECT rect,
+                                           enum wayland_surface_config_state state);
+ RECT map_rect_to_surface(struct wayland_surface *surface, RECT rect);
+@@ -362,6 +437,15 @@ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMA
+ void wayland_shm_buffer_ref(struct wayland_shm_buffer *shm_buffer);
+ void wayland_shm_buffer_unref(struct wayland_shm_buffer *shm_buffer);
+ 
++struct wayland_buffer_queue;
++struct wayland_buffer_queue *wayland_buffer_queue_create(int width, int height, uint32_t format);
++void wayland_buffer_queue_destroy(struct wayland_buffer_queue *queue);
++struct wayland_shm_buffer *wayland_buffer_queue_get_free_buffer(struct wayland_buffer_queue *queue);
++void wayland_buffer_queue_add_damage(struct wayland_buffer_queue *queue, HRGN damage);
++void wayland_buffer_queue_get_size(struct wayland_buffer_queue *queue, int *width, int *height);
++void copy_pixel_region(const char *src_pixels, RECT *src_rect,
++                       char *dst_pixels, RECT *dst_rect, HRGN region, BOOL force_opaque);
++
+ /**********************************************************************
+  *          Wayland Window
+  */
+@@ -378,18 +462,27 @@ struct wayland_win_data
+     struct wayland_surface *wayland_surface;
+     /* wayland client surface (if any) for this window */
+     struct wayland_client_surface *client_surface;
++    /* overlay subsurface presenting pixels painted by other processes */
++    struct wayland_surface *remote_overlay;
++    /* buffer pool for the overlay (busy tracking + per-buffer damage) */
++    struct wayland_buffer_queue *remote_buffer_queue;
+     /* window rects, relative to parent client area */
+     struct window_rects rects;
+     BOOL is_fullscreen;
+-    BOOL resizeable;
+     BOOL managed;
+     BOOL layered_attribs_set;
++    DWORD style;
++    DWORD ex_style;
++    /* IME activation tracking: ime_enabled is this window's own state (set from
++     * the app's ImmAssociateContext), num_ime_children counts how many windows in
++     * this toplevel's tree currently want IME (kept on the GA_ROOT toplevel). */
++    BOOL ime_enabled;
++    int num_ime_children;
+ };
+ 
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+ void wayland_win_data_release(struct wayland_win_data *data);
+ 
+-struct wayland_client_surface *get_client_surface(HWND hwnd);
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
+ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
+@@ -412,6 +505,7 @@ void activate_keyboard_hkl(HWND hwnd, BOOL ime);
+ void wayland_pointer_init(struct wl_pointer *wl_pointer);
+ void wayland_pointer_deinit(void);
+ void wayland_pointer_clear_constraint(void);
++struct wayland_shm_buffer *create_mono_cursor_buffer(HBITMAP bmp);
+ 
+ /**********************************************************************
+  *          Wayland text input
+@@ -419,6 +513,7 @@ void wayland_pointer_clear_constraint(void);
+ 
+ void wayland_text_input_init(void);
+ void wayland_text_input_deinit(void);
++void wayland_text_input_update_ime_state(HWND toplevel, int num_ime_children);
+ 
+ /**********************************************************************
+  *          Wayland data device
+@@ -455,6 +550,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset);
+ LRESULT WAYLAND_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+ void WAYLAND_DestroyWindow(HWND hwnd);
+ BOOL WAYLAND_SetIMECompositionRect(HWND hwnd, RECT rect);
++BOOL WAYLAND_SetIMEEnabled(HWND hwnd, BOOL enabled);
+ void WAYLAND_SetCursor(HWND hwnd, HCURSOR hcursor);
+ BOOL WAYLAND_SetCursorPos(INT x, INT y);
+ void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWORD flags);
+@@ -469,6 +565,15 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+                               const struct window_rects *new_rects, struct window_surface *surface);
+ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
+ struct client_surface *WAYLAND_CreateClientSurface(HWND hwnd, int pixel_format);
++void WAYLAND_FlushRemoteSurface(HWND hwnd, const RECT *dirty, const void *bits,
++                                UINT stride, UINT width, UINT height);
++void WAYLAND_FlushRemoteSurfaceDMABUF(HWND hwnd, HANDLE handle, UINT64 modifier,
++                                      UINT width, UINT height, UINT stride);
++BOOL WAYLAND_NeedsPaintOverlay(HWND hwnd);
++LRESULT WAYLAND_NotifyIcon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data);
++void WAYLAND_CleanupIcons(HWND hwnd);
++BOOL wayland_get_icon_info(HICON handle, ICONINFOEXW *ret);
++NTSTATUS waylanddrv_unix_tray_dispatch(void *arg);
+ BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
+ UINT WAYLAND_VulkanInit(UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs);
+ UINT WAYLAND_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs);
+
+--- dlls/winewayland.drv/waylanddrv_main.c
++++ dlls/winewayland.drv/waylanddrv_main.c
+@@ -32,13 +32,20 @@
+ 
+ char *process_name = NULL;
+ 
++static BOOL WAYLAND_WantsCrossProcessSurfaces(void)
++{
++    return TRUE;
++}
++
+ static const struct user_driver_funcs waylanddrv_funcs =
+ {
++    .pCleanupIcons = WAYLAND_CleanupIcons,
+     .pClipboardWindowProc = WAYLAND_ClipboardWindowProc,
+     .pClipCursor = WAYLAND_ClipCursor,
+     .pDesktopWindowProc = WAYLAND_DesktopWindowProc,
+     .pDestroyWindow = WAYLAND_DestroyWindow,
+     .pSetIMECompositionRect = WAYLAND_SetIMECompositionRect,
++    .pSetIMEEnabled = WAYLAND_SetIMEEnabled,
+     .pKbdLayerDescriptor = WAYLAND_KbdLayerDescriptor,
+     .pReleaseKbdTables = WAYLAND_ReleaseKbdTables,
+     .pSetCursor = WAYLAND_SetCursor,
+@@ -57,6 +64,11 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .pCreateWindowSurface = WAYLAND_CreateWindowSurface,
+     .pVulkanInit = WAYLAND_VulkanInit,
+     .pOpenGLInit = WAYLAND_OpenGLInit,
++    .pWantsCrossProcessSurfaces = WAYLAND_WantsCrossProcessSurfaces,
++    .pFlushRemoteSurface = WAYLAND_FlushRemoteSurface,
++    .pFlushRemoteSurfaceDMABUF = WAYLAND_FlushRemoteSurfaceDMABUF,
++    .pNeedsPaintOverlay = WAYLAND_NeedsPaintOverlay,
++    .pNotifyIcon = WAYLAND_NotifyIcon,
+ };
+ 
+ static void wayland_init_process_name(void)
+@@ -128,6 +140,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     waylanddrv_unix_init,
+     waylanddrv_unix_read_events,
+     waylanddrv_unix_init_clipboard,
++    waylanddrv_unix_tray_dispatch,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == waylanddrv_unix_func_count);
+@@ -139,6 +152,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     waylanddrv_unix_init,
+     waylanddrv_unix_read_events,
+     waylanddrv_unix_init_clipboard,
++    waylanddrv_unix_tray_dispatch,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == waylanddrv_unix_func_count);
+
+--- dlls/winewayland.drv/window.c
++++ dlls/winewayland.drv/window.c
+
+--- dlls/winewayland.drv/window_surface.c
++++ dlls/winewayland.drv/window_surface.c
+@@ -69,7 +69,7 @@ static const struct wl_buffer_listener buffer_listener = { buffer_release };
+  *
+  * Destroys a buffer queue and any contained buffers.
+  */
+-static void wayland_buffer_queue_destroy(struct wayland_buffer_queue *queue)
++void wayland_buffer_queue_destroy(struct wayland_buffer_queue *queue)
+ {
+     struct wayland_shm_buffer *shm_buffer, *next;
+ 
+@@ -103,8 +103,8 @@ static void wayland_buffer_queue_destroy(struct wayland_buffer_queue *queue)
+  *
+  * Creates a buffer queue containing buffers with the specified width and height.
+  */
+-static struct wayland_buffer_queue *wayland_buffer_queue_create(int width, int height,
+-                                                                uint32_t format)
++struct wayland_buffer_queue *wayland_buffer_queue_create(int width, int height,
++                                                         uint32_t format)
+ {
+     struct wayland_buffer_queue *queue;
+ 
+@@ -132,7 +132,7 @@ err:
+  * Gets a free buffer from the buffer queue. If no free buffers
+  * are available this function blocks until it can provide one.
+  */
+-static struct wayland_shm_buffer *wayland_buffer_queue_get_free_buffer(struct wayland_buffer_queue *queue)
++struct wayland_shm_buffer *wayland_buffer_queue_get_free_buffer(struct wayland_buffer_queue *queue)
+ {
+     struct wayland_shm_buffer *shm_buffer;
+ 
+@@ -200,7 +200,7 @@ out:
+ /**********************************************************************
+  *          wayland_buffer_queue_add_damage
+  */
+-static void wayland_buffer_queue_add_damage(struct wayland_buffer_queue *queue, HRGN damage)
++void wayland_buffer_queue_add_damage(struct wayland_buffer_queue *queue, HRGN damage)
+ {
+     struct wayland_shm_buffer *shm_buffer;
+ 
+@@ -211,6 +211,12 @@ static void wayland_buffer_queue_add_damage(struct wayland_buffer_queue *queue,
+     }
+ }
+ 
++void wayland_buffer_queue_get_size(struct wayland_buffer_queue *queue, int *width, int *height)
++{
++    *width = queue->width;
++    *height = queue->height;
++}
++
+ /***********************************************************************
+  *           wayland_window_surface_set_clip
+  */
+@@ -243,9 +249,9 @@ RGNDATA *get_region_data(HRGN region)
+ /**********************************************************************
+  *          copy_pixel_region
+  */
+-static void copy_pixel_region(const char *src_pixels, RECT *src_rect,
+-                              char *dst_pixels, RECT *dst_rect,
+-                              HRGN region, BOOL force_opaque)
++void copy_pixel_region(const char *src_pixels, RECT *src_rect,
++                       char *dst_pixels, RECT *dst_rect,
++                       HRGN region, BOOL force_opaque)
+ {
+     static const int bpp = WINEWAYLAND_BYTES_PER_PIXEL;
+     RGNDATA *rgndata = get_region_data(region);
+@@ -418,6 +424,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+             if (!copy_from_latest_region)
+             {
+                 ERR("failed to create copy_from_latest region\n");
++                wayland_shm_buffer_unref(latest_buffer);
+                 goto done;
+             }
+             NtGdiCombineRgn(copy_from_latest_region, shm_buffer->damage_region,
+
+--- dlls/winex11.drv/xrandr.c
++++ dlls/winex11.drv/xrandr.c
+@@ -1136,6 +1136,10 @@ static BOOL xrandr14_get_monitors( ULONG_PTR adapter_id, struct gdi_monitor **ne
+                 if (!realloc_monitors)
+                     goto done;
+                 monitors = realloc_monitors;
++                /* realloc does not zero the grown slots; clear them so fields the
++                 * loop below leaves unset (edid_info, hdr_enabled) stay zeroed like
++                 * the initial calloc'd slots, matching add_monitor's expectations. */
++                memset( monitors + monitor_count, 0, (capacity - monitor_count) * sizeof(*monitors) );
+             }
+ 
+             if (enum_output_info->crtc)
+
+--- include/wine/gdi_driver.h
++++ include/wine/gdi_driver.h
+@@ -218,7 +218,7 @@ struct gdi_dc_funcs
+ };
+ 
+ /* increment this when you change the DC function table */
+-#define WINE_GDI_DRIVER_VERSION 110
++#define WINE_GDI_DRIVER_VERSION 111
+ 
+ #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
+ #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
+@@ -335,12 +335,41 @@ struct pci_id
+     UINT16 revision;
+ };
+ 
++#define MONITOR_INFO_HAS_MONITOR_ID     0x00000001
++#define MONITOR_INFO_HAS_MONITOR_NAME   0x00000002
++#define MONITOR_INFO_HAS_PREFERRED_MODE 0x00000004
++
++/* Parsed monitor identification exchanged between win32u and the drivers. A
++ * driver may either provide a binary hardware EDID (which win32u parses into
++ * this), or fill this directly (which win32u converts to a binary EDID), so the
++ * EDID byte assembly lives in one place instead of being duplicated per driver.
++ * The first group of fields is what win32u extracts from any EDID; the second
++ * group is only consumed when synthesizing an EDID from driver-provided info. */
++struct edid_monitor_info
++{
++    unsigned int flags;
++    /* MONITOR_INFO_HAS_MONITOR_ID */
++    unsigned short manufacturer, product_code; /* manufacturer: packed big-endian PNP id */
++    char monitor_id_string[8];
++    /* MONITOR_INFO_HAS_MONITOR_NAME */
++    WCHAR monitor_name[14];
++    /* MONITOR_INFO_HAS_PREFERRED_MODE */
++    unsigned int preferred_width, preferred_height;
++    /* used only to synthesize a binary EDID (see edid_info below) */
++    unsigned int serial_number;
++    unsigned int width_mm, height_mm;
++    unsigned int preferred_refresh; /* in mHz */
++};
++
+ struct gdi_monitor
+ {
+     RECT rc_monitor;      /* RcMonitor in MONITORINFO struct */
+     RECT rc_work;         /* RcWork in MONITORINFO struct */
+     unsigned char *edid;  /* Extended Device Identification Data */
+     UINT edid_len;
++    /* parsed monitor info, used to synthesize an EDID when edid above is NULL;
++     * ignored when a binary edid is provided */
++    const struct edid_monitor_info *edid_info;
+     BOOL hdr_enabled;
+ };
+ 
+@@ -379,6 +408,7 @@ struct user_driver_funcs
+     UINT    (*pImeToAsciiEx)(UINT,UINT,const BYTE*,HIMC);
+     void    (*pNotifyIMEStatus)(HWND,UINT);
+     BOOL    (*pSetIMECompositionRect)(HWND,RECT);
++    BOOL    (*pSetIMEEnabled)(HWND,BOOL);
+     /* cursor/icon functions */
+     void    (*pDestroyCursorIcon)(HCURSOR);
+     void    (*pSetCursor)(HWND,HCURSOR);
+@@ -438,6 +468,19 @@ struct user_driver_funcs
+     UINT    (*pOpenGLInit)(UINT,const struct opengl_funcs *,const struct opengl_driver_funcs **);
+     /* thread management */
+     void    (*pThreadDetach)(void);
++    /* whether the driver wants shared-memory surfaces for painting windows
++     * whose toplevel ancestor belongs to another process (no native
++     * cross-process rendering support, e.g. Wayland) */
++    BOOL    (*pWantsCrossProcessSurfaces)(void);
++    /* present cross-process pixels for a toplevel window we own whose
++     * window surface cannot be used (e.g. OpenGL/Vulkan content) */
++    void    (*pFlushRemoteSurface)(HWND,const RECT *,const void *,UINT,UINT,UINT);
++    /* present cross-process DMABUF Vulkan frame */
++    void    (*pFlushRemoteSurfaceDMABUF)(HWND,HANDLE,UINT64,UINT,UINT,UINT);
++    /* whether GDI painting into this toplevel's window surface would be
++     * obscured (e.g. by a GL/VK client surface plane) and should instead
++     * go through pFlushRemoteSurface */
++    BOOL    (*pNeedsPaintOverlay)(HWND);
+ };
+ 
+ W32KAPI void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version );
+
+--- include/wine/vulkan_driver.h
++++ include/wine/vulkan_driver.h
+@@ -89,7 +89,7 @@ struct VkDevice_T
+ #include "wine/list.h"
+ 
+ /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
+-#define WINE_VULKAN_DRIVER_VERSION 48
++#define WINE_VULKAN_DRIVER_VERSION 49
+ 
+ struct vulkan_object
+ {
+@@ -352,6 +352,17 @@ struct vulkan_funcs
+     PFN_vkQueueSubmit2KHR p_vkQueueSubmit2KHR;
+     PFN_vkUnmapMemory p_vkUnmapMemory;
+     PFN_vkUnmapMemory2KHR p_vkUnmapMemory2KHR;
++    void (*p_vkFlushRemoteSurfaceDMABUF)(HWND hwnd, HANDLE handle, UINT64 modifier, UINT width, UINT height, UINT stride);
++    /* Software (CPU bits) present fallback, for when the swapchain could not be
++     * backed by an exportable DMABUF (e.g. a software Vulkan device); mirrors the
++     * gdi_driver pFlushRemoteSurface entry. */
++    void (*p_vkFlushRemoteSurface)(HWND hwnd, const RECT *dirty, const void *bits, UINT stride, UINT width, UINT height);
++    /* Whether the display driver presents through the remote-surface entry
++     * points above (pWantsCrossProcessSurfaces, e.g. winewayland), so
++     * winevulkan should use its client-side (DMABUF) WSI. When FALSE the
++     * driver has a native host WSI (e.g. winex11) and winevulkan routes all
++     * surface/swapchain calls back through win32u instead. */
++    BOOL (*p_client_wsi_supported)(void);
+ };
+ 
+ /* interface between win32u and the user drivers */
+
+--- include/ntuser.h
++++ include/ntuser.h
+@@ -640,6 +640,7 @@ enum wine_internal_message
+     WM_WINE_UPDATEWINDOWSTATE,
+     WM_WINE_TRACKMOUSEEVENT,
+     WM_WINE_SETPIXELFORMAT,
++    WM_WINE_FLUSH_REMOTE_SURFACE,
+     WM_WINE_FIRST_DRIVER_MSG = 0x80001000,  /* range of messages reserved for the USER driver */
+     WM_WINE_CLIPCURSOR = 0x80001ff0, /* internal driver notification messages */
+     WM_WINE_SETCURSOR,
+

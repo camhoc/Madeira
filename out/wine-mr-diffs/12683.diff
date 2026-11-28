@@ -1,0 +1,376 @@
+# ntdll: Use shared XState config for emulated XState on ARM64.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12683 state=merged
+# !12610 implemented in-process xstate config for ARM64EC, which matches released Windows versions. However, the experimental Windows version fills USD xstate config instead. This is generally better for the compatibility as an application can use USD directly as well.
+
+I was looking at this in the context of AVX on wow64. The released Windows version does not seem to support that at all in ntdll; it allows enabling AVX instructions emulation, but OS support is just not present. In experimental Windows the support is still not complete (in particular, getting and setting AVX context is only partially supported), but xstate-related functions work fine and AVX is enabled by default. With this series, functions for manipulating xstate work fine on Wine as well.
+--- dlls/ntdll/unix/system.c
++++ dlls/ntdll/unix/system.c
+@@ -761,7 +761,7 @@ static ULONGLONG get_cpu_features(void)
+ 
+ void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
+ {
+-    BOOLEAN *features = data->ProcessorFeatures;
++    BOOLEAN *features = data->ProcessorFeatures, have_x86 = FALSE;
+ 
+     features[PF_FASTFAIL_AVAILABLE]      = TRUE;
+     features[PF_COMPARE_EXCHANGE_DOUBLE] = TRUE;
+@@ -806,20 +806,40 @@ void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
+         switch (supported_machines[i])
+         {
+         case IMAGE_FILE_MACHINE_I386:
+-            features[PF_MMX_INSTRUCTIONS_AVAILABLE]    = TRUE;
+-            features[PF_XMMI_INSTRUCTIONS_AVAILABLE]   = TRUE;
+-            features[PF_RDTSC_INSTRUCTION_AVAILABLE]   = TRUE;
+-            features[PF_XMMI64_INSTRUCTIONS_AVAILABLE] = TRUE;
+-            features[PF_SSE3_INSTRUCTIONS_AVAILABLE]   = TRUE;
+-            features[PF_COMPARE_EXCHANGE128]           = TRUE;
+-            features[PF_RDTSCP_INSTRUCTION_AVAILABLE]  = TRUE;
+-            features[PF_SSSE3_INSTRUCTIONS_AVAILABLE]  = TRUE;
+-            features[PF_SSE4_1_INSTRUCTIONS_AVAILABLE] = TRUE;
+-            features[PF_SSE4_2_INSTRUCTIONS_AVAILABLE] = TRUE;
++        case IMAGE_FILE_MACHINE_AMD64:
++            have_x86 = TRUE;
+             break;
+         }
+     }
+ #endif
++
++    if (have_x86)
++    {
++        XSTATE_CONFIGURATION *xstate_config = &data->XState;
++
++        features[PF_MMX_INSTRUCTIONS_AVAILABLE]    = TRUE;
++        features[PF_XMMI_INSTRUCTIONS_AVAILABLE]   = TRUE;
++        features[PF_RDTSC_INSTRUCTION_AVAILABLE]   = TRUE;
++        features[PF_XMMI64_INSTRUCTIONS_AVAILABLE] = TRUE;
++        features[PF_SSE3_INSTRUCTIONS_AVAILABLE]   = TRUE;
++        features[PF_COMPARE_EXCHANGE128]           = TRUE;
++        features[PF_XSAVE_ENABLED]                 = TRUE;
++        features[PF_RDTSCP_INSTRUCTION_AVAILABLE]  = TRUE;
++        features[PF_SSSE3_INSTRUCTIONS_AVAILABLE]  = TRUE;
++        features[PF_SSE4_1_INSTRUCTIONS_AVAILABLE] = TRUE;
++        features[PF_SSE4_2_INSTRUCTIONS_AVAILABLE] = TRUE;
++        features[PF_AVX_INSTRUCTIONS_AVAILABLE]    = TRUE;
++        features[PF_AVX2_INSTRUCTIONS_AVAILABLE]   = TRUE;
++
++        xstate_config->EnabledFeatures = xstate_config->EnabledVolatileFeatures = XSTATE_MASK_LEGACY | XSTATE_MASK_AVX;
++        xstate_config->Features[XSTATE_LEGACY_FLOATING_POINT].Offset = 0;
++        xstate_config->Features[XSTATE_LEGACY_FLOATING_POINT].Size   = 10 * sizeof(M128A);
++        xstate_config->Features[XSTATE_LEGACY_SSE].Offset = 10 * sizeof(M128A);
++        xstate_config->Features[XSTATE_LEGACY_SSE].Size   = 16 * sizeof(M128A);
++        xstate_config->Features[XSTATE_AVX].Offset = sizeof(XSAVE_AREA);
++        xstate_config->Features[XSTATE_AVX].Size   = sizeof(YMMCONTEXT);
++        xstate_config->Size = xstate_config->AllFeatureSize = sizeof(XSAVE_FORMAT) + sizeof(XSTATE);
++    }
+ }
+ 
+ #endif /* End architecture specific feature detection for CPUs */
+
+--- dlls/ntdll/exception.c
++++ dlls/ntdll/exception.c
+@@ -601,14 +601,6 @@ void WINAPI RtlGetCallersAddress( void **caller, void **parent )
+ }
+ 
+ 
+-/**********************************************************************
+- *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
+- */
+-ULONG64 WINAPI RtlGetEnabledExtendedFeatures(ULONG64 feature_mask)
+-{
+-    return user_xstate_config->EnabledFeatures & feature_mask;
+-}
+-
+ struct context_copy_range
+ {
+     ULONG start;
+@@ -682,8 +674,8 @@ static int next_compacted_xstate_offset( int off, UINT64 compaction_mask, int fe
+ {
+     const UINT64 feature_mask = (UINT64)1 << feature_idx;
+ 
+-    if (compaction_mask & feature_mask) off += user_xstate_config->Features[feature_idx].Size;
+-    if (user_xstate_config->AlignedFeatures & (feature_mask << 1))
++    if (compaction_mask & feature_mask) off += user_shared_data->XState.Features[feature_idx].Size;
++    if (user_shared_data->XState.AlignedFeatures & (feature_mask << 1))
+         off = (off + 63) & ~63;
+     return off;
+ }
+@@ -701,7 +693,7 @@ static int xstate_get_compacted_size( UINT64 mask )
+     i = 2;
+     while (mask)
+     {
+-        if (mask == 1) return off + user_xstate_config->Features[i].Size;
++        if (mask == 1) return off + user_shared_data->XState.Features[i].Size;
+         off = next_compacted_xstate_offset( off, compaction_mask, i );
+         mask >>= 1;
+         ++i;
+@@ -721,7 +713,7 @@ static int xstate_get_size( UINT64 mask )
+         mask >>= 1;
+         ++i;
+     }
+-    return user_xstate_config->Features[i].Offset + user_xstate_config->Features[i].Size - sizeof(XSAVE_FORMAT);
++    return user_shared_data->XState.Features[i].Offset + user_shared_data->XState.Features[i].Size - sizeof(XSAVE_FORMAT);
+ }
+ 
+ /**********************************************************************
+@@ -751,9 +743,9 @@ NTSTATUS WINAPI RtlGetExtendedContextLength2( ULONG context_flags, ULONG *length
+     size = p->context_size + p->context_ex_size + 63;
+ 
+     compaction_mask &= supported_mask & ~(ULONG64)3;
+-    if (user_xstate_config->CompactionEnabled) size += xstate_get_compacted_size( compaction_mask );
+-    else if (compaction_mask)                  size += xstate_get_size( compaction_mask );
+-    else                                       size += sizeof(XSAVE_AREA_HEADER);
++    if (user_shared_data->XState.CompactionEnabled) size += xstate_get_compacted_size( compaction_mask );
++    else if (compaction_mask)                       size += xstate_get_size( compaction_mask );
++    else                                            size += sizeof(XSAVE_AREA_HEADER);
+ 
+     *length = size;
+     return STATUS_SUCCESS;
+@@ -806,12 +798,12 @@ NTSTATUS WINAPI RtlInitializeExtendedContext2( void *context, ULONG context_flag
+         c_ex->XState.Offset = (ULONG_PTR)xs - (ULONG_PTR)c_ex;
+         compaction_mask &= supported_mask;
+ 
+-        if (user_xstate_config->CompactionEnabled) c_ex->XState.Length = xstate_get_compacted_size( compaction_mask );
+-        else if (compaction_mask & ~(ULONG64)3)    c_ex->XState.Length = xstate_get_size( compaction_mask );
+-        else                                       c_ex->XState.Length = sizeof(XSAVE_AREA_HEADER);
++        if (user_shared_data->XState.CompactionEnabled) c_ex->XState.Length = xstate_get_compacted_size( compaction_mask );
++        else if (compaction_mask & ~(ULONG64)3)         c_ex->XState.Length = xstate_get_size( compaction_mask );
++        else                                            c_ex->XState.Length = sizeof(XSAVE_AREA_HEADER);
+ 
+         memset( xs, 0, c_ex->XState.Length );
+-        if (user_xstate_config->CompactionEnabled)
++        if (user_shared_data->XState.CompactionEnabled)
+             xs->CompactionMask = ((ULONG64)1 << 63) | compaction_mask;
+ 
+         c_ex->All.Length = p->context_size + c_ex->XState.Offset + c_ex->XState.Length;
+@@ -855,7 +847,7 @@ void * WINAPI RtlLocateExtendedFeature2( CONTEXT_EX *context_ex, ULONG feature_i
+         return NULL;
+     }
+ 
+-    if (xstate_config != user_xstate_config)
++    if (xstate_config != &user_shared_data->XState)
+     {
+         FIXME( "Custom xstate configuration is not supported.\n" );
+         return NULL;
+@@ -895,7 +887,7 @@ void * WINAPI RtlLocateExtendedFeature2( CONTEXT_EX *context_ex, ULONG feature_i
+ void * WINAPI RtlLocateExtendedFeature( CONTEXT_EX *context_ex, ULONG feature_id,
+         ULONG *length )
+ {
+-    return RtlLocateExtendedFeature2( context_ex, feature_id, user_xstate_config, length );
++    return RtlLocateExtendedFeature2( context_ex, feature_id, &user_shared_data->XState, length );
+ }
+ 
+ /**********************************************************************
+@@ -1040,7 +1032,7 @@ NTSTATUS WINAPI RtlCopyExtendedContext( CONTEXT_EX *dst, ULONG context_flags, CO
+ 
+     memset(dst_xs, 0, sizeof(XSAVE_AREA_HEADER));
+     dst_xs->Mask = (src_xs->Mask & ~(ULONG64)3) & feature_mask;
+-    dst_xs->CompactionMask = user_xstate_config->CompactionEnabled
++    dst_xs->CompactionMask = user_shared_data->XState.CompactionEnabled
+             ? ((ULONG64)1 << 63) | (src_xs->CompactionMask & feature_mask) : 0;
+     feature_mask = dst_xs->Mask >> 2;
+ 
+@@ -1050,8 +1042,8 @@ NTSTATUS WINAPI RtlCopyExtendedContext( CONTEXT_EX *dst, ULONG context_flags, CO
+     {
+         if (feature_mask & 1)
+         {
+-            if (!dst_xs->CompactionMask) off = user_xstate_config->Features[i].Offset - sizeof(XSAVE_FORMAT);
+-            size = user_xstate_config->Features[i].Size;
++            if (!dst_xs->CompactionMask) off = user_shared_data->XState.Features[i].Offset - sizeof(XSAVE_FORMAT);
++            size = user_shared_data->XState.Features[i].Size;
+             if (src->XState.Length < off + size || dst->XState.Length < off + size) break;
+             memcpy( (BYTE *)dst_xs + off, (BYTE *)src_xs + off, size );
+         }
+
+--- dlls/ntdll/ntdll_misc.h
++++ dlls/ntdll/ntdll_misc.h
+@@ -99,7 +99,6 @@ extern const WCHAR windows_dir[];
+ extern void (FASTCALL *pBaseThreadInitThunk)(DWORD,LPTHREAD_START_ROUTINE,void *);
+ 
+ extern struct _KUSER_SHARED_DATA *user_shared_data;
+-extern struct _XSTATE_CONFIGURATION *user_xstate_config;
+ 
+ #ifdef _WIN64
+ static inline TEB64 *NtCurrentTeb64(void) { return NULL; }
+
+--- dlls/ntdll/signal_arm.c
++++ dlls/ntdll/signal_arm.c
+@@ -586,6 +586,15 @@ BOOLEAN WINAPI RtlIsProcessorFeaturePresent( UINT feature )
+ }
+ 
+ 
++/**********************************************************************
++ *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
++ */
++ULONG64 WINAPI RtlGetEnabledExtendedFeatures( ULONG64 feature_mask )
++{
++    return 0;
++}
++
++
+ /*************************************************************************
+  *		RtlWalkFrameChain (NTDLL.@)
+  */
+
+--- dlls/ntdll/signal_arm64.c
++++ dlls/ntdll/signal_arm64.c
+@@ -674,6 +674,15 @@ BOOLEAN WINAPI RtlIsProcessorFeaturePresent( UINT feature )
+ }
+ 
+ 
++/**********************************************************************
++ *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
++ */
++ULONG64 WINAPI RtlGetEnabledExtendedFeatures( ULONG64 feature_mask )
++{
++    return 0;
++}
++
++
+ /*************************************************************************
+  *		RtlWalkFrameChain (NTDLL.@)
+  */
+
+--- dlls/ntdll/signal_arm64ec.c
++++ dlls/ntdll/signal_arm64ec.c
+@@ -66,10 +66,8 @@ static NTSTATUS (WINAPI *pThreadInit)(void);
+ static void     (WINAPI *pThreadTerm)(HANDLE,LONG);
+ static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
+ 
+-static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
+-static XSTATE_CONFIGURATION xstate_config = {
+-    .EnabledFeatures = XSTATE_MASK_AVX /* store full xstate before the config is fully initialized */
+-};
++/* store full xstate before the config is fully initialized */
++static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX] = { [PF_AVX_INSTRUCTIONS_AVAILABLE] = TRUE };
+ 
+ static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
+ extern void KiUserExceptionDispatcher_thunk(void) asm("EXP+#KiUserExceptionDispatcher");
+@@ -241,23 +239,6 @@ NTSTATUS arm64ec_process_init( HMODULE module )
+         for (unsigned int i = 0; i < PROCESSOR_FEATURE_MAX; i++)
+             emulated_processor_features[i] = pBTCpu64IsProcessorFeaturePresent( i );
+ 
+-        xstate_config.EnabledFeatures = XSTATE_MASK_LEGACY;
+-        xstate_config.Features[XSTATE_LEGACY_FLOATING_POINT].Offset = 0;
+-        xstate_config.Features[XSTATE_LEGACY_FLOATING_POINT].Size   = 10 * sizeof(M128A);
+-        xstate_config.Features[XSTATE_LEGACY_SSE].Offset = 10 * sizeof(M128A);
+-        xstate_config.Features[XSTATE_LEGACY_SSE].Size   = 16 * sizeof(M128A);
+-        xstate_config.Size = sizeof(XSAVE_AREA);
+-        if (emulated_processor_features[PF_AVX_INSTRUCTIONS_AVAILABLE])
+-        {
+-            xstate_config.EnabledFeatures |= XSTATE_MASK_AVX;
+-            xstate_config.Features[XSTATE_AVX].Offset = sizeof(XSAVE_AREA);
+-            xstate_config.Features[XSTATE_AVX].Size   = sizeof(YMMCONTEXT);
+-            xstate_config.Size += sizeof(YMMCONTEXT);
+-        }
+-        xstate_config.EnabledVolatileFeatures = xstate_config.EnabledFeatures;
+-        xstate_config.AllFeatureSize = xstate_config.Size;
+-        user_xstate_config = &xstate_config;
+-
+         status = create_cross_process_work_list( info );
+     }
+     if (!status && pThreadInit) status = pThreadInit();
+@@ -763,7 +744,7 @@ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
+         if (context_ex->XState.Length < sizeof(XSAVE_AREA_HEADER) || context_ex->XState.Length > sizeof(*xstate))
+             return STATUS_INVALID_PARAMETER;
+ 
+-        xstate->Mask &= XSTATE_MASK_AVX & user_xstate_config->EnabledFeatures;
++        xstate->Mask &= XSTATE_MASK_AVX & RtlGetEnabledExtendedFeatures( XSTATE_MASK_AVX );
+         xstate->CompactionMask = 0;
+         if ((xstate->Mask & XSTATE_MASK_AVX) && context_ex->XState.Length < sizeof(*xstate))
+             return STATUS_BUFFER_OVERFLOW;
+@@ -1321,7 +1302,7 @@ static void init_xcontext( struct xcontext *ctx, ARM64_NT_CONTEXT *arm_ctx )
+     ctx->c_ex.All.Offset = ctx->c_ex.Legacy.Offset;
+     ctx->c_ex.All.Length = sizeof(CONTEXT) + ctx->c_ex.XState.Offset + ctx->c_ex.XState.Length;
+ 
+-    xs->Mask = XSTATE_MASK_AVX & xstate_config.EnabledFeatures;
++    xs->Mask = XSTATE_MASK_AVX & RtlGetEnabledExtendedFeatures( XSTATE_MASK_AVX );
+     xs->CompactionMask = 0;
+     memset( xs->Reserved, 0, sizeof(xs->Reserved) );
+ 
+@@ -1906,6 +1887,16 @@ BOOLEAN WINAPI RtlIsProcessorFeaturePresent( UINT feature )
+ }
+ 
+ 
++/**********************************************************************
++ *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
++ */
++ULONG64 WINAPI RtlGetEnabledExtendedFeatures( ULONG64 feature_mask )
++{
++    if (!emulated_processor_features[PF_AVX_INSTRUCTIONS_AVAILABLE]) return 0;
++    return user_shared_data->XState.EnabledFeatures & feature_mask;
++}
++
++
+ /*************************************************************************
+  *		RtlWalkFrameChain (NTDLL.@)
+  */
+
+--- dlls/ntdll/signal_i386.c
++++ dlls/ntdll/signal_i386.c
+@@ -30,6 +30,7 @@
+ #include "ntstatus.h"
+ #include "windef.h"
+ #include "ntdll_misc.h"
++#include "ddk/wdm.h"
+ #include "wine/exception.h"
+ #include "wine/debug.h"
+ #include "ntsyscalls.h"
+@@ -448,6 +449,15 @@ BOOLEAN WINAPI RtlIsProcessorFeaturePresent( UINT feature )
+ }
+ 
+ 
++/**********************************************************************
++ *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
++ */
++ULONG64 WINAPI RtlGetEnabledExtendedFeatures( ULONG64 feature_mask )
++{
++    return user_shared_data->XState.EnabledFeatures & feature_mask;
++}
++
++
+ /*************************************************************************
+  *		RtlWalkFrameChain (NTDLL.@)
+  */
+
+--- dlls/ntdll/signal_x86_64.c
++++ dlls/ntdll/signal_x86_64.c
+@@ -934,6 +934,15 @@ BOOLEAN WINAPI RtlIsProcessorFeaturePresent( UINT feature )
+ }
+ 
+ 
++/**********************************************************************
++ *              RtlGetEnabledExtendedFeatures   (NTDLL.@)
++ */
++ULONG64 WINAPI RtlGetEnabledExtendedFeatures( ULONG64 feature_mask )
++{
++    return user_shared_data->XState.EnabledFeatures & feature_mask;
++}
++
++
+ /*************************************************************************
+  *		RtlWalkFrameChain (NTDLL.@)
+  */
+
+--- dlls/ntdll/thread.c
++++ dlls/ntdll/thread.c
+@@ -36,7 +36,6 @@ WINE_DECLARE_DEBUG_CHANNEL(pid);
+ WINE_DECLARE_DEBUG_CHANNEL(timestamp);
+ 
+ struct _KUSER_SHARED_DATA *user_shared_data = (void *)0x7ffe0000;
+-struct _XSTATE_CONFIGURATION *user_xstate_config = (void *)(0x7ffe0000 + offsetof(KUSER_SHARED_DATA, XState));
+ 
+ struct debug_info
+ {
+
+--- dlls/ntdll/unwind.h
++++ dlls/ntdll/unwind.h
+@@ -179,7 +179,7 @@ static inline NTSTATUS context_x64_to_arm( ARM64_NT_CONTEXT *arm_ctx, const ARM6
+         XSTATE *xstate = (XSTATE *)((char *)context_ex + context_ex->XState.Offset);
+         if (context_ex->XState.Length < sizeof(XSAVE_AREA_HEADER) || context_ex->XState.Length > sizeof(*xstate))
+             status = STATUS_INVALID_PARAMETER;
+-        else if (xstate->Mask & XSTATE_MASK_AVX & user_xstate_config->EnabledFeatures)
++        else if (xstate->Mask & XSTATE_MASK_AVX & RtlGetEnabledExtendedFeatures( XSTATE_MASK_AVX ))
+         {
+             if (context_ex->XState.Length == sizeof(*xstate)) ymm = &xstate->YmmContext;
+             else status = STATUS_BUFFER_OVERFLOW;
+

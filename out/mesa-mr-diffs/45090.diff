@@ -1,0 +1,170 @@
+# agx: Fix rematerialization spilling phis to unlowered memory pseudo-registers
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45090 state=closed
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+```
+agx: Fix rematerialization spilling phis to unlowered memory pseudo-registers
+
+When compiling shaders where register demand exceeds single-wave occupancy
+but is within maximum available registers, agx_ra enters the constant
+rematerialization path (spilling = false, remat = true). Rematerialization
+is intended to avoid scratch memory usage entirely (remat_only = true).
+
+However:
+1. In compute_w_entry(), if a phi source was evicted because it was
+   rematerializable, it was absent from predecessor W_exit. The spiller's
+   heuristic treated this source as "spilled" and evicted the entire phi,
+   converting the phi destination into a memory register.
+2. In min_algorithm() and insert_coupling_code(), spilling phis created memory
+   variables even though remat_only was true. In agx_spill(), the second
+   spill_ctx used for coupling code did not even propagate remat_only.
+3. In agx_ra(), agx_lower_spill() was gated on `if (spilling)`. Because
+   `spilling` was false (only `remat` was true), agx_lower_spill() was skipped
+   even though mem_slot_count > 0. The memory moves (mrN) survived to final
+   instruction encoding, where mr0 was packed as r0 (the AGX hardware
+   control flow nesting counter r0l), causing GPU timeouts and UL1C unmapped
+   faults on hardware.
+
+Fix this by:
+- In compute_w_entry(), skipping rematerializable sources (ctx->remat[v])
+  when deciding whether to spill a phi, since they will be rematerialized
+  along the edge rather than loaded from memory.
+- Propagating remat_only to the coupling spill_ctx and asserting that phis
+  are not spilled when remat_only is set.
+- In agx_ra(), lowering memory registers whenever mem_slot_count is non-zero,
+  defensively preventing unlowered mrN pseudo-registers from surviving to
+  code generation.
+- In test-lower-spill, adding the RematPhiDoesNotSpill regression test
+  covering diamond CFG with rematerializable phi s
+--- src/asahi/compiler/test/test-lower-spill.cpp
++++ src/asahi/compiler/test/test-lower-spill.cpp
+@@ -162,3 +162,72 @@ TEST_F(LowerSpill, Vec6Fill)
+                            BITFIELD_MASK(2));
+       });
+ }
++
++static agx_index
++agx_phi_2(agx_builder *b, agx_index x, agx_index y)
++{
++   agx_index idx = agx_temp(b->shader, x.size);
++   agx_instr *phi = agx_phi_to(b, idx, 2);
++   phi->src[0] = x;
++   phi->src[1] = y;
++   return idx;
++}
++
++TEST_F(LowerSpill, RematPhiDoesNotSpill)
++{
++   agx_builder *b = agx_test_builder(mem_ctx);
++
++   agx_block *A = agx_start_block(b->shader);
++   agx_block *B = agx_test_block(b->shader);
++   agx_block *C = agx_test_block(b->shader);
++   agx_block *D = agx_test_block(b->shader);
++
++   agx_block_add_successor(A, B);
++   agx_block_add_successor(A, C);
++
++   agx_block_add_successor(B, D);
++   agx_block_add_successor(C, D);
++
++   /* Live across diamond: live1 is live into D (2 half-regs), live2 is live into B (2 half-regs) */
++   b->cursor = agx_after_block(A);
++   agx_index live1 = agx_fadd(b, wx, wx);
++   agx_index live2 = agx_fadd(b, live1, wx);
++
++   /* In B: live1 (2) and live2 (2) enter.
++    * We define remat constant c (2). Total weight = 6.
++    * Then we define b_temp (2). With capacity m = 6, allocating b_temp
++    * limits W to 6 - 2 = 4, forcing eviction of remat constant c.
++    * live2 is killed at b_temp, so live-out from B is live1 (2) + b_temp (2) = 4 <= 6.
++    */
++   b->cursor = agx_after_block(B);
++   agx_index c = agx_mov_imm(b, 32, 0x2222);
++   agx_index b_temp = agx_fadd(b, live2, wx);
++   agx_unit_test(b, b_temp);
++
++   /* C creates another value for the phi */
++   b->cursor = agx_after_block(C);
++   agx_index d = agx_fadd(b, live1, wx);
++
++   /* D joins with phi, plus use of live1.
++    * Peak in D is phi (2) + live1 (2) + result (2) = 6 <= 6. Fits without spill.
++    */
++   b->cursor = agx_after_block(D);
++   agx_index phi = agx_phi_2(b, c, d);
++   agx_unit_test(b, agx_fadd(b, phi, live1));
++
++   agx_compute_liveness(b->shader);
++
++   /* Spill with k=8 in remat_only mode. Capacity m = k - 2 = 6 half-regs.
++    * At exit of B, constant c was evicted from W_exit.
++    * In D, evicted constant c must not cause the phi to be spilled to memory.
++    */
++   agx_spill(b->shader, 8, true);
++
++   /* Assert no memory registers were created */
++   agx_foreach_instr_global(b->shader, I) {
++      for (unsigned i = 0; i < I->nr_dests; ++i)
++         EXPECT_FALSE(I->dest[i].memory);
++      for (unsigned i = 0; i < I->nr_srcs; ++i)
++         EXPECT_FALSE(I->src[i].memory);
++   }
++}
+
+--- src/asahi/compiler/agx_register_allocate.c
++++ src/asahi/compiler/agx_register_allocate.c
+@@ -1655,7 +1655,7 @@ agx_ra(agx_context *ctx)
+       }
+    }
+ 
+-   if (spilling)
++   if (mem_slot_count)
+       agx_lower_spill(ctx);
+ 
+    agx_foreach_block(ctx, block) {
+
+--- src/asahi/compiler/agx_spill.c
++++ src/asahi/compiler/agx_spill.c
+@@ -470,6 +470,8 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
+       if (!I->dest[0].memory)
+          continue;
+ 
++      assert(!ctx->remat_only && "must not spill phis in remat-only mode");
++
+       agx_builder b =
+          agx_init_builder(ctx->shader, agx_before_function(ctx->shader));
+ 
+@@ -728,6 +730,7 @@ min_algorithm(struct spill_ctx *ctx)
+        */
+       if (I->op == AGX_OPCODE_PHI) {
+          if (!BITSET_TEST(ctx->W, I->dest[0].value)) {
++            assert(!ctx->remat_only && "must not spill phis in remat-only mode");
+             I->dest[0] = agx_index_as_mem(I->dest[0], ctx->spill_base);
+          }
+ 
+@@ -937,6 +940,14 @@ compute_w_entry(struct spill_ctx *ctx)
+             continue;
+ 
+          unsigned v = src.value;
++
++         /* Rematerializable sources are never really spilled: if evicted, they
++          * are recreated along the edge by insert_coupling_code, so they must
++          * not force the phi into memory.
++          */
++         if (ctx->remat[v])
++            continue;
++
+          for (unsigned i = 0; i < sp->nW_exit; ++i) {
+             if (sp->W_exit[i] == v) {
+                found = true;
+@@ -1244,6 +1255,7 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
+          .W = W,
+          .S = S,
+          .spill_base = n,
++         .remat_only = remat_only,
+       };
+ 
+       agx_foreach_predecessor(block, pred) {
+

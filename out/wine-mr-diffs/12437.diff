@@ -1,0 +1,208 @@
+# dxgi: Release the frame latency semaphore for occluded presents.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12437 state=merged
+# Unity games wait on the frame latency waitable object before every \`Present()\`. When the window is minimized, \`d3d11_swapchain_present()\` returns \`DXGI_STATUS_OCCLUDED\` without queuing anything, so the semaphore is never released and the game hangs after minimize/restore.
+
+This adds \`wined3d_swapchain_skip_present()\`, which queues the release on the command stream behind any pending presents, and calls it on the occluded path. It only applies to waitable swapchains and is skipped for \`DXGI_PRESENT_TEST\`. 
+
+Tested with the dxgi, d3d11 and d3d10core tests and with ULTRAKILL, which no longer hangs.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60111
+--- dlls/dxgi/tests/dxgi.c
++++ dlls/dxgi/tests/dxgi.c
+@@ -5395,7 +5395,7 @@ static void test_swapchain_present(IUnknown *device, BOOL is_d3d12)
+     IDXGIFactory *factory;
+     IDXGIOutput *output;
+     BOOL fullscreen;
+-    unsigned int i;
++    unsigned int i, j;
+     ULONG refcount;
+     HRESULT hr;
+ 
+@@ -5440,8 +5440,12 @@ static void test_swapchain_present(IUnknown *device, BOOL is_d3d12)
+ 
+         /* Minimised window. */
+         ShowWindow(swapchain_desc.OutputWindow, SW_MINIMIZE);
+-        hr = IDXGISwapChain_Present(swapchain, 0, flags[i]);
+-        ok(hr == (is_d3d12 ? S_OK : DXGI_STATUS_OCCLUDED), "Test %u: Got unexpected hr %#lx.\n", i, hr);
++        for (j = 0; j < 5; ++j)
++        {
++            hr = IDXGISwapChain_Present(swapchain, 0, flags[i]);
++            ok(hr == (is_d3d12 ? S_OK : DXGI_STATUS_OCCLUDED),
++                    "Test %u, present %u: Got unexpected hr %#lx.\n", i, j, hr);
++        }
+         ShowWindow(swapchain_desc.OutputWindow, SW_NORMAL);
+ 
+         /* Hidden window. */
+@@ -7929,6 +7933,31 @@ static void test_frame_latency_event(IUnknown *device, BOOL is_d3d12)
+     wait_result = WaitForSingleObject(semaphore, 100);
+     ok(wait_result == WAIT_TIMEOUT, "Got unexpected wait result %#lx.\n", wait_result);
+ 
++    /* occluded frames release the semaphore too */
++    ShowWindow(window, SW_MINIMIZE);
++
++    hr = IDXGISwapChain2_Present(swapchain2, 0, DXGI_PRESENT_TEST);
++    todo_wine_if(is_d3d12)
++    ok(hr == DXGI_STATUS_OCCLUDED || broken(hr == S_OK) /* <= Win10 22H2 */, "Got unexpected hr %#lx.\n", hr);
++    wait_result = WaitForSingleObject(semaphore, 100);
++    ok(wait_result == WAIT_TIMEOUT, "Got unexpected wait result %#lx.\n", wait_result);
++
++    for (i = 0; i < 5; i++)
++    {
++        hr = IDXGISwapChain2_Present(swapchain2, 0, 0);
++        todo_wine_if(is_d3d12)
++        ok(hr == DXGI_STATUS_OCCLUDED || broken(hr == S_OK) /* <= Win10 22H2 */,
++                "Present %u: got unexpected hr %#lx.\n", i, hr);
++
++        wait_result = WaitForSingleObject(semaphore, 100);
++        ok(!wait_result, "Present %u: got unexpected wait result %#lx.\n", i, wait_result);
++    }
++
++    wait_result = WaitForSingleObject(semaphore, 100);
++    ok(wait_result == WAIT_TIMEOUT, "Got unexpected wait result %#lx.\n", wait_result);
++
++    ShowWindow(window, SW_RESTORE);
++
+     if (is_d3d12)
+     {
+         hr = IUnknown_QueryInterface(device, &IID_ID3D12CommandQueue, (void **)&queue);
+
+--- dlls/dxgi/swapchain.c
++++ dlls/dxgi/swapchain.c
+@@ -334,18 +334,20 @@ static HRESULT d3d11_swapchain_present(struct d3d11_swapchain *swapchain,
+         return DXGI_ERROR_INVALID_CALL;
+     }
+ 
+-    if (IsIconic(d3d11_swapchain_get_hwnd(swapchain)))
+-        return DXGI_STATUS_OCCLUDED;
+-
+     if (flags & ~(DXGI_PRESENT_TEST | DXGI_PRESENT_ALLOW_TEARING))
+         FIXME("Unimplemented flags %#x.\n", flags);
+     if (flags & DXGI_PRESENT_TEST)
+     {
++        if (IsIconic(d3d11_swapchain_get_hwnd(swapchain)))
++            return DXGI_STATUS_OCCLUDED;
+         WARN("Returning S_OK for DXGI_PRESENT_TEST.\n");
+         return S_OK;
+     }
+ 
+-    if (SUCCEEDED(hr = wined3d_swapchain_present(swapchain->wined3d_swapchain, NULL, NULL, NULL, sync_interval, 0)))
++    hr = wined3d_swapchain_present(swapchain->wined3d_swapchain, NULL, NULL, NULL, sync_interval, 0);
++    if (hr == WINED3DOK_PRESENT_OCCLUDED)
++        return DXGI_STATUS_OCCLUDED;
++    if (SUCCEEDED(hr))
+         InterlockedIncrement(&swapchain->present_count);
+     return hr;
+ }
+
+--- dlls/dxgi/utils.c
++++ dlls/dxgi/utils.c
+@@ -520,7 +520,8 @@ unsigned int wined3d_bind_flags_from_dxgi_usage(DXGI_USAGE dxgi_usage)
+ 
+ #define DXGI_WINED3D_SWAPCHAIN_FLAGS \
+         (WINED3D_SWAPCHAIN_USE_CLOSEST_MATCHING_MODE | WINED3D_SWAPCHAIN_RESTORE_WINDOW_RECT \
+-        | WINED3D_SWAPCHAIN_REGISTER_STATE | WINED3D_SWAPCHAIN_RESTORE_WINDOW_STATE)
++        | WINED3D_SWAPCHAIN_REGISTER_STATE | WINED3D_SWAPCHAIN_RESTORE_WINDOW_STATE \
++        | WINED3D_SWAPCHAIN_REPORT_OCCLUSION)
+ 
+ unsigned int dxgi_swapchain_flags_from_wined3d(unsigned int wined3d_flags)
+ {
+
+--- dlls/wined3d/cs.c
++++ dlls/wined3d/cs.c
+@@ -767,7 +767,14 @@ static void wined3d_cs_exec_present(struct wined3d_cs *cs, const void *data)
+     ReleaseSemaphore(swapchain->frame_latency_semaphore, 1, NULL);
+ }
+ 
+-void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *swapchain,
++static void wined3d_cs_release_frame_latency(void *object)
++{
++    struct wined3d_swapchain *swapchain = object;
++
++    ReleaseSemaphore(swapchain->frame_latency_semaphore, 1, NULL);
++}
++
++HRESULT wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *swapchain,
+         const RECT *src_rect, const RECT *dst_rect, HWND dst_window_override,
+         unsigned int swap_interval, uint32_t flags)
+ {
+@@ -776,6 +783,13 @@ void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *sw
+ 
+     wined3d_not_from_cs(cs);
+ 
++    if ((swapchain->state.desc.flags & WINED3D_SWAPCHAIN_REPORT_OCCLUSION) && IsIconic(swapchain->win_handle))
++    {
++        TRACE("Window %p is minimised, not presenting.\n", swapchain->win_handle);
++        wined3d_cs_destroy_object(cs, wined3d_cs_release_frame_latency, swapchain);
++        return WINED3DOK_PRESENT_OCCLUDED;
++    }
++
+     op = wined3d_device_context_require_space(&cs->c, sizeof(*op), WINED3D_CS_QUEUE_DEFAULT);
+     op->opcode = WINED3D_CS_OP_PRESENT;
+     op->dst_window_override = dst_window_override;
+@@ -792,6 +806,8 @@ void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *sw
+     }
+ 
+     wined3d_device_context_submit(&cs->c, WINED3D_CS_QUEUE_DEFAULT);
++
++    return WINED3D_OK;
+ }
+ 
+ static void wined3d_cs_exec_clear(struct wined3d_cs *cs, const void *data)
+
+--- dlls/wined3d/swapchain.c
++++ dlls/wined3d/swapchain.c
+@@ -224,6 +224,7 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+         unsigned int swap_interval, uint32_t flags)
+ {
+     const struct wined3d_swapchain_desc *desc = &swapchain->state.desc;
++    HRESULT hr;
+     RECT s, d;
+ 
+     TRACE("swapchain %p, src_rect %s, dst_rect %s, dst_window_override %p, swap_interval %u, flags %#x.\n",
+@@ -265,12 +266,12 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+         dst_rect = &d;
+     }
+ 
+-    wined3d_cs_emit_present(swapchain->device->cs, swapchain, src_rect,
++    hr = wined3d_cs_emit_present(swapchain->device->cs, swapchain, src_rect,
+             dst_rect, dst_window_override, swap_interval, flags);
+ 
+     wined3d_mutex_unlock();
+ 
+-    return WINED3D_OK;
++    return hr;
+ }
+ 
+ HRESULT CDECL wined3d_swapchain_get_front_buffer_data(const struct wined3d_swapchain *swapchain,
+
+--- dlls/wined3d/wined3d_private.h
++++ dlls/wined3d/wined3d_private.h
+@@ -3739,7 +3739,7 @@ void wined3d_cs_emit_decode(struct wined3d_decoder *decoder, struct wined3d_deco
+ void wined3d_device_context_emit_clear_uav(struct wined3d_device_context *context,
+         struct wined3d_unordered_access_view *view, const struct wined3d_uvec4 *clear_value, bool fp);
+ void wined3d_cs_emit_preload_resource(struct wined3d_cs *cs, struct wined3d_resource *resource);
+-void wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *swapchain, const RECT *src_rect,
++HRESULT wined3d_cs_emit_present(struct wined3d_cs *cs, struct wined3d_swapchain *swapchain, const RECT *src_rect,
+         const RECT *dst_rect, HWND dst_window_override, unsigned int swap_interval, uint32_t flags);
+ void wined3d_cs_emit_set_color_key(struct wined3d_cs *cs, struct wined3d_texture *texture,
+         WORD flags, const struct wined3d_color_key *color_key);
+
+--- include/wine/wined3d.h
++++ include/wine/wined3d.h
+@@ -35,6 +35,7 @@
+ #define _FACWINED3D                                             0x876
+ #define MAKE_WINED3DSTATUS(code)                                MAKE_HRESULT(0, _FACWINED3D, code)
+ #define WINED3DOK_NOMIPGEN                                      MAKE_WINED3DSTATUS(2159)
++#define WINED3DOK_PRESENT_OCCLUDED                              MAKE_WINED3DSTATUS(2168)
+ 
+ #define MAKE_WINED3DHRESULT(code)                               MAKE_HRESULT(1, _FACWINED3D, code)
+ #define WINED3DERR_CONFLICTINGRENDERSTATE                       MAKE_WINED3DHRESULT(2081)
+@@ -923,6 +924,7 @@ enum wined3d_memory_segment_group
+ /* Allow the swapchain flag, but not actual locking */
+ #define WINED3D_SWAPCHAIN_ALLOW_MS_LOCKABLE_BACKBUFFER          0x00200000u
+ #define WINED3D_SWAPCHAIN_FRAME_LATENCY_WAITABLE_OBJECT         0x00400000u
++#define WINED3D_SWAPCHAIN_REPORT_OCCLUSION                      0x00800000u
+ 
+ #define WINED3DDP_MAXTEXCOORD                                   8
+ 
+

@@ -1,0 +1,69 @@
+# winepulse.drv: Don't advance read pointer past data not yet consumed by PA
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/10792 state=closed
+# Adds a simple throttling mechanism to prevent pointer overlaps when winepulse is faster than the audio server.
+
+Winepulse uses a fake clock to advance the pointers:
+
+```c
+/* regardless of what PA does, advance one period */
+                    adv_bytes = min(stream->period_bytes, stream->held_bytes);
+                    stream->lcl_offs_bytes += adv_bytes;
+                    stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
+                    stream->held_bytes -= adv_bytes;
+```
+
+And if winepulse is just a little bit faster than the audio server (does not matter PW or PA), it inevitably leads to pointer overlaps and therefore crackling.
+
+This patch proposes a throttling mechanism that is somewhat similar to winealsa - don't ever tell the application we have more space than we actually do. The problem could probably be resolved by making the fake clock perfectly mimic the audio server, but this is orders of magnitude more difficult.
+
+Winealsa achieves similar idea this way:
+
+`data_frames_played = min(stream->data_in_alsa_frames, avail); stream->held_frames -= data_frames_played;`
+
+The issue I am trying to fix is very real - it can cause crackling in any game you try. You don't have to hear the crackling to see that it's mathematically inevitable by logging the difference between held_bytes and pa_held_bytes. If it becomes smaller and goes negative - crackling is inevitable, because pointers will overlap. The issue is not tied to PW or PA specifically, I observed the behavior with both.
+
+In regards to how it interacts with MR https://gitlab.winehq.org/wine/wine/-/merge_requests/8628 - no issues in GoWR in my testing, unless you try enabling PROTON_LOG for pulse (which is very spammy in this game), and spam yes on all threads - which would also cause stream resets with unchanged winepulse, just later.
+
+Additionally, this patch has already been implemented in Proton GE and Proton CachyOS for about two months now - no issues and it has helped some people.
+
+There a
+--- dlls/winepulse.drv/pulse.c
++++ dlls/winepulse.drv/pulse.c
+@@ -1565,6 +1565,7 @@ static NTSTATUS pulse_timer_loop(void *args)
+     LARGE_INTEGER delay;
+     pa_usec_t last_time;
+     UINT32 adv_bytes;
++    SIZE_T safe_bytes;
+     int success;
+ 
+     pulse_lock();
+@@ -1626,12 +1627,22 @@ static NTSTATUS pulse_timer_loop(void *args)
+                 if (stream->dataflow == eRender)
+                 {
+                     pulse_write(stream);
+-
+-                    /* regardless of what PA does, advance one period */
+-                    adv_bytes = min(stream->period_bytes, stream->held_bytes);
+-                    stream->lcl_offs_bytes += adv_bytes;
+-                    stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
+-                    stream->held_bytes -= adv_bytes;
++                    safe_bytes = stream->period_bytes;
++
++                    if ((stream->held_bytes > stream->pa_held_bytes))
++                     {
++                        SIZE_T limit = stream->held_bytes - stream->pa_held_bytes;
++                         if (safe_bytes > limit)
++                             safe_bytes = limit;
++                     }
++                     else {
++                         safe_bytes = 0;
++                     }
++                     
++                     adv_bytes = safe_bytes;
++                     stream->lcl_offs_bytes += adv_bytes;
++                     stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
++                     stream->held_bytes -= adv_bytes;
+                 }
+                 else if(stream->dataflow == eCapture)
+                 {
+

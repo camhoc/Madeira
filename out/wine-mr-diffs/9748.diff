@@ -1,0 +1,178 @@
+# Draft: msi: Implement MsiProvideAssemblyW().
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/9748 state=opened
+# While bug 58578 depends on MsiProvideAssemblyW() my testing target is
+SQL Server Express 2012 (bug 42792 has a download URL).
+
+I marked this MR as a draft because the implementation doesn't seem to work:
+MsiProvideComponent() detects feature INSTALLSTATE_ABSENT, MSDN mentions that
+both MsiProvideAssembly() and MsiProvideComponent() should return ERROR_FILE_NOT_FOUND
+in that case, however the installer generates an exception and crashes once this error
+is returned.
+
+The installer calls MsiProvideAssembly() with the application context, however
+I investigated with Orca the problematic MSI and for the assembly specified in
+the MsiProvideAssembly() call there's no associated application, so it's not
+clear how it's supposed to behave in that case.
+
+Hans, would you mind looking at this and probably suggest the ways to proceed?
+--- dlls/msi/assembly.c
++++ dlls/msi/assembly.c
+@@ -251,11 +251,10 @@ WCHAR *msi_get_assembly_path( const WCHAR *displayname )
+     return info.pszCurrentAssemblyPathBuf;
+ }
+ 
+-IAssemblyEnum *msi_create_assembly_enum( const WCHAR *displayname )
++static IAssemblyName *msi_create_assembly_name( const WCHAR *displayname )
+ {
+     HRESULT hr;
+     IAssemblyName *name;
+-    IAssemblyEnum *ret;
+     WCHAR *str;
+     DWORD len = 0;
+ 
+@@ -284,6 +283,18 @@ IAssemblyEnum *msi_create_assembly_enum( const WCHAR *displayname )
+     free( str );
+     if (FAILED( hr )) return NULL;
+ 
++    return name;
++}
++
++IAssemblyEnum *msi_create_assembly_enum( const WCHAR *displayname )
++{
++    HRESULT hr;
++    IAssemblyName *name;
++    IAssemblyEnum *ret;
++
++    if (!(name = msi_create_assembly_name( displayname )))
++        return NULL;
++
+     hr = pCreateAssemblyEnum( &ret, NULL, name, ASM_CACHE_GAC, NULL );
+     IAssemblyName_Release( name );
+     if (FAILED( hr )) return NULL;
+@@ -710,3 +721,84 @@ UINT ACTION_MsiUnpublishAssemblies( MSIPACKAGE *package )
+     }
+     return ERROR_SUCCESS;
+ }
++
++UINT WINAPI MsiProvideAssemblyW( const WCHAR *assembly, const WCHAR *application, DWORD mode,
++                                 DWORD info, WCHAR *path, DWORD *len )
++{
++    UINT res;
++    IAssemblyName *asm_name;
++    BOOL win32 = info & MSIASSEMBLYINFO_WIN32ASSEMBLY, found = FALSE;
++    DWORD idx;
++    HKEY hkey;
++
++    TRACE( "%s, %s, %#lx, %#lx, %p, %p\n", debugstr_w(assembly), debugstr_w(application), mode, info, path, len );
++
++    if (!assembly || !len)
++        return ERROR_INVALID_PARAMETER;
++
++    if (application)
++        FIXME( "application context %s ignored\n", debugstr_w(application) );
++
++    if (!(asm_name = msi_create_assembly_name( assembly )))
++        return ERROR_INVALID_PARAMETER;
++
++    if ((res = open_global_assembly_key( MSIINSTALLCONTEXT_MACHINE /* FIXME */, win32, &hkey )))
++    {
++        WARN( "failed to open global assembly key %u\n", res );
++        goto done;
++    }
++
++    idx = 0;
++    for (;;)
++    {
++        WCHAR *name;
++        WCHAR val[20 + MAX_FEATURE_CHARS + 1 + 20 + 2]; /* base85_GUID + feaure + '>' + base85_GUID + 2 terminating NULLs */
++        DWORD name_sz, val_sz, type;
++        IAssemblyName *asm_name_enum;
++
++        name_sz = 1024;
++        name = malloc( name_sz );
++        val_sz = ARRAY_SIZE( val );
++        while ((res = RegEnumValueW( hkey, idx, name, &name_sz, NULL, &type, (BYTE *)val, &val_sz )) == ERROR_MORE_DATA)
++        {
++            if (val_sz > ARRAY_SIZE( val ))
++            {
++                FIXME( "value storage overflow (need %lu bytes)\n", val_sz );
++                break;
++            }
++            name = realloc( name, name_sz );
++        }
++
++        if (res != ERROR_SUCCESS || type != REG_MULTI_SZ)
++        {
++            free( name );
++            break;
++        }
++
++        if ((asm_name_enum = msi_create_assembly_name( name )))
++        {
++            if (IAssemblyName_IsEqual( asm_name, asm_name_enum, ASM_CMPF_IL_ALL ) == S_OK)
++            {
++                WCHAR product[MAX_FEATURE_CHARS+1], feature[MAX_FEATURE_CHARS+1], component[MAX_FEATURE_CHARS+1];
++                DWORD size;
++
++                found = TRUE;
++
++                if (!(res = MsiDecomposeDescriptorW( val, product, feature, component, &size )))
++                    res = MsiProvideComponentW( product, feature, component, INSTALLMODE_NODETECTION /* FIXME */, path, len );
++            }
++
++            IAssemblyName_Release( asm_name_enum );
++        }
++
++        free( name );
++        if (found) break;
++        idx++;
++    }
++
++    RegCloseKey( hkey );
++
++done:
++    IAssemblyName_Release( asm_name );
++    return found ? res : ERROR_UNKNOWN_COMPONENT;
++}
+
+--- dlls/msi/msi.c
++++ dlls/msi/msi.c
+@@ -2486,14 +2486,6 @@ UINT WINAPI MsiProvideAssemblyA( const char *szAssemblyName, const char *szAppCo
+     return ERROR_CALL_NOT_IMPLEMENTED;
+ }
+ 
+-UINT WINAPI MsiProvideAssemblyW( const WCHAR *szAssemblyName, const WCHAR *szAppContext, DWORD dwInstallMode,
+-                                 DWORD dwAssemblyInfo, WCHAR *lpPathBuf, DWORD *pcchPathBuf )
+-{
+-    FIXME( "%s, %s, %#lx, %#lx, %p, %p\n", debugstr_w(szAssemblyName), debugstr_w(szAppContext), dwInstallMode,
+-           dwAssemblyInfo, lpPathBuf, pcchPathBuf );
+-    return ERROR_CALL_NOT_IMPLEMENTED;
+-}
+-
+ UINT WINAPI MsiProvideComponentFromDescriptorA( LPCSTR szDescriptor,
+                 LPSTR szPath, LPDWORD pcchPath, LPDWORD pcchArgs )
+ {
+@@ -4291,6 +4283,9 @@ UINT WINAPI MsiProvideComponentW( const WCHAR *product, const WCHAR *feature, co
+         MsiUseFeatureW( product, feature );
+         return ERROR_SUCCESS;
+ 
++    case INSTALLSTATE_ABSENT:
++        return ERROR_FILE_NOT_FOUND;
++
+     default:
+         TRACE("MsiGetComponentPathW returned %d\n", state);
+         return ERROR_INSTALL_FAILURE;
+
+--- include/msi.h
++++ include/msi.h
+@@ -256,6 +256,9 @@ typedef struct tagMSIPATCHSEQUENCEINFOW
+ 
+ #define ERROR_PATCH_TARGET_NOT_FOUND        1642
+ 
++#define MSIASSEMBLYINFO_NETASSEMBLY   0
++#define MSIASSEMBLYINFO_WIN32ASSEMBLY 1
++
+ /* Strings defined in msi.h */
+ /* Advertised Information */
+ 
+

@@ -1,0 +1,268 @@
+# kk: Support native VK_EXT_image_view_min_lod on M6+
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45110 state=merged
+# ### What does this MR do and why?
+
+```
+kk: Support native VK_EXT_image_view_min_lod on M6+
+
+M6 introduces support for specifying a minLOD on a texture view,
+so we can support and advertise this extension without emulation.
+```
+--- docs/drivers/kosmickrisp.rst
++++ docs/drivers/kosmickrisp.rst
+@@ -82,7 +82,7 @@ KosmicKrisp specific environment variables:
+ - ``MESA_KK_DISABLE_WORKAROUNDS``: Provide ``all`` to disable all workarounds. Otherwise, provide a comma separated list to disable wanted workarounds e.g. ``1,3,4`` to disable workaround 1, 3 and 4.
+ - ``MESA_KK_EXPERIMENTAL``: Enables advertising experimental features which may not provide full correctness or may negatively impact performance when enabled. Provide ``all`` to advertise all listed features.
+   - ``custom_border`` to advertise ``VK_EXT_custom_border_color`` and ``VK_EXT_border_color_swizzle``.
+-  - ``image_view_min_lod`` to advertise ``VK_EXT_image_view_min_lod``.
++  - ``image_view_min_lod`` to advertise ``VK_EXT_image_view_min_lod`` for M1-M5 GPUs.
+   - ``optimize_e5r9g9b9`` to use allowGPUOptimizedContents with this format, which causes some CTS tests for vkCmdCopyImage() to fail
+ 
+ Metal workarounds
+
+--- src/kosmickrisp/bridge/stubs/mtl_texture.c
++++ src/kosmickrisp/bridge/stubs/mtl_texture.c
+@@ -22,14 +22,7 @@ mtl_texture_first_mipmap_in_tail(mtl_texture *texture)
+ /* Texture view creation */
+ mtl_texture *
+ mtl_new_texture_view_with(mtl_texture *texture,
+-                          const struct kk_view_layout *layout)
+-{
+-   return NULL;
+-}
+-
+-mtl_texture *
+-mtl_new_texture_view_with_no_swizzle(mtl_texture *texture,
+-                                     const struct kk_view_layout *layout)
++                          const struct kk_view_layout *layout, bool swizzle)
+ {
+    return NULL;
+ }
+
+--- src/kosmickrisp/bridge/mtl_texture.h
++++ src/kosmickrisp/bridge/mtl_texture.h
+@@ -10,6 +10,7 @@
+ #include "mtl_types.h"
+ 
+ #include <inttypes.h>
++#include <stdbool.h>
+ 
+ /* TODO_KOSMICKRISP Move this to bridge. */
+ struct kk_view_layout;
+@@ -21,10 +22,8 @@ uint32_t mtl_texture_first_mipmap_in_tail(mtl_texture *texture);
+ 
+ /* Texture view creation */
+ mtl_texture *mtl_new_texture_view_with(mtl_texture *texture,
+-                                       const struct kk_view_layout *layout);
+-mtl_texture *
+-mtl_new_texture_view_with_no_swizzle(mtl_texture *texture,
+-                                     const struct kk_view_layout *layout);
++                                       const struct kk_view_layout *layout,
++                                       bool swizzle);
+ 
+ void mtl_texture_get_bytes(mtl_texture *texture, void *host_ptr,
+                            struct mtl_texture_memory_copy *data);
+
+--- src/kosmickrisp/bridge/mtl_texture.m
++++ src/kosmickrisp/bridge/mtl_texture.m
+@@ -74,30 +74,27 @@ mtl_texture_swizzle(enum pipe_swizzle swizzle)
+ }
+ 
+ mtl_texture *
+-mtl_new_texture_view_with(mtl_texture *texture, const struct kk_view_layout *layout)
++mtl_new_texture_view_with(mtl_texture *texture, const struct kk_view_layout *layout, bool swizzle)
+ {
+    @autoreleasepool {
+       id<MTLTexture> tex = (id<MTLTexture>)texture;
+-      MTLTextureType type = mtl_texture_view_type(layout->view_type, layout->sample_count_sa);
+-      NSRange levels = NSMakeRange(layout->base_level, layout->num_levels);
+-      NSRange slices = NSMakeRange(layout->base_array_layer, layout->array_len);
+-      MTLTextureSwizzleChannels swizzle = MTLTextureSwizzleChannelsMake(mtl_texture_swizzle(layout->swizzle.red),
+-                                                                        mtl_texture_swizzle(layout->swizzle.green),
+-                                                                        mtl_texture_swizzle(layout->swizzle.blue),
+-                                                                        mtl_texture_swizzle(layout->swizzle.alpha));
+-      return [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices swizzle:swizzle];
+-   }
+-}
+-
+-mtl_texture *
+-mtl_new_texture_view_with_no_swizzle(mtl_texture *texture, const struct kk_view_layout *layout)
+-{
+-   @autoreleasepool {
+-      id<MTLTexture> tex = (id<MTLTexture>)texture;
+-      MTLTextureType type = mtl_texture_view_type(layout->view_type, layout->sample_count_sa);
+-      NSRange levels = NSMakeRange(layout->base_level, layout->num_levels);
+-      NSRange slices = NSMakeRange(layout->base_array_layer, layout->array_len);
+-      return [tex newTextureViewWithPixelFormat:layout->format.mtl textureType:type levels:levels slices:slices];
++      MTLTextureViewDescriptor* desc = [[MTLTextureViewDescriptor new] autorelease];
++      desc.pixelFormat = layout->format.mtl;
++      desc.textureType = mtl_texture_view_type(layout->view_type, layout->sample_count_sa);
++      desc.levelRange = NSMakeRange(layout->base_level, layout->num_levels);
++      desc.sliceRange = NSMakeRange(layout->base_array_layer, layout->array_len);
++      if (swizzle) {
++         desc.swizzle = MTLTextureSwizzleChannelsMake(mtl_texture_swizzle(layout->swizzle.red),
++                                                      mtl_texture_swizzle(layout->swizzle.green),
++                                                      mtl_texture_swizzle(layout->swizzle.blue),
++                                                      mtl_texture_swizzle(layout->swizzle.alpha));
++      }
++#if defined(MAC_OS_VERSION_27_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_27_0
++      if (@available(macOS 27, *)) {
++         desc.minLOD = layout->min_lod_clamp;
++      }
++#endif
++      return [tex newTextureViewWithDescriptor:desc];
+    }
+ }
+ 
+
+--- src/kosmickrisp/vulkan/kk_image_layout.h
++++ src/kosmickrisp/vulkan/kk_image_layout.h
+@@ -138,7 +138,7 @@ struct kk_view_layout {
+    /** Number of miplevels. 1 if no mipmapping is used. */
+    uint8_t num_levels;
+ 
+-   uint16_t min_lod_clamp;
++   float min_lod_clamp;
+ };
+ 
+ static inline bool
+
+--- src/kosmickrisp/vulkan/kk_image_view.c
++++ src/kosmickrisp/vulkan/kk_image_view.c
+@@ -54,6 +54,7 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+                    const VkImageViewCreateInfo *pCreateInfo)
+ {
+    VK_FROM_HANDLE(kk_image, image, pCreateInfo->image);
++   struct kk_physical_device *pdev = kk_device_physical(dev);
+ 
+    memset(view, 0, sizeof(*view));
+ 
+@@ -117,7 +118,9 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+          .num_levels = view->vk.level_count,
+          .base_array_layer = view->vk.base_array_layer,
+          .array_len = view->vk.layer_count,
+-         .min_lod_clamp = view->vk.min_lod,
++         /* Metal only allows non-zero for supported GPUs */
++         .min_lod_clamp =
++            pdev->info.gpu_apple_family >= 11 ? view->vk.min_lod : 0.0f,
+       };
+       uint8_t view_swizzle[4] = {vk_swizzle_to_pipe(view->vk.swizzle.r),
+                                  vk_swizzle_to_pipe(view->vk.swizzle.g),
+@@ -186,7 +189,7 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+ 
+       if (view->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
+          view->planes[view_plane].mtl_handle_sampled =
+-            mtl_new_texture_view_with(mtl_handle, &view_layout);
++            mtl_new_texture_view_with(mtl_handle, &view_layout, true);
+          view->planes[view_plane].sampled_gpu_resource_id =
+             mtl_texture_get_gpu_resource_id(
+                view->planes[view_plane].mtl_handle_sampled);
+@@ -199,7 +202,7 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+             view_layout.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+ 
+          view->planes[view_plane].mtl_handle_storage =
+-            mtl_new_texture_view_with(mtl_handle, &view_layout);
++            mtl_new_texture_view_with(mtl_handle, &view_layout, true);
+          view->planes[view_plane].storage_gpu_resource_id =
+             mtl_texture_get_gpu_resource_id(
+                view->planes[view_plane].mtl_handle_storage);
+@@ -227,7 +230,7 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+                                           ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                           : original_type;
+                view->planes[view_plane].mtl_handle_input =
+-                  mtl_new_texture_view_with(mtl_handle, &view_layout);
++                  mtl_new_texture_view_with(mtl_handle, &view_layout, true);
+             } else
+                view->planes[view_plane].mtl_handle_input =
+                   mtl_retain(mtl_handle);
+@@ -243,8 +246,7 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+             view->planes[view_plane].render_is_view = requires_format_change;
+             if (requires_format_change) {
+                view->planes[view_plane].mtl_handle_render =
+-                  mtl_new_texture_view_with_no_swizzle(mtl_handle,
+-                                                       &view_layout);
++                  mtl_new_texture_view_with(mtl_handle, &view_layout, false);
+             } else /* Subresource indices will be set in attachment descriptor */
+                view->planes[view_plane].mtl_handle_render =
+                   mtl_retain(mtl_handle);
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -184,7 +184,8 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_external_memory_host = true,
+       .EXT_hdr_metadata = true,
+       .EXT_image_2d_view_of_3d = true,
+-      .EXT_image_view_min_lod = KK_EXPERIMENTAL(IMAGE_VIEW_MIN_LOD),
++      .EXT_image_view_min_lod = pdev->info.gpu_apple_family >= 11 ||
++                                KK_EXPERIMENTAL(IMAGE_VIEW_MIN_LOD),
+       .EXT_load_store_op_none = true,
+       .EXT_map_memory_placed = true,
+       .EXT_memory_budget = true,
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -171,19 +171,21 @@ kk_populate_fs_key(struct kk_fs_key *key,
+ enum kk_feature_key {
+    KK_FEAT_CUSTOM_BORDER = BITFIELD_BIT(0),
+    KK_FEAT_NULL_DESCRIPTOR = BITFIELD_BIT(1),
+-   KK_FEAT_IMAGE_VIEW_MIN_LOD = BITFIELD_BIT(2),
++   KK_FEAT_IMAGE_VIEW_MIN_LOD_EMULATED = BITFIELD_BIT(2),
+ };
+ 
+ static enum kk_feature_key
+-kk_make_feature_key(const struct vk_features *feats)
++kk_make_feature_key(const struct vk_features *feats,
++                    const struct kk_physical_device *pdev)
+ {
+    enum kk_feature_key key = 0;
+    if (feats->customBorderColors)
+       key |= KK_FEAT_CUSTOM_BORDER;
+    if (feats->nullDescriptor)
+       key |= KK_FEAT_NULL_DESCRIPTOR;
+-   if (feats->minLod)
+-      key |= KK_FEAT_IMAGE_VIEW_MIN_LOD;
++   /* Emulated in shader on M5 and below */
++   if (feats->minLod && pdev->info.gpu_apple_family < 11)
++      key |= KK_FEAT_IMAGE_VIEW_MIN_LOD_EMULATED;
+    return key;
+ }
+ 
+@@ -193,6 +195,9 @@ kk_hash_graphics_state(struct vk_physical_device *device,
+                        const struct vk_features *enabled_features,
+                        VkShaderStageFlags stages, blake3_hash blake3_out)
+ {
++   struct kk_physical_device *pdev =
++      container_of(device, struct kk_physical_device, vk);
++
+    struct mesa_blake3 blake3_ctx;
+    _mesa_blake3_init(&blake3_ctx);
+ 
+@@ -211,7 +216,8 @@ kk_hash_graphics_state(struct vk_physical_device *device,
+                           sizeof(state->mv->view_mask));
+    }
+ 
+-   enum kk_feature_key feature_key = kk_make_feature_key(enabled_features);
++   enum kk_feature_key feature_key =
++      kk_make_feature_key(enabled_features, pdev);
+    _mesa_blake3_update(&blake3_ctx, &feature_key, sizeof(feature_key));
+ 
+    _mesa_blake3_final(&blake3_ctx, blake3_out);
+@@ -794,7 +800,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
+    if (features & KK_FEAT_CUSTOM_BORDER)
+       NIR_PASS(_, nir, kk_nir_lower_custom_border);
+ 
+-   if (features & KK_FEAT_IMAGE_VIEW_MIN_LOD)
++   if (features & KK_FEAT_IMAGE_VIEW_MIN_LOD_EMULATED)
+       NIR_PASS(_, nir, kk_nir_lower_image_view_min_lod);
+ 
+    /* Descriptor lowering needs to happen after lowering blend since we will
+@@ -1698,7 +1704,7 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+    struct kk_device *dev = container_of(device, struct kk_device, vk);
+    struct kk_physical_device *pdev = kk_device_physical(dev);
+ 
+-   enum kk_feature_key features = kk_make_feature_key(enabled_features);
++   enum kk_feature_key features = kk_make_feature_key(enabled_features, pdev);
+ 
+    /* Vulkan doesn't enforce a fragment shader to build pipelines. We may need
+     * to create one. */
+

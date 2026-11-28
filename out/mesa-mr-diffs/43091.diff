@@ -1,0 +1,62 @@
+# kk: Work around CTS bug using unsupported adjacency topologies
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/43091 state=closed
+# ### What does this MR do and why?
+
+Trying to get these tests to at least stop erroring out with a device loss until they're fixed on the CTS side, so that full CTS runs don't get interrupted. See https://github.com/KhronosGroup/VK-GL-CTS/issues/608
+
+```
+kk: Work around CTS bug using unsupported adjacency topologies
+
+`dEQP-VK.pipeline.monolithic.primitive_restart_index.*` does not check
+if geometry shaders are supported before using adjacency topologies.
+Allow the tests to at least complete without crashing by mapping to
+the corresponding regular primitive topologies.
+
+Note that the tests still fail, but they are no longer an obstacle to
+completing full runs on latest CTS.
+```
+--- src/kosmickrisp/bridge/vk_to_mtl_map.c
++++ src/kosmickrisp/bridge/vk_to_mtl_map.c
+@@ -42,10 +42,13 @@ vk_primitive_topology_to_mtl_primitive_type(enum VkPrimitiveTopology topology)
+    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+       return MTL_PRIMITIVE_TYPE_POINT;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
++   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:
+       return MTL_PRIMITIVE_TYPE_LINE;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
++   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:
+       return MTL_PRIMITIVE_TYPE_LINE_STRIP;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
++   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wswitch"
+    case VK_PRIMITIVE_TOPOLOGY_META_RECT_LIST_MESA:
+@@ -55,6 +58,7 @@ vk_primitive_topology_to_mtl_primitive_type(enum VkPrimitiveTopology topology)
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
+       return MTL_PRIMITIVE_TYPE_TRIANGLE;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
++   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY:
+       return MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP;
+    default:
+       assert(0 && "Primitive topology not supported!");
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1485,12 +1485,16 @@ mesa_prim_to_mtl_primitive_type(enum mesa_prim prim)
+    case MESA_PRIM_POINTS:
+       return MTL_PRIMITIVE_TYPE_POINT;
+    case MESA_PRIM_LINES:
++   case MESA_PRIM_LINES_ADJACENCY:
+       return MTL_PRIMITIVE_TYPE_LINE;
+    case MESA_PRIM_LINE_STRIP:
++   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+       return MTL_PRIMITIVE_TYPE_LINE_STRIP;
+    case MESA_PRIM_TRIANGLES:
++   case MESA_PRIM_TRIANGLES_ADJACENCY:
+       return MTL_PRIMITIVE_TYPE_TRIANGLE;
+    case MESA_PRIM_TRIANGLE_STRIP:
++   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+       return MTL_PRIMITIVE_TYPE_TRIANGLE_STRIP;
+    default:
+       UNREACHABLE("Unsupported primitive type");
+

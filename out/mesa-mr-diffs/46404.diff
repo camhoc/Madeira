@@ -1,0 +1,50 @@
+# kk: Emit 32-bit fdiv as fast::divide
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46404 state=opened
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+kk: Emit 32-bit fdiv as fast::divide
+
+Shaders whose float controls require no contraction or reassociation
+get their ALU ops inside a "#pragma METAL fp math_mode(safe)" block.
+There, '/' is correctly rounded, and in shaders that divide a lot it is
+most of the cost of the safe block.  fast::divide is not affected by
+the pragma.
+
+fast::divide is not correctly rounded: the largest error measured on an
+Apple M5 Pro (macOS 27.2) is 1.7 ULP, against the 2.5 ULP Vulkan allows
+for 32-bit floating-point division.  Infinities, NaNs and signed zeros
+are not changed by this.
+
+Integer division keeps '/'.  fast::divide only takes floating-point
+operands, and an integer quotient computed through it is off by one
+for values as small as 33 / 33.
+
+Assisted-by: LLM
+```
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -317,9 +317,19 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
+       break;
+    case nir_op_idiv:
+    case nir_op_udiv:
+-   case nir_op_fdiv:
+       ALU_BINOP("/");
+       break;
++   case nir_op_fdiv:
++      /* '/' inside a math_mode(safe) block is correctly rounded and much
++       * slower.  fast::divide ignores the pragma; it is not correctly rounded
++       * (up to 1.7 ULP measured on Apple M5), which is within the 2.5 ULP
++       * Vulkan allows for 32-bit division.  It only exists for float types.
++       */
++      if (instr->def.bit_size == 32)
++         alu_funclike(ctx, instr, "fast::divide");
++      else
++         ALU_BINOP("/");
++      break;
+    case nir_op_irem:
+       ALU_BINOP("%");
+       break;
+

@@ -1,0 +1,613 @@
+# winemac: Post IME updates directly from the Cocoa main thread.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12164 state=closed
+# This works by first allowing `WINE_IME_POST_UPDATE` to post cross-thread, and then refactoring winemac in such a way to directly post and avoid using `IM_SET_TEXT`.
+
+I also took the liberty of consolidating all IME-related functions into their own file instead of having them split up in keyboard.c and event.c (where the latter doesn't make sense anymore at all after this series).
+
+The `PsGetCurrentThreadId()` related TODO can also be removed once !9503 is in. All other uses that require Windows headers are still working via C exports, similar to how it was handled previously.
+--- dlls/winemac.drv/Makefile.in
++++ dlls/winemac.drv/Makefile.in
+@@ -31,6 +31,7 @@ SOURCES = \
+ 	event.c \
+ 	gdi.c \
+ 	image.c \
++	ime.c \
+ 	keyboard.c \
+ 	macdrv_main.c \
+ 	mouse.c \
+
+--- dlls/winemac.drv/cocoa_event.m
++++ dlls/winemac.drv/cocoa_event.m
+@@ -666,10 +666,6 @@ void macdrv_release_event(macdrv_event *event)
+         __atomic_thread_fence(__ATOMIC_ACQUIRE);
+         switch (event->type)
+         {
+-            case IM_SET_TEXT:
+-                if (event->im_set_text.text)
+-                    CFRelease(event->im_set_text.text);
+-                break;
+             case KEYBOARD_CHANGED:
+                 CFRelease(event->keyboard_changed.uchr);
+                 CFRelease(event->keyboard_changed.input_source);
+
+--- dlls/winemac.drv/cocoa_window.h
++++ dlls/winemac.drv/cocoa_window.h
+@@ -57,7 +57,6 @@ @interface WineWindow : NSPanel <NSWindowDelegate>
+     NSRect frameAtResizeStart;
+     BOOL resizingFromLeft, resizingFromTop;
+ 
+-    void* himc;
+     BOOL commandDone;
+ 
+     NSSize savedContentMinSize;
+
+--- dlls/winemac.drv/cocoa_window.m
++++ dlls/winemac.drv/cocoa_window.m
+@@ -290,7 +290,6 @@ @interface WineWindow ()
+ 
+ @property (nonatomic) BOOL usePerPixelAlpha;
+ 
+-@property (assign, nonatomic) void* himc;
+ @property (nonatomic) BOOL commandDone;
+ 
+ @property (readonly, copy, nonatomic) NSArray* childWineWindows;
+@@ -693,18 +692,9 @@ - (void) clearMarkedText
+ 
+     - (void) completeText:(NSString*)text
+     {
+-        macdrv_event* event;
+         WineWindow* window = (WineWindow*)[self window];
+ 
+-        event = macdrv_create_event(IM_SET_TEXT, window);
+-        event->im_set_text.himc = [window himc];
+-        event->im_set_text.text = (CFStringRef)[text copy];
+-        event->im_set_text.complete = true;
+-
+-        [[window queue] postEvent:event];
+-
+-        macdrv_release_event(event);
+-
++        macdrv_ime_set_text(window.hwnd, (CFStringRef)text, true, 0, 0);
+         [self clearMarkedText];
+     }
+ 
+@@ -769,7 +759,6 @@ - (void) setMarkedText:(id)string selectedRange:(NSRange)selectedRange replaceme
+ 
+         if ([string isKindOfClass:[NSString class]])
+         {
+-            macdrv_event* event;
+             WineWindow* window = (WineWindow*)[self window];
+ 
+             if (replacementRange.location == NSNotFound)
+@@ -779,16 +768,9 @@ - (void) setMarkedText:(id)string selectedRange:(NSRange)selectedRange replaceme
+             markedTextSelection = selectedRange;
+             markedTextSelection.location += replacementRange.location;
+ 
+-            event = macdrv_create_event(IM_SET_TEXT, window);
+-            event->im_set_text.himc = [window himc];
+-            event->im_set_text.text = (CFStringRef)[[markedText string] copy];
+-            event->im_set_text.complete = false;
+-            event->im_set_text.cursor_begin = markedTextSelection.location;
+-            event->im_set_text.cursor_end = markedTextSelection.location + markedTextSelection.length;
+-
+-            [[window queue] postEvent:event];
+-
+-            macdrv_release_event(event);
++            macdrv_ime_set_text(window.hwnd, (CFStringRef)[markedText string], false,
++                                markedTextSelection.location,
++                                markedTextSelection.location + markedTextSelection.length);
+ 
+             [[self inputContext] invalidateCharacterCoordinates];
+         }
+@@ -916,7 +898,7 @@ @implementation WineWindow
+     @synthesize drawnSinceShown;
+     @synthesize shapeChangedSinceLastDraw;
+     @synthesize usePerPixelAlpha;
+-    @synthesize himc, commandDone;
++    @synthesize commandDone;
+     @synthesize contentViewMaskLayer;
+ 
+     + (WineWindow*) createWindowWithFeatures:(const struct macdrv_window_features*)wf
+@@ -3934,11 +3916,12 @@ uint32_t macdrv_window_background_color(void)
+  * processed by input sources (AKA IMEs). This is only called when there is an
+  * active non-keyboard input source.
+  */
+-bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repeat, void *himc)
++bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repeat,
++                                         struct macdrv_ime_capture *capture)
+ {
+-    __block bool ret;
++    __block bool ret = false;
+ 
+-    OnMainThread(^{
++    dispatch_sync(dispatch_get_main_queue(), ^{
+         WineWindow* window = (WineWindow*)[NSApp keyWindow];
+         if (![window isKindOfClass:[WineWindow class]])
+         {
+@@ -3953,7 +3936,6 @@ bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repea
+             CGEventRef c;
+             NSEvent* event;
+ 
+-            window.himc = himc;
+             fix_device_modifiers_by_generic(&localFlags);
+ 
+             // An NSEvent created with +keyEventWithType:... is internally marked
+@@ -3965,11 +3947,11 @@ bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repea
+             event = [NSEvent eventWithCGEvent:c];
+             CFRelease(c);
+ 
++            macdrv_ime_start_capture(capture);
+             window.commandDone = FALSE;
+             ret = [[[window contentView] inputContext] handleEvent:event] && !window.commandDone;
++            macdrv_ime_stop_capture();
+         }
+-        else
+-            ret = false;
+     });
+ 
+     return ret;
+
+--- dlls/winemac.drv/event.c
++++ dlls/winemac.drv/event.c
+@@ -30,10 +30,6 @@
+ #include <poll.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(event);
+-WINE_DECLARE_DEBUG_CHANNEL(imm);
+-
+-pthread_mutex_t ime_composition_rect_mutex = PTHREAD_MUTEX_INITIALIZER;
+-CGRect ime_composition_rect;
+ 
+ /* return the name of an Mac event */
+ static const char *dbgstr_event(int type)
+@@ -44,7 +40,6 @@ static const char *dbgstr_event(int type)
+         "APP_QUIT_REQUESTED",
+         "DISPLAYS_CHANGED",
+         "HOTKEY_PRESS",
+-        "IM_SET_TEXT",
+         "KEY_PRESS",
+         "KEY_RELEASE",
+         "KEYBOARD_CHANGED",
+@@ -117,7 +112,6 @@ static macdrv_event_mask get_event_mask(DWORD mask)
+         event_mask |= event_mask_for_type(APP_DEACTIVATED);
+         event_mask |= event_mask_for_type(APP_QUIT_REQUESTED);
+         event_mask |= event_mask_for_type(DISPLAYS_CHANGED);
+-        event_mask |= event_mask_for_type(IM_SET_TEXT);
+         event_mask |= event_mask_for_type(LOST_PASTEBOARD_OWNERSHIP);
+         event_mask |= event_mask_for_type(STATUS_ITEM_MOUSE_BUTTON);
+         event_mask |= event_mask_for_type(STATUS_ITEM_MOUSE_MOVE);
+@@ -146,39 +140,6 @@ static macdrv_event_mask get_event_mask(DWORD mask)
+     return event_mask;
+ }
+ 
+-static void post_ime_update( HWND hwnd, UINT cursor_pos, WCHAR *comp_str, WCHAR *result_str )
+-{
+-    NtUserMessageCall( hwnd, WINE_IME_POST_UPDATE, cursor_pos, (LPARAM)comp_str,
+-                       result_str, NtUserImeDriverCall, FALSE );
+-}
+-
+-/***********************************************************************
+- *              macdrv_im_set_text
+- */
+-static void macdrv_im_set_text(const macdrv_event *event)
+-{
+-    HWND hwnd = macdrv_get_window_hwnd(event->window);
+-    WCHAR *text = NULL;
+-
+-    TRACE_(imm)("win %p/%p himc %p text %s complete %u\n", hwnd, event->window, event->im_set_text.himc,
+-                debugstr_cf(event->im_set_text.text), event->im_set_text.complete);
+-
+-    if (event->im_set_text.text)
+-    {
+-        CFIndex length = CFStringGetLength(event->im_set_text.text);
+-        if (!(text = malloc((length + 1) * sizeof(WCHAR)))) return;
+-        if (length) CFStringGetCharacters(event->im_set_text.text, CFRangeMake(0, length), text);
+-        text[length] = 0;
+-    }
+-
+-    if (event->im_set_text.complete) post_ime_update(hwnd, -1, NULL, text);
+-    else post_ime_update(hwnd,
+-                         MAKELONG(event->im_set_text.cursor_begin, event->im_set_text.cursor_end),
+-                         text, NULL);
+-
+-    free(text);
+-}
+-
+ 
+ /**************************************************************************
+  *              drag_operations_to_dropeffects
+@@ -286,29 +247,6 @@ static BOOL query_drag_drop_drag(macdrv_query *query)
+ }
+ 
+ 
+-/***********************************************************************
+- *      SetIMECompositionRect (MACDRV.@)
+- */
+-BOOL macdrv_SetIMECompositionRect(HWND hwnd, RECT rect)
+-{
+-    TRACE("hwnd %p, rect %s\n", hwnd, wine_dbgstr_rect(&rect));
+-    pthread_mutex_lock(&ime_composition_rect_mutex);
+-    ime_composition_rect = cgrect_from_rect(rect);
+-    pthread_mutex_unlock(&ime_composition_rect_mutex);
+-    return TRUE;
+-}
+-
+-
+-/***********************************************************************
+- *      NotifyIMEStatus (MACDRV.@)
+- */
+-void macdrv_NotifyIMEStatus( HWND hwnd, UINT status )
+-{
+-    TRACE_(imm)( "hwnd %p, status %#x\n", hwnd, status );
+-    if (!status) macdrv_clear_ime_text();
+-}
+-
+-
+ /***********************************************************************
+  *              macdrv_query_event
+  *
+@@ -396,9 +334,6 @@ void macdrv_handle_event(const macdrv_event *event)
+     case HOTKEY_PRESS:
+         macdrv_hotkey_press(event);
+         break;
+-    case IM_SET_TEXT:
+-        macdrv_im_set_text(event);
+-        break;
+     case KEY_PRESS:
+     case KEY_RELEASE:
+         macdrv_key_event(hwnd, event);
+
+--- dlls/winemac.drv/ime.c
++++ dlls/winemac.drv/ime.c
+@@ -0,0 +1,210 @@
++/*
++ * MACDRV input method driver
++ *
++ * Copyright 2026 Marc-Aurel Zent for CodeWeavers Inc.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++#include "macdrv.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(imm);
++
++struct macdrv_ime_capture
++{
++    HWND hwnd;
++    UINT cursor_pos;
++    WCHAR *comp_str;
++    WCHAR *result_str;
++};
++
++pthread_mutex_t ime_composition_rect_mutex = PTHREAD_MUTEX_INITIALIZER;
++CGRect ime_composition_rect;
++static struct macdrv_ime_capture *ime_capture; /* Only accessed on the main thread. */
++
++
++/***********************************************************************
++ *              ImeToAsciiEx (MACDRV.@)
++ */
++UINT macdrv_ImeToAsciiEx( UINT vkey, UINT vsc, const BYTE *state, HIMC himc )
++{
++    struct macdrv_thread_data *thread_data = macdrv_thread_data();
++    struct macdrv_ime_capture capture = {0};
++    unsigned int flags;
++    int keyc;
++    bool ret;
++    BOOL repeat = !!(vsc & KF_REPEAT);
++
++    TRACE( "himc %p, vkey %#x state %p repeat %u\n", himc, vkey, state, repeat );
++
++    if (!state) return STATUS_SUCCESS;
++
++    if (vsc & KF_UP)
++    {
++        /* Only key down events should be sent to the Cocoa input context. We do
++           not handle key ups, and instead let those go through as a normal
++           WM_KEYUP. */
++        return STATUS_NOT_IMPLEMENTED;
++    }
++
++    switch (vkey)
++    {
++        case VK_KANA:
++        case VK_KANJI:
++            TRACE( "Skipping metakey\n" );
++            return STATUS_NOT_IMPLEMENTED;
++    }
++
++    flags = thread_data->last_modifiers;
++    if (state[VK_SHIFT] & 0x80)
++        flags |= NX_SHIFTMASK;
++    else
++        flags &= ~(NX_SHIFTMASK | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK);
++    if (state[VK_CAPITAL] & 0x01)
++        flags |= NX_ALPHASHIFTMASK;
++    else
++        flags &= ~NX_ALPHASHIFTMASK;
++    if (state[VK_CONTROL] & 0x80)
++        flags |= NX_CONTROLMASK;
++    else
++        flags &= ~(NX_CONTROLMASK | NX_DEVICELCTLKEYMASK | NX_DEVICERCTLKEYMASK);
++    if (state[VK_MENU] & 0x80)
++        flags |= NX_COMMANDMASK;
++    else
++        flags &= ~(NX_COMMANDMASK | NX_DEVICELCMDKEYMASK | NX_DEVICERCMDKEYMASK);
++
++    /* Find the Mac keycode corresponding to the scan code */
++    for (keyc = 0; keyc < ARRAY_SIZE(thread_data->keyc2vkey); keyc++)
++        if (thread_data->keyc2vkey[keyc] == vkey) break;
++
++    if (keyc >= ARRAY_SIZE(thread_data->keyc2vkey)) return 0;
++
++    TRACE( "flags 0x%08x keyc 0x%04x\n", flags, keyc );
++    ret = macdrv_send_keydown_to_input_source(keyc, flags, repeat, &capture);
++    macdrv_send_captured_data( &capture );
++    return ret ? STATUS_SUCCESS : STATUS_NOT_IMPLEMENTED;
++}
++
++
++/***********************************************************************
++ *              SetIMECompositionRect (MACDRV.@)
++ */
++BOOL macdrv_SetIMECompositionRect( HWND hwnd, RECT rect )
++{
++    TRACE( "hwnd %p, rect %s\n", hwnd, wine_dbgstr_rect( &rect ));
++    pthread_mutex_lock( &ime_composition_rect_mutex );
++    ime_composition_rect = cgrect_from_rect( rect );
++    pthread_mutex_unlock( &ime_composition_rect_mutex );
++    return TRUE;
++}
++
++
++/***********************************************************************
++ *              NotifyIMEStatus (MACDRV.@)
++ */
++void macdrv_NotifyIMEStatus( HWND hwnd, UINT status )
++{
++    TRACE( "hwnd %p, status %#x\n", hwnd, status );
++    if (!status) macdrv_clear_ime_text();
++}
++
++
++void macdrv_ime_start_capture( struct macdrv_ime_capture *capture )
++{
++    ime_capture = capture;
++}
++
++void macdrv_ime_stop_capture(void)
++{
++    ime_capture = NULL;
++}
++
++void macdrv_send_captured_data( struct macdrv_ime_capture *capture )
++{
++    if (capture->hwnd)
++        NtUserMessageCall( capture->hwnd, WINE_IME_POST_UPDATE, capture->cursor_pos, (LPARAM)capture->comp_str,
++                           capture->result_str, NtUserImeDriverCall, FALSE );
++    free( capture->comp_str );
++    free( capture->result_str );
++}
++
++static void post_ime_update( HWND hwnd, UINT cursor_pos, WCHAR *comp_str, WCHAR *result_str )
++{
++    WCHAR *comp = NULL, *result = NULL;
++    UINT comp_len, result_len, prev_result_len;
++
++    if (!ime_capture)
++    {
++        NtUserMessageCall( hwnd, WINE_IME_POST_UPDATE, cursor_pos, (LPARAM)comp_str,
++                           result_str, NtUserImeDriverCall, FALSE );
++        return;
++    }
++
++    comp_len = comp_str ? wcslen( comp_str ) + 1 : 0;
++    if (comp_len && !(comp = malloc( comp_len * sizeof(WCHAR) ))) return;
++    if (comp_len) memcpy( comp, comp_str, comp_len * sizeof(WCHAR) );
++
++    result_len = result_str ? wcslen( result_str ) + 1 : 0;
++    prev_result_len = ime_capture->result_str ? wcslen( ime_capture->result_str ) + 1 : 0;
++    if (prev_result_len || result_len)
++    {
++        if (!(result = malloc( (prev_result_len + result_len) * sizeof(WCHAR) )))
++        {
++            free( comp );
++            return;
++        }
++        if (prev_result_len && result_len) prev_result_len -= 1;
++        if (prev_result_len) memcpy( result, ime_capture->result_str, prev_result_len * sizeof(WCHAR) );
++        if (result_len) memcpy( result + prev_result_len, result_str, result_len * sizeof(WCHAR) );
++    }
++
++    free( ime_capture->comp_str );
++    free( ime_capture->result_str );
++    ime_capture->hwnd = hwnd;
++    ime_capture->cursor_pos = cursor_pos;
++    ime_capture->comp_str = comp;
++    ime_capture->result_str = result;
++}
++
++/***********************************************************************
++ *              macdrv_ime_set_text
++ *
++ * This is only meant to be called from the Cocoa main thread.
++ */
++void macdrv_ime_set_text( void *hwnd, CFStringRef text, bool complete, unsigned int cursor_begin,
++                          unsigned int cursor_end )
++{
++    WCHAR *chars = NULL;
++
++    TRACE( "hwnd %p text %s complete %u cursor %u-%u\n", hwnd, debugstr_cf( text ),
++           complete, cursor_begin, cursor_end );
++
++    if (text)
++    {
++        CFIndex length = CFStringGetLength( text );
++        if (!(chars = malloc( (length + 1) * sizeof(WCHAR) ))) return;
++        if (length) CFStringGetCharacters( text, CFRangeMake( 0, length ), chars );
++        chars[length] = 0;
++    }
++
++    if (complete) post_ime_update( hwnd, -1, NULL, chars );
++    else post_ime_update( hwnd, MAKELONG( cursor_begin, cursor_end ), chars, NULL );
++    free( chars );
++}
+
+--- dlls/winemac.drv/keyboard.c
++++ dlls/winemac.drv/keyboard.c
+@@ -1102,69 +1102,6 @@ void macdrv_hotkey_press(const macdrv_event *event)
+ }
+ 
+ 
+-/***********************************************************************
+- *              ImeToAsciiEx (MACDRV.@)
+- */
+-UINT macdrv_ImeToAsciiEx(UINT vkey, UINT vsc, const BYTE *state, HIMC himc)
+-{
+-    struct macdrv_thread_data *thread_data = macdrv_thread_data();
+-    unsigned int flags;
+-    int keyc;
+-    bool ret;
+-    BOOL repeat = !!(vsc & KF_REPEAT);
+-
+-    TRACE("himc %p, vkey %#x state %p repeat %u\n",
+-          himc, vkey, state, repeat);
+-
+-    if (!state) return STATUS_SUCCESS;
+-
+-    if (vsc & KF_UP)
+-    {
+-        /* Only key down events should be sent to the Cocoa input context. We do
+-           not handle key ups, and instead let those go through as a normal
+-           WM_KEYUP. */
+-        return STATUS_NOT_IMPLEMENTED;
+-    }
+-
+-    switch (vkey)
+-    {
+-        case VK_KANA:
+-        case VK_KANJI:
+-            TRACE("Skipping metakey\n");
+-            return STATUS_NOT_IMPLEMENTED;
+-    }
+-
+-    flags = thread_data->last_modifiers;
+-    if (state[VK_SHIFT] & 0x80)
+-        flags |= NX_SHIFTMASK;
+-    else
+-        flags &= ~(NX_SHIFTMASK | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK);
+-    if (state[VK_CAPITAL] & 0x01)
+-        flags |= NX_ALPHASHIFTMASK;
+-    else
+-        flags &= ~NX_ALPHASHIFTMASK;
+-    if (state[VK_CONTROL] & 0x80)
+-        flags |= NX_CONTROLMASK;
+-    else
+-        flags &= ~(NX_CONTROLMASK | NX_DEVICELCTLKEYMASK | NX_DEVICERCTLKEYMASK);
+-    if (state[VK_MENU] & 0x80)
+-        flags |= NX_COMMANDMASK;
+-    else
+-        flags &= ~(NX_COMMANDMASK | NX_DEVICELCMDKEYMASK | NX_DEVICERCMDKEYMASK);
+-
+-    /* Find the Mac keycode corresponding to the scan code */
+-    for (keyc = 0; keyc < ARRAY_SIZE(thread_data->keyc2vkey); keyc++)
+-        if (thread_data->keyc2vkey[keyc] == vkey) break;
+-
+-    if (keyc >= ARRAY_SIZE(thread_data->keyc2vkey)) return 0;
+-
+-    TRACE("flags 0x%08x keyc 0x%04x\n", flags, keyc);
+-    ret = macdrv_send_keydown_to_input_source(keyc, flags, repeat, himc);
+-    NtUserMsgWaitForMultipleObjectsEx(0, NULL, 0, QS_POSTMESSAGE | QS_SENDMESSAGE, 0);
+-    return ret ? STATUS_SUCCESS : STATUS_NOT_IMPLEMENTED;
+-}
+-
+-
+ /***********************************************************************
+  *              ActivateKeyboardLayout (MACDRV.@)
+  */
+
+--- dlls/winemac.drv/macdrv.h
++++ dlls/winemac.drv/macdrv.h
+@@ -221,6 +221,20 @@ extern BOOL macdrv_SystemParametersInfo(UINT action, UINT int_param, void *ptr_p
+ #endif
+ 
+ 
++/* IME */
++struct macdrv_ime_capture;
++
++extern pthread_mutex_t ime_composition_rect_mutex;
++extern CGRect ime_composition_rect;
++extern void macdrv_clear_ime_text(void);
++extern void macdrv_ime_set_text(void *hwnd, CFStringRef text, bool complete,
++                                unsigned int cursor_begin, unsigned int cursor_end);
++extern void macdrv_ime_start_capture(struct macdrv_ime_capture *capture);
++extern void macdrv_ime_stop_capture(void);
++extern void macdrv_send_captured_data(struct macdrv_ime_capture *capture);
++extern bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repeat,
++                                                struct macdrv_ime_capture *capture);
++
+ /* macdrv private window data */
+ struct macdrv_win_data
+ {
+
+--- dlls/winemac.drv/macdrv_cocoa.h
++++ dlls/winemac.drv/macdrv_cocoa.h
+@@ -278,7 +278,6 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+     APP_QUIT_REQUESTED,
+     DISPLAYS_CHANGED,
+     HOTKEY_PRESS,
+-    IM_SET_TEXT,
+     KEY_PRESS,
+     KEY_RELEASE,
+     KEYBOARD_CHANGED,
+@@ -336,13 +335,6 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+             unsigned int    keycode;
+             unsigned long   time_ms;
+         }                                           hotkey_press;
+-        struct {
+-            void           *himc;
+-            CFStringRef     text;       /* new text or NULL if just completing existing text */
+-            unsigned int    cursor_begin;
+-            unsigned int    cursor_end;
+-            bool            complete;   /* is completing text? */
+-        }                                           im_set_text;
+         struct {
+             CGKeyCode                   keycode;
+             CGEventFlags                modifiers;
+@@ -542,7 +534,6 @@ extern void macdrv_order_cocoa_window(WineWindow *window, WineWindow *prev,
+ extern bool macdrv_get_view_backing_size(WineContentView *view, int backing_size[2]);
+ extern void macdrv_set_view_backing_size(WineContentView *view, const int backing_size[2]);
+ extern uint32_t macdrv_window_background_color(void);
+-extern bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repeat, void *data);
+ extern bool macdrv_is_any_wine_window_visible(void);
+ 
+ 
+@@ -580,9 +571,4 @@ extern void macdrv_get_input_source_info(CFDataRef* uchr,CGEventSourceKeyboardTy
+ extern void macdrv_set_status_item_image(WineStatusItem *item, CGImageRef cgimage);
+ extern void macdrv_set_status_item_tooltip(WineStatusItem *item, CFStringRef cftip);
+ 
+-/* ime */
+-extern pthread_mutex_t ime_composition_rect_mutex;
+-extern CGRect ime_composition_rect;
+-extern void macdrv_clear_ime_text(void);
+-
+ #endif  /* __WINE_MACDRV_COCOA_H */
+

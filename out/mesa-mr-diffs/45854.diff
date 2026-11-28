@@ -1,0 +1,172 @@
+# kk: Feature checks for BC and linear filtering for 32bit float texture formats
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45854 state=merged
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+Not all chips support them, check before we expose
+--- src/kosmickrisp/bridge/stubs/mtl_device.c
++++ src/kosmickrisp/bridge/stubs/mtl_device.c
+@@ -89,6 +89,18 @@ mtl_device_max_argument_buffer_sampler_count(mtl_device *dev)
+    return 0u;
+ }
+ 
++bool
++mtl_device_supports_bc_texture_compression(mtl_device *dev)
++{
++   return false;
++}
++
++bool
++mtl_device_supports_32_bit_float_filtering(mtl_device *dev)
++{
++   return false;
++}
++
+ /* Timestamp query */
+ uint64_t
+ mtl_device_get_gpu_timestamp(mtl_device *dev)
+
+--- src/kosmickrisp/bridge/mtl_device.h
++++ src/kosmickrisp/bridge/mtl_device.h
+@@ -36,6 +36,8 @@ uint64_t mtl_device_max_buffer_length(mtl_device *dev);
+ uint64_t mtl_device_recommended_max_working_set_size(mtl_device *dev);
+ uint64_t mtl_device_current_allocated_size(mtl_device *dev);
+ uint32_t mtl_device_max_argument_buffer_sampler_count(mtl_device *dev);
++bool mtl_device_supports_bc_texture_compression(mtl_device *dev);
++bool mtl_device_supports_32_bit_float_filtering(mtl_device *dev);
+ 
+ /* Timestamp query */
+ uint64_t mtl_device_get_gpu_timestamp(mtl_device *dev);
+
+--- src/kosmickrisp/bridge/mtl_device.m
++++ src/kosmickrisp/bridge/mtl_device.m
+@@ -179,6 +179,24 @@ mtl_device_max_argument_buffer_sampler_count(mtl_device *dev)
+    }
+ }
+ 
++bool
++mtl_device_supports_bc_texture_compression(mtl_device *dev)
++{
++   @autoreleasepool {
++      id<MTLDevice> device = (id<MTLDevice>)dev;
++      return device.supportsBCTextureCompression;
++   }
++}
++
++bool
++mtl_device_supports_32_bit_float_filtering(mtl_device *dev)
++{
++   @autoreleasepool {
++      id<MTLDevice> device = (id<MTLDevice>)dev;
++      return device.supports32BitFloatFiltering;
++   }
++}
++
+ /* Timestamp query */
+ uint64_t
+ mtl_device_get_gpu_timestamp(mtl_device *dev)
+
+--- src/kosmickrisp/vulkan/kk_image.c
++++ src/kosmickrisp/vulkan/kk_image.c
+@@ -21,6 +21,43 @@
+ #include "vk_format.h"
+ #include "wsi_common_private.h"
+ 
++static bool
++vk_format_is_bc(VkFormat format)
++{
++   switch (format) {
++   case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
++   case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
++   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
++   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
++   case VK_FORMAT_BC2_SRGB_BLOCK:
++   case VK_FORMAT_BC2_UNORM_BLOCK:
++   case VK_FORMAT_BC3_UNORM_BLOCK:
++   case VK_FORMAT_BC3_SRGB_BLOCK:
++   case VK_FORMAT_BC4_UNORM_BLOCK:
++   case VK_FORMAT_BC4_SNORM_BLOCK:
++   case VK_FORMAT_BC5_UNORM_BLOCK:
++   case VK_FORMAT_BC5_SNORM_BLOCK:
++   case VK_FORMAT_BC6H_UFLOAT_BLOCK:
++   case VK_FORMAT_BC6H_SFLOAT_BLOCK:
++   case VK_FORMAT_BC7_UNORM_BLOCK:
++   case VK_FORMAT_BC7_SRGB_BLOCK:
++      return true;
++   default:
++      return false;
++   }
++}
++
++static bool
++format_is_32bit_float(enum pipe_format p_format)
++{
++   const struct util_format_description *desc =
++      util_format_description(p_format);
++   int c = util_format_get_first_non_void_channel(p_format);
++
++   return c >= 0 && desc->channel[c].type == UTIL_FORMAT_TYPE_FLOAT &&
++          desc->channel[c].size == 32;
++}
++
+ static VkFormatFeatureFlags2
+ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
+                                    VkFormat vk_format, VkImageTiling tiling,
+@@ -28,6 +65,10 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
+ {
+    VkFormatFeatureFlags2 features = 0;
+ 
++   if (!pdev->info.supports_bc_texture_compression &&
++       vk_format_is_bc(vk_format))
++      return 0;
++
+    /* Metal does not support linear tiling for compressed formats */
+    if (tiling == VK_IMAGE_TILING_LINEAR && vk_format_is_compressed(vk_format))
+       return 0;
+@@ -48,7 +89,9 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
+    features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT;
+    features |= VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
+ 
+-   if (va_format->filter) {
++   /* Not all GPUs support linear filtering of 32bit float formats (A chips) */
++   if (va_format->filter && (pdev->info.supports_32_bit_float_filtering ||
++                             !format_is_32bit_float(p_format))) {
+       features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+       if (pdev->vk.supported_extensions.EXT_sampler_filter_minmax)
+          features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -260,7 +260,7 @@ kk_get_device_features(
+       .shaderUniformBufferArrayDynamicIndexing = true,
+       .tessellationShader = true,
+       .textureCompressionASTC_LDR = true,
+-      .textureCompressionBC = true,
++      .textureCompressionBC = pdev->info.supports_bc_texture_compression,
+       .textureCompressionETC2 = true,
+       .vertexPipelineStoresAndAtomics = true,
+ 
+@@ -1054,6 +1054,10 @@ get_metal_limits(struct kk_physical_device *pdev)
+       mtl_device_max_buffer_length(pdev->mtl_dev_handle);
+    pdev->info.max_sampler_count =
+       mtl_device_max_argument_buffer_sampler_count(pdev->mtl_dev_handle);
++   pdev->info.supports_bc_texture_compression =
++      mtl_device_supports_bc_texture_compression(pdev->mtl_dev_handle);
++   pdev->info.supports_32_bit_float_filtering =
++      mtl_device_supports_32_bit_float_filtering(pdev->mtl_dev_handle);
+    pdev->info.gpu_apple_family =
+       mtl_device_get_gpu_apple_family(pdev->mtl_dev_handle);
+ 
+
+--- src/kosmickrisp/vulkan/kk_physical_device.h
++++ src/kosmickrisp/vulkan/kk_physical_device.h
+@@ -46,6 +46,8 @@ struct kk_device_info {
+    uint32_t rendering_tile_width;
+    uint32_t rendering_tile_height;
+    VkSampleCountFlags supported_sample_counts;
++   bool supports_bc_texture_compression;
++   bool supports_32_bit_float_filtering;
+ };
+ 
+ struct kk_env_settings {
+

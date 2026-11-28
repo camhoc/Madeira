@@ -1,0 +1,511 @@
+# Draft: dxgi: Implement IDXGIFactory2::CreateSwapChainForComposition().
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/2245 state=closed
+# 
+--- dlls/dxgi/tests/dxgi.c
++++ dlls/dxgi/tests/dxgi.c
+@@ -7581,6 +7581,135 @@ done:
+     ok(!refcount, "Device has %lu references left.\n", refcount);
+ }
+ 
++static void test_composition_swapchain(IUnknown *device, BOOL is_d3d12)
++{
++    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc;
++    DXGI_SWAP_CHAIN_DESC1 swapchain_desc;
++    IDXGISwapChain1 *swapchain1;
++    IDXGIFactory2 *factory2;
++    IDXGIFactory *factory;
++    DXGI_MODE_DESC mode;
++    IDXGIOutput *output;
++    IUnknown *unknown;
++    ULONG ref_count;
++    HWND window;
++    HRESULT hr;
++    BOOL ret;
++
++    get_factory(device, is_d3d12, &factory);
++
++    hr = IDXGIFactory_QueryInterface(factory, &IID_IDXGIFactory2, (void**)&factory2);
++    IDXGIFactory_Release(factory);
++    if (FAILED(hr))
++    {
++        win_skip("IDXGIFactory2 not available.\n");
++        return;
++    }
++
++    swapchain_desc.Width = 640;
++    swapchain_desc.Height = 480;
++    swapchain_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    swapchain_desc.Stereo = FALSE;
++    swapchain_desc.SampleDesc.Count = 1;
++    swapchain_desc.SampleDesc.Quality = 0;
++    swapchain_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++    swapchain_desc.BufferCount = 2;
++    swapchain_desc.Scaling = DXGI_SCALING_STRETCH;
++    swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
++    swapchain_desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
++    swapchain_desc.Flags = 0;
++
++    /* Parameter checks */
++    /* NULL device */
++    hr = IDXGIFactory2_CreateSwapChainForComposition(factory2, NULL, &swapchain_desc, NULL, &swapchain1);
++    if (hr == DXGI_ERROR_UNSUPPORTED) /* Win7 */
++    {
++        win_skip("CreateSwapChainForComposition() is unsupported.\n");
++        ref_count = IDXGIFactory2_Release(factory2);
++        ok(ref_count == !is_d3d12, "Factory has %lu references left.\n", ref_count);
++        return;
++    }
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++
++    /* NULL swapchain description */
++    hr = IDXGIFactory2_CreateSwapChainForComposition(factory2, device, NULL, NULL, &swapchain1);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++
++    /* Invalid width */
++    swapchain_desc.Width = 0;
++    hr = IDXGIFactory2_CreateSwapChainForComposition(factory2, device, &swapchain_desc, NULL, &swapchain1);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++    swapchain_desc.Width = 640;
++
++    /* Invalid height */
++    swapchain_desc.Height = 0;
++    hr = IDXGIFactory2_CreateSwapChainForComposition(factory2, device, &swapchain_desc, NULL, &swapchain1);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++    swapchain_desc.Height = 480;
++
++    /* Invalid scaling */
++    swapchain_desc.Scaling = DXGI_SCALING_NONE;
++    hr = IDXGIFactory2_CreateSwapChainForComposition(factory2, device, &swapchain_desc, NULL, &swapchain1);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++    swapchain_desc.Scaling = DXGI_SCALING_STRETCH;
++
++    /* Invalid swap effect */
++    swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL;
++    hr = IDXGIFactory2_CreateSwapChainForComposition(factory2, device, &swapchain_desc, NULL, &swapchain1);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++    swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
++
++    /* NULL swapchain pointer */
++    hr = IDXGIFactory2_CreateSwapChainForComposition(factory2, device, &swapchain_desc, NULL, NULL);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++
++    /* Normal call*/
++    hr = IDXGIFactory2_CreateSwapChainForComposition(factory2, device, &swapchain_desc, NULL, &swapchain1);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    output = (void *)0xdeadbeef;
++    hr = IDXGISwapChain1_GetFullscreenState(swapchain1, &ret, &output);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ok(!ret, "Got unexpected fullscreen state.\n");
++    ok(!output, "Got unexpected output.\n");
++
++    /* ResizeBuffers() tests */
++    hr = IDXGISwapChain1_ResizeBuffers(swapchain1, 2, 0, 768, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++
++    hr = IDXGISwapChain1_ResizeBuffers(swapchain1, 2, 1024, 0, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
++    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++
++    hr = IDXGISwapChain1_ResizeBuffers(swapchain1, 2, 1024, 768, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++
++    /* Invalid method calls for composition swapchains */
++    hr = IDXGISwapChain1_GetFullscreenDesc(swapchain1, &fullscreen_desc);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++
++    hr = IDXGISwapChain1_SetFullscreenState(swapchain1, TRUE, NULL);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++
++    memset(&mode, 0, sizeof(mode));
++    mode.Width = 1024;
++    mode.Height = 768;
++    hr = IDXGISwapChain1_ResizeTarget(swapchain1, &mode);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++
++    hr = IDXGISwapChain1_GetContainingOutput(swapchain1, &output);
++    ok(hr == DXGI_ERROR_UNSUPPORTED, "Got unexpected hr %#lx.\n", hr);
++
++    hr = IDXGISwapChain1_GetHwnd(swapchain1, &window);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++
++    hr = IDXGISwapChain1_GetCoreWindow(swapchain1, &IID_IUnknown, (void **)&unknown);
++    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++
++    IDXGISwapChain1_Release(swapchain1);
++    ref_count = IDXGIFactory2_Release(factory2);
++    ok(ref_count == !is_d3d12, "Factory has %lu references left.\n", ref_count);
++}
++
+ static void run_on_d3d10(void (*test_func)(IUnknown *device, BOOL is_d3d12))
+ {
+     IDXGIDevice *device;
+@@ -7705,6 +7834,7 @@ START_TEST(dxgi)
+     run_on_d3d10(test_default_fullscreen_target_output);
+     run_on_d3d10(test_mode_change);
+     run_on_d3d10(test_swapchain_present_count);
++    run_on_d3d10(test_composition_swapchain);
+ 
+     if (!(d3d12_module = LoadLibraryA("d3d12.dll")))
+     {
+@@ -7736,6 +7866,7 @@ START_TEST(dxgi)
+     run_on_d3d12(test_default_fullscreen_target_output);
+     run_on_d3d12(test_mode_change);
+     run_on_d3d12(test_swapchain_present_count);
++    run_on_d3d12(test_composition_swapchain);
+ 
+     FreeLibrary(d3d12_module);
+ }
+
+--- dlls/dxgi/dxgi_private.h
++++ dlls/dxgi/dxgi_private.h
+@@ -171,6 +171,12 @@ HRESULT dxgi_adapter_create(struct dxgi_factory *factory, UINT ordinal,
+ struct dxgi_adapter *unsafe_impl_from_IDXGIAdapter(IDXGIAdapter *iface) DECLSPEC_HIDDEN;
+ 
+ /* IDXGISwapChain */
++enum dxgi_swapchain_type
++{
++    DXGI_SWAPCHAIN_TYPE_HWND,
++    DXGI_SWAPCHAIN_TYPE_COMPOSITION,
++};
++
+ struct d3d11_swapchain
+ {
+     IDXGISwapChain1 IDXGISwapChain1_iface;
+@@ -181,6 +187,8 @@ struct d3d11_swapchain
+     IWineDXGIDevice *device;
+     IWineDXGIFactory *factory;
+ 
++    enum dxgi_swapchain_type type;
++    HWND window;
+     IDXGIOutput *target;
+     LONG present_count;
+ };
+
+--- dlls/dxgi/factory.c
++++ dlls/dxgi/factory.c
+@@ -381,10 +381,53 @@ static void STDMETHODCALLTYPE dxgi_factory_UnregisterOcclusionStatus(IWineDXGIFa
+ static HRESULT STDMETHODCALLTYPE dxgi_factory_CreateSwapChainForComposition(IWineDXGIFactory *iface,
+         IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *output, IDXGISwapChain1 **swapchain)
+ {
+-    FIXME("iface %p, device %p, desc %p, output %p, swapchain %p stub!\n",
+-            iface, device, desc, output, swapchain);
++    IWineDXGISwapChainFactory *swapchain_factory;
++    ID3D12CommandQueue *command_queue;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, device %p, desc %p,, output %p, swapchain %p.\n", iface, device, desc, output,
++            swapchain);
++
++    if (!device || !desc || !swapchain)
++    {
++        WARN("Invalid pointer.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
++    if (desc->Stereo)
++    {
++        FIXME("Stereo swapchains are not supported.\n");
++        return DXGI_ERROR_UNSUPPORTED;
++    }
++
++    if (!desc->Width || !desc->Height
++            || desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
++            || desc->Scaling != DXGI_SCALING_STRETCH)
++        return DXGI_ERROR_INVALID_CALL;
++
++    if (!dxgi_validate_swapchain_desc(desc))
++        return DXGI_ERROR_INVALID_CALL;
++
++    if (output)
++        FIXME("Ignoring output %p.\n", output);
++
++    if (SUCCEEDED(IUnknown_QueryInterface(device, &IID_IWineDXGISwapChainFactory, (void **)&swapchain_factory)))
++    {
++        hr = IWineDXGISwapChainFactory_create_swapchain(swapchain_factory, (IDXGIFactory *)iface,
++                NULL, desc, NULL, output, swapchain);
++        IWineDXGISwapChainFactory_Release(swapchain_factory);
++        return hr;
++    }
++
++    if (SUCCEEDED(IUnknown_QueryInterface(device, &IID_ID3D12CommandQueue, (void **)&command_queue)))
++    {
++        hr = d3d12_swapchain_create(iface, command_queue, NULL, desc, NULL, swapchain);
++        ID3D12CommandQueue_Release(command_queue);
++        return hr;
++    }
++
++    ERR("This is not the device we're looking for.\n");
++    return DXGI_ERROR_UNSUPPORTED;
+ }
+ 
+ static UINT STDMETHODCALLTYPE dxgi_factory_GetCreationFlags(IWineDXGIFactory *iface)
+
+--- dlls/dxgi/swapchain.c
++++ dlls/dxgi/swapchain.c
+@@ -387,6 +387,12 @@ static HRESULT STDMETHODCALLTYPE DECLSPEC_HOTPATCH d3d11_swapchain_SetFullscreen
+ 
+     TRACE("iface %p, fullscreen %#x, target %p.\n", iface, fullscreen, target);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
+     if (!fullscreen && target)
+     {
+         WARN("Invalid call.\n");
+@@ -520,6 +526,12 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_ResizeBuffers(IDXGISwapChain1 *
+     TRACE("iface %p, buffer_count %u, width %u, height %u, format %s, flags %#x.\n",
+             iface, buffer_count, width, height, debug_dxgi_format(format), flags);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION && (!width || !height))
++    {
++        WARN("Invalid size for composition swapchains.\n");
++        return E_INVALIDARG;
++    }
++
+     if (flags)
+         FIXME("Ignoring flags %#x.\n", flags);
+ 
+@@ -553,6 +565,12 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_ResizeTarget(IDXGISwapChain1 *i
+ 
+     TRACE("iface %p, target_mode_desc %p.\n", iface, target_mode_desc);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
+     state = wined3d_swapchain_get_state(swapchain->wined3d_swapchain);
+ 
+     return dxgi_swapchain_resize_target(state, target_mode_desc);
+@@ -565,6 +583,12 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetContainingOutput(IDXGISwapCh
+ 
+     TRACE("iface %p, output %p.\n", iface, output);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_UNSUPPORTED;
++    }
++
+     if (swapchain->target)
+     {
+         IDXGIOutput_AddRef(*output = swapchain->target);
+@@ -646,6 +670,12 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetFullscreenDesc(IDXGISwapChai
+ 
+     TRACE("iface %p, desc %p.\n", iface, desc);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
+     if (!desc)
+     {
+         WARN("Invalid pointer.\n");
+@@ -673,6 +703,12 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetHwnd(IDXGISwapChain1 *iface,
+ 
+     TRACE("iface %p, hwnd %p.\n", iface, hwnd);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
+     if (!hwnd)
+     {
+         WARN("Invalid pointer.\n");
+@@ -686,8 +722,16 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetHwnd(IDXGISwapChain1 *iface,
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_GetCoreWindow(IDXGISwapChain1 *iface,
+         REFIID iid, void **core_window)
+ {
++    struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain1(iface);
++
+     FIXME("iface %p, iid %s, core_window %p stub!\n", iface, debugstr_guid(iid), core_window);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
+     if (core_window)
+         *core_window = NULL;
+ 
+@@ -799,6 +843,8 @@ static void STDMETHODCALLTYPE d3d11_swapchain_wined3d_object_released(void *pare
+ {
+     struct d3d11_swapchain *swapchain = parent;
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++        DestroyWindow(swapchain->window);
+     wined3d_private_store_cleanup(&swapchain->private_store);
+     heap_free(parent);
+ }
+@@ -866,6 +912,18 @@ HRESULT d3d11_swapchain_init(struct d3d11_swapchain *swapchain, struct dxgi_devi
+     wined3d_mutex_lock();
+     wined3d_private_store_init(&swapchain->private_store);
+ 
++    if (!desc->device_window)
++    {
++        swapchain->type = DXGI_SWAPCHAIN_TYPE_COMPOSITION;
++        desc->device_window = CreateWindowW(L"static", L"dxgi_dummy_window", WS_POPUP, 0, 0, 1, 1,
++                0, 0, 0, 0);
++    }
++    else
++    {
++        swapchain->type = DXGI_SWAPCHAIN_TYPE_HWND;
++    }
++    swapchain->window = desc->device_window;
++
+     if (!desc->windowed && (!desc->backbuffer_width || !desc->backbuffer_height))
+         FIXME("Fullscreen swapchain with back buffer width/height equal to 0 not supported properly.\n");
+ 
+@@ -1011,6 +1069,7 @@ struct d3d12_swapchain
+     ID3D12Device *device;
+     IWineDXGIFactory *factory;
+ 
++    enum dxgi_swapchain_type type;
+     HWND window;
+     IDXGIOutput *target;
+     DXGI_SWAP_CHAIN_DESC1 desc;
+@@ -1843,6 +1902,9 @@ static void d3d12_swapchain_destroy(struct d3d12_swapchain *swapchain)
+     if (swapchain->vk_instance)
+         vk_funcs->p_vkDestroySurfaceKHR(swapchain->vk_instance, swapchain->vk_surface, NULL);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++        DestroyWindow(swapchain->window);
++
+     if (swapchain->target)
+     {
+         WARN("Destroying fullscreen swapchain.\n");
+@@ -2177,6 +2239,12 @@ static HRESULT STDMETHODCALLTYPE DECLSPEC_HOTPATCH d3d12_swapchain_SetFullscreen
+ 
+     TRACE("iface %p, fullscreen %#x, target %p.\n", iface, fullscreen, target);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
+     if (!fullscreen && target)
+     {
+         WARN("Invalid call.\n");
+@@ -2363,6 +2431,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_swapchain_ResizeBuffers(IDXGISwapChain4 *
+     TRACE("iface %p, buffer_count %u, width %u, height %u, format %s, flags %#x.\n",
+             iface, buffer_count, width, height, debug_dxgi_format(format), flags);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION && (!width || !height))
++    {
++        WARN("Invalid size for composition swapchains.\n");
++        return E_INVALIDARG;
++    }
++
+     return d3d12_swapchain_resize_buffers(swapchain, buffer_count, width, height, format, flags);
+ }
+ 
+@@ -2373,6 +2447,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_swapchain_ResizeTarget(IDXGISwapChain4 *i
+ 
+     TRACE("iface %p, target_mode_desc %p.\n", iface, target_mode_desc);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
+     return dxgi_swapchain_resize_target(swapchain->state, target_mode_desc);
+ }
+ 
+@@ -2387,6 +2467,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_swapchain_GetContainingOutput(IDXGISwapCh
+ 
+     TRACE("iface %p, output %p.\n", iface, output);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_UNSUPPORTED;
++    }
++
+     if (swapchain->target)
+     {
+         IDXGIOutput_AddRef(*output = swapchain->target);
+@@ -2460,6 +2546,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_swapchain_GetFullscreenDesc(IDXGISwapChai
+ 
+     TRACE("iface %p, desc %p.\n", iface, desc);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
+     if (!desc)
+     {
+         WARN("Invalid pointer.\n");
+@@ -2481,6 +2573,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_swapchain_GetHwnd(IDXGISwapChain4 *iface,
+ 
+     TRACE("iface %p, hwnd %p.\n", iface, hwnd);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
+     if (!hwnd)
+     {
+         WARN("Invalid pointer.\n");
+@@ -2494,8 +2592,16 @@ static HRESULT STDMETHODCALLTYPE d3d12_swapchain_GetHwnd(IDXGISwapChain4 *iface,
+ static HRESULT STDMETHODCALLTYPE d3d12_swapchain_GetCoreWindow(IDXGISwapChain4 *iface,
+         REFIID iid, void **core_window)
+ {
++    struct d3d12_swapchain *swapchain = d3d12_swapchain_from_IDXGISwapChain4(iface);
++
+     FIXME("iface %p, iid %s, core_window %p stub!\n", iface, debugstr_guid(iid), core_window);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION)
++    {
++        WARN("Invalid swapchain type.\n");
++        return DXGI_ERROR_INVALID_CALL;
++    }
++
+     if (core_window)
+         *core_window = NULL;
+ 
+@@ -2700,6 +2806,12 @@ static HRESULT STDMETHODCALLTYPE d3d12_swapchain_ResizeBuffers1(IDXGISwapChain4
+             "node_mask %p, present_queue %p.\n",
+             iface, buffer_count, width, height, debug_dxgi_format(format), flags, node_mask, present_queue);
+ 
++    if (swapchain->type == DXGI_SWAPCHAIN_TYPE_COMPOSITION && (!width || !height))
++    {
++        WARN("Invalid size for composition swapchains.\n");
++        return E_INVALIDARG;
++    }
++
+     if (!node_mask || !present_queue)
+         return DXGI_ERROR_INVALID_CALL;
+ 
+@@ -2902,6 +3014,15 @@ static HRESULT d3d12_swapchain_init(struct d3d12_swapchain *swapchain, IWineDXGI
+     swapchain->state_parent.ops = &d3d12_swapchain_state_parent_ops;
+     swapchain->refcount = 1;
+ 
++    if (!window)
++    {
++        swapchain->type = DXGI_SWAPCHAIN_TYPE_COMPOSITION;
++        window = CreateWindowW(L"static", L"dxgi_dummy_window", WS_POPUP, 0, 0, 1, 1, 0, 0, 0, 0);
++    }
++    else
++    {
++        swapchain->type = DXGI_SWAPCHAIN_TYPE_HWND;
++    }
+     swapchain->window = window;
+     swapchain->desc = *swapchain_desc;
+     swapchain->fullscreen_desc = *fullscreen_desc;
+

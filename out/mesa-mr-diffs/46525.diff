@@ -1,0 +1,679 @@
+# Draft kk: Allow tessellation, geometry and heap prepasses to overlap fragment work behind MESA_KK_BARRIERS=narrow2
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46525 state=closed
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+kk: Allow tessellation, geometry and heap prepasses to overlap fragment work behind MESA_KK_BARRIERS=narrow2
+
+Under MESA_KK_BARRIERS=narrow, render encoders still end with MTL_STAGE_DISPATCH in beforeStages, stalling mid-pass tessellation, geometry pre-rasterization, and geometry-heap reset compute encoders behind earlier fragment work even though they only write vertex-consumed buffers.
+
+This adds MESA_KK_BARRIERS=narrow2 (off by default, implies narrow):
+
+Render encoders ending for a tessellation, geometry-shader, or heap-reset split (with no fragment wait pending and no queued post-render writes) release MTL_STAGE_DISPATCH and set frag_open.
+The prepass compute encoder waits only VERTEX | OBJECTS | MESH -> DISPATCH and clears only vertex waits on completion.
+Any non-prepass compute encoder opened while frag_open is set (and the first compute encoder of each command buffer) waits ALL -> DISPATCH with device visibility and clears frag_open once real compute work ends ALL -> ALL.
+Pending timestamp resolves flush frag_open through a forced 1-thread compute write before calling resolveCounterHeap.
+
+Depends on !46468, !46472, and !46524.
+```
+--- docs/drivers/kosmickrisp.rst
++++ docs/drivers/kosmickrisp.rst
+@@ -84,6 +84,8 @@ KosmicKrisp specific environment variables:
+   - ``custom_border`` to advertise ``VK_EXT_custom_border_color`` and ``VK_EXT_border_color_swizzle``.
+   - ``image_view_min_lod`` to advertise ``VK_EXT_image_view_min_lod`` for M1-M5 GPUs.
+   - ``optimize_e5r9g9b9`` to use allowGPUOptimizedContents with this format, which causes some CTS tests for vkCmdCopyImage() to fail
++- ``MESA_KK_BARRIERS``: Set to ``narrow`` to allow vertex work in subsequent render encoders to overlap fragment work of earlier render encoders, enforcing Vulkan pipeline barriers, ``vkCmdWaitEvents2``, and vertex-stage timestamp dependencies as consumer barriers. Set to ``narrow2`` to also allow mid-pass tessellation, geometry pre-rasterization, and geometry-heap reset compute prepasses to overlap earlier fragment work (implies ``narrow``).
++- ``MESA_KK_BARRIER_LOG``: Set to ``1`` to log narrow-barrier counters via ``mesa_logi``.
+ 
+ Metal workarounds
+ *****************
+
+--- src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -18,12 +18,26 @@ mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+ {
+ }
+ 
++void
++mtl_barrier_after_stages_options(void *encoder, enum mtl_stages after_stages,
++                                 enum mtl_stages before_queue_stages,
++                                 enum mtl_visibility_options visibility)
++{
++}
++
+ void
+ mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
+                                  enum mtl_stages before_queue_stages)
+ {
+ }
+ 
++void
++mtl_barrier_after_encoder_stages_options(void *encoder, enum mtl_stages after_stages,
++                                         enum mtl_stages before_queue_stages,
++                                         enum mtl_visibility_options visibility)
++{
++}
++
+ void
+ mtl_barrier_after_queue_stages(void *encoder,
+                                enum mtl_stages after_queue_stages,
+@@ -31,6 +45,14 @@ mtl_barrier_after_queue_stages(void *encoder,
+ {
+ }
+ 
++void
++mtl_barrier_after_queue_stages_options(void *encoder,
++                                       enum mtl_stages after_queue_stages,
++                                       enum mtl_stages before_stages,
++                                       enum mtl_visibility_options visibility)
++{
++}
++
+ void
+ mtl_update_fence(void *encoder, mtl_fence *fence, enum mtl_stages after_stages)
+ {
+
+--- src/kosmickrisp/bridge/mtl_encoder.h
++++ src/kosmickrisp/bridge/mtl_encoder.h
+@@ -15,13 +15,25 @@
+ void mtl_end_encoding(void *encoder);
+ void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+                               enum mtl_stages before_queue_stages);
++void mtl_barrier_after_stages_options(void *encoder,
++                                      enum mtl_stages after_stages,
++                                      enum mtl_stages before_queue_stages,
++                                      enum mtl_visibility_options visibility);
+ void mtl_barrier_after_encoder_stages(void *encoder,
+                                       enum mtl_stages after_stages,
+                                       enum mtl_stages before_queue_stages);
++void mtl_barrier_after_encoder_stages_options(void *encoder,
++                                              enum mtl_stages after_stages,
++                                              enum mtl_stages before_queue_stages,
++                                              enum mtl_visibility_options visibility);
+ 
+ void mtl_barrier_after_queue_stages(void *encoder,
+                                     enum mtl_stages after_queue_stages,
+                                     enum mtl_stages before_stages);
++void mtl_barrier_after_queue_stages_options(void *encoder,
++                                            enum mtl_stages after_queue_stages,
++                                            enum mtl_stages before_stages,
++                                            enum mtl_visibility_options visibility);
+ 
+ void mtl_update_fence(void *encoder, mtl_fence *fence,
+                       enum mtl_stages after_stages);
+
+--- src/kosmickrisp/bridge/mtl_encoder.m
++++ src/kosmickrisp/bridge/mtl_encoder.m
+@@ -23,42 +23,68 @@ mtl_end_encoding(void *encoder)
+ }
+ 
+ void
+-mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+-                         enum mtl_stages before_queue_stages)
++mtl_barrier_after_stages_options(void *encoder, enum mtl_stages after_stages,
++                                 enum mtl_stages before_queue_stages,
++                                 enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+-      /* TODO_KOSMICKRISP Expose visibility option since resource alias should only be required
+-       * if occlusion queries are used */
+       [enc barrierAfterStages:(MTLStages)after_stages beforeQueueStages:(MTLStages)before_queue_stages
+-           visibilityOptions:MTL4VisibilityOptionResourceAlias];
++           visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
+ void
+-mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
+-                                 enum mtl_stages before_queue_stages)
++mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
++                         enum mtl_stages before_queue_stages)
++{
++   mtl_barrier_after_stages_options(encoder, after_stages, before_queue_stages,
++                                    MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++}
++
++void
++mtl_barrier_after_encoder_stages_options(void *encoder, enum mtl_stages after_stages,
++                                         enum mtl_stages before_queue_stages,
++                                         enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+       [enc barrierAfterEncoderStages:(MTLStages)after_stages beforeEncoderStages:(MTLStages)before_queue_stages
+-           visibilityOptions:MTL4VisibilityOptionResourceAlias];
++           visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
+ void
+-mtl_barrier_after_queue_stages(void *encoder,
+-                               enum mtl_stages after_queue_stages,
+-                               enum mtl_stages before_stages)
++mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
++                                 enum mtl_stages before_queue_stages)
++{
++   mtl_barrier_after_encoder_stages_options(encoder, after_stages, before_queue_stages,
++                                           MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++}
++
++void
++mtl_barrier_after_queue_stages_options(void *encoder,
++                                       enum mtl_stages after_queue_stages,
++                                       enum mtl_stages before_stages,
++                                       enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+       [enc barrierAfterQueueStages:(MTLStages)after_queue_stages
+                       beforeStages:(MTLStages)before_stages
+-                 visibilityOptions:MTL4VisibilityOptionResourceAlias];
++                 visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
++void
++mtl_barrier_after_queue_stages(void *encoder,
++                               enum mtl_stages after_queue_stages,
++                               enum mtl_stages before_stages)
++{
++   mtl_barrier_after_queue_stages_options(encoder, after_queue_stages, before_stages,
++                                         MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++}
++
+ void
+ mtl_update_fence(void *encoder, mtl_fence *fence, enum mtl_stages after_stages)
+ {
+
+--- src/kosmickrisp/bridge/mtl_types.h
++++ src/kosmickrisp/bridge/mtl_types.h
+@@ -252,6 +252,12 @@ enum mtl_barrier_scope {
+    MTL_BARRIER_SCOPE_RENDER_TARGETS = 1 << 2,
+ };
+ 
++enum mtl_visibility_options {
++   MTL_VISIBILITY_OPTION_NONE = 0,
++   MTL_VISIBILITY_OPTION_DEVICE = 1 << 0,
++   MTL_VISIBILITY_OPTION_RESOURCE_ALIAS = 1 << 1,
++};
++
+ enum mtl_stages {
+    MTL_STAGE_VERTEX = 1 << 0,
+    MTL_STAGE_FRAGMENT = 1 << 1,
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.c
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -11,6 +11,7 @@
+ #include "kk_private.h"
+ 
+ #include "kk_descriptor_set.h"
++#include "kk_device.h"
+ #include "kk_image.h"
+ #include "kk_nir_lower_vbo.h"
+ #include "kk_shader.h"
+@@ -164,6 +165,11 @@ struct kk_graphics_state {
+        * There can only be one active at a time (hardware constraint).
+        */
+       uint16_t index;
++
++      /* Visibility results were enabled at some point in the open render
++       * encoder, so it may have written them.
++       */
++      bool vis_enabled;
+    } occlusion;
+ 
+    /* Index buffer */
+@@ -221,7 +227,8 @@ struct kk_uploader {
+ };
+ 
+ /* A pending resolve of one timestamp counter-heap entry into a query pool BO.
+- * Recorded by vkCmdWriteTimestamp2 and flushed on the GPU timeline at cs_end. */
++ * Recorded by vkCmdWriteTimestamp2 and flushed, merged, when the command buffer
++ * ends or before a query reset or copy. */
+ struct kk_ts_resolve {
+    mtl_counter_heap *heap;
+    uint32_t index;
+@@ -243,7 +250,7 @@ struct kk_cmd_buffer {
+       mtl_render_encoder *render;
+       mtl_compute_encoder *compute;
+    } metal;
+-   /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
++   /* Pending timestamp resolves (struct kk_ts_resolve). */
+    struct util_dynarray ts_resolves;
+    /* Timestamps already sampled by the current render encoder. (struct
+     * kk_ts_stage_entry). */
+@@ -264,6 +271,43 @@ struct kk_cmd_buffer {
+       uint64_t root_addr;
+       /* Only tracks graphics shaders since compute is always bound for now. */
+       uint32_t dirty_shaders;
++      /* Narrow end-of-encoder render barriers:
++       * - Render encoders with draws (not meta, no visibility results) end
++       *   without blocking later vertex/object/mesh stages.
++       * - wait_f / wait_v are sticky across encoders until a compute encoder
++       *   that executed at least one direct non-zero dispatch ends ALL -> ALL.
++       * - held records that such a compute encoder already ordered earlier
++       *   encoders, so barrier recording skips until the next render start.
++       * - BeginCommandBuffer starts with wait_f/wait_v set (and frag_open set
++       *   under narrow2), conservative across command buffers on the queue.
++       * - Barriers inside an open render encoder add consumers in place if
++       *   !enc_had_draw, otherwise split the encoder.
++       * - frag_open invariant (MESA_KK_BARRIERS=narrow2): set at command
++       *   buffer begin and whenever a narrowed render end for a vertex-only
++       *   prepass (TESSELLATION, GEOMETRY_SHADER, HEAP, with !wait_f and no
++       *   queued post-render writes) also releases MTL_STAGE_DISPATCH. While
++       *   frag_open is set, every compute encoder opened in
++       *   cs_get_compute_tagged latches either enc_vertex_only (VERTEX ->
++       *   DISPATCH consumer, only for vertex-only prepasses with !wait_f) or
++       *   enc_full (ALL -> DISPATCH consumer with device visibility). Only an
++       *   enc_full encoder that ran real work (compute_real) clears frag_open
++       *   at end_encoder; an enc_vertex_only encoder clears only wait_v and
++       *   chain_v, leaving frag_open, wait_f and held untouched. Hidden
++       *   command-buffer work (kk_cmd_flush_ts_resolves) must close an open
++       *   frag_open via kk_barrier_get_compute_real + cs_end first. */
++      struct {
++         VkPipelineStageFlags2 chain_f, chain_v;
++         uint32_t meta_depth;
++         bool wait_f, wait_v;
++         bool held;
++         bool compute_real;
++         bool enc_wait_f, enc_wait_v;
++         bool enc_had_draw;
++         bool frag_open, frag_from_begin;
++         bool enc_vertex_only, enc_full;
++         /* One-shot split reason for kk_cmd_write_tagged, 0 = none */
++         uint32_t write_reason;
++      } barrier;
+    } state;
+ 
+    struct kk_uploader uploader;
+@@ -312,9 +356,37 @@ kk_get_descriptors_state(struct kk_cmd_buffer *cmd,
+    }
+ };
+ 
++enum kk_split_reason {
++   KK_SPLIT_UNKNOWN = 0,
++   KK_SPLIT_UNROLL_GEOM,
++   KK_SPLIT_UNROLL_RESTART,
++   KK_SPLIT_UNROLL_ADJACENCY,
++   KK_SPLIT_TESSELLATION,
++   KK_SPLIT_GEOMETRY_SHADER,
++   KK_SPLIT_QUERY,
++   KK_SPLIT_BARRIER,
++   KK_SPLIT_COPY,
++   KK_SPLIT_DISPATCH,
++   KK_SPLIT_PREDICATION,
++   KK_SPLIT_HEAP,
++   KK_SPLIT_REASONS,
++};
++
+ void cs_start_render(struct kk_cmd_buffer *cmd);
+ mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
+-mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd);
++mtl_compute_encoder *cs_get_compute_tagged(struct kk_cmd_buffer *cmd,
++                                           enum kk_split_reason reason);
++static inline mtl_compute_encoder *
++cs_get_compute(struct kk_cmd_buffer *cmd)
++{
++   return cs_get_compute_tagged(cmd, KK_SPLIT_UNKNOWN);
++}
++mtl_compute_encoder *kk_barrier_get_compute_real(struct kk_cmd_buffer *cmd,
++                                                 enum kk_split_reason reason,
++                                                 enum kk_barrier_count count);
++void kk_barrier_vertex_timestamp(struct kk_cmd_buffer *cmd);
++void kk_barrier_log_print(struct kk_device *dev, const char *tag);
++void kk_cmd_flush_ts_resolves(struct kk_cmd_buffer *cmd);
+ void cs_end(struct kk_cmd_buffer *cmd);
+ void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
+                                         uint64_t addr);
+@@ -428,6 +500,11 @@ void kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
+ #define MESA_DISPATCH_PRECOMP kk_dispatch_precomp
+ 
+ void kk_cmd_write(struct kk_cmd_buffer *cmd, struct libkk_imm_write write);
++/* kk_cmd_write whose dispatch, if it runs now, goes through
++ * cs_get_compute_tagged with this reason instead of the program's */
++void kk_cmd_write_tagged(struct kk_cmd_buffer *cmd,
++                         struct libkk_imm_write write,
++                         enum kk_split_reason reason);
+ 
+ void kk_cmd_buffer_set_label(struct kk_cmd_buffer *cb, const char *label);
+ 
+
+--- src/kosmickrisp/vulkan/kk_cmd_dispatch.c
++++ src/kosmickrisp/vulkan/kk_cmd_dispatch.c
+@@ -108,6 +108,8 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
+       };
+ 
+       kk_flush_compute_state(cmd);
++      if (kk_cmd_buffer_device(cmd)->barriers.narrow)
++         cmd->state.barrier.compute_real = true;
+       mtl_dispatch_threads(encoder, grid_size, local_size);
+    }
+ }
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1058,12 +1058,15 @@ kk_heap(struct kk_cmd_buffer *cmd)
+       /* Zeroing the allocated index frees everything. Force compute encoder
+        * since this path is only taken by tessellation, GS and unroll, which
+        * already force a compute encoder break */
+-      mtl_compute_encoder *encoder = cs_get_compute(cmd);
+-      kk_cmd_write(cmd, (struct libkk_imm_write){
+-                           addr + offsetof(struct poly_heap, bottom), 0});
+-
+-      /* Ensure heap is set to 0 before we allocate anything. */
+-      mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
++      cs_get_compute_tagged(cmd, KK_SPLIT_HEAP);
++      kk_cmd_write_tagged(cmd,
++                          (struct libkk_imm_write){
++                             addr + offsetof(struct poly_heap, bottom), 0},
++                          KK_SPLIT_HEAP);
++
++      /* Ensure heap is set to 0 before we allocate anything. The write runs
++       * in the encoder that is open now. */
++      mtl_barrier_after_encoder_stages(cmd->metal.compute, MTL_STAGE_DISPATCH,
+                                        MTL_STAGE_DISPATCH);
+ 
+       cmd->uses_heap = true;
+@@ -1189,6 +1192,9 @@ static void
+ kk_upload_tess_params(struct kk_cmd_buffer *cmd, struct poly_tess_params *out,
+                       const struct kk_draw_data *draw)
+ {
++   if (cmd->metal.render)
++      cs_get_compute_tagged(cmd, KK_SPLIT_TESSELLATION);
++
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+@@ -1281,6 +1287,9 @@ static uint64_t
+ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+                           const struct kk_draw_data *draw, bool restart)
+ {
++   if (cmd->metal.render)
++      cs_get_compute_tagged(cmd, KK_SPLIT_GEOMETRY_SHADER);
++
+    /* The tessellator output always feeds the GS indirectly */
+    bool indirect = kk_grid_is_indirect(draw->grid) ||
+                    cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+@@ -1513,6 +1522,8 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+    }
+ 
+    if (gfx->dirty & KK_DIRTY_OCCLUSION) {
++      gfx->occlusion.vis_enabled |=
++         gfx->occlusion.mode != MTL_VISIBILITY_RESULT_MODE_DISABLED;
+       mtl_set_visibility_result_mode(enc, gfx->occlusion.mode,
+                                      gfx->occlusion.index * sizeof(uint64_t));
+    }
+@@ -1658,6 +1669,9 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    if (unlikely(!out_draws.gpu))
+       return false;
+ 
++   if (cmd->metal.render)
++      cs_get_compute_tagged(cmd, KK_SPLIT_UNROLL_GEOM);
++
+    struct libkk_unroll_geometry_args info = {
+       .index_buffer = data->index_buffer.addr,
+       .heap = kk_heap(cmd),
+@@ -1697,6 +1711,9 @@ kk_unroll_adjacency(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    if (unlikely(!out_draws.gpu))
+       return false;
+ 
++   if (cmd->metal.render)
++      cs_get_compute_tagged(cmd, KK_SPLIT_UNROLL_ADJACENCY);
++
+    struct libkk_unroll_adjacency_args info = {
+       .index_buffer = data->index_buffer.addr,
+       .heap = kk_heap(cmd),
+@@ -1808,6 +1825,8 @@ static void
+ kk_dispatch_draw(struct kk_cmd_buffer *cmd, struct kk_draw_data data)
+ {
+    mtl_render_encoder *enc = cs_get_render(cmd);
++   if (kk_cmd_buffer_device(cmd)->barriers.narrow)
++      cmd->state.barrier.enc_had_draw = true;
+ 
+    if (kk_grid_is_indirect(data.grid)) {
+       if (data.index.el_size_B) {
+@@ -2133,7 +2152,7 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+ 
+    /* First launch the VS and TCS */
+ 
+-   mtl_compute_encoder *enc = cs_get_compute(cmd);
++   mtl_compute_encoder *enc = cs_get_compute_tagged(cmd, KK_SPLIT_TESSELLATION);
+    {
+       mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[0];
+       struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
+@@ -2184,6 +2203,9 @@ kk_draw_without_restart(struct kk_cmd_buffer *cmd,
+    struct kk_ptr out_draw =
+       kk_pool_alloc(cmd, sizeof(VkDrawIndexedIndirectCommand), 4u);
+ 
++   if (cmd->metal.render)
++      cs_get_compute_tagged(cmd, KK_SPLIT_UNROLL_RESTART);
++
+    struct libkk_unroll_restart_args args = {
+       .index_buffer = draw.index.gpu.addr,
+       .heap = kk_heap(cmd),
+@@ -2265,7 +2287,8 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+     * pipelines */
+    uint32_t pre_render_count = vs->pipeline.gfx.pre_render_count;
+    struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
+-   mtl_compute_encoder *enc = cs_get_compute(cmd);
++   mtl_compute_encoder *enc =
++      cs_get_compute_tagged(cmd, KK_SPLIT_GEOMETRY_SHADER);
+ 
+    /* KK_WORKAROUND_19 */
+    if (!(pdev->settings.disabled_workarounds & BITFIELD64_BIT(19)))
+
+--- src/kosmickrisp/vulkan/kk_cmd_meta.c
++++ src/kosmickrisp/vulkan/kk_cmd_meta.c
+@@ -96,6 +96,8 @@ kk_meta_begin(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
+    struct kk_descriptor_state *desc = kk_get_descriptors_state(cmd, bind_point);
+ 
+    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
++      if (kk_cmd_buffer_device(cmd)->barriers.narrow)
++         cmd->state.barrier.meta_depth++;
+       save->dynamic = cmd->vk.dynamic_graphics_state;
+       save->_dynamic_vi = cmd->state.gfx._dynamic_vi;
+       save->_dynamic_sl = cmd->state.gfx._dynamic_sl;
+@@ -163,6 +165,8 @@ kk_meta_end(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
+    }
+ 
+    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
++      if (kk_cmd_buffer_device(cmd)->barriers.narrow)
++         cmd->state.barrier.meta_depth--;
+       /* Restore the dynamic state */
+       assert(save->dynamic.vi == &cmd->state.gfx._dynamic_vi);
+       assert(save->dynamic.ms.sample_locations == &cmd->state.gfx._dynamic_sl);
+
+--- src/kosmickrisp/vulkan/kk_device.c
++++ src/kosmickrisp/vulkan/kk_device.c
+@@ -29,6 +29,8 @@
+ #include "vulkan/wsi/wsi_common.h"
+ #include "vk_pipeline_cache.h"
+ 
++#include "util/log.h"
++
+ #include <time.h>
+ 
+ struct kk_mtl_compiler {
+@@ -331,6 +333,42 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (result != VK_SUCCESS)
+       goto fail_sampler_heap;
+ 
++   const char *barriers = debug_get_option("MESA_KK_BARRIERS", NULL);
++   if (barriers && *barriers) {
++      if (!strcmp(barriers, "narrow")) {
++         dev->barriers.narrow = true;
++      } else if (!strcmp(barriers, "narrow2")) {
++         dev->barriers.narrow = true;
++         dev->barriers.narrow2 = true;
++      }
++#ifndef NDEBUG
++      else if (!strcmp(barriers, "narrow-nowait")) {
++         dev->barriers.narrow = true;
++         dev->barriers.nowait = true;
++      } else if (!strcmp(barriers, "narrow-nobegin")) {
++         dev->barriers.narrow = true;
++         dev->barriers.nobegin = true;
++      } else if (!strcmp(barriers, "narrow2-nobegin")) {
++         dev->barriers.narrow = true;
++         dev->barriers.narrow2 = true;
++         dev->barriers.nobegin = true;
++      } else if (!strcmp(barriers, "narrow2-nowait")) {
++         dev->barriers.narrow = true;
++         dev->barriers.narrow2 = true;
++         dev->barriers.nowait2 = true;
++      } else if (!strcmp(barriers, "narrow2-nobegin-nowait")) {
++         dev->barriers.narrow = true;
++         dev->barriers.narrow2 = true;
++         dev->barriers.nobegin = true;
++         dev->barriers.nowait2 = true;
++      }
++#endif
++      else {
++         mesa_logw("kk: unknown MESA_KK_BARRIERS=%s\n", barriers);
++      }
++   }
++   dev->barriers.log = debug_get_bool_option("MESA_KK_BARRIER_LOG", false);
++
+    if (pdev->settings.gpu_capture_immediately) {
+       mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
+       dev->gpu_capture_active = true;
+@@ -392,6 +430,9 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+       dev->has_queue = false;
+    }
+ 
++   if (dev->barriers.log)
++      kk_barrier_log_print(dev, "KKBNEND");
++
+    /* Release the residency set last once all BOs are released. */
+    mtl_release(dev->residency_set.handle);
+    simple_mtx_destroy(&dev->residency_set.mutex);
+
+--- src/kosmickrisp/vulkan/kk_device.h
++++ src/kosmickrisp/vulkan/kk_device.h
+@@ -77,6 +77,33 @@ struct kk_precompiled_cache {
+    struct kk_precompiled_shader shaders[LIBKK_NUM_PROGRAMS];
+ };
+ 
++enum kk_barrier_count {
++   KK_BARRIER_COUNT_END_NARROW,
++   KK_BARRIER_COUNT_END_OCCLUSION,
++   KK_BARRIER_COUNT_END_NO_DRAW,
++   KK_BARRIER_COUNT_END_META,
++   KK_BARRIER_COUNT_END_COMPUTE_REAL,
++   KK_BARRIER_COUNT_END_COMPUTE_OTHER,
++   KK_BARRIER_COUNT_START_RENDER,
++   KK_BARRIER_COUNT_CONSUMER_F,
++   KK_BARRIER_COUNT_CONSUMER_V,
++   KK_BARRIER_COUNT_IN_PLACE,
++   KK_BARRIER_COUNT_SPLIT,
++   KK_BARRIER_COUNT_VERTEX_TS,
++   KK_BARRIER_COUNT_END_NARROW2,
++   KK_BARRIER_COUNT_VONLY_OPEN,
++   KK_BARRIER_COUNT_VONLY_END_REAL,
++   KK_BARRIER_COUNT_VONLY_END_EARLY,
++   KK_BARRIER_COUNT_VONLY_END_WAIT_F,
++   KK_BARRIER_COUNT_FULL_OPEN,
++   KK_BARRIER_COUNT_FULL_OPEN_BEGIN,
++   KK_BARRIER_COUNT_FULL_END_REAL,
++   KK_BARRIER_COUNT_NO_NARROW2_POST,
++   KK_BARRIER_COUNT_NO_NARROW2_WAIT_F,
++   KK_BARRIER_COUNT_TS_FULL,
++   KK_BARRIER_COUNT_MAX,
++};
++
+ struct kk_device {
+    struct vk_device vk;
+ 
+@@ -96,6 +123,17 @@ struct kk_device {
+ 
+    struct kk_precompiled_cache precompiled_cache;
+ 
++   /* Narrow end-of-encoder render barriers (MESA_KK_BARRIERS=narrow/narrow2) */
++   struct {
++      bool narrow;
++      bool narrow2;
++      bool nowait;  /* debug-only: skip consumer waits and splits */
++      bool nowait2; /* debug-only: vertex-only encoders get no consumer */
++      bool nobegin; /* debug-only: skip command-buffer-begin waits */
++      bool log;     /* MESA_KK_BARRIER_LOG=1: log counters via mesa_logi */
++      uint64_t counts[KK_BARRIER_COUNT_MAX];
++   } barriers;
++
+    bool has_queue;
+    struct kk_queue queue;
+ 
+
+--- src/kosmickrisp/vulkan/kk_event.c
++++ src/kosmickrisp/vulkan/kk_event.c
+@@ -106,11 +106,3 @@ kk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    kk_cmd_write(cmd, (struct libkk_imm_write){event->addr, VK_EVENT_RESET});
+ }
+-
+-VKAPI_ATTR void VKAPI_CALL
+-kk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
+-                  const VkEvent *pEvents,
+-                  const VkDependencyInfo *pDependencyInfos)
+-{
+-   /* We do nothing, event should already be set by the time we are here. */
+-}
+
+--- src/kosmickrisp/vulkan/kk_query_pool.c
++++ src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -25,6 +25,11 @@ struct kk_query_report {
+    uint64_t value;
+ };
+ 
++/* Timestamp resolves are merged on the assumption that reports are one
++ * uint64_t each, back to back. */
++static_assert(sizeof(struct kk_query_report) == sizeof(uint64_t),
++              "query reports must be 64-bit");
++
+ uint16_t *
+ kk_pool_index_ptr(const struct kk_query_pool *pool)
+ {
+@@ -296,8 +301,10 @@ kk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+    /* A prior timestamp write may have a resolve still pending. Land it before
+     * the reset zeroes the pool BO, otherwise the deferred resolve would clobber
+     * the reset and leave the query spuriously available. */
+-   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) > 0)
++   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve)) {
+       cs_end(cmd);
++      kk_cmd_flush_ts_resolves(cmd);
++   }
+ 
+    emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
+ }
+@@ -384,6 +391,13 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+ 
+    uint32_t heap_index = query;
+ 
++   /* Vertex-class stage. TOP and NONE also map to the vertex stage but need no
++    * wait. */
++   if ((mtl_stage & (MTL_RENDER_STAGE_VERTEX | MTL_RENDER_STAGE_OBJECT |
++                     MTL_RENDER_STAGE_MESH)) &&
++       (stage & ~VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT))
++      kk_barrier_vertex_timestamp(cmd);
++
+    if (cmd->metal.render) {
+       /* If we've already issued a timestamp write for a render stage, reuse it
+        * because reissuing might return a 0 timestamp
+@@ -585,8 +599,10 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
+    /* Timestamp results are resolved into the pool BO on a deferred command
+     * buffer; make sure any pending resolve lands before this copy reads it.
+     * This also gives VK_QUERY_RESULT_WAIT_BIT its meaning for timestamps. */
+-   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) > 0)
++   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve)) {
+       cs_end(cmd);
++      kk_cmd_flush_ts_resolves(cmd);
++   }
+ 
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+    /* The resolveCounterHeap runs on the blit stage and it needs to be available
+

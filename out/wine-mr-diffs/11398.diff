@@ -1,0 +1,143 @@
+# wined3d: Support WINE_D3D_CONFIG=no_create_flags=0x800 (bug #50277)
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11398 state=opened
+# Fix for UnityPlayer.dll calls to D3D11_CREATE_DEVICE_VIDEO_SUPPORT until supported.
+
+Forces UnityPlayer.dll software video decoding which skips all the cross-device multi-thread calls involving dxgi_resource_GetSharedHandle and d3d11_device_OpenSharedResource.
+
+https://bugs.winehq.org/show_bug.cgi?id=50277#c46
+--- dlls/dxgi/device.c
++++ dlls/dxgi/device.c
+@@ -485,7 +485,7 @@ static const struct IWineDXGISwapChainFactoryVtbl dxgi_swapchain_factory_vtbl =
+ };
+ 
+ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *layer,
+-        IDXGIFactory *factory, IDXGIAdapter *adapter,
++        IDXGIFactory *factory, IDXGIAdapter *adapter, unsigned int flags,
+         const D3D_FEATURE_LEVEL *feature_levels, unsigned int level_count)
+ {
+     struct wined3d_device_parent *wined3d_device_parent;
+@@ -494,6 +494,7 @@ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *l
+     struct dxgi_adapter *dxgi_adapter;
+     struct dxgi_factory *dxgi_factory;
+     struct dxgi_output *dxgi_output;
++    unsigned int wined3d_flags = 0;
+     struct IDXGIOutput *output;
+     void *layer_base;
+     HWND window;
+@@ -540,8 +541,11 @@ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *l
+     wined3d_device_parent = IWineDXGIDeviceParent_get_wined3d_device_parent(dxgi_device_parent);
+     IWineDXGIDeviceParent_Release(dxgi_device_parent);
+ 
++    if (flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT)
++        wined3d_flags |= WINED3DCREATE_VIDEO_SUPPORT;
++
+     if (FAILED(hr = wined3d_device_create(dxgi_factory->wined3d,
+-            dxgi_adapter->wined3d_adapter, WINED3D_DEVICE_TYPE_HAL, NULL, 0, 4,
++            dxgi_adapter->wined3d_adapter, WINED3D_DEVICE_TYPE_HAL, NULL, wined3d_flags, 4,
+             (const enum wined3d_feature_level *)feature_levels, level_count,
+             wined3d_device_parent, &device->wined3d_device)))
+     {
+
+--- dlls/dxgi/dxgi_main.c
++++ dlls/dxgi/dxgi_main.c
+@@ -191,7 +191,7 @@ HRESULT WINAPI DXGID3D10CreateDevice(HMODULE d3d10core, IDXGIFactory *factory, I
+         return E_OUTOFMEMORY;
+     }
+ 
+-    hr = dxgi_device_init(dxgi_device, &d3d10_layer, factory, adapter, feature_levels, level_count);
++    hr = dxgi_device_init(dxgi_device, &d3d10_layer, factory, adapter, flags, feature_levels, level_count);
+     if (FAILED(hr))
+     {
+         WARN("Failed to initialize device, hr %#lx.\n", hr);
+
+--- dlls/dxgi/dxgi_private.h
++++ dlls/dxgi/dxgi_private.h
+@@ -32,6 +32,7 @@
+ 
+ #include "dxgi1_6.h"
+ #include "d3d10_1.h"
++#include "d3d11.h"
+ #include "d3d12.h"
+ #ifdef DXGI_INIT_GUID
+ #include "initguid.h"
+@@ -138,7 +139,7 @@ struct dxgi_device
+ };
+ 
+ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *layer,
+-        IDXGIFactory *factory, IDXGIAdapter *adapter,
++        IDXGIFactory *factory, IDXGIAdapter *adapter, unsigned int flags,
+         const D3D_FEATURE_LEVEL *feature_levels, unsigned int level_count);
+ 
+ /* IDXGIOutput */
+
+--- dlls/wined3d/directx.c
++++ dlls/wined3d/directx.c
+@@ -25,6 +25,7 @@
+ #include "wined3d_gl.h"
+ #include "winternl.h"
+ #include "wine/list.h"
++#include "d3d11.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d3d);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+@@ -2788,6 +2789,7 @@ HRESULT CDECL wined3d_device_create(struct wined3d *wined3d, struct wined3d_adap
+         struct wined3d_device_parent *device_parent, struct wined3d_device **device)
+ {
+     struct wined3d_device *object;
++    uint32_t wined3d_flags = 0;
+     HRESULT hr;
+ 
+     TRACE("wined3d %p, adapter %p, device_type %#x, focus_window %p, flags %#x, "
+@@ -2795,6 +2797,17 @@ HRESULT CDECL wined3d_device_create(struct wined3d *wined3d, struct wined3d_adap
+             wined3d, adapter, device_type, focus_window, flags, surface_alignment,
+             feature_levels, feature_level_count, device_parent, device);
+ 
++    /* Unity uses shared resources if D3D11_CREATE_DEVICE_VIDEO_SUPPORT succeeds,
++     * so allow failing for now */
++    if (wined3d_settings.no_create_flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT)
++        wined3d_flags |= WINED3DCREATE_VIDEO_SUPPORT;
++
++    if (flags != (flags & ~wined3d_flags))
++    {
++        FIXME("Failing for device create flags 0x%x forced unsupported by WINE_D3D_CONFIG override.\n", wined3d_settings.no_create_flags);
++        return E_FAIL;
++    }
++
+     if (FAILED(hr = adapter->adapter_ops->adapter_create_device(wined3d, adapter,
+             device_type, focus_window, flags, surface_alignment,
+             feature_levels, feature_level_count, device_parent, &object)))
+
+--- dlls/wined3d/wined3d_main.c
++++ dlls/wined3d/wined3d_main.c
+@@ -344,6 +344,8 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
+     {
+         if (!get_config_key_dword(hkey, appkey, env, "csmt", &wined3d_settings.cs_multithreaded))
+             ERR_(winediag)("Setting multithreaded command stream to %#x.\n", wined3d_settings.cs_multithreaded);
++        if (!get_config_key_dword(hkey, appkey, env, "no_create_flags", &wined3d_settings.no_create_flags))
++            ERR_(winediag)("Force D3D device creation without support for flags %#x.\n", wined3d_settings.no_create_flags);        
+         if (!get_config_key_dword(hkey, appkey, env, "MaxVersionGL", &tmpvalue))
+         {
+             ERR_(winediag)("Setting maximum allowed wined3d GL version to %u.%u.\n",
+
+--- dlls/wined3d/wined3d_private.h
++++ dlls/wined3d/wined3d_private.h
+@@ -466,6 +466,7 @@ struct wined3d_settings
+ {
+     unsigned int cs_multithreaded;
+     unsigned int max_gl_version;
++    unsigned int no_create_flags;
+     unsigned short pci_vendor_id;
+     unsigned short pci_device_id;
+     /* Memory tracking and object counting. */
+
+--- include/wine/wined3d.h
++++ include/wine/wined3d.h
+@@ -1054,6 +1054,7 @@ enum wined3d_memory_segment_group
+ #define WINED3DCREATE_ENABLE_PRESENTSTATS                       0x00004000
+ #define WINED3DCREATE_DISABLE_PRINTSCREEN                       0x00008000
+ #define WINED3DCREATE_SCREENSAVER                               0x10000000
++#define WINED3DCREATE_VIDEO_SUPPORT                             0x20000000
+ 
+ /* VTF defines */
+ #define WINED3DDMAPSAMPLER                                      0x100
+

@@ -1,0 +1,33 @@
+# install: On macOS, use clonefile() when possible.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12642 state=opened
+# 
+--- tools/install.c
++++ tools/install.c
+@@ -28,6 +28,10 @@
+ #include <string.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
++#ifdef __APPLE__
++# include <sys/clonefile.h>
++# include <sys/time.h>
++#endif
+ 
+ #include "tools.h"
+ 
+@@ -155,6 +159,15 @@ static void copy_file( const char *src, const char *dst )
+ 
+     if (verbose) printf( "%s -> %s\n", src, dst );
+ 
++#ifdef __APPLE__
++    if (!clonefile( src, dst, 0 ))
++    {
++        /* reset the access/modification times, which clonefile() doesn't do */
++        utimes( dst, NULL );
++        return;
++    }
++#endif
++
+     if ((input = open( src, O_RDONLY | O_BINARY )) == -1)
+         fatal_perror( "%s", src );
+     if ((output = open( dst, O_RDWR | O_CREAT | O_EXCL | O_BINARY, 0755 )) == -1)
+

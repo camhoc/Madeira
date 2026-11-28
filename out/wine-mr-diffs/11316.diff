@@ -1,0 +1,143 @@
+# ntdll: Clamp the sendmsg() iovec count to IOV_MAX in try_send().
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11316 state=opened
+# Linux sendmsg() rejects msg_iovlen > IOV_MAX (1024) with EMSGSIZE, but native WSASend() imposes no practical limit on the number of WSABUF elements for a stream socket. Wine forwards the whole WSABUF array to a single sendmsg() call, so any WSASend() with more than 1024 buffers fails with an unexpected WSAEMSGSIZE.
+
+Real-world impact: a gRPC/C++ server (grpc 1.71.0) running under Wine drops its TCP connection under a storm of concurrent unary calls. gRPC's chttp2 transport puts each HTTP/2 frame slice into its own WSABUF and flushes the whole outbound buffer with one WSASend() — under load the batch easily exceeds 1024 slices (observed batches of 20000+). The failed send is treated as a fatal transport error and the connection is closed, failing every in-flight call with `Unavailable: error reading from server: EOF`.
+
+The fix clamps msg_iovlen to IOV_MAX for stream sockets in try_send() and lets the existing short-write handling (iov_cursor) resend the remaining buffers in a subsequent sendmsg() call. Datagram sockets are intentionally left untouched, since splitting a datagram would change semantics.
+
+The first commit adds a conformance test (WSASend() with 2000 one-byte WSABUFs on a TCP socketpair), wrapped in todo_wine; the second commit implements the clamp and removes the todo_wine. The test passes on native Windows.
+
+Verification, beyond the conformance test:
+
+* Minimal repro (plain Winsock, no gRPC): WSASend() with 1024 buffers passes, 1025 fails with WSAEMSGSIZE on every unpatched Wine tried (10.0, 10.9, 10.10, 11.0); passes with the patch.
+* Rebuilt ntdll.so from patched source and dropped it into a stock distribution Wine installation (both wine-10.0 and wine-11.0): the previously failing gRPC server now survives storms of 12000 concurrent calls across repeated rounds, with WSASend() batches observed up to ~6000 WSABUFs and zero EMSGSIZE occurrences (WINEDEBUG=+winsock). Without the patch the very first batch above 1024 buffers kills the connection.
+--- dlls/ntdll/unix/socket.c
++++ dlls/ntdll/unix/socket.c
+@@ -25,6 +25,7 @@
+ #include "config.h"
+ #include <assert.h>
+ #include <errno.h>
++#include <limits.h>
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ #include <sys/ioctl.h>
+@@ -1087,6 +1088,18 @@ static NTSTATUS try_send( int fd, struct async_send_ioctl *async )
+ 
+     hdr.msg_iov = async->iov + async->iov_cursor;
+     hdr.msg_iovlen = async->count - async->iov_cursor;
++    /* Linux sendmsg() rejects msg_iovlen > IOV_MAX with EMSGSIZE, unlike native
++     * WSASend(), which imposes no such limit. Clamp for stream sockets and let
++     * the short write handling below resend the remaining buffers. Datagram
++     * sockets would need the payload coalesced into a single buffer instead. */
++    if (hdr.msg_iovlen > IOV_MAX)
++    {
++        if (sock_type == SOCK_STREAM)
++            hdr.msg_iovlen = IOV_MAX;
++        else
++            FIXME( "msg_iovlen %u exceeds IOV_MAX for a datagram socket.\n",
++                   (unsigned int)hdr.msg_iovlen );
++    }
+ 
+     while ((ret = sendmsg( fd, &hdr, async->unix_flags )) == -1)
+     {
+
+--- dlls/ws2_32/tests/sock.c
++++ dlls/ws2_32/tests/sock.c
+@@ -14710,6 +14710,87 @@ static void test_send_buffering(void)
+     closesocket(client);
+ }
+ 
++static void test_send_many_buffers(void)
++{
++    char *send_data, *recv_data;
++    unsigned int i, count, recv_size;
++    struct sockaddr_in addr;
++    SOCKET client, server;
++    int addrlen, ret;
++    WSABUF *bufs;
++    DWORD sent;
++
++    /* Native WSASend() imposes no practical limit on the number of WSABUF
++     * elements for a stream socket. Wine used to forward the whole array to
++     * a single sendmsg() call, which Linux rejects with EMSGSIZE once
++     * msg_iovlen exceeds IOV_MAX (1024 on Linux). */
++    count = 2000;
++    send_data = malloc(count);
++    bufs = malloc(count * sizeof(*bufs));
++    for (i = 0; i < count; ++i)
++    {
++        send_data[i] = i;
++        bufs[i].buf = &send_data[i];
++        bufs[i].len = 1;
++    }
++
++    tcp_socketpair(&client, &server);
++
++    sent = 0xdeadbeef;
++    ret = WSASend(client, bufs, count, &sent, 0, NULL, NULL);
++    ok(!ret, "got %d, error %u.\n", ret, WSAGetLastError());
++    if (!ret)
++    {
++        ok(sent == count, "got %lu.\n", sent);
++
++        recv_data = calloc(1, count);
++        recv_size = 0;
++        while (recv_size < count
++               && (ret = recv(server, recv_data + recv_size, count - recv_size, 0)) > 0)
++            recv_size += ret;
++        ok(recv_size == count, "got %u, expected %u.\n", recv_size, count);
++        ok(!memcmp(recv_data, send_data, count), "data mismatch.\n");
++        free(recv_data);
++    }
++
++    closesocket(client);
++    closesocket(server);
++
++    /* Native WSASendTo() has no such limit for datagram sockets either; the
++     * buffers are coalesced into a single datagram. */
++    client = socket(AF_INET, SOCK_DGRAM, 0);
++    server = socket(AF_INET, SOCK_DGRAM, 0);
++
++    memset(&addr, 0, sizeof(addr));
++    addr.sin_family = AF_INET;
++    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    ret = bind(server, (struct sockaddr *)&addr, sizeof(addr));
++    ok(!ret, "got error %u.\n", WSAGetLastError());
++    addrlen = sizeof(addr);
++    ret = getsockname(server, (struct sockaddr *)&addr, &addrlen);
++    ok(!ret, "got error %u.\n", WSAGetLastError());
++
++    sent = 0xdeadbeef;
++    ret = WSASendTo(client, bufs, count, &sent, 0, (struct sockaddr *)&addr, sizeof(addr), NULL, NULL);
++    todo_wine
++    ok(!ret, "got %d, error %u.\n", ret, WSAGetLastError());
++    if (!ret)
++    {
++        ok(sent == count, "got %lu.\n", sent);
++
++        recv_data = calloc(1, count);
++        ret = recv(server, recv_data, count, 0);
++        ok(ret == (int)count, "got %d, error %u.\n", ret, WSAGetLastError());
++        ok(!memcmp(recv_data, send_data, count), "data mismatch.\n");
++        free(recv_data);
++    }
++
++    closesocket(client);
++    closesocket(server);
++    free(bufs);
++    free(send_data);
++}
++
+ static void test_valid_handle(void)
+ {
+     HANDLE duplicated, invalid;
+@@ -15129,6 +15210,7 @@ START_TEST( sock )
+     test_tcp_sendto_recvfrom();
+     test_broadcast();
+     test_send_buffering();
++    test_send_many_buffers();
+     test_valid_handle();
+     test_afunix();
+ 
+

@@ -1,0 +1,31 @@
+# rusticl/kernel: don't hold CL images after launch
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45825 state=opened
+# ### What does this MR do and why?
+
+After a day long debugging #16741 I found that `QueueContextWithState` keeps the sampler views and shader images of the last launch bound until a later launch replaces them. Each view holds a reference on its `pipe_resource`, so images the application has already released stay alive while their views remain bound.
+
+As mentioned in #16741, exporting a 24 MP raw 8 times in one `darktable-cli` process grows live texture memory (`ASAHI_MESA_DEBUG=bodump`, "Texture") by ~0.9 GiB per export, to 6–8 GiB, freed only at process exit. darktable releases all its `cl_mem`s, rusticl drops all its `Image`s (verified with a debug print in `MemBase::drop`), but the `pipe_resource`s survive.
+
+`GALLIUM_REFCNT_LOG` on the retained textures shows the unmatched references coming from `PipeImageView` and sampler views created in `Kernel::launch`.
+
+With this change texture memory returns to 0 after every export (peak during an export unchanged).
+
+Also from the debugging session: refcount data says that the previous bindings to be released when the next launch rebinds are not released. So a 
+review from someone who knows the binding/recycling path well is welcome here.
+
+Fixes #16741, also tagging @karolherbst 
+
+This change was developed with AI assistance (Claude). I have reviewed and tested it and confirm the issue is fixed with this MR.
+--- src/gallium/frontends/rusticl/core/kernel.rs
++++ src/gallium/frontends/rusticl/core/kernel.rs
+@@ -2035,6 +2035,9 @@ impl Kernel {
+             ctx.memory_barrier(write_barriers);
+             ctx.clear_global_binding(globals.len() as u32);
+ 
++            ctx.bind_sampler_views(Vec::new());
++            ctx.bind_shader_images(Vec::new());
++
+             if let Some(printf_buf) = &printf_buf {
+                 let tx = ctx
+                     .buffer_map(printf_buf, 0, printf_size as i32, RWFlags::RD)
+

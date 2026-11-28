@@ -1,0 +1,504 @@
+# winedump: Replace sprintf with snprintf to avoid deprecation warnings on macOS.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12677 state=merged
+# 
+--- tools/winedump/debug.c
++++ tools/winedump/debug.c
+@@ -507,7 +507,7 @@ static const char* storage_class(BYTE sc)
+     case IMAGE_SYM_CLASS_EXTERNAL:      return "extrnl";
+     case IMAGE_SYM_CLASS_LABEL:         return "label ";
+     }
+-    sprintf(tmp, "#%d", sc);
++    snprintf(tmp, sizeof(tmp), "#%d", sc);
+     return tmp;
+ }
+ 
+@@ -704,9 +704,9 @@ void    dump_stabs(const void* pv_stabs, unsigned szstabs, const char* stabstr,
+             ptr = stabbuff;
+         }
+         if ((stab_ptr->n_type & 1) || !stabs_defs[stab_ptr->n_type / 2])
+-            sprintf(n_buffer, "<0x%02x>", stab_ptr->n_type);
++            snprintf(n_buffer, sizeof(n_buffer), "<0x%02x>", stab_ptr->n_type);
+         else
+-            sprintf(n_buffer, "%-6s", stabs_defs[stab_ptr->n_type / 2]);
++            snprintf(n_buffer, sizeof(n_buffer), "%-6s", stabs_defs[stab_ptr->n_type / 2]);
+         printf("%4d %s %-8x % 6d %-8x %-6x %s\n",
+                i, n_buffer, stab_ptr->n_other, stab_ptr->n_desc, stab_ptr->n_value,
+                stab_ptr->n_un.n_strx, ptr);
+
+--- tools/winedump/dump.c
++++ tools/winedump/dump.c
+@@ -116,12 +116,13 @@ int dump_strA( const char *str, size_t len )
+ {
+     static const char escapes[32] = ".......abtnvfr.............e....";
+     char buffer[256];
++    char *buffer_end = buffer + sizeof(buffer);
+     char *pos = buffer;
+     int count = 0;
+ 
+     for (; len; str++, len--)
+     {
+-        if (pos > buffer + sizeof(buffer) - 8)
++        if (pos > buffer_end - 8)
+         {
+             fwrite( buffer, pos - buffer, 1, stdout );
+             count += pos - buffer;
+@@ -129,18 +130,18 @@ int dump_strA( const char *str, size_t len )
+         }
+         if ((unsigned char)*str > 127)  /* hex escape */
+         {
+-            pos += sprintf( pos, "\\x%02x", (unsigned char)*str );
++            pos += snprintf( pos, buffer_end - pos, "\\x%02x", (unsigned char)*str );
+             continue;
+         }
+         if (*str < 32)  /* octal or C escape */
+         {
+             if (!*str && len == 1) continue;  /* do not output terminating NULL */
+             if (escapes[(unsigned char)*str] != '.')
+-                pos += sprintf( pos, "\\%c", escapes[(unsigned char)*str] );
++                pos += snprintf( pos, buffer_end - pos, "\\%c", escapes[(unsigned char)*str] );
+             else if (len > 1 && str[1] >= '0' && str[1] <= '7')
+-                pos += sprintf( pos, "\\%03o", *str );
++                pos += snprintf( pos, buffer_end - pos, "\\%03o", *str );
+             else
+-                pos += sprintf( pos, "\\%o", *str );
++                pos += snprintf( pos, buffer_end - pos, "\\%o", *str );
+             continue;
+         }
+         if (*str == '\\') *pos++ = '\\';
+@@ -156,12 +157,13 @@ int dump_strW( const WCHAR *str, size_t len )
+ {
+     static const char escapes[32] = ".......abtnvfr.............e....";
+     char buffer[256];
++    char *buffer_end = buffer + sizeof(buffer);
+     char *pos = buffer;
+     int count = 0;
+ 
+     for (; len; str++, len--)
+     {
+-        if (pos > buffer + sizeof(buffer) - 8)
++        if (pos > buffer_end - 8)
+         {
+             fwrite( buffer, pos - buffer, 1, stdout );
+             count += pos - buffer;
+@@ -170,20 +172,20 @@ int dump_strW( const WCHAR *str, size_t len )
+         if (*str > 127)  /* hex escape */
+         {
+             if (len > 1 && str[1] < 128 && isxdigit((char)str[1]))
+-                pos += sprintf( pos, "\\x%04x", *str );
++                pos += snprintf( pos, buffer_end - pos, "\\x%04x", *str );
+             else
+-                pos += sprintf( pos, "\\x%x", *str );
++                pos += snprintf( pos, buffer_end - pos, "\\x%x", *str );
+             continue;
+         }
+         if (*str < 32)  /* octal or C escape */
+         {
+             if (!*str && len == 1) continue;  /* do not output terminating NULL */
+             if (escapes[*str] != '.')
+-                pos += sprintf( pos, "\\%c", escapes[*str] );
++                pos += snprintf( pos, buffer_end - pos, "\\%c", escapes[*str] );
+             else if (len > 1 && str[1] >= '0' && str[1] <= '7')
+-                pos += sprintf( pos, "\\%03o", *str );
++                pos += snprintf( pos, buffer_end - pos, "\\%03o", *str );
+             else
+-                pos += sprintf( pos, "\\%o", *str );
++                pos += snprintf( pos, buffer_end - pos, "\\%o", *str );
+             continue;
+         }
+         if (*str == '\\') *pos++ = '\\';
+@@ -196,11 +198,12 @@ int dump_strW( const WCHAR *str, size_t len )
+ 
+ const char *get_hexint64_str( DWORD64 l )
+ {
+-    char *buf = dump_want_n(2 + 16 + 1);
++    size_t buf_size = 2 + 16 + 1;
++    char *buf = dump_want_n(buf_size);
+     if (sizeof(l) > sizeof(unsigned long) && l >> 32)
+-        sprintf(buf, "%#lx%08lx", (unsigned long)(l >> 32), (unsigned long)l);
++        snprintf(buf, buf_size, "%#lx%08lx", (unsigned long)(l >> 32), (unsigned long)l);
+     else
+-        sprintf(buf, "%#lx", (unsigned long)l);
++        snprintf(buf, buf_size, "%#lx", (unsigned long)l);
+     assert(strlen(buf) <= 18);
+     return buf;
+ }
+@@ -232,21 +235,23 @@ const char* get_guid_str(const GUID* guid)
+ 
+     str = dump_want_n(39);
+     if (str)
+-        sprintf(str, "{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+-                (unsigned int)guid->Data1, guid->Data2, guid->Data3,
+-                guid->Data4[0], guid->Data4[1], guid->Data4[2], guid->Data4[3],
+-                guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
++        snprintf(str, 39, "{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
++                 (unsigned int)guid->Data1, guid->Data2, guid->Data3,
++                 guid->Data4[0], guid->Data4[1], guid->Data4[2], guid->Data4[3],
++                 guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
+     return str;
+ }
+ 
+ const char *get_unicode_str( const WCHAR *str, int len )
+ {
+     char *buffer;
++    size_t buffer_size;
+     int i = 0;
+ 
+     if (!str) return "(null)";
+     if (len == -1) len = strlenW( str );
+-    buffer = dump_want_n( len * 6 + 3);
++    buffer_size = len * 6 + 3;
++    buffer = dump_want_n( buffer_size );
+     buffer[i++] = '"';
+     while (len-- > 0 && *str)
+     {
+@@ -260,7 +265,7 @@ const char *get_unicode_str( const WCHAR *str, int len )
+         case '\\': strcpy( buffer + i, "\\\\" ); i += 2; break;
+         default:
+             if (c >= ' ' && c <= 126) buffer[i++] = c;
+-            else i += sprintf( buffer + i, "\\u%04x",c);
++            else i += snprintf( buffer + i, buffer_size - i, "\\u%04x",c);
+         }
+     }
+     buffer[i++] = '"';
+
+--- tools/winedump/minidump.c
++++ tools/winedump/minidump.c
+@@ -291,11 +291,11 @@ void mdmp_dump(void)
+                     if (msi->ProcessorLevel == 3 || msi->ProcessorLevel == 4)
+                     {
+                         if (HIBYTE(msi->ProcessorRevision) == 0xFF)
+-                            sprintf(tmp + strlen(tmp), "%c%d", 'A' + ((msi->ProcessorRevision>>4)&0xf)-0x0a, msi->ProcessorRevision&0xf);
++                            snprintf(tmp + strlen(tmp), sizeof(tmp) - strlen(tmp), "%c%d", 'A' + ((msi->ProcessorRevision>>4)&0xf)-0x0a, msi->ProcessorRevision&0xf);
+                         else
+-                            sprintf(tmp + strlen(tmp), "%c%d", 'A' + HIBYTE(msi->ProcessorRevision), LOBYTE(msi->ProcessorRevision));
++                            snprintf(tmp + strlen(tmp), sizeof(tmp) - strlen(tmp), "%c%d", 'A' + HIBYTE(msi->ProcessorRevision), LOBYTE(msi->ProcessorRevision));
+                     }
+-                    else sprintf(tmp + strlen(tmp), "%d.%d", HIBYTE(msi->ProcessorRevision), LOBYTE(msi->ProcessorRevision));
++                    else snprintf(tmp + strlen(tmp), sizeof(tmp) - strlen(tmp), "%d.%d", HIBYTE(msi->ProcessorRevision), LOBYTE(msi->ProcessorRevision));
+                     str = tmp;
+                     break;
+                 case PROCESSOR_ARCHITECTURE_MIPS:
+
+--- tools/winedump/msc.c
++++ tools/winedump/msc.c
+@@ -179,8 +179,8 @@ static const char* full_value_string(const struct full_value* fv)
+ 
+     switch (fv->type)
+     {
+-    case fv_integer: sprintf(tmp, "0x%x", fv->v.i); break;
+-    case fv_longlong: sprintf(tmp, "0x%x%08x", (unsigned)(fv->v.llu >> 32), (unsigned)fv->v.llu); break;
++    case fv_integer: snprintf(tmp, sizeof(tmp), "0x%x", fv->v.i); break;
++    case fv_longlong: snprintf(tmp, sizeof(tmp), "0x%x%08x", (unsigned)(fv->v.llu >> 32), (unsigned)fv->v.llu); break;
+     }
+     return tmp;
+ }
+@@ -244,9 +244,9 @@ static const char* get_property(cv_property_t prop)
+     if (prop.is_scoped)                 X("scoped");
+     if (prop.has_decorated_name)        X("decorated-name");
+     if (prop.is_sealed)                 X("sealed");
+-    if (prop.hfa)                       pos += sprintf(tmp, "hfa%x", prop.hfa);
++    if (prop.hfa)                       pos += snprintf(tmp, sizeof(tmp) - pos, "hfa%x", prop.hfa);
+     if (prop.is_intrinsic)              X("intrinsic");
+-    if (prop.mocom)                     pos += sprintf(tmp, "mocom%x", prop.mocom);
++    if (prop.mocom)                     pos += snprintf(tmp, sizeof(tmp) - pos, "mocom%x", prop.mocom);
+ #undef X
+     if (!pos) return "none";
+ 
+@@ -266,7 +266,7 @@ static const char* get_funcattr(unsigned attr)
+     if (attr & 0x0001) X("C++ReturnUDT");
+     if (attr & 0x0002) X("Ctor");
+     if (attr & 0x0004) X("Ctor-w/virtualbase");
+-    if (attr & 0xfff8) pos += sprintf(tmp, "unk:%x", attr & 0xfff8);
++    if (attr & 0xfff8) pos += snprintf(tmp, sizeof(tmp), "unk:%x", attr & 0xfff8);
+ #undef X
+ 
+     tmp[pos] = '\0';
+@@ -292,7 +292,7 @@ static const char* get_varflags(struct cv_local_varflag flags)
+     if (flags.optimized_out)   X("optimized-out");
+     if (flags.enreg_global)    X("enreg-global");
+     if (flags.enreg_static)    X("enreg-static");
+-    if (flags.unused)          pos += sprintf(tmp, "unk:%x", flags.unused);
++    if (flags.unused)          pos += snprintf(tmp, sizeof(tmp), "unk:%x", flags.unused);
+ #undef X
+ 
+     if (!pos) return "none";
+@@ -386,7 +386,7 @@ static const char* get_machine(unsigned m)
+     default:
+         {
+             static char tmp[16];
+-            sprintf(tmp, "machine=%x", m);
++            snprintf(tmp, sizeof(tmp), "machine=%x", m);
+             machine = tmp;
+         }
+         break;
+@@ -420,7 +420,7 @@ static const char* get_language(unsigned l)
+     default:
+         {
+             static char tmp[16];
+-            sprintf(tmp, "lang=%x", l);
++            snprintf(tmp, sizeof(tmp), "lang=%x", l);
+             lang = tmp;
+         }
+         break;
+@@ -463,7 +463,7 @@ static const char* get_callconv(unsigned cc)
+     default:
+         {
+             static char tmp[20];
+-            sprintf(tmp, "callconv=%x", cc);
++            snprintf(tmp, sizeof(tmp), "callconv=%x", cc);
+             callconv = tmp;
+         }
+         break;
+
+--- tools/winedump/msmangle.c
++++ tools/winedump/msmangle.c
+@@ -237,7 +237,7 @@ static const char* get_number(struct parsed_symbol* sym)
+         if (*sym->current != '@') return NULL;
+ 
+         ptr = und_alloc(sym, 17);
+-        sprintf(ptr, "%s%u", sgn ? "-" : "", ret);
++        snprintf(ptr, 17, "%s%u", sgn ? "-" : "", ret);
+         sym->current++;
+     }
+     else return NULL;
+
+--- tools/winedump/ne.c
++++ tools/winedump/ne.c
+@@ -178,7 +178,7 @@ static const char *get_resource_type( WORD id )
+     case NE_RSCTYPE_GROUP_ICON: return "ICON_GROUP";
+     case NE_RSCTYPE_VERSION: return "VERSION";
+     default:
+-        sprintf( buffer, "%04x", id );
++        snprintf( buffer, sizeof(buffer), "%04x", id );
+         return buffer;
+     }
+ }
+
+--- tools/winedump/nls.c
++++ tools/winedump/nls.c
+@@ -540,9 +540,9 @@ static const char *get_sortkey( UINT key )
+     static char buffer[16];
+     if (!key) return "....";
+     if ((WORD)key == 0x200)
+-        sprintf( buffer, "expand %04x", key >> 16 );
++        snprintf( buffer, sizeof(buffer), "expand %04x", key >> 16 );
+     else
+-        sprintf( buffer, "%u.%u.%u.%u", (BYTE)(key >> 8), (BYTE)key, (BYTE)(key >> 16), (BYTE)(key >> 24) );
++        snprintf( buffer, sizeof(buffer), "%u.%u.%u.%u", (BYTE)(key >> 8), (BYTE)key, (BYTE)(key >> 16), (BYTE)(key >> 24) );
+     return buffer;
+ }
+ 
+@@ -837,7 +837,7 @@ static const char *get_locale_string( DWORD offset )
+     {
+         if (*p < 0x20)
+         {
+-            i += sprintf( buffer + i, "\\%03o", *p );
++            i += snprintf( buffer + i, sizeof(buffer) - i, "\\%03o", *p );
+         }
+         else if (*p < 0x80)
+         {
+@@ -885,7 +885,7 @@ static const char *get_locale_strarray( DWORD offset )
+     while (count--)
+     {
+         if (i > 1) buffer[i++] = ' ';
+-        i += sprintf( buffer + i, "%s", get_locale_string( *array++ ));
++        i += snprintf( buffer + i, sizeof(buffer) - i, "%s", get_locale_string( *array++ ));
+     }
+     buffer[i++] = '}';
+     buffer[i] = 0;
+@@ -904,7 +904,7 @@ static const char *get_locale_uints( DWORD offset )
+     if (offset + len + 1 > locale_strings_len) return "<invalid>";
+     if (len < 2) return "[]";
+     for (p = (unsigned int *)(locale_strings + offset + 1); len >= 2; p++, len -= 2)
+-        sprintf( buffer + strlen(buffer), " %08x", *p );
++        snprintf( buffer + strlen(buffer), sizeof(buffer) - strlen(buffer), " %08x", *p );
+     buffer[0] = '[';
+     strcat( buffer, "]" );
+     return buffer;
+
+--- tools/winedump/output.c
++++ tools/winedump/output.c
+@@ -67,7 +67,7 @@ void  output_spec_symbol (const parsed_symbol *sym)
+   assert (sym && sym->symbol);
+ 
+   if (sym->ordinal >= 0)
+-    sprintf(ord_spec, "%d", sym->ordinal);
++    snprintf(ord_spec, sizeof(ord_spec), "%d", sym->ordinal);
+   else
+   {
+     ord_spec[0] = '@';
+@@ -484,7 +484,7 @@ void  output_c_banner (const parsed_symbol *sym)
+   size_t i;
+ 
+   if (sym->ordinal >= 0)
+-    sprintf(ord_spec, "%d", sym->ordinal);
++    snprintf(ord_spec, sizeof(ord_spec), "%d", sym->ordinal);
+   else
+   {
+     ord_spec[0] = '@';
+
+--- tools/winedump/pdb.c
++++ tools/winedump/pdb.c
+@@ -532,9 +532,9 @@ static void pdb_dump_symbols(struct pdb_reader* reader)
+             printf("-Unknown symbol info version %d\n", symbols->version);
+         }
+         if (symbols->flags & 0x8000) /* new */
+-            sprintf(tcver, "%u.%u", (symbols->flags >> 8) & 0x7f, symbols->flags & 0xff);
++            snprintf(tcver, sizeof(tcver), "%u.%u", (symbols->flags >> 8) & 0x7f, symbols->flags & 0xff);
+         else
+-            sprintf(tcver, "old-%x", symbols->flags);
++            snprintf(tcver, sizeof(tcver), "old-%x", symbols->flags);
+         printf("Symbols:\n"
+                "\tsignature:          %08x\n"
+                "\tversion:            %u\n"
+
+--- tools/winedump/pe.c
++++ tools/winedump/pe.c
+@@ -195,9 +195,9 @@ static inline const char *longlong_str( ULONGLONG value )
+     static char buffer[20];
+ 
+     if (sizeof(value) > sizeof(unsigned long) && value >> 32)
+-        sprintf(buffer, "%lx%08lx", (unsigned long)(value >> 32), (unsigned long)value);
++        snprintf(buffer, sizeof(buffer), "%lx%08lx", (unsigned long)(value >> 32), (unsigned long)value);
+     else
+-        sprintf(buffer, "%lx", (unsigned long)value);
++        snprintf(buffer, sizeof(buffer), "%lx", (unsigned long)value);
+     return buffer;
+ }
+ 
+@@ -1598,9 +1598,9 @@ static void dump_armnt_unwind_info( const struct runtime_function_armnt *fnc )
+                     last = 3;
+             }
+             if (first == last)
+-                sprintf(intregs, "r%u", first);
++                snprintf(intregs, sizeof(intregs), "r%u", first);
+             else
+-                sprintf(intregs, "r%u-r%u", first, last);
++                snprintf(intregs, sizeof(intregs), "r%u-r%u", first, last);
+             fpoffset = last + 1 - first;
+         }
+ 
+@@ -1614,9 +1614,9 @@ static void dump_armnt_unwind_info( const struct runtime_function_armnt *fnc )
+                     last = 3;
+             }
+             if (first == last)
+-                sprintf(intregspop, "r%u", first);
++                snprintf(intregspop, sizeof(intregspop), "r%u", first);
+             else
+-                sprintf(intregspop, "r%u-r%u", first, last);
++                snprintf(intregspop, sizeof(intregspop), "r%u-r%u", first, last);
+         }
+ 
+         if (fnc->C)
+@@ -1645,7 +1645,7 @@ static void dump_armnt_unwind_info( const struct runtime_function_armnt *fnc )
+         if (fnc->R)
+         {
+             if (fnc->Reg)
+-                sprintf(vfpregs, "d8-d%u", fnc->Reg + 8);
++                snprintf(vfpregs, sizeof(vfpregs), "d8-d%u", fnc->Reg + 8);
+             else
+                 strcpy(vfpregs, "d8");
+         }
+@@ -5298,7 +5298,7 @@ static	void	do_grab_sym( void )
+ 	{
+ 	    char ordinal_text[256];
+ 	    /* Ordinal only entry */
+-            sprintf (ordinal_text, "%s_%u",
++            snprintf (ordinal_text, sizeof(ordinal_text), "%s_%u",
+ 		      globals.forward_dll ? globals.forward_dll : OUTPUT_UC_DLL_NAME,
+                       (UINT)exportDir->Base + i);
+ 	    str_toupper(ordinal_text);
+
+--- tools/winedump/tlb.c
++++ tools/winedump/tlb.c
+@@ -195,7 +195,7 @@ static void print_begin_block(const char *name)
+ static void print_begin_block_id(const char *name, int id)
+ {
+     char buf[64];
+-    sprintf(buf, "%s %d", name, id);
++    snprintf(buf, sizeof(buf), "%s %d", name, id);
+     print_begin_block(buf);
+ }
+ 
+@@ -225,7 +225,7 @@ static int print_hex(const char *name)
+ static int print_hex_id(const char *name, int id)
+ {
+     char buf[64];
+-    sprintf(buf, name, id);
++    snprintf(buf, sizeof(buf), name, id);
+     return print_hex(buf);
+ }
+ 
+@@ -540,7 +540,7 @@ static void print_string0(void)
+         else
+         {
+             char buf[16];
+-            sprintf(buf, "\\%u", c);
++            snprintf(buf, sizeof(buf), "\\%u", c);
+             fwrite(buf, 1, strlen(buf), stdout);
+         }
+     }
+@@ -1245,7 +1245,7 @@ static void dump_sltg_block_entry(int idx, const char *index)
+     char name[32];
+     short index_offset;
+ 
+-    sprintf(name, "Block entry %d", idx);
++    snprintf(name, sizeof(name), "Block entry %d", idx);
+     print_begin_block(name);
+ 
+     print_hex("len");
+@@ -1305,7 +1305,7 @@ static void dump_sltg_other_typeinfo(int idx, const char *hlp_strings)
+     int hlpstr_len, saved_offset;
+     char name[32];
+ 
+-    sprintf(name, "Other typeinfo %d", idx);
++    snprintf(name, sizeof(name), "Other typeinfo %d", idx);
+     print_begin_block(name);
+ 
+     print_sltg_name("index name");
+@@ -1577,7 +1577,7 @@ static void dump_type(int len, const char *hlp_strings)
+             char magic, flags;
+             short next, value;
+ 
+-            sprintf(name, "variable %d", i);
++            snprintf(name, sizeof(name), "variable %d", i);
+             print_begin_block(name);
+ 
+             saved_off = offset;
+@@ -1683,7 +1683,7 @@ static void dump_type(int len, const char *hlp_strings)
+         {
+             char name[64];
+ 
+-            sprintf(name, "impl.type %d (current offset %#x)", i, offset);
++            snprintf(name, sizeof(name), "impl.type %d (current offset %#x)", i, offset);
+             print_begin_block(name);
+ 
+             print_short_hex("res00");
+@@ -1714,7 +1714,7 @@ static void dump_type(int len, const char *hlp_strings)
+             BYTE magic, flags;
+             short args_off, value, n_params, j;
+ 
+-            sprintf(name, "function %d (current offset %#x)", i, offset);
++            snprintf(name, sizeof(name), "function %d (current offset %#x)", i, offset);
+             print_begin_block(name);
+ 
+             magic = print_byte("magic");
+@@ -1812,7 +1812,7 @@ static void dump_type(int len, const char *hlp_strings)
+                 char name[32];
+                 unsigned short name_offset;
+ 
+-                sprintf(name, "arg %d", j);
++                snprintf(name, sizeof(name), "arg %d", j);
+                 print_begin_block(name);
+ 
+                 name_offset = tlb_read_short();
+@@ -1960,7 +1960,7 @@ static void sltg_dump(void)
+ 
+         saved_offset = offset;
+ 
+-        sprintf(name, "Block %d", i);
++        snprintf(name, sizeof(name), "Block %d", i);
+         print_begin_block(name);
+         magic = tlb_read_short();
+         assert(magic == 0x0501);
+

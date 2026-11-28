@@ -1,0 +1,135 @@
+# wsi/metal: Retain CAMetalLayer to avoid use-after-free
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45767 state=opened
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+Won't go on a rant about how `VkMetalSurfaceCreateInfoEXT.pLayer` shouldn't be `const` nor the lack of specification in the extension about the lifetime of the `CAMetalLayer`. Just bite the bullet and retain the layer
+
+```
+wsi/metal: Retain CAMetalLayer to avoid use-after-free
+
+Found through dawn_end2end_tests's
+SurfaceConfigurationValidationTests.AlphaModeAuto
+
+VK_EXT_metal_surface doesn't specify ownership nor lifetime of the
+CAMetalLayer. This means that apps can release the CAMetalLayer before
+they have destroyed the VkSwapchainKHR and VkSurfaceKHR that depend on it.
+Retain the CAMetalLayer at surface creation and release it at destroy.
+
+Signed-off-by: Aitor Camacho <aitor@lunarg.com>
+```
+--- src/vulkan/wsi/wsi_common.c
++++ src/vulkan/wsi/wsi_common.c
+@@ -391,6 +391,13 @@ wsi_DestroySurfaceKHR(VkInstance _instance,
+    }
+ #endif
+ 
++#ifdef VK_USE_PLATFORM_METAL_EXT
++   if (surface->platform == VK_ICD_WSI_PLATFORM_METAL) {
++      wsi_metal_surface_destroy(surface, _instance, pAllocator);
++      return;
++   }
++#endif
++
+    vk_free2(&instance->alloc, pAllocator, surface);
+ }
+ 
+
+--- src/vulkan/wsi/wsi_common_metal.c
++++ src/vulkan/wsi/wsi_common_metal.c
+@@ -653,7 +653,7 @@ wsi_metal_swapchain_release_images(struct wsi_swapchain *wsi_chain,
+       }
+ 
+       if (image->drawable) {
+-         wsi_metal_release_drawable(image->drawable);
++         wsi_metal_release_nsobj(image->drawable);
+          image->drawable = NULL;
+       }
+    }
+@@ -848,7 +848,7 @@ wsi_metal_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+    for (uint32_t i = 0; i < chain->base.image_count; i++) {
+       struct wsi_metal_image *image = &chain->images[i];
+       if (image->drawable) {
+-         wsi_metal_release_drawable(image->drawable);
++         wsi_metal_release_nsobj(image->drawable);
+          image->drawable = NULL;
+       }
+ 
+@@ -1061,7 +1061,7 @@ wsi_CreateMetalSurfaceEXT(
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
+    surface->base.platform = VK_ICD_WSI_PLATFORM_METAL;
+-   surface->pLayer = pCreateInfo->pLayer;
++   surface->pLayer = wsi_metal_retain_nsobj((CAMetalLayer *)pCreateInfo->pLayer);
+    assert(surface->pLayer);
+ 
+    *pSurface = VkIcdSurfaceBase_to_handle(&surface->base);
+@@ -1144,3 +1144,13 @@ wsi_metal_configure_image(const struct wsi_swapchain *chain,
+ 
+    return VK_SUCCESS;
+ }
++
++void
++wsi_metal_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
++                          const VkAllocationCallbacks *pAllocator)
++{
++   VK_FROM_HANDLE(vk_instance, instance, _instance);
++   VkIcdSurfaceMetal *surface = container_of(icd_surface, VkIcdSurfaceMetal, base);
++   wsi_metal_release_nsobj((CAMetalLayer *)surface->pLayer);
++   vk_free2(&instance->alloc, pAllocator, icd_surface);
++}
+
+--- src/vulkan/wsi/wsi_common_metal_layer.h
++++ src/vulkan/wsi/wsi_common_metal_layer.h
+@@ -36,8 +36,11 @@ wsi_metal_layer_set_hdr_metadata(const CAMetalLayer *metal_layer,
+ CAMetalDrawable *
+ wsi_metal_layer_acquire_drawable(const CAMetalLayer *metal_layer);
+ 
++void *
++wsi_metal_retain_nsobj(void *nsobj);
++
+ void
+-wsi_metal_release_drawable(CAMetalDrawable *drawable_ptr);
++wsi_metal_release_nsobj(void *nsobj);
+ 
+ void
+ wsi_metal_layer_add_presented_handler(CAMetalDrawable *drawable_ptr,
+
+--- src/vulkan/wsi/wsi_common_metal_layer.m
++++ src/vulkan/wsi/wsi_common_metal_layer.m
+@@ -276,10 +276,18 @@ wsi_metal_layer_acquire_drawable(const CAMetalLayer *metal_layer)
+    }
+ }
+ 
++void *
++wsi_metal_retain_nsobj(void *nsobj)
++{
++   NSObject *obj = (NSObject *)nsobj;
++   return [obj retain];
++}
++
+ void
+-wsi_metal_release_drawable(CAMetalDrawable *drawable_ptr)
++wsi_metal_release_nsobj(void *nsobj)
+ {
+-   [(id<CAMetalDrawable>)drawable_ptr release];
++   NSObject *obj = (NSObject *)nsobj;
++   [obj release];
+ }
+ 
+ void
+
+--- src/vulkan/wsi/wsi_common_private.h
++++ src/vulkan/wsi/wsi_common_private.h
+@@ -360,6 +360,10 @@ void
+ wsi_win32_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
+                           const VkAllocationCallbacks *pAllocator);
+ 
++void
++wsi_metal_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
++                          const VkAllocationCallbacks *pAllocator);
++
+ VkResult
+ wsi_swapchain_init(const struct wsi_device *wsi,
+                    struct wsi_swapchain *chain,
+

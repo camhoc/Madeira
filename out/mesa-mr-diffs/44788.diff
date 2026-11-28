@@ -1,0 +1,73 @@
+# kk: Add linear image textures to the residency set
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44788 state=closed
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+kk: Add linear image textures to the residency set
+
+Linear images are backed by a texture created from the memory's
+MTLBuffer. Metal treats that texture as an allocation of its own, so
+having the heap (or the host-pointer buffer) in the device's residency
+set doesn't make the texture resident. With Metal API validation on,
+the first render pass using a linear image as a color attachment fails
+commit validation:
+
+  Attachment texture (Label: (null)) used in command buffer (at index 0)
+  is not added to any residency set on the command buffer or command
+  queue.
+
+Add the texture to the device's residency set when the plane is bound
+and remove it when the plane is destroyed. Swapchain-bound images reuse
+the swapchain image's texture and are left alone.
+
+Found running Venus on KosmicKrisp through virglrenderer on macOS
+(Apple M4 Pro, Linux guest in krunkit), where GNOME Shell renders into
+linear images. Reproduced on main with a standalone test that clears a
+VK_IMAGE_TILING_LINEAR color attachment with dynamic rendering under
+MTL_DEBUG_LAYER=1.
+
+FYI, the error only shows with MTL_DEBUG_LAYER_ERROR_MODE=nslog
+```
+--- src/kosmickrisp/vulkan/kk_image.c
++++ src/kosmickrisp/vulkan/kk_image.c
+@@ -582,8 +582,11 @@ kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
+                       VkImageCreateFlags create_flags,
+                       const VkAllocationCallbacks *pAllocator)
+ {
+-   if (plane->mtl_handle != NULL)
++   if (plane->mtl_handle != NULL) {
++      if (plane->resident)
++         kk_device_remove_buffer_from_residency_set(dev, plane->mtl_handle);
+       mtl_release(plane->mtl_handle);
++   }
+    if (plane->mtl_handle_array != NULL)
+       mtl_release(plane->mtl_handle_array);
+ }
+@@ -858,6 +861,12 @@ kk_image_plane_bind(struct kk_device *dev, struct kk_image *image,
+    plane->mem = mem;
+    plane->mem_offset_B = *offset_B;
+    plane->mtl_handle = kk_image_plane_create_texture(plane, &plane->layout, 0u);
++   /* A texture made from a buffer is a separate allocation to Metal, so the
++    * residency of the buffer or heap behind it doesn't cover it. */
++   if (plane->layout.linear) {
++      kk_device_add_buffer_to_residency_set(dev, plane->mtl_handle);
++      plane->resident = true;
++   }
+    if (image->vk.base.object_name)
+       mtl_resource_set_label(plane->mtl_handle, image->vk.base.object_name);
+ 
+
+--- src/kosmickrisp/vulkan/kk_image.h
++++ src/kosmickrisp/vulkan/kk_image.h
+@@ -40,6 +40,8 @@ struct kk_image_plane {
+    /* Metal handle with 2D array type for 3D images */
+    mtl_texture *mtl_handle_array;
+    uint64_t addr;
++   /* mtl_handle is in the device's residency set */
++   bool resident;
+ };
+ 
+ struct kk_image {
+

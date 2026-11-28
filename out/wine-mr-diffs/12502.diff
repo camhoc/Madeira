@@ -1,0 +1,15 @@
+# ntdll: Increase the threadpool worker timeout to 60 seconds.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12502 state=merged
+# 
+--- dlls/ntdll/threadpool.c
++++ dlls/ntdll/threadpool.c
+@@ -95,7 +95,7 @@ struct timer_queue
+  * Object-oriented thread pooling API
+  */
+ 
+-#define THREADPOOL_WORKER_TIMEOUT 5000
++#define THREADPOOL_WORKER_TIMEOUT 60000
+ #define MAXIMUM_WAITQUEUE_OBJECTS (MAXIMUM_WAIT_OBJECTS - 1)
+ 
+ /* internal threadpool representation */
+

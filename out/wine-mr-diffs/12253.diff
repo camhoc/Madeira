@@ -1,0 +1,381 @@
+# winemac: Handle hotkey presses directly on the main thread.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12253 state=opened
+# This also moves all of the static per-thread keyboard layout data into a r/w lock that is also only updated on the main thread, also in preparation for removing KEY_PRESS and KEY_RELEASE events afterwards (and makes this change a bit more straightforward too).
+--- dlls/winemac.drv/cocoa_app.m
++++ dlls/winemac.drv/cocoa_app.m
+@@ -466,21 +466,16 @@ - (void) keyboardSelectionDidChange:(BOOL)force
+                 macdrv_event* event;
+                 WineEventQueue* queue;
+ 
++                if (!macdrv_update_keyboard_layout(uchr, self.keyboardType,
++                                                   KBGetLayoutType(self.keyboardType) == kKeyboardISO)) return;
++
+                 event = macdrv_create_event(KEYBOARD_CHANGED, nil);
+-                event->keyboard_changed.keyboard_type = self.keyboardType;
+-                event->keyboard_changed.iso_keyboard = (KBGetLayoutType(self.keyboardType) == kKeyboardISO);
+-                event->keyboard_changed.uchr = CFDataCreateCopy(NULL, uchr);
+                 event->keyboard_changed.input_source = (TISInputSourceRef)CFRetain(inputSource);
+ 
+-                if (event->keyboard_changed.uchr)
+-                {
+-                    [eventQueuesLock lock];
+-
+-                    for (queue in eventQueues)
+-                        [queue postEvent:event];
+-
+-                    [eventQueuesLock unlock];
+-                }
++                [eventQueuesLock lock];
++                for (queue in eventQueues)
++                    [queue postEvent:event];
++                [eventQueuesLock unlock];
+ 
+                 macdrv_release_event(event);
+             }
+@@ -2401,26 +2396,22 @@ void macdrv_window_rejected_focus(const macdrv_event *event)
+ /***********************************************************************
+  *              macdrv_get_input_source_info
+  *
+- * Returns the keyboard layout uchr data, keyboard type and input source.
++ * Update the native layout and return the current input source.
+  */
+-void macdrv_get_input_source_info(CFDataRef* uchr, CGEventSourceKeyboardType* keyboard_type, bool* is_iso, TISInputSourceRef* input_source)
++void macdrv_get_input_source_info(TISInputSourceRef *input_source)
+ {
+     OnMainThread(^{
+-        TISInputSourceRef inputSourceLayout;
++        WineApplicationController* controller = [WineApplicationController sharedController];
++        TISInputSourceRef inputSourceLayout = TISCopyCurrentKeyboardLayoutInputSource();
+ 
+-        inputSourceLayout = TISCopyCurrentKeyboardLayoutInputSource();
+         if (inputSourceLayout)
+         {
+-            CFDataRef data = TISGetInputSourceProperty(inputSourceLayout,
+-                                kTISPropertyUnicodeKeyLayoutData);
+-            *uchr = CFDataCreateCopy(NULL, data);
++            CFDataRef data = TISGetInputSourceProperty(inputSourceLayout, kTISPropertyUnicodeKeyLayoutData);
++            macdrv_update_keyboard_layout(data, controller.keyboardType,
++                                          KBGetLayoutType(controller.keyboardType) == kKeyboardISO);
+             CFRelease(inputSourceLayout);
+-
+-            *keyboard_type = [WineApplicationController sharedController].keyboardType;
+-            *is_iso = (KBGetLayoutType(*keyboard_type) == kKeyboardISO);
+-            if (input_source)
+-                *input_source = TISCopyCurrentKeyboardInputSource();
+         }
++        *input_source = TISCopyCurrentKeyboardInputSource();
+     });
+ }
+ 
+@@ -2694,6 +2685,8 @@ bool macdrv_select_input_source(TISInputSourceRef input_source)
+ 
+     OnMainThread(^{
+         ret = (TISSelectInputSource(input_source) == noErr);
++        /* Publish the layout before Cocoa can deliver another key. */
++        if (ret) [[WineApplicationController sharedController] keyboardSelectionDidChange:YES];
+     });
+ 
+     return ret;
+
+--- dlls/winemac.drv/cocoa_event.m
++++ dlls/winemac.drv/cocoa_event.m
+@@ -371,22 +371,17 @@ - (void) resetMouseEventPositions:(CGPoint)pos
+         [eventsLock unlock];
+     }
+ 
+-    - (BOOL) postHotKeyEvent:(UInt32)hotKeyNumber time:(double)time
++    - (BOOL) handleHotKey:(UInt32)hotKeyNumber time:(double)time
+     {
+         NSDictionary<NSString *, id> *hotKeyDict = hotKeysByMacID[@(hotKeyNumber)];
+         if (hotKeyDict)
+         {
+-            macdrv_event* event;
++            WineApplicationController *controller = [WineApplicationController sharedController];
+ 
+-            event = macdrv_create_event(HOTKEY_PRESS, nil);
+-            event->hotkey_press.vkey        = [hotKeyDict[WineHotKeyVkeyKey] unsignedIntValue];
+-            event->hotkey_press.mod_flags   = [hotKeyDict[WineHotKeyModFlagsKey] unsignedIntValue];
+-            event->hotkey_press.keycode     = [hotKeyDict[WineHotKeyKeyCodeKey] unsignedIntValue];
+-            event->hotkey_press.time_ms     = [[WineApplicationController sharedController] ticksForEventTime:time];
+-
+-            [self postEvent:event];
+-
+-            macdrv_release_event(event);
++            macdrv_hotkey_press([hotKeyDict[WineHotKeyVkeyKey] unsignedIntValue],
++                                [hotKeyDict[WineHotKeyModFlagsKey] unsignedIntValue],
++                                [hotKeyDict[WineHotKeyKeyCodeKey] unsignedIntValue],
++                                [controller ticksForEventTime:time]);
+         }
+ 
+         return hotKeyDict != nil;
+@@ -403,7 +398,7 @@ static OSStatus HotKeyHandler(EventHandlerCallRef nextHandler, EventRef theEvent
+         if (status == noErr)
+         {
+             if (hotKeyID.signature != WineHotKeySignature ||
+-                ![self postHotKeyEvent:hotKeyID.id time:GetEventTime(theEvent)])
++                ![self handleHotKey:hotKeyID.id time:GetEventTime(theEvent)])
+                 status = eventNotHandledErr;
+         }
+ 
+@@ -667,7 +662,6 @@ void macdrv_release_event(macdrv_event *event)
+         switch (event->type)
+         {
+             case KEYBOARD_CHANGED:
+-                CFRelease(event->keyboard_changed.uchr);
+                 CFRelease(event->keyboard_changed.input_source);
+                 break;
+             case QUERY_EVENT:
+
+--- dlls/winemac.drv/event.c
++++ dlls/winemac.drv/event.c
+@@ -39,7 +39,6 @@ static const char *dbgstr_event(int type)
+         "APP_DEACTIVATED",
+         "APP_QUIT_REQUESTED",
+         "DISPLAYS_CHANGED",
+-        "HOTKEY_PRESS",
+         "KEY_PRESS",
+         "KEY_RELEASE",
+         "KEYBOARD_CHANGED",
+@@ -84,9 +83,6 @@ static macdrv_event_mask get_event_mask(DWORD mask)
+ 
+     if ((mask & QS_ALLINPUT) == QS_ALLINPUT) return -1;
+ 
+-    if (mask & QS_HOTKEY)
+-        event_mask |= event_mask_for_type(HOTKEY_PRESS);
+-
+     if (mask & QS_KEY)
+     {
+         event_mask |= event_mask_for_type(KEY_PRESS);
+@@ -331,9 +327,6 @@ void macdrv_handle_event(const macdrv_event *event)
+     case DISPLAYS_CHANGED:
+         macdrv_displays_changed(event);
+         break;
+-    case HOTKEY_PRESS:
+-        macdrv_hotkey_press(event);
+-        break;
+     case KEY_PRESS:
+     case KEY_RELEASE:
+         macdrv_key_event(hwnd, event);
+
+--- dlls/winemac.drv/ime.c
++++ dlls/winemac.drv/ime.c
+@@ -37,6 +37,7 @@ CGRect ime_composition_rect;
+ UINT macdrv_ImeToAsciiEx( UINT vkey, UINT vsc, const BYTE *state, void *update )
+ {
+     struct macdrv_thread_data *thread_data = macdrv_thread_data();
++    const struct macdrv_keyboard_layout *layout = &keyboard_layout;
+     unsigned int flags;
+     int keyc;
+     BOOL repeat = !!(vsc & KF_REPEAT);
+@@ -56,6 +57,7 @@ UINT macdrv_ImeToAsciiEx( UINT vkey, UINT vsc, const BYTE *state, void *update )
+     case VK_KANJI: TRACE( "Skipping metakey\n" ); return STATUS_NOT_IMPLEMENTED;
+     }
+ 
++    pthread_rwlock_rdlock(&keyboard_layout.lock);
+     flags = thread_data->last_modifiers;
+     if (state[VK_SHIFT] & 0x80) flags |= NX_SHIFTMASK;
+     else flags &= ~(NX_SHIFTMASK | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK);
+@@ -67,9 +69,10 @@ UINT macdrv_ImeToAsciiEx( UINT vkey, UINT vsc, const BYTE *state, void *update )
+     else flags &= ~(NX_COMMANDMASK | NX_DEVICELCMDKEYMASK | NX_DEVICERCMDKEYMASK);
+ 
+     /* Find the Mac keycode corresponding to the scan code */
+-    for (keyc = 0; keyc < ARRAY_SIZE(thread_data->keyc2vkey); keyc++)
+-        if (thread_data->keyc2vkey[keyc] == vkey) break;
+-    if (keyc >= ARRAY_SIZE(thread_data->keyc2vkey)) return 0;
++    for (keyc = 0; keyc < ARRAY_SIZE(layout->keyc2vkey); keyc++)
++        if (layout->keyc2vkey[keyc] == vkey) break;
++    pthread_rwlock_unlock(&keyboard_layout.lock);
++    if (keyc >= ARRAY_SIZE(layout->keyc2vkey)) return 0;
+ 
+     TRACE( "flags %#x keyc %#x\n", flags, keyc );
+ 
+
+--- dlls/winemac.drv/keyboard.c
++++ dlls/winemac.drv/keyboard.c
+
+--- dlls/winemac.drv/macdrv.h
++++ dlls/winemac.drv/macdrv.h
+@@ -138,20 +138,27 @@ static inline RECT rect_from_cgrect(CGRect cgrect)
+     WM_MACDRV_RELEASE_REMOTE_LAYER,
+ };
+ 
++/* Process-wide native keyboard state. Layout writes run on the Cocoa main thread
++ * under write lock; layout reads on other threads require read lock. */
++struct macdrv_keyboard_layout
++{
++    pthread_rwlock_t           lock;
++    CFDataRef                  uchr;
++    CGEventSourceKeyboardType  keyboard_type;
++    bool                       iso_keyboard;
++    WORD                       keyc2vkey[128];
++    WORD                       keyc2scan[128];
++};
++
+ struct macdrv_thread_data
+ {
+     WineEventQueue             *queue;
+     const macdrv_event         *current_event;
+     WineWindow                 *capture_window;
+-    CFDataRef                   keyboard_layout_uchr;
+-    CGEventSourceKeyboardType   keyboard_type;
+-    bool                        iso_keyboard;
+     CGEventFlags                last_modifiers;
+     UInt32                      dead_key_state;
+     HKL                         active_keyboard_layout;
+     bool                        ime_open;
+-    WORD                        keyc2vkey[128];
+-    WORD                        keyc2scan[128];
+ };
+ 
+ extern struct macdrv_thread_data *macdrv_init_thread_data(void);
+@@ -290,10 +297,13 @@ extern void macdrv_ime_set_text(HWND hwnd, CFStringRef text, bool complete,
+ extern void macdrv_mouse_scroll(HWND hwnd, const macdrv_event *event);
+ extern void macdrv_release_capture(HWND hwnd, const macdrv_event *event);
+ 
+-extern void macdrv_compute_keyboard_layout(struct macdrv_thread_data *thread_data);
++extern struct macdrv_keyboard_layout keyboard_layout;
++extern bool macdrv_update_keyboard_layout(CFDataRef uchr, CGEventSourceKeyboardType keyboard_type,
++                                         bool iso_keyboard);
+ extern void macdrv_keyboard_changed(const macdrv_event *event);
+ extern void macdrv_key_event(HWND hwnd, const macdrv_event *event);
+-extern void macdrv_hotkey_press(const macdrv_event *event);
++extern void macdrv_hotkey_press(unsigned int vkey, unsigned int mod_flags, unsigned int keycode,
++                                unsigned long time_ms);
+ extern HKL macdrv_get_hkl_from_source(TISInputSourceRef input_source);
+ 
+ extern void macdrv_displays_changed(const macdrv_event *event);
+
+--- dlls/winemac.drv/macdrv_cocoa.h
++++ dlls/winemac.drv/macdrv_cocoa.h
+@@ -257,7 +257,6 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+     APP_DEACTIVATED,
+     APP_QUIT_REQUESTED,
+     DISPLAYS_CHANGED,
+-    HOTKEY_PRESS,
+     KEY_PRESS,
+     KEY_RELEASE,
+     KEYBOARD_CHANGED,
+@@ -309,21 +308,12 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+         struct {
+             bool activating;
+         }                                           displays_changed;
+-        struct {
+-            unsigned int    vkey;
+-            unsigned int    mod_flags;
+-            unsigned int    keycode;
+-            unsigned long   time_ms;
+-        }                                           hotkey_press;
+         struct {
+             CGKeyCode                   keycode;
+             CGEventFlags                modifiers;
+             unsigned long               time_ms;
+         }                                           key;
+         struct {
+-            CFDataRef                   uchr;
+-            CGEventSourceKeyboardType   keyboard_type;
+-            bool                        iso_keyboard;
+             TISInputSourceRef           input_source;
+         }                                           keyboard_changed;
+         struct {
+@@ -520,8 +510,7 @@ extern void macdrv_order_cocoa_window(WineWindow *window, WineWindow *prev,
+ 
+ 
+ /* keyboard */
+-extern void macdrv_get_input_source_info(CFDataRef* uchr,CGEventSourceKeyboardType* keyboard_type, bool* is_iso,
+-                                         TISInputSourceRef* input_source);
++extern void macdrv_get_input_source_info(TISInputSourceRef *input_source);
+ extern CFArrayRef macdrv_create_input_source_list(void);
+ extern bool macdrv_select_input_source(TISInputSourceRef input_source);
+ extern bool macdrv_get_ime_open_status(TISInputSourceRef input_source);
+
+--- dlls/winemac.drv/macdrv_main.c
++++ dlls/winemac.drv/macdrv_main.c
+@@ -452,8 +452,6 @@ void macdrv_ThreadDetach(void)
+     if (data)
+     {
+         macdrv_destroy_event_queue(data->queue);
+-        if (data->keyboard_layout_uchr)
+-            CFRelease(data->keyboard_layout_uchr);
+         free(data);
+         /* clear data in case we get re-entered from user32 before the thread is truly dead */
+         pthread_setspecific( macdrv_thread_data_key, NULL );
+@@ -513,11 +511,10 @@ struct macdrv_thread_data *macdrv_init_thread_data(void)
+         NtTerminateProcess(0, 1);
+     }
+ 
+-    macdrv_get_input_source_info(&data->keyboard_layout_uchr, &data->keyboard_type, &data->iso_keyboard, &input_source);
++    macdrv_get_input_source_info(&input_source);
+     data->active_keyboard_layout = macdrv_get_hkl_from_source(input_source);
+     data->ime_open = macdrv_get_ime_open_status(input_source);
+     CFRelease(input_source);
+-    macdrv_compute_keyboard_layout(data);
+ 
+     set_queue_display_fd(macdrv_get_event_queue_fd(data->queue));
+     pthread_setspecific( macdrv_thread_data_key, data );
+
+--- dlls/winemac.drv/window.c
++++ dlls/winemac.drv/window.c
+@@ -606,10 +606,11 @@ static void set_focus(HWND hwnd, BOOL raise)
+ 
+     if (data->cocoa_window && data->on_screen)
+     {
+-        BOOL activate = activate_on_focus_time && (NtGetTickCount() - activate_on_focus_time < 2000);
++        unsigned int time = ReadNoFence((LONG *)&activate_on_focus_time);
++        BOOL activate = time && (NtGetTickCount() - time < 2000);
+         /* Set Mac focus */
+         macdrv_give_cocoa_window_focus(data->cocoa_window, activate);
+-        activate_on_focus_time = 0;
++        InterlockedCompareExchangeNoFence((LONG *)&activate_on_focus_time, 0, time);
+     }
+ 
+     release_win_data(data);
+@@ -625,6 +626,7 @@ static void show_window(struct macdrv_win_data *data)
+     WineWindow *prev_window = NULL;
+     WineWindow *next_window = NULL;
+     BOOL activate = FALSE;
++    unsigned int time;
+     GUITHREADINFO info;
+ 
+     /* find window that this one must be after */
+@@ -644,8 +646,9 @@ static void show_window(struct macdrv_win_data *data)
+     TRACE("win %p/%p below %p/%p above %p/%p\n",
+           data->hwnd, data->cocoa_window, prev, prev_window, next, next_window);
+ 
++    time = ReadNoFence((LONG *)&activate_on_focus_time);
+     if (!prev_window)
+-        activate = activate_on_focus_time && (NtGetTickCount() - activate_on_focus_time < 2000);
++        activate = time && (NtGetTickCount() - time < 2000);
+     macdrv_order_cocoa_window(data->cocoa_window, prev_window, next_window, activate);
+     data->on_screen = TRUE;
+ 
+@@ -654,7 +657,7 @@ static void show_window(struct macdrv_win_data *data)
+         (data->hwnd == info.hwndFocus || NtUserIsChild(data->hwnd, info.hwndFocus)))
+         set_focus(info.hwndFocus, FALSE);
+     if (activate)
+-        activate_on_focus_time = 0;
++        InterlockedCompareExchangeNoFence((LONG *)&activate_on_focus_time, 0, time);
+ }
+ 
+ 
+@@ -777,8 +780,8 @@ static void sync_window_position(struct macdrv_win_data *data, UINT swp_flags, c
+  */
+ void activate_on_following_focus(void)
+ {
+-    activate_on_focus_time = NtGetTickCount();
+-    if (!activate_on_focus_time) activate_on_focus_time = 1;
++    unsigned int time = NtGetTickCount();
++    WriteNoFence((LONG *)&activate_on_focus_time, time ? time : 1);
+ }
+ 
+ 
+@@ -1546,7 +1549,8 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+         return 0;
+     case WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS:
+         activate_on_following_focus();
+-        TRACE("WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS time %u\n", activate_on_focus_time);
++        TRACE("WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS time %u\n",
++              (unsigned int)ReadNoFence((LONG *)&activate_on_focus_time));
+         return 0;
+     case WM_MACDRV_CREATE_REMOTE_LAYER:
+         if ((data = get_win_data(hwnd)))
+

@@ -1,0 +1,36 @@
+# kk: Align index buffers to 4 bytes on macOS 26
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45988 state=merged
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+```
+kk: Align index buffers to 4 bytes on macOS 26
+
+macOS 26 has a bug where it will ignore the last index if the addr + range
+are not 4 byte aligned. The change rounds up the range when not 4 byte
+aligned so the last index is not dropped. The additional bytes are never
+read.
+
+Closes: https://gitlab.freedesktop.org/mesa/mesa/-/work_items/16700
+Signed-off-by: Aitor Camacho <aitor@lunarg.com>
+```
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1791,6 +1791,16 @@ kk_sanitize_index_range(struct kk_cmd_buffer *cmd, struct kk_addr_range range)
+       range.range = sizeof(uint32_t);
+    }
+ 
++   /* KK_WORKAROUND_12: macOS 26 requires addr + range to be 4 byte aligned due
++    * to a known bug where Metal drops the last index if addr + range is not 4
++    * byte aligned. The extra bytes will not be read. The issue is not present
++    * in macOS 27.
++    */
++   struct kk_physical_device *pdev =
++      kk_device_physical(kk_cmd_buffer_device(cmd));
++   if (!(pdev->settings.disabled_workarounds & BITFIELD64_BIT(12)))
++      range.range = align64(range.addr + range.range, 4u) - range.addr;
++
+    return range;
+ }
+ 
+

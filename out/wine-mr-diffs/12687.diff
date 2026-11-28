@@ -1,0 +1,16 @@
+# fonts: Fix the Tahoma Bold bitmap strike glyphs that are not bold, broken or too wide.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12687 state=merged
+# Many glyphs of the Tahoma Bold bitmap strikes are the regular Tahoma bitmaps: accented letters at 9-11 pixels and nearly all the glyphs at 13, 15 and 16 pixels, so the text is drawn in regular weight there. Embolden them by one column, like simulated bold text, and place them like the other glyphs. A few strike glyphs are only a dot or a fragment of the glyph; draw them from the outline instead. A few others are one column wider than on Windows at the same advance width and touch the neighbouring letters; make them one column narrower.
+
+Tahoma Bold 9-16 pixels, no antialiasing, 2x zoom:
+
+![tahomabd-strike-glyphs-mr-en](/uploads/ddc2dc21fc7cb7e8424e7a993704642c/tahomabd-strike-glyphs-mr-en.png)
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60741
+--- fonts/tahomabd.sfd
++++ fonts/tahomabd.sfd
+
+--- fonts/tahomabd.ttf
++++ fonts/tahomabd.ttf
+Binary files a/fonts/tahomabd.ttf and b/fonts/tahomabd.ttf differ
+

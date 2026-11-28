@@ -1,0 +1,255 @@
+# vbscript: Implement IActiveScript::InterruptScriptThread.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12655 state=merged
+# A running script can now be aborted through `IActiveScript::InterruptScriptThread`, from the script thread or from any other thread:
+
+```c
+IActiveScript_InterruptScriptThread(script, SCRIPTTHREADID_BASE, &ei, SCRIPTINTERRUPT_RAISEEXCEPTION);
+```
+
+The error from the passed `EXCEPINFO` is raised at the next statement, can't be handled with `On Error Resume Next` and is reported through `OnScriptError`. As on native, the engine stays interrupted until the script state is set again: calls into the script fail with `E_FAIL` and new script text is queued instead of run.
+
+The call only succeeds while a script is running, and the flags are ignored, like native does.
+
+Known difference: when the interrupt hits the end of a procedure, the error is located at its last statement instead of its `End` line (marked `todo_wine`).
+--- dlls/vbscript/tests/vbscript.c
++++ dlls/vbscript/tests/vbscript.c
+
+--- dlls/vbscript/interp.c
++++ dlls/vbscript/interp.c
+@@ -353,6 +353,38 @@ void clear_error_loc(script_ctx_t *ctx)
+     }
+ }
+ 
++void clear_interrupt(script_ctx_t *ctx)
++{
++    EnterCriticalSection(&ctx->interrupt_cs);
++    if(ctx->interrupt == INTERRUPT_PENDING) {
++        clear_ei(&ctx->interrupt_ei);
++        InterlockedExchange(&ctx->interrupt, INTERRUPT_NONE);
++    }
++    LeaveCriticalSection(&ctx->interrupt_cs);
++}
++
++static HRESULT raise_interrupt(script_ctx_t *ctx)
++{
++    clear_error(ctx);
++
++    EnterCriticalSection(&ctx->interrupt_cs);
++    ctx->ei = ctx->interrupt_ei;
++    ctx->ei.bstrSource = SysAllocString(ctx->interrupt_ei.bstrSource);
++    ctx->ei.bstrDescription = SysAllocString(ctx->interrupt_ei.bstrDescription);
++    ctx->ei.bstrHelpFile = SysAllocString(ctx->interrupt_ei.bstrHelpFile);
++    LeaveCriticalSection(&ctx->interrupt_cs);
++
++    if(!ctx->ei.scode) {
++        if(ctx->ei.wCode) {
++            ctx->ei.scode = MAKE_VBSERROR(ctx->ei.wCode);
++            ctx->ei.wCode = 0;
++        }else {
++            ctx->ei.scode = E_FAIL;
++        }
++    }
++    return SCRIPT_E_RECORDED;
++}
++
+ /* The identifier is not part of the error description visible to scripts
+    through the Err object; report_script_error appends it to the description
+    passed to the host. */
+@@ -3214,11 +3246,23 @@ HRESULT exec_script(script_ctx_t *ctx, BOOL extern_caller, function_t *func, vbd
+     ctx->current_named_item = exec.code->named_item;
+ 
+     prev_exec = ctx->current_exec;
+-    ctx->current_exec = &exec;
++    if(prev_exec) {
++        ctx->current_exec = &exec;
++    }else {
++        EnterCriticalSection(&ctx->interrupt_cs);
++        ctx->current_exec = &exec;
++        LeaveCriticalSection(&ctx->interrupt_cs);
++    }
+ 
+     while(exec.instr) {
+         op = exec.instr->op;
+-        hres = op_funcs[op](&exec);
++        /* An interrupt is not raised at the end of a statement or of the global code,
++         * so that the error is located at the statement that would have run next. */
++        if(ReadNoFence(&ctx->interrupt) == INTERRUPT_PENDING && op != OP_catch
++           && (op != OP_ret || func->type != FUNC_GLOBAL))
++            hres = raise_interrupt(ctx);
++        else
++            hres = op_funcs[op](&exec);
+         if(FAILED(hres)) {
+             if(hres != SCRIPT_E_RECORDED) {
+                 /* SCRIPT_E_RECORDED means ctx->ei is already populated */
+@@ -3229,7 +3273,7 @@ HRESULT exec_script(script_ctx_t *ctx, BOOL extern_caller, function_t *func, vbd
+             if(!ctx->ei.bstrDescription)
+                 map_vbs_exception(&ctx->ei);
+ 
+-            if(exec.resume_next) {
++            if(exec.resume_next && ReadNoFence(&ctx->interrupt) != INTERRUPT_PENDING) {
+                 unsigned stack_off;
+ 
+                 WARN("Failed %08lx in resume next mode\n", ctx->ei.scode);
+@@ -3276,7 +3320,16 @@ HRESULT exec_script(script_ctx_t *ctx, BOOL extern_caller, function_t *func, vbd
+         exec.instr += op_move[op];
+     }
+ 
+-    ctx->current_exec = prev_exec;
++    if(prev_exec) {
++        ctx->current_exec = prev_exec;
++    }else {
++        EnterCriticalSection(&ctx->interrupt_cs);
++        ctx->current_exec = NULL;
++        /* Once the script is left, the interrupt stays pending without its error info. */
++        if(ctx->interrupt == INTERRUPT_PENDING)
++            clear_ei(&ctx->interrupt_ei);
++        LeaveCriticalSection(&ctx->interrupt_cs);
++    }
+ 
+     assert(!exec.top);
+ 
+
+--- dlls/vbscript/vbscript.c
++++ dlls/vbscript/vbscript.c
+@@ -81,7 +81,10 @@ static void change_state(VBScript *This, SCRIPTSTATE state)
+     if(This->state == state)
+         return;
+ 
++    EnterCriticalSection(&This->ctx->interrupt_cs);
+     This->state = state;
++    LeaveCriticalSection(&This->ctx->interrupt_cs);
++
+     if(This->ctx->site)
+         IActiveScriptSite_OnStateChange(This->ctx->site, state);
+ }
+@@ -341,6 +344,7 @@ static void release_script(script_ctx_t *ctx)
+ 
+     collect_objects(ctx);
+     clear_error(ctx);
++    clear_interrupt(ctx);
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(code, code_next, &ctx->code_list, vbscode_t, entry)
+     {
+@@ -769,6 +773,7 @@ static ULONG WINAPI VBScript_Release(IActiveScript *iface)
+         decrease_state(This, SCRIPTSTATE_CLOSED);
+         detach_global_objects(This->ctx);
+         IServiceProvider_Release(&This->ctx->vbcaller->IServiceProvider_iface);
++        DeleteCriticalSection(&This->ctx->interrupt_cs);
+         free(This->ctx);
+         free(This);
+     }
+@@ -855,6 +860,8 @@ static HRESULT WINAPI VBScript_SetScriptState(IActiveScript *iface, SCRIPTSTATE
+     if(!This->is_initialized || (!This->ctx->site && ss != SCRIPTSTATE_CLOSED))
+         return E_UNEXPECTED;
+ 
++    clear_interrupt(This->ctx);
++
+     switch(ss) {
+     case SCRIPTSTATE_STARTED:
+     case SCRIPTSTATE_CONNECTED: /* FIXME */
+@@ -1032,8 +1039,48 @@ static HRESULT WINAPI VBScript_InterruptScriptThread(IActiveScript *iface,
+         SCRIPTTHREADID stidThread, const EXCEPINFO *pexcepinfo, DWORD dwFlags)
+ {
+     VBScript *This = impl_from_IActiveScript(iface);
+-    FIXME("(%p)->()\n", This);
+-    return E_NOTIMPL;
++    script_ctx_t *ctx = This->ctx;
++    HRESULT hres = S_OK;
++
++    TRACE("(%p)->(%Ix %p %lx)\n", This, (DWORD_PTR)stidThread, pexcepinfo, dwFlags);
++
++    EnterCriticalSection(&ctx->interrupt_cs);
++
++    if(This->state == SCRIPTSTATE_UNINITIALIZED) {
++        hres = E_UNEXPECTED;
++    }else if(!ctx->current_exec) {
++        /* Only a thread that is running a script may be interrupted. */
++        hres = E_INVALIDARG;
++    }else {
++        switch(stidThread) {
++        case SCRIPTTHREADID_BASE:
++        case SCRIPTTHREADID_ALL:
++            break;
++        case SCRIPTTHREADID_CURRENT:
++            if(GetCurrentThreadId() != This->thread_id)
++                hres = E_INVALIDARG;
++            break;
++        default:
++            if(stidThread != This->thread_id)
++                hres = E_INVALIDARG;
++        }
++    }
++
++    if(SUCCEEDED(hres) && ctx->interrupt == INTERRUPT_NONE) {
++        if(pexcepinfo) {
++            ctx->interrupt_ei.wCode = pexcepinfo->wCode;
++            ctx->interrupt_ei.scode = pexcepinfo->scode;
++            ctx->interrupt_ei.bstrSource = SysAllocString(pexcepinfo->bstrSource);
++            ctx->interrupt_ei.bstrDescription = SysAllocString(pexcepinfo->bstrDescription);
++            ctx->interrupt_ei.bstrHelpFile = SysAllocString(pexcepinfo->bstrHelpFile);
++            ctx->interrupt_ei.dwHelpContext = pexcepinfo->dwHelpContext;
++        }
++        /* The script thread polls the flag without taking the lock. */
++        InterlockedExchange(&ctx->interrupt, INTERRUPT_PENDING);
++    }
++
++    LeaveCriticalSection(&ctx->interrupt_cs);
++    return hres;
+ }
+ 
+ static HRESULT WINAPI VBScript_Clone(IActiveScript *iface, IActiveScript **ppscript)
+@@ -1199,7 +1246,8 @@ static HRESULT WINAPI VBScriptParse_ParseScriptText(IActiveScriptParse *iface,
+         return hres;
+     }
+ 
+-    if(!(dwFlags & SCRIPTTEXT_ISEXPRESSION) && !is_started(This)) {
++    if(!(dwFlags & SCRIPTTEXT_ISEXPRESSION)
++       && (!is_started(This) || ReadNoFence(&This->ctx->interrupt) == INTERRUPT_PENDING)) {
+         code->pending_exec = TRUE;
+         return S_OK;
+     }
+@@ -1381,6 +1429,7 @@ HRESULT WINAPI VBScriptFactory_CreateInstance(IClassFactory *iface, IUnknown *pU
+     vbcaller->ctx = ctx;
+     ctx->vbcaller = vbcaller;
+     ctx->safeopt = INTERFACE_USES_DISPEX;
++    InitializeCriticalSection(&ctx->interrupt_cs);
+     list_init(&ctx->objects);
+     list_init(&ctx->code_list);
+     list_init(&ctx->named_items);
+
+--- dlls/vbscript/vbscript.h
++++ dlls/vbscript/vbscript.h
+@@ -260,6 +260,12 @@ struct _script_ctx_t {
+     vbscode_t *error_loc_code;
+     unsigned error_loc_offset;
+ 
++    /* InterruptScriptThread may be called from any thread. The lock guards the engine
++     * state, the interrupt and whether a script is running (current_exec being set). */
++    CRITICAL_SECTION interrupt_cs;
++    LONG interrupt;
++    EXCEPINFO interrupt_ei;
++
+     struct list objects;
+     struct list code_list;
+     struct list named_items;
+@@ -473,6 +479,7 @@ void release_dynamic_var(dynamic_var_t*);
+ named_item_t *lookup_named_item(script_ctx_t*,const WCHAR*,unsigned);
+ void release_named_item(named_item_t*);
+ void clear_error_loc(script_ctx_t*);
++void clear_interrupt(script_ctx_t*);
+ void clear_ei(EXCEPINFO*);
+ void clear_error(script_ctx_t*);
+ HRESULT report_script_error(script_ctx_t*,vbscode_t*,unsigned,BOOL);
+@@ -516,6 +523,11 @@ void map_vbs_exception(EXCEPINFO *);
+ 
+ HRESULT create_safearray_iter(SAFEARRAY *sa, BOOL owned, IEnumVARIANT **ev);
+ 
++enum {
++    INTERRUPT_NONE,
++    INTERRUPT_PENDING
++};
++
+ #define FACILITY_VBS 0xa
+ #define MAKE_VBSERROR(code) MAKE_HRESULT(SEVERITY_ERROR, FACILITY_VBS, code)
+ 
+

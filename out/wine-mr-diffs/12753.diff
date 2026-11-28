@@ -1,0 +1,40 @@
+# ntdll: Skip missing page protection tables in get_vprot_range_size
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12753 state=merged
+# 571d2d4de775300a052a1a0b411aee90ec11fa4a added lazy allocation of page
+protection tables, however it can leave some page protection tables
+absent. When get_vprot_range_size reaches missing table, it advances
+curr_idx but still tries to read it.
+
+Instead of that, give up on that iteration instead so the next iteration
+can reload the table pointer or end the loop.
+
+Fixes: 571d2d4de775 ("ntdll: Delay allocating page protection tables only the pages are committed.")
+Signed-off-by: Gopal Prasad <llyyr.public@gmail.com>
+--- dlls/ntdll/unix/virtual.c
++++ dlls/ntdll/unix/virtual.c
+@@ -909,13 +909,14 @@ static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vp
+ 
+     vprot_word = word_from_byte * *vprot;
+     mask_word = word_from_byte * mask;
+-    for (; curr_idx < end_idx; curr_idx += sizeof(UINT_PTR), vprot_ptr += sizeof(UINT_PTR))
++    while (curr_idx < end_idx)
+     {
+ #ifdef _WIN64
+         if (!(curr_idx & pages_vprot_mask) && !(vprot_ptr = pages_vprot[curr_idx >> pages_vprot_shift]))
+         {
+             if (*vprot & mask) return (curr_idx - start_idx) << page_shift;
+             curr_idx += pages_vprot_mask + 1;
++            continue;
+         }
+ #endif
+         if ((vprot_word ^ *(UINT_PTR *)vprot_ptr) & mask_word)
+@@ -924,6 +925,8 @@ static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vp
+                 if ((*vprot ^ *vprot_ptr) & mask) break;
+             return (curr_idx - start_idx) << page_shift;
+         }
++        curr_idx += sizeof(UINT_PTR);
++        vprot_ptr += sizeof(UINT_PTR);
+     }
+     return size;
+ }
+

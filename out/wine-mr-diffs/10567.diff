@@ -1,0 +1,741 @@
+# wined3d: fix SRGB RTV fail for UNORM swapchain backbuffers > 1 for d3d10/11
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/10567 state=closed
+# wined3d: fix vk swapchain rendering too dark by supporting UNORM to SRGB conversion for brightness similar to gl
+
+
+This merge request addresses: 
+https://bugs.winehq.org/show_bug.cgi?id=45364 Frostpunk is very dark
+
+
+Very dark rendering issues for Frostpunk seem to match the same problem for Vulkan renderer for "Against the Storm":
+- https://bugs.winehq.org/show_bug.cgi?id=58632
+- https://bugs.winehq.org/attachment.cgi?id=80656
+
+
+Running both games with gl renderer seems to fix excessive darkness:
+- https://bugs.winehq.org/attachment.cgi?id=80654
+- https://bugs.winehq.org/attachment.cgi?id=80690
+
+
+Vulkan renderer seems to be missing SRGB conversion handling availiable for GL renderer.
+
+
+GL renderer can be forced to render darker the same as Vulkan by bypassing EXT_TEXTURE_SRGB support for ./dlls/wined3d/utils.c:
+
+```
+@@ -3133,7 +3146,7 @@ static BOOL init_format_texture_info(struct wined3d_adapter *adapter, struct win
+             continue;
+ 
+         copy_format(adapter, &srgb_format->f, &format->f);
++#if 000
+         if (gl_info->supported[EXT_TEXTURE_SRGB]
+                 && !(adapter->d3d_info.wined3d_creation_flags & WINED3D_SRGB_READ_WRITE_CONTROL))
+         {
+@@ -3142,6 +3155,7 @@ static BOOL init_format_texture_info(struct wined3d_adapter *adapter, struct win
+             format_set_caps(&srgb_format->f, WINED3D_FORMAT_CAP_SRGB_READ | WINED3D_FORMAT_CAP_SRGB_WRITE);
+             query_internal_format(adapter, srgb_format, &format_texture_info[i], gl_info, TRUE);
+         }
++#endif
+     }
+```
+
+
+This merge request patch allows Vulkan renderer to perform SRGB conversion for wined3d_swapchain_vk_select_vk_format() to mimic the GL capability.
+
+
+Changing VkSwapchainCreateInfoKHR imageColorSpace from VK_COLOR_SPACE_SRGB_NONLINEAR_KHR for `wined3d_swapchain_vk_create_vulkan_swapchain()` had no effect despite enabling VK_EXT_swapchain_colorspace for dlls/win32u/vulkan.c `convert_instance_create_info():`
+
+https://docs.vulkan.org/refpages/latest/refpages/source/VkColo
+--- dlls/d3d10core/tests/d3d10core.c
++++ dlls/d3d10core/tests/d3d10core.c
+@@ -11061,9 +11061,10 @@ static void test_swapchain_views(void)
+ 
+ static void test_swapchain_flip(void)
+ {
++    ID3D10RenderTargetView *backbuffer_0_rtv, *backbuffer_0_rtv_srgb, *backbuffer_1_rtv_srgb, *offscreen_rtv;
+     ID3D10Texture2D *backbuffer_0, *backbuffer_1, *backbuffer_2, *offscreen;
+     ID3D10ShaderResourceView *backbuffer_0_srv, *backbuffer_1_srv;
+-    ID3D10RenderTargetView *backbuffer_0_rtv, *offscreen_rtv;
++    D3D10_RENDER_TARGET_VIEW_DESC rtv_desc;
+     unsigned int color, stride, offset;
+     D3D10_TEXTURE2D_DESC texture_desc;
+     ID3D10InputLayout *input_layout;
+@@ -11139,6 +11140,7 @@ static void test_swapchain_flip(void)
+     static const float red[] = {1.0f, 0.0f, 0.0f, 0.5f};
+     static const float green[] = {0.0f, 1.0f, 0.0f, 0.5f};
+     static const float blue[] = {0.0f, 0.0f, 1.0f, 0.5f};
++    static const float grey[] = {0.5, 0.5f, 0.5f, 0.5f};
+     struct swapchain_desc desc;
+ 
+     if (!(device = create_device()))
+@@ -11227,6 +11229,19 @@ static void test_swapchain_flip(void)
+     ok(SUCCEEDED(hr), "Failed to create pixel shader, hr %#lx.\n", hr);
+     ID3D10Device_PSSetShader(device, ps);
+ 
++    /* Test SRGB rtv for UNORM swapchain common for Unity games for Win10 */
++    rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
++    rtv_desc.ViewDimension = D3D10_RTV_DIMENSION_TEXTURE2D;
++    rtv_desc.Texture2D.MipSlice = 0;
++    hr = ID3D10Device_CreateRenderTargetView(device, (ID3D10Resource *)backbuffer_0, &rtv_desc, &backbuffer_0_rtv_srgb);
++    ok(hr == S_OK || broken(hr == E_INVALIDARG), "Failed to create render target view, hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        ID3D10Device_ClearRenderTargetView(device, backbuffer_0_rtv_srgb, grey);
++        color = get_texture_color(backbuffer_0, 320, 240); /* grey */
++        ok(compare_color(color, 0x80bcbcbc, 1), "Got unexpected srgb color 0x%08x.\n", color);
++    }
++
+     ID3D10Device_ClearRenderTargetView(device, backbuffer_0_rtv, red);
+ 
+     ID3D10Device_Draw(device, 4, 0);
+@@ -11244,6 +11259,15 @@ static void test_swapchain_flip(void)
+      * for more than one buffer. */
+     IDXGISwapChain_Present(swapchain, 0, 0);
+ 
++    hr = ID3D10Device_CreateRenderTargetView(device, (ID3D10Resource *)backbuffer_0, &rtv_desc, &backbuffer_1_rtv_srgb);
++    ok(hr == S_OK || broken(hr == E_INVALIDARG), "Failed to create render target view, hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        ID3D10Device_ClearRenderTargetView(device, backbuffer_1_rtv_srgb, grey);
++        color = get_texture_color(backbuffer_0, 320, 240); /* grey */
++        ok(compare_color(color, 0x80bcbcbc, 1), "Got unexpected srgb color 0x%08x.\n", color);
++    }
++
+     ID3D10Device_ClearRenderTargetView(device, backbuffer_0_rtv, green);
+ 
+     ID3D10Device_Draw(device, 4, 0);
+@@ -11281,6 +11305,10 @@ static void test_swapchain_flip(void)
+     ID3D10ShaderResourceView_Release(backbuffer_1_srv);
+     ID3D10RenderTargetView_Release(backbuffer_0_rtv);
+     ID3D10RenderTargetView_Release(offscreen_rtv);
++    if (backbuffer_0_rtv_srgb)
++        ID3D10RenderTargetView_Release(backbuffer_0_rtv_srgb);
++    if (backbuffer_1_rtv_srgb)
++        ID3D10RenderTargetView_Release(backbuffer_1_rtv_srgb);
+     ID3D10Texture2D_Release(offscreen);
+     ID3D10Texture2D_Release(backbuffer_0);
+     ID3D10Texture2D_Release(backbuffer_1);
+
+--- dlls/d3d11/tests/d3d11.c
++++ dlls/d3d11/tests/d3d11.c
+@@ -16013,9 +16013,10 @@ static void test_swapchain_views(void)
+ 
+ static void test_swapchain_flip(void)
+ {
++    ID3D11RenderTargetView *backbuffer_0_rtv, *backbuffer_0_rtv_srgb, *backbuffer_1_rtv_srgb, *offscreen_rtv;
+     ID3D11Texture2D *backbuffer_0, *backbuffer_1, *backbuffer_2, *offscreen;
+     ID3D11ShaderResourceView *backbuffer_0_srv, *backbuffer_1_srv;
+-    ID3D11RenderTargetView *backbuffer_0_rtv, *offscreen_rtv;
++    D3D11_RENDER_TARGET_VIEW_DESC rtv_desc;
+     D3D11_TEXTURE2D_DESC texture_desc;
+     ID3D11InputLayout *input_layout;
+     ID3D11DeviceContext *context;
+@@ -16094,6 +16095,7 @@ static void test_swapchain_flip(void)
+     static const float red[] = {1.0f, 0.0f, 0.0f, 0.5f};
+     static const float green[] = {0.0f, 1.0f, 0.0f, 0.5f};
+     static const float blue[] = {0.0f, 0.0f, 1.0f, 0.5f};
++    static const float grey[] = {0.5, 0.5f, 0.5f, 0.5f};
+ 
+     if (!(device = create_device(NULL)))
+     {
+@@ -16183,6 +16185,19 @@ static void test_swapchain_flip(void)
+     ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
+     ID3D11DeviceContext_PSSetShader(context, ps, NULL, 0);
+ 
++    /* Test SRGB rtv for UNORM swapchain common for Unity games for Win10 */
++    rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
++    rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
++    rtv_desc.Texture2D.MipSlice = 0;
++    hr = ID3D11Device_CreateRenderTargetView(device, (ID3D11Resource *)backbuffer_0, &rtv_desc, &backbuffer_0_rtv_srgb);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        ID3D11DeviceContext_ClearRenderTargetView(context, backbuffer_0_rtv_srgb, grey);
++        color = get_texture_color(backbuffer_0, 320, 240); /* grey */
++        ok(compare_color(color, 0x80bcbcbc, 1), "Got unexpected srgb color 0x%08lx.\n", color);
++    }
++
+     ID3D11DeviceContext_ClearRenderTargetView(context, backbuffer_0_rtv, red);
+ 
+     ID3D11DeviceContext_Draw(context, 4, 0);
+@@ -16201,6 +16216,16 @@ static void test_swapchain_flip(void)
+      * any productive use for more than one buffer. */
+     IDXGISwapChain_Present(swapchain, 0, 0);
+ 
++    /* Check RTVs created after present/rotate are properly handled/offset accordingly */
++    hr = ID3D11Device_CreateRenderTargetView(device, (ID3D11Resource *)backbuffer_0, &rtv_desc, &backbuffer_1_rtv_srgb);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        ID3D11DeviceContext_ClearRenderTargetView(context, backbuffer_1_rtv_srgb, grey);
++        color = get_texture_color(backbuffer_0, 320, 240); /* grey */
++        ok(compare_color(color, 0x80bcbcbc, 1), "Got unexpected srgb color 0x%08lx.\n", color);
++    }
++
+     ID3D11DeviceContext_ClearRenderTargetView(context, backbuffer_0_rtv, green);
+ 
+     ID3D11DeviceContext_Draw(context, 4, 0);
+@@ -16238,6 +16263,10 @@ static void test_swapchain_flip(void)
+     ID3D11ShaderResourceView_Release(backbuffer_1_srv);
+     ID3D11RenderTargetView_Release(backbuffer_0_rtv);
+     ID3D11RenderTargetView_Release(offscreen_rtv);
++    if (backbuffer_0_rtv_srgb)
++        ID3D11RenderTargetView_Release(backbuffer_0_rtv_srgb);
++    if (backbuffer_1_rtv_srgb)
++        ID3D11RenderTargetView_Release(backbuffer_1_rtv_srgb);
+     ID3D11Texture2D_Release(offscreen);
+     ID3D11Texture2D_Release(backbuffer_0);
+     ID3D11Texture2D_Release(backbuffer_1);
+
+--- dlls/wined3d/adapter_gl.c
++++ dlls/wined3d/adapter_gl.c
+@@ -4564,12 +4564,16 @@ static HRESULT adapter_gl_create_rendertarget_view(const struct wined3d_view_des
+         struct wined3d_rendertarget_view **view)
+ {
+     struct wined3d_rendertarget_view_gl *view_gl;
++    unsigned int count = 1;
+     HRESULT hr;
+ 
+     TRACE("desc %s, resource %p, parent %p, parent_ops %p, view %p.\n",
+             wined3d_debug_view_desc(desc, resource), resource, parent, parent_ops, view);
+ 
+-    if (!(view_gl = calloc(1, sizeof(*view_gl))))
++    if (resource->type == WINED3D_RTYPE_TEXTURE_2D && texture_from_resource(resource)->swapchain)
++        count = texture_from_resource(resource)->swapchain->state.desc.backbuffer_count;;
++
++    if (!(view_gl = calloc(1, offsetof(struct wined3d_rendertarget_view_gl, gl_view[count]))))
+         return E_OUTOFMEMORY;
+ 
+     if (FAILED(hr = wined3d_rendertarget_view_gl_init(view_gl, desc, resource, parent, parent_ops)))
+@@ -4588,7 +4592,7 @@ static HRESULT adapter_gl_create_rendertarget_view(const struct wined3d_view_des
+ struct wined3d_view_gl_destroy_ctx
+ {
+     struct wined3d_device *device;
+-    const struct wined3d_gl_view *gl_view;
++    GLuint name;
+     struct wined3d_bo_user *bo_user;
+     struct wined3d_bo_gl *counter_bo;
+     void *object;
+@@ -4608,14 +4612,14 @@ static void wined3d_view_gl_destroy_object(void *object)
+     device = ctx->device;
+ 
+     counter_id = ctx->counter_bo ? ctx->counter_bo->id : 0;
+-    if (ctx->gl_view->name || counter_id)
++    if (ctx->name || counter_id)
+     {
+         context = context_acquire(device, NULL, 0);
+         gl_info = wined3d_context_gl(context)->gl_info;
+-        if (ctx->gl_view->name)
++        if (ctx->name)
+         {
+-            context_gl_resource_released(device, ctx->gl_view->name, FALSE);
+-            gl_info->gl_ops.gl.p_glDeleteTextures(1, &ctx->gl_view->name);
++            context_gl_resource_released(device, ctx->name, FALSE);
++            gl_info->gl_ops.gl.p_glDeleteTextures(1, &ctx->name);
+         }
+         if (counter_id)
+             wined3d_context_gl_destroy_bo(wined3d_context_gl(context), ctx->counter_bo);
+@@ -4629,7 +4633,7 @@ static void wined3d_view_gl_destroy_object(void *object)
+     free(ctx->free);
+ }
+ 
+-static void wined3d_view_gl_destroy(struct wined3d_device *device, const struct wined3d_gl_view *gl_view,
++static void wined3d_view_gl_destroy(struct wined3d_device *device, GLuint name,
+         struct wined3d_bo_user *bo_user, struct wined3d_bo_gl *counter_bo, void *object)
+ {
+     struct wined3d_view_gl_destroy_ctx *ctx, c;
+@@ -4637,7 +4641,7 @@ static void wined3d_view_gl_destroy(struct wined3d_device *device, const struct
+     if (!(ctx = malloc(sizeof(*ctx))))
+         ctx = &c;
+     ctx->device = device;
+-    ctx->gl_view = gl_view;
++    ctx->name = name;
+     ctx->bo_user = bo_user;
+     ctx->counter_bo = counter_bo;
+     ctx->object = object;
+@@ -4656,7 +4660,14 @@ static void adapter_gl_destroy_rendertarget_view(struct wined3d_rendertarget_vie
+     TRACE("view_gl %p.\n", view_gl);
+ 
+     wined3d_rendertarget_view_cleanup(&view_gl->v);
+-    wined3d_view_gl_destroy(resource->device, &view_gl->gl_view, NULL, NULL, view_gl);
++    if (resource->type == WINED3D_RTYPE_TEXTURE_2D && texture_from_resource(resource)->swapchain)
++    {
++        unsigned int i;
++        for (i = 1; i < texture_from_resource(resource)->swapchain->state.desc.backbuffer_count; i++)
++            wined3d_view_gl_destroy(resource->device, view_gl->gl_view[i].name, NULL, NULL, NULL);
++    }
++
++    wined3d_view_gl_destroy(resource->device, view_gl->gl_view[0].name, NULL, NULL, view_gl);
+ }
+ 
+ static HRESULT adapter_gl_create_shader_resource_view(const struct wined3d_view_desc *desc,
+@@ -4693,7 +4704,7 @@ static void adapter_gl_destroy_shader_resource_view(struct wined3d_shader_resour
+     TRACE("view_gl %p.\n", view_gl);
+ 
+     wined3d_shader_resource_view_cleanup(&view_gl->v);
+-    wined3d_view_gl_destroy(resource->device, &view_gl->gl_view, &view_gl->bo_user, NULL, view_gl);
++    wined3d_view_gl_destroy(resource->device, view_gl->gl_view.name, &view_gl->bo_user, NULL, view_gl);
+ }
+ 
+ static HRESULT adapter_gl_create_unordered_access_view(const struct wined3d_view_desc *desc,
+@@ -4730,7 +4741,7 @@ static void adapter_gl_destroy_unordered_access_view(struct wined3d_unordered_ac
+     TRACE("view_gl %p.\n", view_gl);
+ 
+     wined3d_unordered_access_view_cleanup(&view_gl->v);
+-    wined3d_view_gl_destroy(resource->device, &view_gl->gl_view, &view_gl->bo_user, &view_gl->counter_bo, view_gl);
++    wined3d_view_gl_destroy(resource->device, view_gl->gl_view.name, &view_gl->bo_user, &view_gl->counter_bo, view_gl);
+ }
+ 
+ static HRESULT adapter_gl_create_video_decoder_output_view(const struct wined3d_view_desc *desc,
+
+--- dlls/wined3d/adapter_vk.c
++++ dlls/wined3d/adapter_vk.c
+@@ -1393,12 +1393,17 @@ static HRESULT adapter_vk_create_rendertarget_view(const struct wined3d_view_des
+         struct wined3d_rendertarget_view **view)
+ {
+     struct wined3d_rendertarget_view_vk *view_vk;
++    unsigned int count = 1;
+     HRESULT hr;
+ 
+     TRACE("desc %s, resource %p, parent %p, parent_ops %p, view %p.\n",
+             wined3d_debug_view_desc(desc, resource), resource, parent, parent_ops, view);
+ 
+-    if (!(view_vk = calloc(1, sizeof(*view_vk))))
++
++    if (resource->type == WINED3D_RTYPE_TEXTURE_2D && texture_from_resource(resource)->swapchain)
++        count = texture_from_resource(resource)->swapchain->state.desc.backbuffer_count;
++
++    if (!(view_vk = calloc(1, offsetof(struct wined3d_rendertarget_view_vk, vk_image_view[count]))))
+         return E_OUTOFMEMORY;
+ 
+     if (FAILED(hr = wined3d_rendertarget_view_vk_init(view_vk, desc, resource, parent, parent_ops)))
+@@ -1522,7 +1527,19 @@ static void adapter_vk_destroy_rendertarget_view(struct wined3d_rendertarget_vie
+     TRACE("view_vk %p.\n", view_vk);
+ 
+     wined3d_rendertarget_view_cleanup(&view_vk->v);
+-    wined3d_view_vk_destroy(resource->device, NULL, &view_vk->vk_image_view,
++
++
++    if (resource->type == WINED3D_RTYPE_TEXTURE_2D && texture_from_resource(resource)->swapchain)
++    {
++        unsigned int i;
++        for (i = 1; i < texture_from_resource(resource)->swapchain->state.desc.backbuffer_count; i++)
++        {
++            wined3d_view_vk_destroy(resource->device, NULL, &view_vk->vk_image_view[i],
++                    NULL, NULL, NULL, &view_vk->command_buffer_id, NULL);
++        }
++    }
++
++    wined3d_view_vk_destroy(resource->device, NULL, &view_vk->vk_image_view[0],
+             NULL, NULL, NULL, &view_vk->command_buffer_id, view_vk);
+ }
+ 
+
+--- dlls/wined3d/context_gl.c
++++ dlls/wined3d/context_gl.c
+@@ -3235,7 +3235,7 @@ BOOL wined3d_context_gl_apply_clear_state(struct wined3d_context_gl *context_gl,
+                 if (rts[i])
+                 {
+                     struct wined3d_rendertarget_view_gl *rtv_gl = wined3d_rendertarget_view_gl(rts[i]);
+-                    context_gl->blit_targets[i].gl_view = rtv_gl->gl_view;
++                    context_gl->blit_targets[i].gl_view = rtv_gl->gl_view[0];
+                     context_gl->blit_targets[i].resource = rtv_gl->v.resource;
+                     context_gl->blit_targets[i].sub_resource_idx = rtv_gl->v.sub_resource_idx;
+                     context_gl->blit_targets[i].layer_count = rtv_gl->v.layer_count;
+@@ -3247,7 +3247,7 @@ BOOL wined3d_context_gl_apply_clear_state(struct wined3d_context_gl *context_gl,
+             if (dsv)
+             {
+                 struct wined3d_rendertarget_view_gl *dsv_gl = wined3d_rendertarget_view_gl(dsv);
+-                ds_info.gl_view = dsv_gl->gl_view;
++                ds_info.gl_view = dsv_gl->gl_view[0];
+                 ds_info.resource = dsv_gl->v.resource;
+                 ds_info.sub_resource_idx = dsv_gl->v.sub_resource_idx;
+                 ds_info.layer_count = dsv_gl->v.layer_count;
+@@ -3400,7 +3400,7 @@ void context_state_fb(struct wined3d_context *context, const struct wined3d_stat
+             continue;
+ 
+         view_gl = wined3d_rendertarget_view_gl(fb->render_targets[i]);
+-        context_gl->blit_targets[i].gl_view = view_gl->gl_view;
++        context_gl->blit_targets[i].gl_view = view_gl->gl_view[0];
+         context_gl->blit_targets[i].resource = view_gl->v.resource;
+         context_gl->blit_targets[i].sub_resource_idx = view_gl->v.sub_resource_idx;
+         context_gl->blit_targets[i].layer_count = view_gl->v.layer_count;
+@@ -3412,7 +3412,7 @@ void context_state_fb(struct wined3d_context *context, const struct wined3d_stat
+     if (fb->depth_stencil)
+     {
+         view_gl = wined3d_rendertarget_view_gl(fb->depth_stencil);
+-        ds_info.gl_view = view_gl->gl_view;
++        ds_info.gl_view = view_gl->gl_view[0];
+         ds_info.resource = view_gl->v.resource;
+         ds_info.sub_resource_idx = view_gl->v.sub_resource_idx;
+         ds_info.layer_count = view_gl->v.layer_count;
+
+--- dlls/wined3d/swapchain.c
++++ dlls/wined3d/swapchain.c
+@@ -543,6 +543,34 @@ static void swapchain_gl_set_swap_interval(struct wined3d_swapchain *swapchain,
+     }
+ }
+ 
++static void wined3d_swapchain_rendertarget_view_gl_rotate(struct wined3d_swapchain *swapchain)
++{
++    struct wined3d_rendertarget_view_gl *view_gl;
++    struct wined3d_rendertarget_view *swap_view;
++    GLuint name, name_prev;
++    unsigned int i;
++
++    LIST_FOR_EACH_ENTRY(swap_view, &swapchain->back_buffer_rendertarget_views,
++            struct wined3d_rendertarget_view, entry)
++    {
++        view_gl = wined3d_rendertarget_view_gl(swap_view);
++        if (!view_gl->gl_view[0].name)
++        {
++            FIXME("Skipping rotate for view_gl %p with gl view name 0 which should not occur.\n", view_gl);
++            continue;
++        }
++
++        name_prev = view_gl->gl_view[0].name;
++        for (i = 1; i < swapchain->state.desc.backbuffer_count; i++)
++        {
++            name = view_gl->gl_view[i].name;
++            view_gl->gl_view[i].name = name_prev;
++            name_prev = name;
++        }
++        view_gl->gl_view[0].name = name_prev;
++    }
++}
++
+ /* Context activation is done by the caller. */
+ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, struct wined3d_context *context)
+ {
+@@ -583,7 +611,7 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
+ 
+     texture_prev->texture_rgb = tex0;
+     texture_prev->rb_multisample = rb0;
+-
++    wined3d_swapchain_rendertarget_view_gl_rotate(swapchain);
+     wined3d_texture_validate_location(&texture_prev->t, 0, locations0 & supported_locations);
+     wined3d_texture_invalidate_location(&texture_prev->t, 0, ~(locations0 & supported_locations));
+ 
+@@ -1205,6 +1233,34 @@ static VkResult wined3d_swapchain_vk_blit(struct wined3d_swapchain_vk *swapchain
+     return vr;
+ }
+ 
++static void wined3d_swapchain_rendertarget_view_vk_rotate(struct wined3d_swapchain *swapchain)
++{
++    VkImageView vk_image_view, vk_image_view_prev;
++    struct wined3d_rendertarget_view_vk *view_vk;
++    struct wined3d_rendertarget_view *swap_view;
++    unsigned int i;
++
++    LIST_FOR_EACH_ENTRY(swap_view, &swapchain->back_buffer_rendertarget_views,
++            struct wined3d_rendertarget_view, entry)
++    {
++        view_vk = wined3d_rendertarget_view_vk(swap_view);
++        if (!view_vk->vk_image_view[0])
++        {
++            FIXME("Skipping rotate for view_vk %p with vk_image_view 0 which should not occur.\n", view_vk);
++            continue;
++        }
++
++        vk_image_view_prev = view_vk->vk_image_view[0];
++        for (i = 1; i < swapchain->state.desc.backbuffer_count; i++)
++        {
++            vk_image_view = view_vk->vk_image_view[i];
++            view_vk->vk_image_view[i] = vk_image_view_prev;
++            vk_image_view_prev = vk_image_view;
++        }
++        view_vk->vk_image_view[0] = vk_image_view_prev;
++    }
++}
++
+ static void wined3d_swapchain_vk_rotate(struct wined3d_swapchain *swapchain, struct wined3d_context_vk *context_vk)
+ {
+     struct wined3d_texture_sub_resource *sub_resource;
+@@ -1253,7 +1309,7 @@ static void wined3d_swapchain_vk_rotate(struct wined3d_swapchain *swapchain, str
+     texture_prev->layout = vk_layout0;
+     texture_prev->bind_mask = bind_mask0;
+     texture_prev->default_image_info = vk_info0;
+-
++    wined3d_swapchain_rendertarget_view_vk_rotate(swapchain);
+     wined3d_texture_validate_location(&texture_prev->t, 0, locations0 & supported_locations);
+     wined3d_texture_invalidate_location(&texture_prev->t, 0, ~(locations0 & supported_locations));
+ 
+@@ -1813,6 +1869,7 @@ HRESULT wined3d_swapchain_gl_init(struct wined3d_swapchain_gl *swapchain_gl, str
+     TRACE("swapchain_gl %p, device %p, desc %p, state_parent %p, parent %p, parent_ops %p.\n",
+             swapchain_gl, device, desc, state_parent, parent, parent_ops);
+ 
++    list_init(&swapchain_gl->s.back_buffer_rendertarget_views);
+     return wined3d_swapchain_init(&swapchain_gl->s, device, desc, state_parent, parent,
+             parent_ops, &swapchain_gl_ops);
+ }
+@@ -1826,6 +1883,7 @@ HRESULT wined3d_swapchain_vk_init(struct wined3d_swapchain_vk *swapchain_vk, str
+     TRACE("swapchain_vk %p, device %p, desc %p, parent %p, parent_ops %p.\n",
+             swapchain_vk, device, desc, parent, parent_ops);
+ 
++    list_init(&swapchain_vk->s.back_buffer_rendertarget_views);
+     if (FAILED(hr = wined3d_swapchain_init(&swapchain_vk->s, device, desc, state_parent, parent,
+             parent_ops, &swapchain_vk_ops)))
+         return hr;
+
+--- dlls/wined3d/texture_gl.c
++++ dlls/wined3d/texture_gl.c
+@@ -913,6 +913,12 @@ static void texture2d_blt_fbo(struct wined3d_device *device, struct wined3d_cont
+     gl_info->gl_ops.gl.p_glDisable(GL_SCISSOR_TEST);
+     context_invalidate_state(context, STATE_RASTERIZER);
+ 
++    if (gl_info->supported[ARB_FRAMEBUFFER_SRGB] && (dst_location == WINED3D_LOCATION_DRAWABLE || src_location == WINED3D_LOCATION_DRAWABLE))
++    {
++        gl_info->gl_ops.gl.p_glDisable(GL_FRAMEBUFFER_SRGB);
++        context_invalidate_state(context, STATE_SHADER(WINED3D_SHADER_TYPE_PIXEL));
++    }
++
+     gl_info->fbo_ops.glBlitFramebuffer(src_rect->left, src_rect->top, src_rect->right, src_rect->bottom,
+             dst_rect->left, dst_rect->top, dst_rect->right, dst_rect->bottom, GL_COLOR_BUFFER_BIT, gl_filter);
+     checkGLcall("glBlitFramebuffer()");
+
+--- dlls/wined3d/view.c
++++ dlls/wined3d/view.c
+@@ -421,6 +421,20 @@ ULONG CDECL wined3d_rendertarget_view_decref(struct wined3d_rendertarget_view *v
+         /* Release the resource after destroying the view.
+          * See wined3d_shader_resource_view_decref(). */
+         wined3d_mutex_lock();
++
++        if (resource->type == WINED3D_RTYPE_TEXTURE_2D && texture_from_resource(resource)->swapchain)
++        {
++            struct wined3d_rendertarget_view *swap_view;
++            LIST_FOR_EACH_ENTRY(swap_view, &texture_from_resource(resource)->swapchain->back_buffer_rendertarget_views, struct wined3d_rendertarget_view, entry)
++            {
++                if (swap_view != view)
++                    continue;
++
++                list_remove(&swap_view->entry);
++                break;
++            }
++        }
++
+         resource->device->adapter->adapter_ops->adapter_destroy_rendertarget_view(view);
+         wined3d_mutex_unlock();
+         wined3d_resource_decref(resource);
+@@ -590,44 +604,62 @@ static void wined3d_render_target_view_gl_cs_init(void *object)
+     struct wined3d_rendertarget_view_gl *view_gl = object;
+     struct wined3d_resource *resource = view_gl->v.resource;
+     const struct wined3d_view_desc *desc = &view_gl->v.desc;
++    struct wined3d_texture_gl *texture_gl;
++    struct wined3d_swapchain *swapchain;
++    unsigned int depth_or_layer_count;
++    GLenum resource_class, view_class;
++    unsigned int i;
+ 
+     TRACE("view_gl %p.\n", view_gl);
+ 
+     if (resource->type == WINED3D_RTYPE_BUFFER)
+     {
+         FIXME("Not implemented for resources %s.\n", debug_d3dresourcetype(resource->type));
++        return;
+     }
++
++    texture_gl = wined3d_texture_gl(texture_from_resource(resource));
++    if (resource->type == WINED3D_RTYPE_TEXTURE_3D)
++        depth_or_layer_count = wined3d_texture_get_level_depth(&texture_gl->t, desc->u.texture.level_idx);
+     else
++        depth_or_layer_count = texture_gl->t.layer_count;
++
++    if (resource->format->id == view_gl->v.format->id
++        && (view_gl->v.layer_count == 1 && view_gl->v.layer_count == depth_or_layer_count))
+     {
+-        struct wined3d_texture_gl *texture_gl = wined3d_texture_gl(texture_from_resource(resource));
+-        unsigned int depth_or_layer_count;
++        TRACE("Skipping view init because format and layer_count matches underlying texture\n");
++        return;
++    }
+ 
+-        if (resource->type == WINED3D_RTYPE_TEXTURE_3D)
+-            depth_or_layer_count = wined3d_texture_get_level_depth(&texture_gl->t, desc->u.texture.level_idx);
+-        else
+-            depth_or_layer_count = texture_gl->t.layer_count;
++    resource_class = wined3d_format_gl(resource->format)->view_class;
++    view_class = wined3d_format_gl(view_gl->v.format)->view_class;
++    if (resource_class != view_class)
++    {
++        FIXME("Render target view not supported, resource format %s, view format %s.\n",
++              debug_d3dformat(resource->format->id), debug_d3dformat(view_gl->v.format->id));
++        return;
++    }
+ 
+-        if (resource->format->id != view_gl->v.format->id
+-                || (view_gl->v.layer_count != 1 && view_gl->v.layer_count != depth_or_layer_count))
+-        {
+-            GLenum resource_class, view_class;
++    create_texture_view(&view_gl->gl_view[0], texture_gl->target, desc, texture_gl, view_gl->v.format);
+ 
+-            resource_class = wined3d_format_gl(resource->format)->view_class;
+-            view_class = wined3d_format_gl(view_gl->v.format)->view_class;
+-            if (resource_class != view_class)
+-            {
+-                FIXME("Render target view not supported, resource format %s, view format %s.\n",
+-                        debug_d3dformat(resource->format->id), debug_d3dformat(view_gl->v.format->id));
+-                return;
+-            }
+-            if (texture_gl->t.swapchain && texture_gl->t.swapchain->state.desc.backbuffer_count > 1)
+-            {
+-                FIXME("Swapchain views not supported.\n");
+-                return;
+-            }
++    if (!view_gl->gl_view[0].name)
++    {
++        FIXME("Failed to create render target view for resource %p\n", resource);
++        return;
++    }
+ 
+-            create_texture_view(&view_gl->gl_view, texture_gl->target, desc, texture_gl, view_gl->v.format);
+-        }
++    if (!(swapchain = texture_gl->t.swapchain))
++        return;
++
++    for (i = 1; i < swapchain->state.desc.backbuffer_count; i++)
++    {
++        struct wined3d_texture_gl *tex_gl = wined3d_texture_gl(swapchain->back_buffers[i]);
++        create_texture_view(&view_gl->gl_view[i], texture_gl->target, desc, tex_gl, view_gl->v.format);
++        if (view_gl->gl_view[i].name)
++            continue;
++
++        ERR("Failed to create render target view for swapchain %p backbuffer[%u]\n", swapchain, i);
++        break;
+     }
+ }
+ 
+@@ -644,9 +676,11 @@ static HRESULT wined3d_rendertarget_view_init(struct wined3d_rendertarget_view *
+     if (resource->type != WINED3D_RTYPE_BUFFER)
+     {
+         struct wined3d_texture *texture = texture_from_resource(resource);
+-
+         if (texture->swapchain)
++        {
+             allow_srgb_toggle = TRUE;
++            list_add_head(&texture->swapchain->back_buffer_rendertarget_views, &view->entry);
++        }
+     }
+     if (!(view->format = validate_resource_view(desc, resource, TRUE, allow_srgb_toggle)))
+         return E_INVALIDARG;
+@@ -900,10 +934,12 @@ static void wined3d_render_target_view_vk_cs_init(void *object)
+     struct wined3d_view_desc *desc = &view_vk->v.desc;
+     const struct wined3d_format_vk *format_vk;
+     struct wined3d_texture_vk *texture_vk;
++    struct wined3d_swapchain *swapchain;
+     struct wined3d_resource *resource;
+     struct wined3d_context *context;
+     VkImageUsageFlags vk_usage = 0;
+     uint32_t default_flags = 0;
++    unsigned int i;
+ 
+     TRACE("view_vk %p.\n", view_vk);
+ 
+@@ -930,26 +966,42 @@ static void wined3d_render_target_view_vk_cs_init(void *object)
+         return;
+     }
+ 
+-    if (texture_vk->t.swapchain && texture_vk->t.swapchain->state.desc.backbuffer_count > 1)
+-    {
+-        FIXME("Swapchain views not supported.\n");
+-        return;
+-    }
+-
+     if (resource->bind_flags & WINED3D_BIND_RENDER_TARGET)
+         vk_usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+     if (resource->bind_flags & WINED3D_BIND_DEPTH_STENCIL)
+         vk_usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+ 
+     context = context_acquire(resource->device, NULL, 0);
+-    view_vk->vk_image_view = wined3d_view_vk_create_vk_image_view(wined3d_context_vk(context),
++    view_vk->vk_image_view[0] = wined3d_view_vk_create_vk_image_view(wined3d_context_vk(context),
+             desc, texture_vk, format_vk, COLOR_FIXUP_IDENTITY, true, vk_usage);
+-    context_release(context);
+ 
+-    if (!view_vk->vk_image_view)
++    if (!view_vk->vk_image_view[0])
++    {
++        context_release(context);
++        ERR("Failed to create render target view for resource %p\n", resource);
++        return;
++    }
++
++    if (!(swapchain = texture_vk->t.swapchain))
++    {
++        context_release(context);
+         return;
++    }
++
++    for (i = 1; i < swapchain->state.desc.backbuffer_count; i++)
++    {
++        struct wined3d_texture_vk *tex_vk = wined3d_texture_vk(swapchain->back_buffers[i]);
++        if ((view_vk->vk_image_view[i] = wined3d_view_vk_create_vk_image_view(wined3d_context_vk(context),
++                desc, tex_vk, format_vk, COLOR_FIXUP_IDENTITY, true, vk_usage)))
++            continue;
++
++        ERR("Failed to create render target view for swapchain %p backbuffer[%u]\n", swapchain, i);
++        break;
++    }
++
++    context_release(context);
+ 
+-    TRACE("Created image view 0x%s.\n", wine_dbgstr_longlong(view_vk->vk_image_view));
++    TRACE("Created image view 0x%s.\n", wine_dbgstr_longlong(view_vk->vk_image_view[0]));
+ }
+ 
+ HRESULT wined3d_rendertarget_view_vk_init(struct wined3d_rendertarget_view_vk *view_vk,
+
+--- dlls/wined3d/wined3d_gl.h
++++ dlls/wined3d/wined3d_gl.h
+@@ -1081,7 +1081,7 @@ HRESULT wined3d_buffer_gl_init(struct wined3d_buffer_gl *buffer_gl, struct wined
+ struct wined3d_rendertarget_view_gl
+ {
+     struct wined3d_rendertarget_view v;
+-    struct wined3d_gl_view gl_view;
++    struct wined3d_gl_view gl_view[1];
+ };
+ 
+ static inline struct wined3d_rendertarget_view_gl *wined3d_rendertarget_view_gl(
+
+--- dlls/wined3d/wined3d_private.h
++++ dlls/wined3d/wined3d_private.h
+@@ -3978,6 +3978,7 @@ struct wined3d_rendertarget_view
+     unsigned int height;
+ 
+     struct wined3d_view_desc desc;
++    struct list entry;
+ };
+ 
+ void wined3d_rendertarget_view_cleanup(struct wined3d_rendertarget_view *view);
+@@ -4103,6 +4104,7 @@ struct wined3d_swapchain
+ 
+     struct wined3d_texture **back_buffers;
+     struct wined3d_texture *front_buffer;
++    struct list back_buffer_rendertarget_views;
+     struct wined3d_gamma_ramp orig_gamma;
+     bool reapply_mode;
+     const struct wined3d_format *ds_format;
+
+--- dlls/wined3d/wined3d_vk.h
++++ dlls/wined3d/wined3d_vk.h
+@@ -1035,8 +1035,8 @@ struct wined3d_rendertarget_view_vk
+ {
+     struct wined3d_rendertarget_view v;
+ 
+-    VkImageView vk_image_view;
+     uint64_t command_buffer_id;
++    VkImageView vk_image_view[1];
+ };
+ 
+ static inline struct wined3d_rendertarget_view_vk *wined3d_rendertarget_view_vk(
+@@ -1056,8 +1056,8 @@ static inline VkImageView wined3d_rendertarget_view_vk_get_image_view(struct win
+ {
+     struct wined3d_texture_vk *texture_vk;
+ 
+-    if (rtv_vk->vk_image_view)
+-        return rtv_vk->vk_image_view;
++    if (rtv_vk->vk_image_view[0])
++        return rtv_vk->vk_image_view[0];
+ 
+     texture_vk = wined3d_texture_vk(wined3d_texture_from_resource(rtv_vk->v.resource));
+     return wined3d_texture_vk_get_default_image_info(texture_vk, context_vk)->imageView;
+

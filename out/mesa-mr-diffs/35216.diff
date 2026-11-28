@@ -1,0 +1,1290 @@
+# Draft: ci: delete now-unused baremetal infra
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/35216 state=opened
+# Not to be merged until the commit `DO NOT MERGE - broadcom/ci: delete baremetal jobs` is rebased out of existence; see https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/35215 for the plan.
+
+---
+Closes: https://gitlab.freedesktop.org/mesa/mesa/-/work_items/16781
+--- .gitlab-ci/bare-metal/.editorconfig
++++ .gitlab-ci/bare-metal/.editorconfig
+@@ -1,2 +0,0 @@
+-[*.sh]
+-indent_size = 2
+
+--- .gitlab-ci/bare-metal/bm-init.sh
++++ .gitlab-ci/bare-metal/bm-init.sh
+@@ -1,16 +0,0 @@
+-#!/bin/sh
+-
+-# Init entrypoint for bare-metal devices; calls common init code.
+-
+-# First stage: very basic setup to bring up network and /dev etc
+-/init-stage1.sh
+-INIT_STAGE1_EXIT_CODE=$?
+-
+-export CURRENT_SECTION=dut_boot
+-
+-# Second stage: run jobs
+-test $INIT_STAGE1_EXIT_CODE -eq 0 && /init-stage2.sh
+-
+-# Wait until the job would have timed out anyway, so we don't spew a "init
+-# exited" panic.
+-sleep 6000
+
+--- .gitlab-ci/bare-metal/gitlab-ci.yml
++++ .gitlab-ci/bare-metal/gitlab-ci.yml
+@@ -1,121 +0,0 @@
+-.baremetal-test:
+-  extends:
+-    - .test
+-  # Cancel job if a newer commit is pushed to the same branch
+-  interruptible: true
+-  before_script:
+-    - !reference [.download_s3, before_script]
+-  variables:
+-    BM_ROOTFS: /rootfs-${DEBIAN_ARCH}
+-  artifacts:
+-    when: always
+-    name: "${CI_PROJECT_NAME}_${CI_JOB_NAME_SLUG}"
+-    paths:
+-      - results/
+-      - serial*.txt
+-    exclude:
+-      - results/*.shader_cache
+-    reports:
+-      junit: results/junit.xml
+-
+-# ARM testing of bare-metal boards attached to an x86 gitlab-runner system
+-.baremetal-test-arm32-gl:
+-  extends:
+-    - .baremetal-test
+-    - .use-debian/baremetal_arm32_test-gl
+-  variables:
+-    DEBIAN_ARCH: armhf
+-    S3_ARTIFACT_NAME: mesa-arm32-default-debugoptimized
+-  needs:
+-    - job: debian/baremetal_arm32_test-gl
+-      optional: true
+-    - job: debian-arm32
+-      artifacts: false
+-
+-# ARM64 testing of bare-metal boards attached to an x86 gitlab-runner system
+-.baremetal-test-arm64-gl:
+-  extends:
+-    - .baremetal-test
+-    - .use-debian/baremetal_arm64_test-gl
+-  variables:
+-    DEBIAN_ARCH: arm64
+-    S3_ARTIFACT_NAME: mesa-arm64-default-debugoptimized
+-  needs:
+-    - job: debian/baremetal_arm64_test-gl
+-      optional: true
+-    - job: debian-arm64
+-      artifacts: false
+-
+-# ARM64 testing of bare-metal boards attached to an x86 gitlab-runner system
+-.baremetal-test-arm64-vk:
+-  extends:
+-    - .baremetal-test
+-    - .use-debian/baremetal_arm64_test-vk
+-  variables:
+-    DEBIAN_ARCH: arm64
+-    S3_ARTIFACT_NAME: mesa-arm64-default-debugoptimized
+-  needs:
+-    - job: debian/baremetal_arm64_test-vk
+-      optional: true
+-    - job: debian-arm64
+-      artifacts: false
+-
+-# ARM32/64 testing of bare-metal boards attached to an x86 gitlab-runner system, using an asan mesa build
+-.baremetal-arm32-asan-test-gl:
+-  variables:
+-    S3_ARTIFACT_NAME: mesa-arm32-asan-debugoptimized
+-    DEQP_FORCE_ASAN: 1
+-  needs:
+-    - job: debian/baremetal_arm32_test-gl
+-      optional: true
+-    - job: debian-arm32-asan
+-      artifacts: false
+-
+-.baremetal-arm64-asan-test-gl:
+-  variables:
+-    S3_ARTIFACT_NAME: mesa-arm64-asan-debugoptimized
+-    DEQP_FORCE_ASAN: 1
+-  needs:
+-    - job: debian/baremetal_arm64_test-gl
+-      optional: true
+-    - job: debian-arm64-asan
+-      artifacts: false
+-
+-.baremetal-arm64-asan-test-vk:
+-  variables:
+-    S3_ARTIFACT_NAME: mesa-arm64-asan-debugoptimized
+-    DEQP_FORCE_ASAN: 1
+-  needs:
+-    - job: debian/baremetal_arm64_test-vk
+-      optional: true
+-    - job: debian-arm64-asan
+-      artifacts: false
+-
+-.baremetal-arm64-ubsan-test-gl:
+-  extends:
+-    - .baremetal-test
+-    - .use-debian/baremetal_arm64_test-gl
+-  variables:
+-    S3_ARTIFACT_NAME: mesa-arm64-ubsan-debugoptimized
+-  needs:
+-    - job: debian/baremetal_arm64_test-gl
+-      optional: true
+-    - job: debian-arm64-ubsan
+-      artifacts: false
+-
+-.baremetal-arm64-ubsan-test-vk:
+-  extends:
+-    - .baremetal-test
+-    - .use-debian/baremetal_arm64_test-vk
+-  variables:
+-    S3_ARTIFACT_NAME: mesa-arm64-ubsan-debugoptimized
+-  needs:
+-    - job: debian/baremetal_arm64_test-vk
+-      optional: true
+-    - job: debian-arm64-ubsan
+-      artifacts: false
+-
+-.baremetal-deqp-test:
+-  variables:
+-    HWCI_TEST_SCRIPT: "/install/deqp-runner.sh"
+-    FDO_CI_CONCURRENT: 0  # Default to number of CPUs
+
+--- .gitlab-ci/bare-metal/poe-off
++++ .gitlab-ci/bare-metal/poe-off
+@@ -1,16 +0,0 @@
+-#!/bin/bash
+-
+-if [ -z "$BM_POE_INTERFACE" ]; then
+-    echo "Must supply the PoE Interface to power up"
+-    exit 1
+-fi
+-
+-if [ -z "$BM_POE_ADDRESS" ]; then
+-    echo "Must supply the PoE Switch host"
+-    exit 1
+-fi
+-
+-SNMP_KEY="SNMPv2-SMI::mib-2.105.1.1.1.3.1.$((${BM_POE_BASE:-0} + BM_POE_INTERFACE))"
+-SNMP_OFF="i 2"
+-
+-flock /var/run/poe.lock -c "snmpset -v2c -r 3 -t 30 -cmesaci $BM_POE_ADDRESS $SNMP_KEY $SNMP_OFF"
+
+--- .gitlab-ci/bare-metal/poe-on
++++ .gitlab-ci/bare-metal/poe-on
+@@ -1,19 +0,0 @@
+-#!/bin/bash
+-
+-if [ -z "$BM_POE_INTERFACE" ]; then
+-    echo "Must supply the PoE Interface to power up"
+-    exit 1
+-fi
+-
+-if [ -z "$BM_POE_ADDRESS" ]; then
+-    echo "Must supply the PoE Switch host"
+-    exit 1
+-fi
+-
+-SNMP_KEY="SNMPv2-SMI::mib-2.105.1.1.1.3.1.$((${BM_POE_BASE:-0} + BM_POE_INTERFACE))"
+-SNMP_ON="i 1"
+-SNMP_OFF="i 2"
+-
+-flock /var/run/poe.lock -c "snmpset -v2c -r 3 -t 30 -cmesaci $BM_POE_ADDRESS $SNMP_KEY $SNMP_OFF"
+-sleep 3s
+-flock /var/run/poe.lock -c "snmpset -v2c -r 3 -t 30 -cmesaci $BM_POE_ADDRESS $SNMP_KEY $SNMP_ON"
+
+--- .gitlab-ci/bare-metal/poe-powered.sh
++++ .gitlab-ci/bare-metal/poe-powered.sh
+@@ -1,175 +0,0 @@
+-#!/bin/bash
+-# shellcheck disable=SC1091
+-# shellcheck disable=SC2034
+-# shellcheck disable=SC2059
+-# shellcheck disable=SC2086 # we want word splitting
+-
+-. "$SCRIPTS_DIR"/setup-test-env.sh
+-
+-# Boot script for devices attached to a PoE switch, using NFS for the root
+-# filesystem.
+-
+-# We're run from the root of the repo, make a helper var for our paths
+-BM=$CI_PROJECT_DIR/install/bare-metal
+-CI_COMMON=$CI_PROJECT_DIR/install/common
+-CI_INSTALL=$CI_PROJECT_DIR/install
+-
+-# Runner config checks
+-if [ -z "$BM_SERIAL" ]; then
+-  echo "Must set BM_SERIAL in your gitlab-runner config.toml [[runners]] environment"
+-  echo "This is the serial port to listen the device."
+-  exit 1
+-fi
+-
+-if [ -z "$BM_POE_ADDRESS" ]; then
+-  echo "Must set BM_POE_ADDRESS in your gitlab-runner config.toml [[runners]] environment"
+-  echo "This is the PoE switch address to connect for powering up/down devices."
+-  exit 1
+-fi
+-
+-if [ -z "$BM_POE_INTERFACE" ]; then
+-  echo "Must set BM_POE_INTERFACE in your gitlab-runner config.toml [[runners]] environment"
+-  echo "This is the PoE switch interface where the device is connected."
+-  exit 1
+-fi
+-
+-if [ -z "$BM_POWERUP" ]; then
+-  echo "Must set BM_POWERUP in your gitlab-runner config.toml [[runners]] environment"
+-  echo "This is a shell script that should power up the device and begin its boot sequence."
+-  exit 1
+-fi
+-
+-if [ -z "$BM_POWERDOWN" ]; then
+-  echo "Must set BM_POWERDOWN in your gitlab-runner config.toml [[runners]] environment"
+-  echo "This is a shell script that should power off the device."
+-  exit 1
+-fi
+-
+-if [ ! -d /nfs ]; then
+-  echo "NFS rootfs directory needs to be mounted at /nfs by the gitlab runner"
+-  exit 1
+-fi
+-
+-if [ ! -d /tftp ]; then
+-  echo "TFTP directory for this board needs to be mounted at /tftp by the gitlab runner"
+-  exit 1
+-fi
+-
+-# job config checks
+-if [ -z "$BM_ROOTFS" ]; then
+-  echo "Must set BM_ROOTFS to your board's rootfs directory in the job's variables"
+-  exit 1
+-fi
+-
+-if [ -z "$BM_BOOTFS" ] && { [ -z "$BM_KERNEL" ] || [ -z "$BM_DTB" ]; } ; then
+-  echo "Must set /boot files for the TFTP boot in the job's variables or set kernel and dtb"
+-  exit 1
+-fi
+-
+-if [ -z "$BM_CMDLINE" ]; then
+-  echo "Must set BM_CMDLINE to your board's kernel command line arguments"
+-  exit 1
+-fi
+-
+-section_start prepare_rootfs "Preparing rootfs components"
+-
+-set -ex
+-
+-# Clear out any previous run's artifacts.
+-rm -rf results/
+-mkdir -p results
+-
+-# Create the rootfs in the NFS directory.  rm to make sure it's in a pristine
+-# state, since it's volume-mounted on the host.
+-rsync -a --delete $BM_ROOTFS/ /nfs/
+-
+-# If BM_BOOTFS is an URL, download it
+-if echo $BM_BOOTFS | grep -q http; then
+-  curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
+-    "${FDO_HTTP_CACHE_URI:-}$BM_BOOTFS" -o /tmp/bootfs.tar
+-  BM_BOOTFS=/tmp/bootfs.tar
+-fi
+-
+-# If BM_BOOTFS is a file, assume it is a tarball and uncompress it
+-if [ -f "${BM_BOOTFS}" ]; then
+-  mkdir -p /tmp/bootfs
+-  tar xf $BM_BOOTFS -C /tmp/bootfs
+-  BM_BOOTFS=/tmp/bootfs
+-fi
+-
+-# Install kernel modules (it could be either in /lib/modules or
+-# /usr/lib/modules, but we want to install in the latter)
+-if [ -n "${BM_BOOTFS}" ]; then
+-  [ -d $BM_BOOTFS/usr/lib/modules ] && rsync -a $BM_BOOTFS/usr/lib/modules/ /nfs/usr/lib/modules/
+-  [ -d $BM_BOOTFS/lib/modules ] && rsync -a $BM_BOOTFS/lib/modules/ /nfs/lib/modules/
+-else
+-  echo "No modules!"
+-fi
+-
+-
+-# Install kernel image + bootloader files
+-if [ -z "$BM_BOOTFS" ]; then
+-  mv "${BM_KERNEL}" "${BM_DTB}.dtb" /tftp/
+-else  # BM_BOOTFS
+-  rsync -aL --delete $BM_BOOTFS/boot/ /tftp/
+-fi
+-
+-# Create the rootfs in the NFS directory
+-. $BM/rootfs-setup.sh /nfs
+-
+-echo "$BM_CMDLINE" > /tftp/cmdline.txt
+-
+-# Add some options in config.txt, if defined
+-if [ -n "$BM_BOOTCONFIG" ]; then
+-  printf "$BM_BOOTCONFIG" >> /tftp/config.txt
+-fi
+-
+-section_end prepare_rootfs
+-
+-set +e
+-STRUCTURED_LOG_FILE=results/job_detail.json
+-export PYTHONPATH=$CI_INSTALL
+-python3 $CI_INSTALL/custom_logger.py ${STRUCTURED_LOG_FILE} --update dut_job_type "${DEVICE_TYPE}"
+-python3 $CI_INSTALL/custom_logger.py ${STRUCTURED_LOG_FILE} --update farm "${FARM}"
+-ATTEMPTS=3
+-first_attempt=True
+-while [ $((ATTEMPTS--)) -gt 0 ]; do
+-  section_start dut_boot "Booting hardware device ..."
+-  python3 $CI_INSTALL/custom_logger.py ${STRUCTURED_LOG_FILE} --create-dut-job dut_name "${CI_RUNNER_DESCRIPTION}"
+-  # Update subtime time to CI_JOB_STARTED_AT only for the first run
+-  if [ "$first_attempt" = "True" ]; then
+-    python3 $CI_INSTALL/custom_logger.py ${STRUCTURED_LOG_FILE} --update-dut-time submit "${CI_JOB_STARTED_AT}"
+-  else
+-    python3 $CI_INSTALL/custom_logger.py ${STRUCTURED_LOG_FILE} --update-dut-time submit
+-  fi
+-  python3 $BM/poe_run.py \
+-          --dev="$BM_SERIAL" \
+-          --powerup="$BM_POWERUP" \
+-          --powerdown="$BM_POWERDOWN" \
+-          --boot-timeout-seconds ${BOOT_PHASE_TIMEOUT_SECONDS:-300} \
+-          --test-timeout-minutes ${TEST_PHASE_TIMEOUT_MINUTES:-$((CI_JOB_TIMEOUT/60 - ${TEST_SETUP_AND_UPLOAD_MARGIN_MINUTES:-5}))}
+-  ret=$?
+-
+-  if [ $ret -eq 2 ]; then
+-    python3 $CI_INSTALL/custom_logger.py ${STRUCTURED_LOG_FILE} --close-dut-job
+-    first_attempt=False
+-    error "Device failed to boot; will retry"
+-  else
+-    # We're no longer in dut_boot by this point
+-    unset CURRENT_SECTION
+-    ATTEMPTS=0
+-  fi
+-done
+-
+-section_start dut_cleanup "Cleaning up after job"
+-python3 $CI_INSTALL/custom_logger.py ${STRUCTURED_LOG_FILE} --close-dut-job
+-python3 $CI_INSTALL/custom_logger.py ${STRUCTURED_LOG_FILE} --close
+-set -e
+-
+-# Bring artifacts back from the NFS dir to the build dir where gitlab-runner
+-# will look for them.
+-cp -Rp /nfs/results/. results/
+-
+-section_end dut_cleanup
+-
+-exit $ret
+
+--- .gitlab-ci/bare-metal/poe_run.py
++++ .gitlab-ci/bare-metal/poe_run.py
+@@ -1,132 +0,0 @@
+-#!/usr/bin/env python3
+-#
+-# Copyright © 2020 Igalia, S.L.
+-#
+-# Permission is hereby granted, free of charge, to any person obtaining a
+-# copy of this software and associated documentation files (the "Software"),
+-# to deal in the Software without restriction, including without limitation
+-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+-# and/or sell copies of the Software, and to permit persons to whom the
+-# Software is furnished to do so, subject to the following conditions:
+-#
+-# The above copyright notice and this permission notice (including the next
+-# paragraph) shall be included in all copies or substantial portions of the
+-# Software.
+-#
+-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+-# IN THE SOFTWARE.
+-
+-import argparse
+-import os
+-import re
+-import sys
+-
+-from custom_logger import CustomLogger
+-from serial_buffer import SerialBuffer
+-
+-
+-class PoERun:
+-    def __init__(self, args, boot_timeout, test_timeout, logger):
+-        self.powerup = args.powerup
+-        self.powerdown = args.powerdown
+-        self.ser = SerialBuffer(args.dev, "results/serial-output.txt")
+-        self.boot_timeout = boot_timeout
+-        self.test_timeout = test_timeout
+-        self.logger = logger
+-
+-    def print_error(self, message):
+-        RED = '\033[0;31m'
+-        NO_COLOR = '\033[0m'
+-        print(RED + message + NO_COLOR)
+-        self.logger.update_status_fail(message)
+-
+-    def logged_system(self, cmd):
+-        print("Running '{}'".format(cmd))
+-        return os.system(cmd)
+-
+-    def run(self):
+-        if self.logged_system(self.powerup) != 0:
+-            self.logger.update_status_fail("powerup failed")
+-            return 1
+-
+-        boot_detected = False
+-        self.logger.create_job_phase("boot")
+-        for line in self.ser.lines(timeout=self.boot_timeout, phase="bootloader"):
+-            if re.search("Booting Linux", line):
+-                boot_detected = True
+-                break
+-
+-        if not boot_detected:
+-            self.print_error(
+-                "Something wrong; couldn't detect the boot start up sequence")
+-            return 2
+-
+-        self.logger.create_job_phase("test")
+-        for line in self.ser.lines(timeout=self.test_timeout, phase="test"):
+-            if re.search("---. end Kernel panic", line):
+-                self.logger.update_status_fail("kernel panic")
+-                return 1
+-
+-            # Binning memory problems
+-            if re.search("binner overflow mem", line):
+-                self.print_error("Memory overflow in the binner; GPU hang")
+-                return 1
+-
+-            if re.search("nouveau 57000000.gpu: bus: MMIO read of 00000000 FAULT at 137000", line):
+-                self.print_error("nouveau jetson boot bug, abandoning run.")
+-                return 1
+-
+-            # network fail on tk1
+-            if re.search("NETDEV WATCHDOG:.* transmit queue 0 timed out", line):
+-                self.print_error("nouveau jetson tk1 network fail, abandoning run.")
+-                return 1
+-
+-            result = re.search(r"hwci: mesa: exit_code: (\d+)", line)
+-            if result:
+-                exit_code = int(result.group(1))
+-
+-                if exit_code == 0:
+-                    self.logger.update_dut_job("status", "pass")
+-                else:
+-                    self.logger.update_status_fail("test fail")
+-
+-                self.logger.update_dut_job("exit_code", exit_code)
+-                return exit_code
+-
+-        self.print_error(
+-            "Reached the end of the CPU serial log without finding a result")
+-        return 1
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument('--dev', type=str,
+-                        help='Serial device to monitor', required=True)
+-    parser.add_argument('--powerup', type=str,
+-                        help='shell command for rebooting', required=True)
+-    parser.add_argument('--powerdown', type=str,
+-                        help='shell command for powering off', required=True)
+-    parser.add_argument(
+-        '--boot-timeout-seconds', type=int, help='Boot phase timeout (seconds)', required=True)
+-    parser.add_argument(
+-        '--test-timeout-minutes', type=int, help='Test phase timeout (minutes)', required=True)
+-    args = parser.parse_args()
+-
+-    logger = CustomLogger("results/job_detail.json")
+-    logger.update_dut_time("start", None)
+-    poe = PoERun(args, args.boot_timeout_seconds, args.test_timeout_minutes * 60, logger)
+-    retval = poe.run()
+-
+-    poe.logged_system(args.powerdown)
+-    logger.update_dut_time("end", None)
+-
+-    sys.exit(retval)
+-
+-
+-if __name__ == '__main__':
+-    main()
+
+--- .gitlab-ci/bare-metal/rootfs-setup.sh
++++ .gitlab-ci/bare-metal/rootfs-setup.sh
+@@ -1,28 +0,0 @@
+-#!/usr/bin/env bash
+-# shellcheck disable=SC2086 # we want word splitting
+-
+-rootfs_dst=$1
+-
+-mkdir -p $rootfs_dst/results
+-
+-# Set up the init script that brings up the system.
+-cp $BM/bm-init.sh $rootfs_dst/init
+-cp $CI_COMMON/init*.sh $rootfs_dst/
+-
+-# Make JWT token available as file in the bare-metal storage to enable access
+-# to MinIO
+-cp "${S3_JWT_FILE}" "${rootfs_dst}${S3_JWT_FILE}"
+-
+-cp "$SCRIPTS_DIR/setup-test-env.sh" "$rootfs_dst/"
+-
+-set +x
+-
+-# Pass through relevant env vars from the gitlab job to the baremetal init script
+-echo "Variables passed through:"
+-filter_env_vars | tee $rootfs_dst/set-job-env-vars.sh
+-
+-set -x
+-
+-# Add the Mesa drivers we built, and make a consistent symlink to them.
+-mkdir -p $rootfs_dst/$CI_PROJECT_DIR
+-rsync -aH --delete $CI_PROJECT_DIR/install/ $rootfs_dst/$CI_PROJECT_DIR/install/
+
+--- .gitlab-ci/bare-metal/serial_buffer.py
++++ .gitlab-ci/bare-metal/serial_buffer.py
+@@ -1,179 +0,0 @@
+-#!/usr/bin/env python3
+-#
+-# Copyright © 2020 Google LLC
+-#
+-# Permission is hereby granted, free of charge, to any person obtaining a
+-# copy of this software and associated documentation files (the "Software"),
+-# to deal in the Software without restriction, including without limitation
+-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+-# and/or sell copies of the Software, and to permit persons to whom the
+-# Software is furnished to do so, subject to the following conditions:
+-#
+-# The above copyright notice and this permission notice (including the next
+-# paragraph) shall be included in all copies or substantial portions of the
+-# Software.
+-#
+-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+-# IN THE SOFTWARE.
+-
+-import argparse
+-import queue
+-import serial
+-import threading
+-import time
+-
+-
+-class SerialBuffer:
+-    def __init__(self, dev, filename, timeout=None, line_queue=None):
+-        self.filename = filename
+-        self.dev = dev
+-
+-        if dev:
+-            self.f = open(filename, "wb+")
+-            self.serial = serial.Serial(dev, 115200, timeout=timeout)
+-        else:
+-            self.f = open(filename, "rb")
+-            self.serial = None
+-
+-        self.byte_queue = queue.Queue()
+-        # allow multiple SerialBuffers to share a line queue so you can merge
+-        # servo's CPU and EC streams into one thing to watch the boot/test
+-        # progress on.
+-        if line_queue:
+-            self.line_queue = line_queue
+-        else:
+-            self.line_queue = queue.Queue()
+-        self.timeout = timeout
+-        self.sentinel = object()
+-        self.closing = False
+-
+-        if self.dev:
+-            self.read_thread = threading.Thread(
+-                target=self.serial_read_thread_loop, daemon=True)
+-        else:
+-            self.read_thread = threading.Thread(
+-                target=self.serial_file_read_thread_loop, daemon=True)
+-        self.read_thread.start()
+-
+-        self.lines_thread = threading.Thread(
+-            target=self.serial_lines_thread_loop, daemon=True)
+-        self.lines_thread.start()
+-
+-    def close(self):
+-        self.closing = True
+-        if self.serial:
+-            self.serial.cancel_read()
+-        self.read_thread.join()
+-        self.lines_thread.join()
+-        if self.serial:
+-            self.serial.close()
+-
+-    # Thread that just reads the bytes from the serial device to try to keep from
+-    # buffer overflowing it. If nothing is received in 1 minute, it finalizes.
+-    def serial_read_thread_loop(self):
+-        greet = "Serial thread reading from %s\n" % self.dev
+-        self.byte_queue.put(greet.encode())
+-
+-        while not self.closing:
+-            try:
+-                b = self.serial.read()
+-                if len(b) == 0:
+-                    break
+-                self.byte_queue.put(b)
+-            except Exception as err:
+-                print(str(err))
+-                break
+-        self.byte_queue.put(self.sentinel)
+-
+-    # Thread that just reads the bytes from the file of serial output that some
+-    # other process is appending to.
+-    def serial_file_read_thread_loop(self):
+-        greet = "Serial thread reading from %s\n" % self.filename
+-        self.byte_queue.put(greet.encode())
+-
+-        while not self.closing:
+-            line = self.f.readline()
+-            if line:
+-                self.byte_queue.put(line)
+-            else:
+-                time.sleep(0.1)
+-        self.byte_queue.put(self.sentinel)
+-
+-    # Thread that processes the stream of bytes to 1) log to stdout, 2) log to
+-    # file, 3) add to the queue of lines to be read by program logic
+-
+-    def serial_lines_thread_loop(self):
+-        line = bytearray()
+-        while True:
+-            bytes = self.byte_queue.get(block=True)
+-
+-            if bytes == self.sentinel:
+-                self.read_thread.join()
+-                self.line_queue.put(self.sentinel)
+-                break
+-
+-            # Write our data to the output file if we're the ones reading from
+-            # the serial device
+-            if self.dev:
+-                self.f.write(bytes)
+-                self.f.flush()
+-
+-            for b in bytes:
+-                line.append(b)
+-                if b == b'\n'[0]:
+-                    line = line.decode(errors="replace")
+-
+-                    print("{endc}{line}".format(line=line, endc='\033[0m'), flush=True, end='')
+-
+-                    self.line_queue.put(line)
+-                    line = bytearray()
+-
+-    def lines(self, timeout=None, phase=None):
+-        start_time = time.monotonic()
+-        while True:
+-            read_timeout = None
+-            if timeout:
+-                read_timeout = timeout - (time.monotonic() - start_time)
+-                if read_timeout <= 0:
+-                    print("read timeout waiting for serial during {}".format(phase))
+-                    self.close()
+-                    break
+-
+-            try:
+-                line = self.line_queue.get(timeout=read_timeout)
+-            except queue.Empty:
+-                print("read timeout waiting for serial during {}".format(phase))
+-                self.close()
+-                break
+-
+-            if line == self.sentinel:
+-                print("End of serial output")
+-                self.lines_thread.join()
+-                break
+-
+-            yield line
+-
+-
+-def main():
+-    parser = argparse.ArgumentParser()
+-
+-    parser.add_argument('--dev', type=str, help='Serial device')
+-    parser.add_argument('--file', type=str,
+-                        help='Filename for serial output', required=True)
+-
+-    args = parser.parse_args()
+-
+-    ser = SerialBuffer(args.dev, args.file)
+-    for line in ser.lines():
+-        # We're just using this as a logger, so eat the produced lines and drop
+-        # them
+-        pass
+-
+-
+-if __name__ == '__main__':
+-    main()
+
+--- .gitlab-ci/common/init-stage2.sh
++++ .gitlab-ci/common/init-stage2.sh
+@@ -243,7 +243,7 @@ fi
+ set +x
+ section_end post_test_cleanup
+ 
+-# Print the final result; both bare-metal and LAVA look for this string to get
++# Print the final result; hardware jobs look for this string to get
+ # the result of our run, so try really hard to get it out rather than losing
+ # the run. The device gets shut down right at this point, and a630 seems to
+ # enjoy corrupting the last line of serial output before shutdown.
+
+--- .gitlab-ci/container/debian/baremetal_arm32_test-gl.sh
++++ .gitlab-ci/container/debian/baremetal_arm32_test-gl.sh
+@@ -1,5 +0,0 @@
+-#!/usr/bin/env bash
+-
+-set -e
+-
+-arch=armhf . .gitlab-ci/container/debian/baremetal_arm_test.sh
+
+--- .gitlab-ci/container/debian/baremetal_arm64_test-gl.sh
++++ .gitlab-ci/container/debian/baremetal_arm64_test-gl.sh
+@@ -1,5 +0,0 @@
+-#!/usr/bin/env bash
+-
+-set -e
+-
+-arch=arm64 . .gitlab-ci/container/debian/baremetal_arm_test.sh
+
+--- .gitlab-ci/container/debian/baremetal_arm64_test-vk.sh
++++ .gitlab-ci/container/debian/baremetal_arm64_test-vk.sh
+@@ -1,5 +0,0 @@
+-#!/usr/bin/env bash
+-
+-set -e
+-
+-arch=arm64 . .gitlab-ci/container/debian/baremetal_arm_test.sh
+
+--- .gitlab-ci/container/debian/baremetal_arm_test.sh
++++ .gitlab-ci/container/debian/baremetal_arm_test.sh
+@@ -1,41 +0,0 @@
+-#!/usr/bin/env bash
+-# shellcheck disable=SC2154 # arch is assigned in previous scripts
+-# When changing this file, you need to bump the following
+-# .gitlab-ci/image-tags.yml tags:
+-# DEBIAN_TEST_BASE_TAG
+-
+-set -e
+-
+-. .gitlab-ci/setup-test-env.sh
+-
+-set -o xtrace
+-
+-############### Install packages for baremetal testing
+-DEPS=(
+-    cpio
+-    curl
+-    netcat-openbsd
+-    openssh-server
+-    procps
+-    python3-filelock
+-    python3-fire
+-    python3-minimal
+-    python3-serial
+-    rsync
+-    snmp
+-    zstd
+-)
+-
+-apt-get install -y ca-certificates
+-sed -i -e 's/http:\/\/deb/https:\/\/deb/g' /etc/apt/sources.list.d/*
+-echo "deb [trusted=yes] https://gitlab.freedesktop.org/gfx-ci/ci-deb-repo/-/raw/${PKG_REPO_REV}/ ${FDO_DISTRIBUTION_VERSION%-*} main" | tee /etc/apt/sources.list.d/gfx-ci_.list
+-apt-get update
+-
+-apt-get install -y --no-remove "${DEPS[@]}"
+-
+-# setup SNMPv2 SMI MIB
+-curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
+-    https://raw.githubusercontent.com/net-snmp/net-snmp/master/mibs/SNMPv2-SMI.txt \
+-    -o /usr/share/snmp/mibs/SNMPv2-SMI.txt
+-
+-. .gitlab-ci/container/baremetal_build.sh
+
+--- .gitlab-ci/container/debian/gitlab-ci.yml
++++ .gitlab-ci/container/debian/gitlab-ci.yml
+@@ -572,76 +572,3 @@ debian/arm64_test-android:
+       optional: true
+     - job: debian/arm64_test-android-tools
+       optional: true
+-
+-# x86_64 image with ARM64 & ARM32 kernel & rootfs for baremetal testing
+-.debian/baremetal_arm_test:
+-  extends:
+-    - .fdo.container-build@debian
+-    - .container
+-    - .debian-container-version
+-  variables:
+-    FDO_DISTRIBUTION_TAG: "${MESA_IMAGE_TAG}--${KERNEL_TAG}--${MESA_TEMPLATES_COMMIT}"
+-    MESA_ARTIFACTS_TAG: *debian-arm64_build
+-
+-debian/baremetal_arm32_test-gl:
+-  extends:
+-    - .debian/baremetal_arm_test
+-  needs:
+-    - job: debian/arm32_test-gl
+-      optional: true
+-  variables:
+-    MESA_IMAGE_TAG: &baremetal-arm32_test-gl "${DEBIAN_TEST_GL_TAG}--${DEBIAN_TEST_BASE_TAG}--${PKG_REPO_REV}"
+-    LAVA_DISTRIBUTION_TAG: "debian/arm32_test-gl:${DEBIAN_TEST_GL_TAG}--${DEBIAN_TEST_BASE_TAG}--${PKG_REPO_REV}--${MESA_TEMPLATES_COMMIT}"
+-
+-debian/baremetal_arm64_test-gl:
+-  extends:
+-    - .debian/baremetal_arm_test
+-  needs:
+-    - job: debian/arm64_test-gl
+-      optional: true
+-  variables:
+-    MESA_IMAGE_TAG: &baremetal-arm64_test-gl "${DEBIAN_TEST_GL_TAG}--${DEBIAN_TEST_BASE_TAG}--${PKG_REPO_REV}"
+-    LAVA_DISTRIBUTION_TAG: "debian/arm64_test-gl:${DEBIAN_TEST_GL_TAG}--${DEBIAN_TEST_BASE_TAG}--${PKG_REPO_REV}--${MESA_TEMPLATES_COMMIT}"
+-
+-debian/baremetal_arm64_test-vk:
+-  extends:
+-    - .debian/baremetal_arm_test
+-  needs:
+-    - job: debian/arm64_test-vk
+-      optional: true
+-  variables:
+-    MESA_IMAGE_TAG: &baremetal-arm64_test-vk "${DEBIAN_TEST_VK_TAG}--${DEBIAN_TEST_BASE_TAG}--${PKG_REPO_REV}"
+-    LAVA_DISTRIBUTION_TAG: "debian/arm64_test-vk:${DEBIAN_TEST_VK_TAG}--${DEBIAN_TEST_BASE_TAG}--${PKG_REPO_REV}--${MESA_TEMPLATES_COMMIT}"
+-
+-.use-debian/baremetal_arm32_test-gl:
+-  image: "$CI_REGISTRY_IMAGE/${MESA_IMAGE_PATH}:${MESA_IMAGE_TAG}--${KERNEL_TAG}--${MESA_TEMPLATES_COMMIT}"
+-  variables:
+-    MESA_IMAGE_PATH: "debian/baremetal_arm32_test-gl"
+-    MESA_IMAGE_TAG: *baremetal-arm32_test-gl
+-  needs:
+-    - job: sanity
+-      optional: true
+-    - job: debian/baremetal_arm32_test-gl
+-      optional: true
+-
+-.use-debian/baremetal_arm64_test-gl:
+-  image: "$CI_REGISTRY_IMAGE/${MESA_IMAGE_PATH}:${MESA_IMAGE_TAG}--${KERNEL_TAG}--${MESA_TEMPLATES_COMMIT}"
+-  variables:
+-    MESA_IMAGE_PATH: "debian/baremetal_arm64_test-gl"
+-    MESA_IMAGE_TAG: *baremetal-arm64_test-gl
+-  needs:
+-    - job: sanity
+-      optional: true
+-    - job: debian/baremetal_arm64_test-gl
+-      optional: true
+-
+-.use-debian/baremetal_arm64_test-vk:
+-  image: "$CI_REGISTRY_IMAGE/${MESA_IMAGE_PATH}:${MESA_IMAGE_TAG}--${KERNEL_TAG}--${MESA_TEMPLATES_COMMIT}"
+-  variables:
+-    MESA_IMAGE_PATH: "debian/baremetal_arm64_test-vk"
+-    MESA_IMAGE_TAG: *baremetal-arm64_test-vk
+-  needs:
+-    - job: sanity
+-      optional: true
+-    - job: debian/baremetal_arm64_test-vk
+-      optional: true
+
+--- .gitlab-ci/container/baremetal_build.sh
++++ .gitlab-ci/container/baremetal_build.sh
+@@ -1,27 +0,0 @@
+-#!/usr/bin/env bash
+-# shellcheck disable=SC2154 # arch is assigned in previous scripts
+-
+-set -e
+-set -o xtrace
+-
+-# Fetch the arm-built rootfs image and unpack it in our x86_64 container (saves
+-# network transfer, disk usage, and runtime on test jobs)
+-
+-# shellcheck disable=SC2034 # S3_BASE_PATH is used in find_s3_project_artifact
+-S3_BASE_PATH="${S3_HOST}/${S3_KERNEL_BUCKET}"
+-ARTIFACTS_PATH="${LAVA_DISTRIBUTION_TAG}/lava-rootfs.tar.zst"
+-ARTIFACTS_URL="$(find_s3_project_artifact "${ARTIFACTS_PATH}")"
+-
+-curl-with-retry -o rootfs.tar.zst "${ARTIFACTS_URL}"
+-mkdir -p /rootfs-"$arch"
+-tar -C /rootfs-"$arch" '--exclude=./dev/*' --zstd -xf rootfs.tar.zst
+-rm rootfs.tar.zst
+-
+-if [[ $arch == "arm64" ]]; then
+-    mkdir -p /baremetal-files
+-    pushd /baremetal-files
+-
+-    curl-with-retry -O "${KERNEL_IMAGE_BASE}"/arm64/Image
+-    curl-with-retry -O "${KERNEL_IMAGE_BASE}"/arm64/Image.gz
+-    popd
+-fi
+
+--- .gitlab-ci/farm-rules.yml
++++ .gitlab-ci/farm-rules.yml
+@@ -34,7 +34,7 @@
+ #   anholt           | (decommissioned)                 | @anholt
+ #   austriancoder    | ci-tron                          | @austriancoder
+ #   collabora        | lava                             | @daniels, @sergi
+-#   igalia           | baremetal/poe-powered, ci-tron   | @jasuarez, @chema
++#   igalia           | ci-tron                          | @jasuarez, @chema
+ #   imagination      | ci-tron                          | @Robert-Mazur-ai, @frankbinns
+ #   lima             | lava                             | @enunes
+ #   lumag            | ci-tron                          | @lumag
+
+--- .gitlab-ci/prepare-artifacts.sh
++++ .gitlab-ci/prepare-artifacts.sh
+@@ -41,7 +41,6 @@ echo "$(cat VERSION) (git-$git_sha)" > install/VERSION
+ # Test runs don't pull down the git tree, so put the dEQP helper
+ # script and associated bits there.
+ for f in \
+-  .gitlab-ci/bare-metal \
+   .gitlab-ci/common \
+   .gitlab-ci/piglit \
+   .gitlab-ci/fossils.yml \
+
+--- docs/ci/bare-metal.rst
++++ docs/ci/bare-metal.rst
+@@ -1,10 +0,0 @@
+-Bare-metal CI
+-=============
+-
+-Bare-metal support is being removed from Mesa, and adding new devices is
+-no longer supported.
+-
+-Please consider using one of the following alternatives:
+-
+-- `CI-tron <https://docs.ci-tron.dev>`__
+-- :doc:`LAVA`
+
+--- docs/ci/index.rst
++++ docs/ci/index.rst
+@@ -62,7 +62,6 @@ The three GitLab CI systems currently integrated are:
+ .. toctree::
+    :maxdepth: 1
+ 
+-   bare-metal
+    LAVA
+    docker
+ 
+@@ -210,10 +209,8 @@ to just run 1/10th of the test list.
+ For Collabora's LAVA farm, the `device types
+ <https://lava.collabora.dev/scheduler/device_types>`__ page can tell you how
+ many boards of a specific tag are currently available by adding the "Idle" and
+-"Busy" columns.  For bare-metal, a gitlab admin can look at the `runners
+-<https://gitlab.freedesktop.org/admin/runners>`__ page.  A pipeline should
+-probably not create more jobs for a board type than there are boards, unless you
+-clearly have some short-runtime jobs.
++"Busy" columns. A pipeline should probably not create more jobs for a board type
++than there are boards, unless you clearly have some short-runtime jobs.
+ 
+ If a HW CI farm goes offline (network dies and all CI pipelines end up
+ stalled) or its runners are consistently spuriously failing (disk
+
+--- docs/ci/kernel.rst
++++ docs/ci/kernel.rst
+@@ -123,17 +123,6 @@ Step-by-step
+ 4. Now do the same for the kernel uprev branch
+ 5. Compare the job results. If a CI job turned red on your uprev branch, it means that the kernel update broke the test. Otherwise, it should be fine.
+ 
+-Bare-metal custom kernels
+-^^^^^^^^^^^^^^^^^^^^^^^^^
+-
+-Some CI jobs have support to plug in a custom kernel by simply changing a variable.
+-This is great, since rebuilding the kernel and rootfs may takes dozens of minutes.
+-
+-For example, Freedreno jobs ``gitlab.yml`` manifest support a variable named
+-``BM_KERNEL``. If one puts a gz-compressed kernel URL there, the job will use that
+-kernel to boot the Freedreno bare-metal devices. The same works for ``BM_DTB`` in
+-the case of device tree binaries.
+-
+ Careful reading of the job logs
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 
+
+--- src/broadcom/ci/gitlab-ci-inc.yml
++++ src/broadcom/ci/gitlab-ci-inc.yml
+@@ -137,32 +137,6 @@
+     - !reference [.v3d-manual-rules, rules]
+     - !reference [.v3dv-manual-rules, rules]
+ 
+-# 4 devices (2026-02-16)
+-.igalia-bcm2837-rpi-3-b:
+-  variables:
+-    DEVICE_TYPE: rpi3
+-    GPU_VERSION: broadcom-rpi3
+-  tags:
+-    - igalia-rpi3
+-
+-# 14 devices (2026-02-16)
+-.igalia-bcm2711-rpi-4:
+-  variables:
+-    DEVICE_TYPE: rpi4
+-    GPU_VERSION: broadcom-rpi4
+-    VK_DRIVER: broadcom
+-  tags:
+-    - igalia-rpi4
+-
+-# 6 devices (2026-02-16)
+-.igalia-bcm2712-rpi-5:
+-  variables:
+-    DEVICE_TYPE: rpi5
+-    GPU_VERSION: broadcom-rpi5
+-    VK_DRIVER: broadcom
+-  tags:
+-    - igalia-rpi5
+-
+ 
+ # 4 device (2025-11-28)
+ .igalia-bcm2835-vc4:
+@@ -318,28 +292,3 @@
+     - .v3d-rules
+   variables:
+     PIGLIT_TRACES_FILE: traces-broadcom.yml
+-
+-
+-.broadcom-test:
+-  script:
+-    - ./install/bare-metal/poe-powered.sh
+-  variables:
+-    BOOT_PHASE_TIMEOUT_SECONDS: 90
+-    HWCI_TEST_SCRIPT: "/install/deqp-runner.sh"
+-    FLAKES_CHANNEL: "#videocore-ci"
+-    FARM: igalia
+-
+-.broadcom-test:arm64-gl:
+-  extends:
+-    - .broadcom-test
+-    - .baremetal-test-arm64-gl
+-  variables:
+-    BM_BOOTFS: /boot/raspberrypi_arm64
+-
+-.broadcom-test:arm64-vk:
+-  extends:
+-    - .broadcom-test
+-    - .baremetal-test-arm64-vk
+-  variables:
+-    BM_BOOTFS: /boot/raspberrypi_arm64
+-
+
+--- src/broadcom/ci/gitlab-ci.yml
++++ src/broadcom/ci/gitlab-ci.yml
+@@ -2,18 +2,6 @@ include:
+   - local: 'src/broadcom/ci/gitlab-ci-inc.yml'
+ 
+ vc4-rpi3-gl:arm64:
+-  extends:
+-    - .igalia-bcm2837-rpi-3-b
+-    - .broadcom-test:arm64-gl
+-    - .test-piglit
+-    - .vc4-rules
+-  timeout: 25m
+-  parallel: 3
+-  variables:
+-    DEQP_SUITE: broadcom-rpi3-gl
+-    HWCI_START_WESTON: 1
+-
+-.ci-tron-vc4-rpi3-gl:arm64:
+   extends:
+     - .ci-tron-arm64-test-gl
+     - .ci-tron-broadcom-rpi3:arm64
+@@ -28,7 +16,7 @@ vc4-rpi3-gl:arm64:
+ 
+ vc4-rpi3-gl-piglit-full:arm64:
+   extends:
+-    - .ci-tron-vc4-rpi3-gl:arm64
++    - vc4-rpi3-gl:arm64
+     - .vc4-manual-rules
+   timeout: 25m
+   variables:
+@@ -74,18 +62,6 @@ vc4-rpi3-gl-ubsan:arm64:
+     DEQP_FRACTION: 3
+ 
+ v3d-rpi4-gl:arm64:
+-  extends:
+-    - .igalia-bcm2711-rpi-4
+-    - .broadcom-test:arm64-gl
+-    - .test-piglit
+-    - .v3d-rules
+-  timeout: 25m
+-  parallel: 7
+-  variables:
+-    HWCI_START_WESTON: 1
+-    DEQP_SUITE: broadcom-rpi4-gl
+-
+-.ci-tron-v3d-rpi4-gl:arm64:
+   extends:
+     - .ci-tron-arm64-test-gl
+     - .ci-tron-broadcom-rpi4:arm64
+@@ -100,7 +76,7 @@ v3d-rpi4-gl:arm64:
+ 
+ v3d-rpi4-gl-full:arm64:
+   extends:
+-    - .ci-tron-v3d-rpi4-gl:arm64
++    - v3d-rpi4-gl:arm64
+     - .v3d-manual-rules
+   timeout: 45m
+   parallel: 8
+@@ -120,16 +96,6 @@ v3d-rpi4-rusticl-full:arm64:
+     DEQP_SUITE: v3d-rusticl
+ 
+ v3d-rpi4-traces:arm64:
+-  extends:
+-    - .igalia-bcm2711-rpi-4
+-    - .broadcom-test:arm64-gl
+-    - .piglit-traces-test
+-    - .v3d-rules
+-  timeout: 25m
+-  variables:
+-    PIGLIT_TRACES_FILE: traces-broadcom.yml
+-
+-.ci-tron-v3d-rpi4-traces:arm64:
+   extends:
+     - .ci-tron-v3d-traces:arm64
+     - .ci-tron-broadcom-rpi4:arm64
+@@ -175,19 +141,6 @@ v3d-rpi4-gl-ubsan:arm64:
+     DEQP_FRACTION: 7
+ 
+ v3dv-rpi4-vk:arm64:
+-  extends:
+-    - .igalia-bcm2711-rpi-4
+-    - .broadcom-test:arm64-vk
+-    - .v3dv-rules
+-  timeout: 25m
+-  parallel: 7
+-  variables:
+-    HWCI_START_WESTON: 1
+-    DEQP_SUITE: broadcom-rpi4-vk
+-    DEQP_FRACTION: 4
+-    FLAKES_CHANNEL: "#videocore-ci"
+-
+-.ci-tron-v3dv-rpi4-vk:arm64:
+   extends:
+     - .ci-tron-arm64-test-vk
+     - .ci-tron-broadcom-rpi4:arm64
+@@ -202,7 +155,7 @@ v3dv-rpi4-vk:arm64:
+ 
+ v3dv-rpi4-vk-full:arm64:
+   extends:
+-    - .ci-tron-v3dv-rpi4-vk:arm64
++    - v3dv-rpi4-vk:arm64
+     - .v3dv-manual-rules
+   parallel: 8
+   timeout: 2h
+@@ -239,18 +192,6 @@ v3dv-rpi4-vk-ubsan:arm64:
+     DEQP_FRACTION: 45
+ 
+ v3d-rpi5-gl:arm64:
+-  extends:
+-    - .igalia-bcm2712-rpi-5
+-    - .broadcom-test:arm64-gl
+-    - .test-piglit
+-    - .v3d-rules
+-  timeout: 25m
+-  variables:
+-    HWCI_START_WESTON: 1
+-    DEQP_SUITE: broadcom-rpi5-gl
+-    DEQP_FRACTION: 3
+-
+-.ci-tron-v3d-rpi5-gl:arm64:
+   extends:
+     - .ci-tron-arm64-test-gl
+     - .ci-tron-broadcom-rpi5:arm64
+@@ -265,7 +206,7 @@ v3d-rpi5-gl:arm64:
+ 
+ v3d-rpi5-gl-full:arm64:
+   extends:
+-    - .ci-tron-v3d-rpi5-gl:arm64
++    - v3d-rpi5-gl:arm64
+     - .v3d-manual-rules
+   timeout: 1h
+   variables:
+@@ -296,16 +237,6 @@ v3d-rpi5-opencl-cts-quick:
+     RUSTICL_ENABLE: v3d
+     DEQP_SUITE: broadcom-rpi-opencl-cts-quick
+ 
+-v3d-rpi5-traces:arm64:
+-  extends:
+-    - .igalia-bcm2712-rpi-5
+-    - .broadcom-test:arm64-gl
+-    - .piglit-traces-test
+-    - .v3d-rules
+-  timeout: 25m
+-  variables:
+-    PIGLIT_TRACES_FILE: traces-broadcom.yml
+-
+ v3d-rpi5-gl-asan:arm64:
+   extends:
+     - .ci-tron-arm64-test-asan-gl
+@@ -318,7 +249,7 @@ v3d-rpi5-gl-asan:arm64:
+     DEQP_SUITE: broadcom-rpi5-gl-asan
+     DEQP_FRACTION: 4
+ 
+-.ci-tron-v3d-rpi5-traces:arm64:
++v3d-rpi5-traces:arm64:
+   extends:
+     - .ci-tron-v3d-traces:arm64
+     - .ci-tron-broadcom-rpi5:arm64
+@@ -327,19 +258,6 @@ v3d-rpi5-gl-asan:arm64:
+     CI_TRON_TIMEOUT__OVERALL__MINUTES: 5
+ 
+ v3dv-rpi5-vk:arm64:
+-  extends:
+-    - .igalia-bcm2712-rpi-5
+-    - .broadcom-test:arm64-vk
+-    - .v3dv-rules
+-  timeout: 25m
+-  parallel: 2
+-  variables:
+-    HWCI_START_WESTON: 1
+-    DEQP_SUITE: broadcom-rpi5-vk
+-    DEQP_FRACTION: 6
+-    FLAKES_CHANNEL: "#videocore-ci"
+-
+-.ci-tron-v3dv-rpi5-vk:arm64:
+   extends:
+     - .ci-tron-arm64-test-vk
+     - .ci-tron-broadcom-rpi5:arm64
+@@ -354,7 +272,7 @@ v3dv-rpi5-vk:arm64:
+ 
+ v3dv-rpi5-vk-full:arm64:
+   extends:
+-    - .ci-tron-v3dv-rpi5-vk:arm64
++    - v3dv-rpi5-vk:arm64
+     - .v3dv-manual-rules
+   timeout: 2h 30m
+   variables:
+
+--- src/gallium/drivers/nouveau/ci/gitlab-ci.yml
++++ src/gallium/drivers/nouveau/ci/gitlab-ci.yml
+@@ -3,7 +3,6 @@ include:
+ 
+ .gk20a-gles:
+   extends:
+-    - .baremetal-test-arm32-gl
+     - .nouveau-bm-test
+     - .anholt-tegra124-jetson-tk1:arm32
+   parallel: 4
+@@ -15,7 +14,6 @@ include:
+ # Single Jetson Nano board at anholt's house.
+ .gm20b-gles-full:
+   extends:
+-    - .baremetal-test-arm64-gl
+     - .nouveau-bm-test
+     - .google-tegra210-p3450-0000:arm64
+     - .nouveau-manual-rules
+
+--- .gitlab-ci.yml
++++ .gitlab-ci.yml
+@@ -315,7 +315,6 @@ include:
+     ref: *ci-tron-template-commit
+     file: '/.gitlab-ci/dut.yml'
+   - local: '.gitlab-ci/image-tags.yml'
+-  - local: '.gitlab-ci/bare-metal/gitlab-ci.yml'
+   - local: '.gitlab-ci/ci-tron/gitlab-ci.yml'
+   - local: '.gitlab-ci/lava/gitlab-ci.yml'
+   - local: '.gitlab-ci/container/gitlab-ci.yml'
+

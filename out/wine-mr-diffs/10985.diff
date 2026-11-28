@@ -1,0 +1,62 @@
+# Draft: ntdll: Notify ARM64EC memory tracking for non-image section maps
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/10985 state=closed
+# NtMapViewOfSection reports ARM64EC image mappings through NotifyMapViewOfSection, but executable non-image section mappings currently return before any ARM64EC memory notification is sent. Those mappings can replace a previously tracked executable range. This patch reports non-image mappings through the existing memory-protection notification callback so the ARM64EC runtime sees the final mapped protection. This fixes a reduced FEX repro where an executable pagefile section is mapped over a previously executed allocation and then executed.
+
+See also: https://github.com/ValveSoftware/wine/pull/330
+
+This issue was preventing Starcraft II x64 client from launching on NVIDIA GB10.
+
+StarCraft II's x64 client exercises two ARM64EC cases where Wine has better source information than FEX:
+
+- An executable non-image section view can replace an earlier image mapping, but the ARM64EC notification path only reports the image map.
+- The process can read ARM64EC DLL bytes into a private buffer and execute copied syscall wrapper code from that buffer, bypassing the normal image loader path that applies ARM64X dynamic-value fixups.
+
+Before:
+
+![image.png](/uploads/a22d9762e05b068c71cd11d91c34a47c/image.png){width="201" height="120"}
+
+After: SC2 works smoothly
+
+![image.png](/uploads/c3ebb0cbce64000caf3073fa7368e279/image.png){width="900" height="507"}
+
+![image.png](/uploads/52d41bf609dee01886f7809960944c2d/image.png){width="900" height="507"}
+
+# Crash Repro:
+
+https://gist.github.com/dllu/b0277fe3165578951d99c3c4af56bca0
+
+```
+docker run --rm \
+  -u "$(id -u):$(id -g)" \
+  -v "$PWD:/work" \
+  -w /work \
+  registry.gitlab.steamos.cloud/proton/steamrt4/sdk/arm64-llvm:4.0.20260331.220802-0 \
+  /opt/llvm-mingw/bin/x86_64-w64-mingw32-clang \
+    -Wall -Wextra -O2 -g \
+    -o repros/fex_exec_section_remap_repro.exe \
+    scripts/fex_exec_section_remap_repro.c
+```
+
+Please note: this is my first contribution to Wine and I relied on Codex with GPT 5.5 to help prepare this MR. Please let me know
+--- dlls/ntdll/signal_arm64ec.c
++++ dlls/ntdll/signal_arm64ec.c
+@@ -725,9 +725,17 @@ static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size,
+     SECTION_IMAGE_INFORMATION info;
+     NTSTATUS status;
+ 
++    if (NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL ))
++    {
++        if (pNotifyMemoryProtect)
++        {
++            pNotifyMemoryProtect( addr, size, protect, FALSE, 0 );
++            pNotifyMemoryProtect( addr, size, protect, TRUE, STATUS_SUCCESS );
++        }
++        return;
++    }
+     if (!pNotifyMapViewOfSection) return;
+     if (!NtCurrentTeb()->Tib.ArbitraryUserPointer) return;
+-    if (NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL )) return;
+     status = pNotifyMapViewOfSection( NULL, addr, NULL, size, alloc, protect );
+     if (NT_SUCCESS(status)) return;
+     NtUnmapViewOfSection( GetCurrentProcess(), addr );
+

@@ -1,0 +1,1157 @@
+# win32u: Introduce a keyboard layout cache
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12675 state=closed
+# This is my take on !11909. All the changes were originally fixing a bug visible in winex11 or winemac or making things easier for the following patches. I've been iterating these patches quite a few times though, so the exact reason for some of the changes might not be super apparent by now. Feel free to ask for clarification.
+
+The exception to that is the change of `keyboard_layouts` from a list to an rbtree, which is something I meant to do for a while (except it was for the winex11 layout list - which is entirely gone now, nicely enough) and that should be pretty reasonable, I think.
+--- dlls/win32u/driver.c
++++ dlls/win32u/driver.c
+@@ -625,7 +625,7 @@ static void nulldrv_Beep(void)
+ {
+ }
+ 
+-static UINT nulldrv_GetKeyboardLayoutList( INT size, HKL *layouts )
++static UINT nulldrv_UpdateKeyboardLayouts( const struct keyboard_funcs *funcs )
+ {
+     return ~0; /* use default implementation */
+ }
+@@ -1085,9 +1085,9 @@ static INT loaderdrv_GetKeyNameText( LONG lparam, LPWSTR buffer, INT size )
+     return load_driver()->pGetKeyNameText( lparam, buffer, size );
+ }
+ 
+-static UINT loaderdrv_GetKeyboardLayoutList( INT size, HKL *layouts )
++static UINT loaderdrv_UpdateKeyboardLayouts( const struct keyboard_funcs *funcs )
+ {
+-    return load_driver()->pGetKeyboardLayoutList( size, layouts );
++    return load_driver()->pUpdateKeyboardLayouts( funcs );
+ }
+ 
+ static UINT loaderdrv_MapVirtualKeyEx( UINT code, UINT type, HKL layout )
+@@ -1275,7 +1275,7 @@ static const struct user_driver_funcs lazy_load_driver =
+     loaderdrv_ActivateKeyboardLayout,
+     loaderdrv_Beep,
+     loaderdrv_GetKeyNameText,
+-    loaderdrv_GetKeyboardLayoutList,
++    loaderdrv_UpdateKeyboardLayouts,
+     loaderdrv_MapVirtualKeyEx,
+     loaderdrv_RegisterHotKey,
+     loaderdrv_ToUnicodeEx,
+@@ -1380,7 +1380,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
+     SET_USER_FUNC(ActivateKeyboardLayout);
+     SET_USER_FUNC(Beep);
+     SET_USER_FUNC(GetKeyNameText);
+-    SET_USER_FUNC(GetKeyboardLayoutList);
++    SET_USER_FUNC(UpdateKeyboardLayouts);
+     SET_USER_FUNC(MapVirtualKeyEx);
+     SET_USER_FUNC(RegisterHotKey);
+     SET_USER_FUNC(ToUnicodeEx);
+
+--- dlls/win32u/input.c
++++ dlls/win32u/input.c
+@@ -44,15 +44,9 @@ WINE_DECLARE_DEBUG_CHANNEL(keyboard);
+ 
+ static const struct ratio no_dpi;
+ 
+-static const WCHAR keyboard_layouts_keyW[] =
+-{
+-    '\\','R','e','g','i','s','t','r','y',
+-    '\\','M','a','c','h','i','n','e',
+-    '\\','S','y','s','t','e','m',
+-    '\\','C','u','r','r','e','n','t','C','o','n','t','r','o','l','S','e','t',
+-    '\\','C','o','n','t','r','o','l',
+-    '\\','K','e','y','b','o','a','r','d',' ','L','a','y','o','u','t','s'
+-};
++static const char keyboard_layouts_keyA[] = "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Keyboard Layouts";
++static HKEY keyboard_layouts_key;
++
+ static const WCHAR escW[] = {'E','s','c',0};
+ static const WCHAR backspaceW[] = {'B','a','c','k','s','p','a','c','e',0};
+ static const WCHAR tabW[] = {'T','a','b',0};
+@@ -559,6 +553,313 @@ static WCHAR kbd_tables_vkey_to_wchar( const KBDTABLES *tables, UINT vkey, const
+ 
+ #undef NEXT_ENTRY
+ 
++struct keyboard_layout
++{
++    struct rb_entry entry;
++    UINT klid;            /* MAKELONG(lang, index) */
++    UINT id;              /* globally unique ID */
++
++    char *variant;        /* host layout variant */
++    UINT_PTR host_id;     /* host layout ID, -1 if not loaded */
++};
++
++static const char *debugstr_keyboard_layout( const struct keyboard_layout *layout )
++{
++    const char *host, *variant;
++    if (!layout) return "(null)";
++    host = layout->host_id == -1 ? "(none)" : wine_dbg_sprintf( "%#zx", layout->host_id );
++    variant = layout->variant && *layout->variant ? wine_dbg_sprintf( " (%s)", layout->variant ) : "";
++    return wine_dbg_sprintf( "%08x/%04x host %s%s", layout->klid, layout->id, host, variant );
++}
++
++static pthread_mutex_t keyboard_layouts_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct rb_tree keyboard_layouts;
++static BOOL keyboard_layouts_inited;
++static BOOL keyboard_layouts_loaded;
++
++static int keyboard_layouts_map_cmp(const void *key, const struct rb_entry *entry)
++{
++    int id = HandleToULong(key);
++    struct keyboard_layout *layout = RB_ENTRY_VALUE(entry, struct keyboard_layout, entry);
++
++    if (layout->id) return id - (int)layout->id;
++    return id - (int)LOWORD(layout->klid);
++}
++
++static UINT klid_from_lang( LANGID lang )
++{
++    struct keyboard_layout *layout;
++    UINT index = 0;
++
++    /* make up some new klid that doesn't conflict with the already loaded layouts */
++    RB_FOR_EACH_ENTRY( layout, &keyboard_layouts, struct keyboard_layout, entry )
++    {
++        if (LOWORD(layout->klid) != lang) continue;
++        if (!HIWORD(layout->klid) && layout->host_id == -1) return layout->klid;
++        if (HIWORD(layout->klid) >= 0x20) index++;
++    }
++
++    if (!index) return MAKELONG(lang, 0);
++    return MAKELONG(lang, index + 0x1f);
++}
++
++/* sorted by lang, then by variant */
++static const struct klid_map_entry
++{
++    LANGID lang;
++    const char *variant;
++    UINT klid;
++} klid_map[] =
++{
++    { 0x0409, "dvorak",   0x00010409 },
++    { 0x0409, "dvorak-l", 0x00030409 },
++    { 0x0409, "dvorak-r", 0x00040409 },
++};
++
++static int klid_map_cmp( const void *key, const void *element )
++{
++    const struct klid_map_entry *map_key = key;
++    const struct klid_map_entry *entry = element;
++    int c;
++
++    if ((c = (int)map_key->lang - (int)entry->lang)) return c;
++    return strcmp( map_key->variant, entry->variant );
++}
++
++static DWORD klid_from_lang_variant( LANGID lang, const char *variant )
++{
++    struct klid_map_entry key = { .lang = lang, .variant = variant };
++    const struct klid_map_entry *entry;
++    struct keyboard_layout *layout;
++    UINT index = 0;
++
++    entry = bsearch( &key, klid_map, ARRAY_SIZE(klid_map), sizeof(*klid_map), klid_map_cmp );
++    if (entry) return entry->klid;
++
++    WARN_(keyboard)( "Unknown lang %04x variant %s\n", lang, debugstr_a(variant) );
++
++    /* make up some new klid that doesn't conflict with the known layouts */
++    RB_FOR_EACH_ENTRY( layout, &keyboard_layouts, struct keyboard_layout, entry )
++    {
++        if (LOWORD(layout->klid) != lang) continue;
++        if (layout->variant && !strcmp( layout->variant, variant ))
++        {
++            if (layout->host_id != -1)
++                WARN_(keyboard)( "Duplicate layout %s\n", debugstr_keyboard_layout( layout ) );
++            return layout->klid;
++        }
++        if (HIWORD(layout->klid) >= 0x20) index++;
++    }
++
++    if (!index && !*variant) return MAKELONG(lang, 0);
++    return MAKELONG(lang, index + 0x20);
++}
++
++static void add_keyboard_layout( struct keyboard_layout *layout )
++{
++    ULONG id = layout->id ? layout->id : LOWORD(layout->klid);
++
++    if (rb_put( &keyboard_layouts, ULongToHandle(id), &layout->entry ))
++        ERR_(keyboard)("duplicated layout entry id %04x, klid %08x, layout id %04x\n", id, layout->klid, layout->id);
++}
++
++/* read the predefined keyboard layout list from the registry */
++static void read_keyboard_layouts( HKEY hkey )
++{
++    char buffer[4096];
++    KEY_NODE_INFORMATION *key = (KEY_NODE_INFORMATION *)buffer;
++    KEY_VALUE_PARTIAL_INFORMATION *value = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
++    struct keyboard_layout *layout;
++    WCHAR name[KL_NAMELENGTH];
++    UINT id, len, next_id = 0x100;
++    HKEY subkey;
++
++    for (UINT i = 0; !NtEnumerateKey( hkey, i, KeyNodeInformation, key, sizeof(buffer) - sizeof(WCHAR), &len ); i++)
++    {
++        if (!(subkey = reg_open_key( hkey, key->Name, key->NameLength ))) continue;
++        memcpy( name, key->Name, key->NameLength );
++        name[key->NameLength / sizeof(WCHAR)] = 0;
++
++        if (!query_reg_ascii_value( subkey, "Layout Id", value, sizeof(buffer) ) || value->Type != REG_SZ) id = 0;
++        else id = (wcstoul( (const WCHAR *)value->Data, NULL, 16 ) & 0xfff) | 0xf000;
++        NtClose( subkey );
++
++        if (!(layout = calloc( 1, sizeof(*layout) ))) break;
++        layout->klid = wcstoul( name, NULL, 16 );
++        if (!id && HIWORD(layout->klid))
++        {
++            if ((HIWORD(layout->klid) & 0xf000) == 0xe000) id = HIWORD(layout->klid);
++            else id = 0xf000 | next_id;
++        }
++        if ((id & 0xfff) >= next_id) next_id = (id & 0xfff) + 1;
++        layout->id = id;
++        layout->host_id = -1;
++        add_keyboard_layout( layout );
++        TRACE_(keyboard)( "Created empty layout %s\n", debugstr_keyboard_layout( layout ) );
++    }
++}
++
++static HKL get_hkl( struct keyboard_layout *layout )
++{
++    LCID locale = LOWORD(layout->klid);
++    if (layout->id) return ULongToHandle(MAKELONG(locale, layout->id));
++    return ULongToHandle(MAKELONG(locale, LOWORD(layout->klid)));
++}
++
++static struct keyboard_layout *get_keyboard_layout_from_klid( UINT klid, UINT *next_id )
++{
++    struct keyboard_layout *layout;
++    UINT id = 0x100;
++
++    RB_FOR_EACH_ENTRY( layout, &keyboard_layouts, struct keyboard_layout, entry )
++    {
++        if (klid == layout->klid) return layout;
++        if ((layout->id & 0xfff) >= id) id = (layout->id & 0xfff) + 1;
++    }
++
++    if (next_id) *next_id = id;
++    return NULL;
++}
++
++static HKL add_layout( LANGID lang, const char *variant, BOOL ime, UINT_PTR host_id )
++{
++    struct keyboard_layout *layout;
++    UINT next_id, klid;
++
++    TRACE_(keyboard)( "lang %04x variant %s ime %u host_id %#zx\n", lang, debugstr_a(variant), ime, host_id );
++
++    klid = variant && *variant ? klid_from_lang_variant( lang, variant ) : klid_from_lang( lang );
++    if (!variant) variant = ""; /* to avoid NULL checks from now on */
++
++    if ((layout = get_keyboard_layout_from_klid( klid, &next_id )))
++    {
++        BOOL loaded = layout->host_id != -1;
++        if (loaded && !strcmp( layout->variant, variant ))
++        {
++            WARN_(keyboard)( "Keeping duplicate layout %s\n", debugstr_keyboard_layout( layout ) );
++            goto done;
++        }
++
++        free( layout->variant );
++        layout->variant = strdup( variant );
++        layout->host_id = host_id;
++
++        if (loaded) WARN_(keyboard)( "Replacing layout with %s\n", debugstr_keyboard_layout( layout ) );
++        else TRACE_(keyboard)( "Loading known layout %s\n", debugstr_keyboard_layout( layout ) );
++    }
++    else if (!(layout = calloc( 1, sizeof(*layout) ))) return 0;
++    else
++    {
++        layout->klid = klid;
++        layout->id = HIWORD(klid) ? (ime ? 0xe000 : 0xf000) | next_id : 0;
++        layout->variant = strdup( variant );
++        layout->host_id = host_id;
++        add_keyboard_layout( layout );
++        TRACE_(keyboard)( "Created new layout %s\n", debugstr_keyboard_layout( layout ) );
++    }
++
++done:
++    return get_hkl( layout );
++}
++
++/* load the active keyboard layouts on the host */
++static void load_keyboard_layouts(void)
++{
++    const struct keyboard_funcs keyboard_funcs =
++    {
++        add_layout,
++    };
++
++    user_driver->pUpdateKeyboardLayouts( &keyboard_funcs );
++}
++
++static HANDLE get_keyboard_layout_preload_mutex( void )
++{
++    WCHAR bufferW[256];
++    UNICODE_STRING name = {.Buffer = bufferW};
++    OBJECT_ATTRIBUTES attr;
++    char buffer[256];
++    HANDLE mutex;
++
++    snprintf( buffer, ARRAY_SIZE(buffer), "\\Sessions\\%u\\BaseNamedObjects\\keyboard_layout_reg_init",
++              RtlGetCurrentPeb()->SessionId );
++    name.MaximumLength = asciiz_to_unicode( bufferW, buffer );
++    name.Length = name.MaximumLength - sizeof(WCHAR);
++
++    InitializeObjectAttributes( &attr, &name, OBJ_OPENIF, NULL, NULL );
++    if (NtCreateMutant( &mutex, MUTEX_ALL_ACCESS, &attr, FALSE ) < 0) return 0;
++    NtWaitForSingleObject( mutex, FALSE, NULL );
++    return mutex;
++}
++
++static void release_keyboard_layout_preload_mutex( HANDLE mutex )
++{
++    NtReleaseMutant( mutex, NULL );
++    NtClose( mutex );
++}
++
++static void update_layout_cache(void)
++{
++    struct keyboard_layout *layout;
++    HKEY hkey;
++
++    if (keyboard_layouts_loaded) return;
++
++    if (!keyboard_layouts_key && !(keyboard_layouts_key = reg_create_ascii_key( NULL, keyboard_layouts_keyA, 0, NULL ))) return;
++    if (!keyboard_layouts_inited)
++    {
++        rb_init(&keyboard_layouts, keyboard_layouts_map_cmp);
++        read_keyboard_layouts( keyboard_layouts_key );
++        keyboard_layouts_inited = TRUE;
++    }
++
++    RB_FOR_EACH_ENTRY( layout, &keyboard_layouts, struct keyboard_layout, entry )
++        layout->host_id = -1;
++    load_keyboard_layouts();
++
++    if ((hkey = reg_create_ascii_key( hkcu_key, "Keyboard Layout\\Preload", 0, NULL )))
++    {
++        char index[16], name[KL_NAMELENGTH];
++        HANDLE mutex;
++        int i = 0;
++
++        mutex = get_keyboard_layout_preload_mutex();
++        reg_empty_key( hkey, NULL, FALSE );
++
++        RB_FOR_EACH_ENTRY( layout, &keyboard_layouts, struct keyboard_layout, entry )
++        {
++            if (layout->host_id == -1) continue;
++            sprintf( index, "%u", ++i );
++            sprintf( name, "%08X", layout->klid );
++            set_reg_ascii_value( hkey, index, name );
++        }
++
++        release_keyboard_layout_preload_mutex( mutex );
++        NtClose( hkey );
++    }
++
++    keyboard_layouts_loaded = TRUE;
++}
++
++static void lock_keyboard_layouts(void)
++{
++    pthread_mutex_lock( &keyboard_layouts_lock );
++    update_layout_cache();
++}
++
++static void unlock_keyboard_layouts(void)
++{
++    pthread_mutex_unlock( &keyboard_layouts_lock );
++}
++
++void keyboard_layouts_init( BOOL changed )
++{
++    pthread_mutex_lock( &keyboard_layouts_lock );
++    if (changed) keyboard_layouts_loaded = FALSE;
++    else update_layout_cache();
++    pthread_mutex_unlock( &keyboard_layouts_lock );
++}
++
+ /*******************************************************************
+  *           NtUserGetForegroundWindow  (win32u.@)
+  */
+@@ -1105,12 +1406,14 @@ static HKL get_locale_kbd_layout(void)
+ HKL WINAPI NtUserGetKeyboardLayout( DWORD thread_id )
+ {
+     struct user_thread_info *thread = get_user_thread_info();
+-    HKL layout = thread->kbd_layout;
++    HKL layout;
+ 
+     if (thread_id && thread_id != GetCurrentThreadId())
+         FIXME( "couldn't return keyboard layout for thread %04x\n", thread_id );
+ 
+-    if (!layout) return get_locale_kbd_layout();
++    keyboard_layouts_init( FALSE );
++
++    if (!(layout = thread->kbd_layout)) return get_locale_kbd_layout();
+     return layout;
+ }
+ 
+@@ -1509,13 +1812,11 @@ UINT WINAPI NtUserGetKeyboardLayoutList( INT size, HKL *layouts )
+     KEY_NODE_INFORMATION *key_info = (KEY_NODE_INFORMATION *)buffer;
+     KEY_VALUE_PARTIAL_INFORMATION *value_info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
+     DWORD count, tmp, i = 0;
+-    HKEY hkey, subkey;
++    HKEY subkey;
+     HKL layout;
+ 
+     TRACE_(keyboard)( "size %d, layouts %p.\n", size, layouts );
+ 
+-    if ((count = user_driver->pGetKeyboardLayoutList( size, layouts )) != ~0) return count;
+-
+     layout = get_locale_kbd_layout();
+     count = 0;
+ 
+@@ -1526,12 +1827,14 @@ UINT WINAPI NtUserGetKeyboardLayoutList( INT size, HKL *layouts )
+         if (count == size) return count;
+     }
+ 
+-    if ((hkey = reg_open_key( NULL, keyboard_layouts_keyW, sizeof(keyboard_layouts_keyW) )))
++    lock_keyboard_layouts();
++
++    if (keyboard_layouts_key)
+     {
+-        while (!NtEnumerateKey( hkey, i++, KeyNodeInformation, key_info,
++        while (!NtEnumerateKey( keyboard_layouts_key, i++, KeyNodeInformation, key_info,
+                                 sizeof(buffer) - sizeof(WCHAR), &tmp ))
+         {
+-            if (!(subkey = reg_open_key( hkey, key_info->Name, key_info->NameLength ))) continue;
++            if (!(subkey = reg_open_key( keyboard_layouts_key, key_info->Name, key_info->NameLength ))) continue;
+             key_info->Name[key_info->NameLength / sizeof(WCHAR)] = 0;
+             tmp = wcstoul( key_info->Name, NULL, 16 );
+             if (query_reg_ascii_value( subkey, "Layout Id", value_info, sizeof(buffer) ) &&
+@@ -1549,9 +1852,10 @@ UINT WINAPI NtUserGetKeyboardLayoutList( INT size, HKL *layouts )
+                 if (count == size) break;
+             }
+         }
+-        NtClose( hkey );
+     }
+ 
++    unlock_keyboard_layouts();
++
+     return count;
+ }
+ 
+@@ -1567,7 +1871,7 @@ BOOL WINAPI NtUserGetKeyboardLayoutName( WCHAR *name )
+     WCHAR klid[KL_NAMELENGTH];
+     UINT id;
+     ULONG len, i = 0;
+-    HKEY hkey, subkey;
++    HKEY subkey;
+     HKL layout;
+ 
+     TRACE_(keyboard)( "name %p\n", name );
+@@ -1590,12 +1894,15 @@ BOOL WINAPI NtUserGetKeyboardLayoutName( WCHAR *name )
+     if (!(HIWORD( id ) & 0xf000)) id = HIWORD( id );
+     snprintf( buffer, sizeof(buffer), "%08X", id );
+     asciiz_to_unicode( name, buffer );
+-    if ((HIWORD( id ) & 0x1000) && (hkey = reg_open_key( NULL, keyboard_layouts_keyW, sizeof(keyboard_layouts_keyW) )))
++
++    if (HIWORD( id ) & 0x1000)
+     {
+-        while (!NtEnumerateKey( hkey, i++, KeyNodeInformation, key,
++        lock_keyboard_layouts();
++
++        while (!NtEnumerateKey( keyboard_layouts_key, i++, KeyNodeInformation, key,
+                                 sizeof(buffer) - sizeof(WCHAR), &len ))
+         {
+-            if (!(subkey = reg_open_key( hkey, key->Name, key->NameLength ))) continue;
++            if (!(subkey = reg_open_key( keyboard_layouts_key, key->Name, key->NameLength ))) continue;
+             memcpy( klid, key->Name, key->NameLength );
+             klid[key->NameLength / sizeof(WCHAR)] = 0;
+             if (query_reg_ascii_value( subkey, "Layout Id", value, sizeof(buffer) ) &&
+@@ -1611,7 +1918,8 @@ BOOL WINAPI NtUserGetKeyboardLayoutName( WCHAR *name )
+                 break;
+             }
+         }
+-        NtClose( hkey );
++
++        unlock_keyboard_layouts();
+     }
+ 
+     info->kbd_layout_id = wcstoul( name, NULL, 16 );
+
+--- dlls/win32u/sysparams.c
++++ dlls/win32u/sysparams.c
+@@ -816,7 +816,7 @@ static BOOL read_source_monitor_path( HKEY hkey, UINT index, char *path )
+     return TRUE;
+ }
+ 
+-static void reg_empty_key( HKEY root, const char *key_name, BOOL subkeys_only )
++void reg_empty_key( HKEY root, const char *key_name, BOOL subkeys_only )
+ {
+     char buffer[4096];
+     KEY_NODE_INFORMATION *key = (KEY_NODE_INFORMATION *)buffer;
+@@ -5985,12 +5985,10 @@ void sysparams_init(void)
+     WCHAR buffer[MAX_PATH+16], *p, *appname;
+     char *app_compat_flags = NULL;
+     DWORD i, dispos, dpi_scaling;
+-    WCHAR layout[KL_NAMELENGTH];
+     pthread_mutexattr_t attr;
+     HKEY hkey, appkey = 0;
+     DWORD len;
+ 
+-    static const WCHAR oneW[] = {'1',0};
+     static const WCHAR x11driverW[] = {'\\','X','1','1',' ','D','r','i','v','e','r',0};
+ 
+     pthread_mutexattr_init( &attr );
+@@ -6002,9 +6000,12 @@ void sysparams_init(void)
+ 
+     if ((hkey = reg_create_ascii_key( hkcu_key, "Keyboard Layout\\Preload", 0, NULL )))
+     {
+-        if (NtUserGetKeyboardLayoutName( layout ))
+-            set_reg_value( hkey, oneW, REG_SZ, (const BYTE *)layout,
+-                           (lstrlenW(layout) + 1) * sizeof(WCHAR) );
++        char layout[KL_NAMELENGTH];
++        LCID locale;
++
++        NtQueryDefaultLocale( TRUE, &locale );
++        sprintf( layout, "%08X", MAKELONG( locale, locale ) );
++        set_reg_ascii_value( hkey, "1", layout );
+         NtClose( hkey );
+     }
+ 
+@@ -7625,6 +7626,10 @@ ULONG_PTR WINAPI NtUserCallNoParam( ULONG code )
+         display_mode_changed( FALSE );
+         return TRUE;
+ 
++    case NtUserCallNoParam_KeyboardLayoutsChanged:
++        keyboard_layouts_init( TRUE );
++        return TRUE;
++
+     /* temporary exports */
+     case NtUserExitingThread:
+         exiting_thread_id = GetCurrentThreadId();
+
+--- dlls/win32u/win32u_private.h
++++ dlls/win32u/win32u_private.h
+@@ -94,6 +94,7 @@ extern void unregister_imm_window( HWND hwnd );
+ /* input.c */
+ extern BOOL grab_pointer;
+ extern BOOL grab_fullscreen;
++extern void keyboard_layouts_init( BOOL changed );
+ extern BOOL is_mouse_in_pointer_enabled( HWND hwnd );
+ extern HWND get_active_window(void);
+ extern HWND get_capture(void);
+@@ -365,6 +366,7 @@ extern void winstation_init(void);
+ extern void sysparams_init(void);
+ extern int muldiv( int a, int b, int c );
+ 
++extern void reg_empty_key( HKEY root, const char *key_name, BOOL subkeys_only );
+ extern HKEY reg_create_key( HKEY root, const WCHAR *name, ULONG name_len,
+                             DWORD options, DWORD *disposition );
+ extern HKEY reg_create_ascii_key( HKEY root, const char *name, DWORD options,
+
+--- dlls/winemac.drv/gdi.c
++++ dlls/winemac.drv/gdi.c
+@@ -251,7 +251,7 @@ static const struct user_driver_funcs macdrv_funcs =
+     .pDestroyWindow = macdrv_DestroyWindow,
+     .pUpdateDisplayDevices = macdrv_UpdateDisplayDevices,
+     .pGetCursorPos = macdrv_GetCursorPos,
+-    .pGetKeyboardLayoutList = macdrv_GetKeyboardLayoutList,
++    .pUpdateKeyboardLayouts = macdrv_UpdateKeyboardLayouts,
+     .pGetKeyNameText = macdrv_GetKeyNameText,
+     .pMapVirtualKeyEx = macdrv_MapVirtualKeyEx,
+     .pProcessEvents = macdrv_ProcessEvents,
+
+--- dlls/winemac.drv/keyboard.c
++++ dlls/winemac.drv/keyboard.c
+@@ -34,35 +34,6 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(keyboard);
+ WINE_DECLARE_DEBUG_CHANNEL(key);
+ 
+-static BOOL is_ime_hkl( HKL hkl )
+-{
+-    /* See https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/windows-language-pack-default-values#input-method-editors */
+-    switch (HIWORD(hkl))
+-    {
+-    case MAKELANGID(LANG_AMHARIC, SUBLANG_AMHARIC_ETHIOPIA): return TRUE;
+-    case MAKELANGID(LANG_BENGALI, SUBLANG_BENGALI_INDIA): return TRUE;
+-    case MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED): return TRUE;
+-    case MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_TRADITIONAL): return TRUE;
+-    case MAKELANGID(LANG_GUJARATI, SUBLANG_GUJARATI_INDIA): return TRUE;
+-    case MAKELANGID(LANG_HINDI, SUBLANG_HINDI_INDIA): return TRUE;
+-    case MAKELANGID(LANG_JAPANESE, SUBLANG_JAPANESE_JAPAN): return TRUE;
+-    case MAKELANGID(LANG_KANNADA, SUBLANG_KANNADA_INDIA): return TRUE;
+-    case MAKELANGID(LANG_KOREAN, SUBLANG_KOREAN): return TRUE;
+-    case MAKELANGID(LANG_MALAYALAM, SUBLANG_MALAYALAM_INDIA): return TRUE;
+-    case MAKELANGID(LANG_MARATHI, SUBLANG_MARATHI_INDIA): return TRUE;
+-    case MAKELANGID(LANG_NEPALI, SUBLANG_NEPALI_NEPAL): return TRUE;
+-    case MAKELANGID(LANG_ODIA, SUBLANG_ODIA_INDIA): return TRUE;
+-    case MAKELANGID(LANG_PUNJABI, SUBLANG_PUNJABI_INDIA): return TRUE;
+-    case MAKELANGID(LANG_TAMIL, SUBLANG_TAMIL_INDIA): return TRUE;
+-    case MAKELANGID(LANG_TAMIL, SUBLANG_TAMIL_SRI_LANKA): return TRUE;
+-    case MAKELANGID(LANG_TELUGU, SUBLANG_TELUGU_INDIA): return TRUE;
+-    case MAKELANGID(LANG_TIGRINYA, SUBLANG_TIGRINYA_ETHIOPIA): return TRUE;
+-    case MAKELANGID(LANG_VIETNAMESE, SUBLANG_VIETNAMESE_VIETNAM): return TRUE;
+-    case MAKELANGID(LANG_YI, SUBLANG_YI_PRC): return TRUE;
+-    default: return (HIWORD(hkl) & 0xf000) == 0xe000;
+-    }
+-}
+-
+ /* Indexed by Mac virtual keycode values defined above. */
+ static const struct {
+     WORD vkey;
+@@ -338,11 +309,8 @@ static struct list layout_list = LIST_INIT( layout_list );
+ struct layout
+ {
+     struct list entry;
+-    LANGID lang;
+-    /* "Layout Id", used by NtUserGetKeyboardLayoutName / LoadKeyboardLayoutW */
+-    WORD layout_id;
+     TISInputSourceRef input_source;
+-    BOOL enabled; /* is the input source enabled - ie displayed in the input source selector UI */
++    HKL hkl;
+ };
+ 
+ static pthread_mutex_t layout_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+@@ -439,12 +407,6 @@ static DWORD get_lcid(CFStringRef lang)
+     return locale->inotneutral ? entry->id : locale->idefaultlanguage;
+ }
+ 
+-static HKL get_layout_hkl(struct layout *layout, LCID locale)
+-{
+-    if (!layout->layout_id) return UlongToHandle(MAKELONG(locale, layout->lang));
+-    return UlongToHandle(MAKELONG(locale, layout->layout_id));
+-}
+-
+ /******************************************************************
+  *                get_layout_from_source
+  *
+@@ -478,52 +440,8 @@ static struct layout *get_layout_from_source(TISInputSourceRef input)
+  */
+ static void update_layout_list(void)
+ {
+-    LCID locale = LOWORD(NtUserGetKeyboardLayout(0));
+-    CFArrayRef sources;
+-    struct layout *layout;
+-    int i;
+-
+     if (!InterlockedExchange((LONG *)&macdrv_layout_list_needs_update, FALSE)) return;
+-
+-    sources = macdrv_create_input_source_list();
+-
+-    LIST_FOR_EACH_ENTRY(layout, &layout_list, struct layout, entry)
+-        layout->enabled = FALSE;
+-
+-    for (i = 0; i < CFArrayGetCount(sources); i++)
+-    {
+-        CFDictionaryRef dict = CFArrayGetValueAtIndex(sources, i);
+-        TISInputSourceRef input = (TISInputSourceRef)CFDictionaryGetValue(dict, macdrv_input_source_input_key);
+-        layout = get_layout_from_source(input);
+-        if (!layout)
+-        {
+-            static WORD next_layout_id = 1;
+-
+-            CFStringRef type = CFDictionaryGetValue(dict, macdrv_input_source_type_key);
+-            LANGID lang = get_lcid(CFDictionaryGetValue(dict, macdrv_input_source_lang_key));
+-            HKL lang_hkl = UlongToPtr(MAKELONG(lang, lang));
+-            UINT index = 0;
+-
+-            LIST_FOR_EACH_ENTRY_REV(layout, &layout_list, struct layout, entry)
+-                if (layout->lang == lang) index++;
+-
+-            layout = calloc(1, sizeof(*layout));
+-            layout->input_source = (TISInputSourceRef)CFRetain(input);
+-            layout->lang = lang;
+-            if (is_ime_hkl(lang_hkl) && !index) layout->layout_id = 0; /* HKL has a builtin IME */
+-            else if (!CFEqual(type, kTISTypeKeyboardLayout)) layout->layout_id = 0xe000 | next_layout_id++;
+-            else if (index) layout->layout_id = 0xf000 | next_layout_id++;
+-
+-            list_add_tail(&layout_list, &layout->entry);
+-            TRACE("adding new layout %p\n", get_layout_hkl(layout, locale));
+-        }
+-        else
+-            TRACE("enabling already existing layout %p\n", get_layout_hkl(layout, locale));
+-
+-        layout->enabled = TRUE;
+-    }
+-
+-    CFRelease(sources);
++    NtUserCallNoParam( NtUserCallNoParam_KeyboardLayoutsChanged );
+ }
+ 
+ /***********************************************************************
+@@ -537,11 +455,12 @@ HKL macdrv_get_hkl_from_source(TISInputSourceRef input)
+     struct layout *layout;
+     HKL ret = 0;
+ 
++    update_layout_list();
++
+     pthread_mutex_lock(&layout_list_mutex);
+ 
+-    update_layout_list();
+     layout = get_layout_from_source(input);
+-    if (layout) ret = get_layout_hkl(layout, locale);
++    if (layout) ret = UlongToPtr(MAKELONG(locale, HIWORD(layout->hkl)));
+ 
+     pthread_mutex_unlock(&layout_list_mutex);
+ 
+@@ -1117,12 +1036,13 @@ BOOL macdrv_ActivateKeyboardLayout(HKL hkl, UINT flags)
+     if (hkl == thread_data->active_keyboard_layout)
+         goto done;
+ 
+-    pthread_mutex_lock(&layout_list_mutex);
+     update_layout_list();
+ 
++    pthread_mutex_lock(&layout_list_mutex);
++
+     LIST_FOR_EACH_ENTRY(layout, &layout_list, struct layout, entry)
+     {
+-        if (HIWORD(hkl) == layout->layout_id ? layout->layout_id : layout->lang)
++        if (HIWORD(hkl) == HIWORD(layout->hkl))
+         {
+             if (macdrv_select_input_source(layout->input_source))
+             {
+@@ -1260,35 +1180,51 @@ INT macdrv_GetKeyNameText(LONG lparam, LPWSTR buffer, INT size)
+ 
+ 
+ /***********************************************************************
+- *     GetKeyboardLayoutList (MACDRV.@)
++ *     UpdateKeyboardLayouts (MACDRV.@)
+  */
+-UINT macdrv_GetKeyboardLayoutList(INT size, HKL *list)
++UINT macdrv_UpdateKeyboardLayouts(const struct keyboard_funcs *funcs)
+ {
+-    LCID locale = LOWORD(NtUserGetKeyboardLayout(0));
+-    int count = 0;
+     struct layout *layout;
++    CFArrayRef sources;
++    struct list *ptr;
+ 
+-    TRACE("%d, %p\n", size, list);
++    TRACE("\n");
+ 
+     pthread_mutex_lock(&layout_list_mutex);
+ 
+-    update_layout_list();
++    while ((ptr = list_head(&layout_list)))
++    {
++        layout = LIST_ENTRY(ptr, struct layout, entry);
++        CFRelease(layout->input_source);
++        list_remove(&layout->entry);
++        free(layout);
++    }
+ 
+-    LIST_FOR_EACH_ENTRY(layout, &layout_list, struct layout, entry)
++    sources = macdrv_create_input_source_list();
++
++    for (int i = 0; i < CFArrayGetCount(sources); i++)
+     {
+-        if (!layout->enabled) continue;
+-        if (list)
+-        {
+-            if (count >= size) break;
+-            list[count] = get_layout_hkl(layout, locale);
+-            TRACE("\t%d: %p\n", count, list[count]);
+-        }
+-        count++;
++        CFDictionaryRef dict = CFArrayGetValueAtIndex(sources, i);
++        TISInputSourceRef input = (TISInputSourceRef)CFDictionaryGetValue(dict, macdrv_input_source_input_key);
++        LCID lang = get_lcid(CFDictionaryGetValue(dict, macdrv_input_source_lang_key));
++        CFStringRef type = CFDictionaryGetValue(dict, macdrv_input_source_type_key);
++        HKL hkl;
++
++        hkl = funcs->add_layout(lang, NULL, !CFEqual(type, kTISTypeKeyboardLayout), (UINT_PTR)input);
++
++        if (!(layout = calloc(1, sizeof(*layout)))) break;
++        layout->input_source = (TISInputSourceRef)CFRetain(input);
++        layout->hkl = hkl;
++        list_add_tail(&layout_list, &layout->entry);
++
++        TRACE("added new layout %p for source %p\n", hkl, input);
+     }
++
++    CFRelease(sources);
++
+     pthread_mutex_unlock(&layout_list_mutex);
+ 
+-    TRACE("returning %d\n", count);
+-    return count;
++    return 0;
+ }
+ 
+ 
+
+--- dlls/winemac.drv/macdrv.h
++++ dlls/winemac.drv/macdrv.h
+@@ -211,7 +211,7 @@ extern void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hin
+ extern UINT macdrv_MapVirtualKeyEx(UINT wCode, UINT wMapType, HKL hkl);
+ extern INT macdrv_ToUnicodeEx(UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
+                               LPWSTR bufW, int bufW_size, UINT flags, HKL hkl);
+-extern UINT macdrv_GetKeyboardLayoutList(INT size, HKL *list);
++extern UINT macdrv_UpdateKeyboardLayouts(const struct keyboard_funcs *funcs);
+ extern INT macdrv_GetKeyNameText(LONG lparam, LPWSTR buffer, INT size);
+ extern void macdrv_NotifyIMEStatus(HWND hwnd, UINT status);
+ extern BOOL macdrv_SetIMECompositionRect(HWND hwnd, RECT rect);
+
+--- dlls/winex11.drv/init.c
++++ dlls/winex11.drv/init.c
+@@ -617,6 +617,7 @@ static const struct user_driver_funcs x11drv_funcs =
+ 
+     .pActivateKeyboardLayout = X11DRV_ActivateKeyboardLayout,
+     .pBeep = X11DRV_Beep,
++    .pUpdateKeyboardLayouts = X11DRV_UpdateKeyboardLayouts,
+     .pGetKeyNameText = X11DRV_GetKeyNameText,
+     .pMapVirtualKeyEx = X11DRV_MapVirtualKeyEx,
+     .pToUnicodeEx = X11DRV_ToUnicodeEx,
+
+--- dlls/winex11.drv/keyboard.c
++++ dlls/winex11.drv/keyboard.c
+@@ -74,18 +74,6 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(keyboard);
+ WINE_DECLARE_DEBUG_CHANNEL(key);
+ 
+-struct layout
+-{
+-    struct list entry;
+-
+-    int xkb_group;
+-    char *xkb_layout;
+-
+-    LANGID lang;
+-    DWORD klid;
+-    WORD layout_id;
+-};
+-
+ static const unsigned int ControlMask = 1 << 2;
+ 
+ static int min_keycode, max_keycode, keysyms_per_keycode;
+@@ -238,97 +226,9 @@ static WORD keyc2scan( unsigned int keycode, unsigned int state )
+ static int NumLockMask, ScrollLockMask, AltGrMask; /* mask in the XKeyEvent state */
+ 
+ static pthread_mutex_t kbd_mutex = PTHREAD_MUTEX_INITIALIZER;
+-static struct list xkb_layouts = LIST_INIT( xkb_layouts );
+ 
+ static char KEYBOARD_MapDeadKeysym(KeySym keysym);
+ 
+-static const WCHAR keyboard_layouts_keyW[] =
+-{
+-    '\\','R','e','g','i','s','t','r','y',
+-    '\\','M','a','c','h','i','n','e',
+-    '\\','S','y','s','t','e','m',
+-    '\\','C','u','r','r','e','n','t','C','o','n','t','r','o','l','S','e','t',
+-    '\\','C','o','n','t','r','o','l',
+-    '\\','K','e','y','b','o','a','r','d',' ','L','a','y','o','u','t','s'
+-};
+-
+-static ULONG query_reg_ascii_value( HKEY hkey, const char *name, KEY_VALUE_PARTIAL_INFORMATION *info, ULONG size )
+-{
+-    WCHAR nameW[64];
+-
+-    asciiz_to_unicode( nameW, name );
+-    return query_reg_value( hkey, nameW, info, size );
+-}
+-
+-static WORD get_layout_id_from_klid( DWORD klid )
+-{
+-    static WORD next_layout_id = 0x100;
+-
+-    char buffer[2048];
+-    KEY_VALUE_PARTIAL_INFORMATION *value = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
+-    WORD layout_id = 0;
+-    HKEY hkey = NULL, subkey;
+-    WCHAR name[16];
+-
+-    TRACE( "klid %08x\n", klid );
+-
+-    if (!HIWORD(klid)) return 0;
+-    if (klid == -1) goto done;
+-
+-    snprintf( buffer, sizeof(buffer), "%08x", klid );
+-    asciiz_to_unicode( name, buffer );
+-
+-    if (!(hkey = reg_open_key( NULL, keyboard_layouts_keyW, sizeof(keyboard_layouts_keyW) ))) goto done;
+-
+-    if (!(subkey = reg_open_key( hkey, name, 8 * sizeof(WCHAR) ))) goto done;
+-
+-    if (query_reg_ascii_value( subkey, "Layout Id", value, sizeof(buffer) ) && value->Type == REG_SZ)
+-        layout_id = wcstoul( (const WCHAR *)value->Data, NULL, 16 );
+-    NtClose( subkey );
+-
+-done:
+-    if (hkey) NtClose( hkey );
+-    if (!layout_id) layout_id = next_layout_id++;
+-    TRACE( "layout_id %04x\n", layout_id );
+-    return layout_id;
+-}
+-
+-static void create_layout_from_xkb( int xkb_group, const char *xkb_layout, LANGID lang, DWORD klid )
+-{
+-    struct layout *layout;
+-    WORD index = 0;
+-
+-    TRACE( "xkb_group %u, xkb_layout %s, lang %04x, klid %08x\n", xkb_group, xkb_layout, lang, klid );
+-
+-    LIST_FOR_EACH_ENTRY( layout, &xkb_layouts, struct layout, entry )
+-    {
+-        if (!strcmp( layout->xkb_layout, xkb_layout ))
+-        {
+-            TRACE( "Found existing layout entry %p, lang %04x, klid %08x, layout_id %04x\n",
+-                   layout, layout->lang, layout->klid, layout->layout_id );
+-            if (layout->xkb_group == -1) layout->xkb_group = xkb_group;
+-            return;
+-        }
+-        if (lang == layout->lang && HIWORD(layout->klid) >= 0x20) index++;
+-    }
+-
+-    if (!(layout = calloc( 1, sizeof(*layout) + strlen( xkb_layout ) + 1 )))
+-    {
+-        WARN( "Failed to allocate memory for Xkb layout entry\n" );
+-        return;
+-    }
+-    list_add_tail( &xkb_layouts, &layout->entry );
+-
+-    layout->xkb_group = xkb_group;
+-    layout->xkb_layout = strcpy( (char *)(layout + 1), xkb_layout );
+-
+-    layout->lang = lang;
+-    layout->klid = !klid ? MAKELONG(lang, 0) : (klid == -1) ? MAKELONG(lang, index + 0x20) : klid;
+-    layout->layout_id = get_layout_id_from_klid( klid );
+-
+-    TRACE( "Created layout entry %p, lang %04x, klid %08x, layout_id %04x\n", layout, layout->lang, layout->klid, layout->layout_id );
+-}
+-
+ /* Keyboard translation tables */
+ #define MAIN_LEN 49
+ static const WORD main_key_vkey_qwerty[MAIN_LEN] =
+@@ -1619,8 +1519,8 @@ static const struct layout_id_map_entry
+     { "am", MAKELANGID(LANG_ARMENIAN, SUBLANG_DEFAULT) },
+     { "ara", MAKELANGID(LANG_ARABIC, SUBLANG_DEFAULT) },
+     { "at", MAKELANGID(LANG_GERMAN, SUBLANG_GERMAN_AUSTRIAN) },
+-    { "az", MAKELANGID(LANG_AZERBAIJANI, SUBLANG_DEFAULT) },
+     { "au", MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_AUS) },
++    { "az", MAKELANGID(LANG_AZERBAIJANI, SUBLANG_DEFAULT) },
+     { "ba", MAKELANGID(LANG_BOSNIAN, SUBLANG_BOSNIAN_BOSNIA_HERZEGOVINA_CYRILLIC) },
+     { "bd", MAKELANGID(LANG_BANGLA, SUBLANG_DEFAULT) },
+     { "be", MAKELANGID(LANG_FRENCH, SUBLANG_FRENCH_BELGIAN) },
+@@ -1738,43 +1638,6 @@ static const char *xkb_layout_from_langid( LANGID langid )
+     return NULL;
+ }
+ 
+-static const struct klid_map_entry
+-{
+-    const char *layout;
+-    const char *variant;
+-    DWORD klid;
+-} klid_map[] =
+-{
+-    { "us", "dvorak", 0x00010409 },
+-    { "us", "dvorak-l", 0x00030409 },
+-    { "us", "dvorak-r", 0x00040409 },
+-};
+-
+-static int klid_map_cmp( const void *key, const void *element )
+-{
+-    const struct klid_map_entry *map_key = key;
+-    const struct klid_map_entry *entry = element;
+-    int c;
+-
+-    if ((c = strcmp( map_key->layout, entry->layout ))) return c;
+-    return strcmp( map_key->variant, entry->variant );
+-}
+-
+-static DWORD klid_from_xkb_layout( const char *layout, const char *variant )
+-{
+-    struct klid_map_entry key = { layout, variant };
+-    const struct klid_map_entry *entry;
+-
+-    if (!variant)
+-        return 0;
+-
+-    entry = bsearch( &key, klid_map, ARRAY_SIZE(klid_map), sizeof(*klid_map), klid_map_cmp );
+-    if (entry) return entry->klid;
+-
+-    FIXME( "Unknown variant %s\n", debugstr_a(variant) );
+-    return -1;
+-}
+-
+ /* fuzzy layout detection through keysym / keycode matching, kbd_section must be held */
+ static unsigned int detect_keyboard_layout( Display *display, XModifierKeymap *modmap, unsigned int xkb_group )
+ {
+@@ -2110,7 +1973,7 @@ static void init_keycode_mappings( Display *display )
+ }
+ 
+ static void find_xkb_layout_variant( Display *display, XModifierKeymap *mmp, int group, const char *name,
+-                                     const char **layout, const char **variant )
++                                     const char **layout, const char **variant, LANGID *lang )
+ {
+     unsigned int index;
+ #ifdef SONAME_LIBXKBREGISTRY
+@@ -2128,6 +1991,7 @@ static void find_xkb_layout_variant( Display *display, XModifierKeymap *mmp, int
+             {
+                 *layout = p_rxkb_layout_get_name( iter );
+                 *variant = p_rxkb_layout_get_variant( iter );
++                *lang = langid_from_xkb_layout( *layout );
+                 return;
+             }
+         }
+@@ -2139,19 +2003,20 @@ static void find_xkb_layout_variant( Display *display, XModifierKeymap *mmp, int
+ #endif
+ 
+     index = detect_keyboard_layout( display, mmp, group );
++    *lang = main_key_tab[index].lcid;
+     *layout = xkb_layout_from_langid( main_key_tab[index].lcid );
+     if (strstr( main_key_tab[index].comment, "dvorak" )) *variant = "dvorak";
+ }
+ 
+ /* initialize or update keyboard layouts */
+-void init_keyboard_layouts( Display *display )
++UINT X11DRV_UpdateKeyboardLayouts( const struct keyboard_funcs *funcs )
+ {
++    Display *display = x11drv_init_thread_data()->display;
+     char *names[4] = { NULL };
+     unsigned int xkb_group;
+     XkbStateRec xkb_state;
+     XModifierKeymap *mmp;
+     XkbDescRec *xkb_desc;
+-    struct layout *entry;
+     LANGID xkb_lang = 0;
+     Status status;
+     KeyCode *kcp;
+@@ -2183,10 +2048,6 @@ void init_keyboard_layouts( Display *display )
+         }
+     }
+ 
+-    /* Flag any previously created Xkb layout as invalid */
+-    LIST_FOR_EACH_ENTRY( entry, &xkb_layouts, struct layout, entry )
+-        entry->xkb_group = -1;
+-
+     if (!use_xkb) init_default_keyc2scan( display );
+ 
+     status = XkbGetState( display, XkbUseCoreKbd, &xkb_state );
+@@ -2208,21 +2069,18 @@ void init_keyboard_layouts( Display *display )
+     for (int i = 0; i < count; i++)
+     {
+         const char *layout, *variant = NULL;
+-        char buffer[1024];
+-        DWORD klid;
+         LANGID lang;
++        HKL hkl;
+ 
+-        find_xkb_layout_variant( display, mmp, i, names[i], &layout, &variant );
+-        lang = langid_from_xkb_layout( layout );
+-        klid = klid_from_xkb_layout( layout, variant );
+-        if (i == xkb_group) xkb_lang = lang;
++        find_xkb_layout_variant( display, mmp, i, names[i], &layout, &variant, &lang );
++        if (!variant) variant = "";
+ 
+-        TRACE( "Found group %u with name %s -> layout %s:%s, lang %04x, klid %08x\n", i, debugstr_a(names[i]),
+-               debugstr_a(layout), debugstr_a(variant), lang, klid );
++        hkl = funcs->add_layout( lang, variant, FALSE, i );
+ 
+-        snprintf( buffer, ARRAY_SIZE(buffer), "%s:%s", layout, variant );
+-        create_layout_from_xkb( i, buffer, lang, klid );
++        TRACE( "Found group %u with name %s -> layout %s:%s, hkl %p\n", i, debugstr_a(names[i]),
++               debugstr_a(layout), debugstr_a(variant), hkl );
+ 
++        if (i == xkb_group) xkb_lang = LOWORD(hkl);
+         if (names[i]) XFree( names[i] );
+     }
+ 
+@@ -2236,9 +2094,9 @@ void init_keyboard_layouts( Display *display )
+     init_keycode_mappings( display );
+ 
+     pthread_mutex_unlock( &kbd_mutex );
++    return 0;
+ }
+ 
+-
+ /***********************************************************************
+  *		ActivateKeyboardLayout (X11DRV.@)
+  */
+@@ -2261,7 +2119,7 @@ static BOOL X11DRV_KeyboardMappingNotify( HWND dummy, XEvent *event )
+     HWND hwnd;
+ 
+     XRefreshKeyboardMapping(&event->xmapping);
+-    init_keyboard_layouts( event->xmapping.display );
++    NtUserCallNoParam( NtUserCallNoParam_KeyboardLayoutsChanged );
+ 
+     hwnd = get_focus();
+     if (!hwnd) hwnd = get_active_window();
+@@ -2297,14 +2155,14 @@ void x11drv_init_keyboard( Display *display )
+     if (!(xkbregistry_handle = dlopen( SONAME_LIBXKBREGISTRY, RTLD_NOW )))
+     {
+         WARN( "Failed to load %s\n", SONAME_LIBXKBREGISTRY );
+-        goto xkbregistry_init_done;
++        return;
+     }
+ #define LOAD_FUNCPTR( f )                                                                          \
+     if (!(p_##f = dlsym( xkbregistry_handle, #f )))                                                \
+     {                                                                                              \
+         ERR( "Failed to find " #f "\n" );                                                          \
+         dlclose( xkbregistry_handle );                                                             \
+-        goto xkbregistry_init_done;                                                                \
++        return;                                                                                    \
+     }
+ 
+     LOAD_FUNCPTR(rxkb_context_new)
+@@ -2319,11 +2177,7 @@ void x11drv_init_keyboard( Display *display )
+     if (!(rxkb_context = p_rxkb_context_new( RXKB_CONTEXT_NO_FLAGS )) ||
+         !p_rxkb_context_parse_default_ruleset( rxkb_context ))
+         ERR( "Failed to parse default Xkb ruleset\n" );
+-
+-xkbregistry_init_done:
+ #endif
+-
+-    init_keyboard_layouts( display );
+ }
+ 
+ 
+
+--- dlls/winex11.drv/x11drv.h
++++ dlls/winex11.drv/x11drv.h
+@@ -206,6 +206,7 @@ extern BOOL X11DRV_UnrealizePalette( HPALETTE hpal );
+ 
+ extern BOOL X11DRV_ActivateKeyboardLayout( HKL hkl, UINT flags );
+ extern void X11DRV_Beep(void);
++extern UINT X11DRV_UpdateKeyboardLayouts( const struct keyboard_funcs *funcs );
+ extern INT X11DRV_GetKeyNameText( LONG lparam, LPWSTR buffer, INT size );
+ extern UINT X11DRV_MapVirtualKeyEx( UINT code, UINT map_type, HKL hkl );
+ extern INT X11DRV_ToUnicodeEx( UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
+
+--- include/wine/gdi_driver.h
++++ include/wine/gdi_driver.h
+@@ -363,6 +363,11 @@ struct gdi_device_manager
+     void (*add_modes)( const DEVMODEW *current, UINT modes_count, const DEVMODEW *modes, void *param );
+ };
+ 
++struct keyboard_funcs
++{
++    HKL (*add_layout)( LANGID lang, const char *variant, BOOL ime, UINT_PTR host_id );
++};
++
+ #define WINE_DM_UNSUPPORTED 0x80000000
+ #define WINE_SWP_FULLSCREEN 0x80000000
+ #define WINE_SWP_RESIZABLE  0x40000000
+@@ -378,7 +383,7 @@ struct user_driver_funcs
+     BOOL    (*pActivateKeyboardLayout)(HKL, UINT);
+     void    (*pBeep)(void);
+     INT     (*pGetKeyNameText)(LONG,LPWSTR,INT);
+-    UINT    (*pGetKeyboardLayoutList)(INT, HKL *);
++    UINT    (*pUpdateKeyboardLayouts)(const struct keyboard_funcs *funcs);
+     UINT    (*pMapVirtualKeyEx)(UINT,UINT,HKL);
+     BOOL    (*pRegisterHotKey)(HWND,UINT,UINT);
+     INT     (*pToUnicodeEx)(UINT,UINT,const BYTE *,LPWSTR,int,UINT,HKL);
+
+--- include/ntuser.h
++++ include/ntuser.h
+@@ -1073,6 +1073,7 @@ enum
+     NtUserCallNoParam_GetShellWindow,
+     NtUserCallNoParam_GetTaskmanWindow,
+     NtUserCallNoParam_DisplayModeChanged,
++    NtUserCallNoParam_KeyboardLayoutsChanged,
+     /* temporary exports */
+     NtUserExitingThread,
+     NtUserThreadDetach,
+

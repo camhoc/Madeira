@@ -1,0 +1,32 @@
+# Revert "ntdll: Pre-check entry->addr before taking a spin lock in RtlWaitOnAddress()."
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12309 state=closed
+# This reverts commit `e00cbef06d8df1c5aeed3bcabc3dfe660a21fa1d`.
+
+This commit introduces a flawed (optimization?).
+Suppose a `RtlWaitOnAddress` times out and an `RtlWakeAddressAll` (setting the futex entry.addr to NULL) happens on a secondary thread in between the call to `NtWaitForAlertByThreadId` and the `if (entry.addr)` then there is a race condition where the function returns and the futex entry that lives on the stack is invalidated while the `RtlWakeAddressAll` call is still accessing it. The revert ensures that all signalers are finished operating on the futex_entry before the wait returns.
+
+This bug was originally found (and fixed) by Erhan Bilgili, so I have made him the patch author. 
+
+cc @gofman
+--- dlls/ntdll/sync.c
++++ dlls/ntdll/sync.c
+@@ -908,14 +908,11 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+ 
+     ret = NtWaitForAlertByThreadId( NULL, timeout );
+ 
+-    /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
++    spin_lock( &queue->lock );
++    /* We may have already been removed by a call to RtlWakeAddressSingle(). */
+     if (entry.addr)
+-    {
+-        spin_lock( &queue->lock );
+-        if (entry.addr)
+-            list_remove( &entry.entry );
+-        spin_unlock( &queue->lock );
+-    }
++        list_remove( &entry.entry );
++    spin_unlock( &queue->lock );
+ 
+     TRACE("returning %#lx\n", ret);
+ 
+

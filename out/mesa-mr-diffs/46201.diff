@@ -1,0 +1,32 @@
+# kk: Compute timestamps now use precise granularity
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46201 state=opened
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+Currently, from the 5th consecutive timestamp in a compute encoder, Metal starts returning 0 and KK marks it as available.
+
+So, `MTL4TimestampGranularityRelaxed` changes to `Precise` in `mtl_compute_write_timestamp`.
+
+* Identified in AnyPS5, and it also happens on the M5 Pro (macOS 27.3).
+* Minimal test: before, from the 5th timestamp it returned 0; now 0 zeros.
+* CTS: 2266 cases, same results, 0 failures.
+* Cost: 2000 timestamps go from 132 to 139–146 ms.
+
+Closes: https://gitlab.freedesktop.org/mesa/mesa/-/issues/16668
+
+Assisted-by: LLM
+
+Original Language: ESP
+--- src/kosmickrisp/bridge/mtl_encoder.m
++++ src/kosmickrisp/bridge/mtl_encoder.m
+@@ -504,7 +504,7 @@ mtl_compute_write_timestamp(mtl_compute_encoder *encoder,
+       id<MTL4ComputeCommandEncoder> enc =
+          (id<MTL4ComputeCommandEncoder>)encoder;
+       id<MTL4CounterHeap> h = (id<MTL4CounterHeap>)heap;
+-      [enc writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed
++      [enc writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                                 intoHeap:h
+                                  atIndex:index];
+    }
+

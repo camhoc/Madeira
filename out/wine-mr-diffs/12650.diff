@@ -1,0 +1,277 @@
+# kernelbase: Implement GetSecurityDescriptorRMControl and SetSecurityDescriptorRMControl.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12650 state=closed
+# This series implements the Resource Manager Control security descriptor APIs:
+
+1. ntdll: Implement RtlGetSecurityDescriptorRMControl and RtlSetSecurityDescriptorRMControl.
+2. kernelbase: Implement GetSecurityDescriptorRMControl and SetSecurityDescriptorRMControl, forwarding from advapi32.
+
+Also adds accompanying unit tests in the advapi32 security winetest suite.
+--- dlls/advapi32/tests/security.c
++++ dlls/advapi32/tests/security.c
+@@ -81,6 +81,8 @@ static DWORD (WINAPI *pRtlAdjustPrivilege)(ULONG,BOOLEAN,BOOLEAN,PBOOLEAN);
+ static NTSTATUS (WINAPI *pNtAccessCheck)(PSECURITY_DESCRIPTOR, HANDLE, ACCESS_MASK, PGENERIC_MAPPING,
+                                          PPRIVILEGE_SET, PULONG, PULONG, NTSTATUS*);
+ static BOOL     (WINAPI *pRtlDosPathNameToNtPathName_U)(LPCWSTR,PUNICODE_STRING,PWSTR*,CURDIR*);
++static DWORD    (WINAPI *pGetSecurityDescriptorRMControl)(PSECURITY_DESCRIPTOR, PUCHAR);
++static DWORD    (WINAPI *pSetSecurityDescriptorRMControl)(PSECURITY_DESCRIPTOR, PUCHAR);
+ 
+ static HMODULE hmod;
+ static int     myARGC;
+@@ -120,6 +122,8 @@ static void init(void)
+ 
+     hmod = GetModuleHandleA("advapi32.dll");
+     pAddMandatoryAce = (void *)GetProcAddress(hmod, "AddMandatoryAce");
++    pGetSecurityDescriptorRMControl = (void *)GetProcAddress(hmod, "GetSecurityDescriptorRMControl");
++    pSetSecurityDescriptorRMControl = (void *)GetProcAddress(hmod, "SetSecurityDescriptorRMControl");
+ 
+     myARGC = winetest_get_mainargs( &myARGV );
+ }
+@@ -8827,6 +8831,48 @@ static void test_NtCreateToken(void)
+     CloseHandle(process_token);
+ }
+ 
++static void test_security_descriptor_rm_control(void)
++{
++    SECURITY_DESCRIPTOR sd;
++    UCHAR rm, set_rm;
++    DWORD ret;
++    BOOL b_ret;
++
++    if (!pGetSecurityDescriptorRMControl || !pSetSecurityDescriptorRMControl)
++    {
++        win_skip("GetSecurityDescriptorRMControl or SetSecurityDescriptorRMControl not available.\n");
++        return;
++    }
++
++    b_ret = InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
++    ok(b_ret, "InitializeSecurityDescriptor failed, error %lu\n", GetLastError());
++
++    /* Before RMControl is set, SE_RM_CONTROL_VALID is not present */
++    rm = 0x55;
++    ret = pGetSecurityDescriptorRMControl(&sd, &rm);
++    ok(ret == ERROR_INVALID_DATA, "expected ERROR_INVALID_DATA, got %lu\n", ret);
++    ok(rm == 0, "expected rm 0, got %#x\n", rm);
++
++    /* Setting RMControl should set SE_RM_CONTROL_VALID and the control byte */
++    set_rm = 0x42;
++    ret = pSetSecurityDescriptorRMControl(&sd, &set_rm);
++    ok(ret == ERROR_SUCCESS, "SetSecurityDescriptorRMControl failed, error %lu\n", ret);
++
++    rm = 0;
++    ret = pGetSecurityDescriptorRMControl(&sd, &rm);
++    ok(ret == ERROR_SUCCESS, "GetSecurityDescriptorRMControl failed, error %lu\n", ret);
++    ok(rm == 0x42, "expected rm 0x42, got %#x\n", rm);
++
++    /* Setting NULL clears SE_RM_CONTROL_VALID */
++    ret = pSetSecurityDescriptorRMControl(&sd, NULL);
++    ok(ret == ERROR_SUCCESS, "SetSecurityDescriptorRMControl(NULL) failed, error %lu\n", ret);
++
++    rm = 0x55;
++    ret = pGetSecurityDescriptorRMControl(&sd, &rm);
++    ok(ret == ERROR_INVALID_DATA, "expected ERROR_INVALID_DATA, got %lu\n", ret);
++    ok(rm == 0, "expected rm 0, got %#x\n", rm);
++}
++
+ START_TEST(security)
+ {
+     init();
+@@ -8900,6 +8946,7 @@ START_TEST(security)
+     test_IsValidSecurityDescriptor();
+     test_window_security();
+     test_NtCreateToken();
++    test_security_descriptor_rm_control();
+ 
+     /* Must be the last test, modifies process token */
+     test_token_security_descriptor();
+
+--- dlls/advapi32/advapi32.spec
++++ dlls/advapi32/advapi32.spec
+@@ -355,7 +355,7 @@
+ @ stdcall -import GetSecurityDescriptorGroup(ptr ptr ptr)
+ @ stdcall -import GetSecurityDescriptorLength(ptr)
+ @ stdcall -import GetSecurityDescriptorOwner(ptr ptr ptr)
+-# @ stub GetSecurityDescriptorRMControl
++@ stdcall -import GetSecurityDescriptorRMControl(ptr ptr)
+ @ stdcall -import GetSecurityDescriptorSacl (ptr ptr ptr ptr)
+ @ stdcall GetSecurityInfo (long long long ptr ptr ptr ptr ptr)
+ @ stdcall GetSecurityInfoExA (long long long str str ptr ptr ptr ptr)
+@@ -755,7 +755,7 @@
+ @ stdcall -import SetSecurityDescriptorDacl(ptr long ptr long)
+ @ stdcall -import SetSecurityDescriptorGroup (ptr ptr long)
+ @ stdcall -import SetSecurityDescriptorOwner (ptr ptr long)
+-# @ stub SetSecurityDescriptorRMControl
++@ stdcall -import SetSecurityDescriptorRMControl(ptr ptr)
+ @ stdcall -import SetSecurityDescriptorSacl(ptr long ptr long)
+ @ stdcall SetSecurityInfo (long long long ptr ptr ptr ptr)
+ # @ stub SetSecurityInfoExA
+
+--- dlls/kernelbase/kernelbase.spec
++++ dlls/kernelbase/kernelbase.spec
+@@ -691,7 +691,7 @@
+ @ stdcall GetSecurityDescriptorGroup(ptr ptr ptr)
+ @ stdcall GetSecurityDescriptorLength(ptr)
+ @ stdcall GetSecurityDescriptorOwner(ptr ptr ptr)
+-@ stub GetSecurityDescriptorRMControl
++@ stdcall GetSecurityDescriptorRMControl(ptr ptr)
+ @ stdcall GetSecurityDescriptorSacl(ptr ptr ptr ptr)
+ # @ stub GetSerializedAtomBytes
+ # @ stub GetSharedLocalFolder
+@@ -1520,7 +1520,7 @@
+ @ stdcall SetSecurityDescriptorDacl(ptr long ptr long)
+ @ stdcall SetSecurityDescriptorGroup(ptr ptr long)
+ @ stdcall SetSecurityDescriptorOwner(ptr ptr long)
+-@ stub SetSecurityDescriptorRMControl
++@ stdcall SetSecurityDescriptorRMControl(ptr ptr)
+ @ stdcall SetSecurityDescriptorSacl(ptr long ptr long)
+ # @ stub SetStateVersion
+ @ stdcall SetStdHandle(long long)
+
+--- dlls/kernelbase/security.c
++++ dlls/kernelbase/security.c
+@@ -1089,6 +1089,18 @@ BOOL WINAPI GetSecurityDescriptorOwner( PSECURITY_DESCRIPTOR descr, PSID *owner,
+     return ret;
+ }
+ 
++/******************************************************************************
++ * GetSecurityDescriptorRMControl    (kernelbase.@)
++ */
++DWORD WINAPI GetSecurityDescriptorRMControl( PSECURITY_DESCRIPTOR descr, PUCHAR rm_control )
++{
++    TRACE( "(%p, %p)\n", descr, rm_control );
++
++    if (!RtlGetSecurityDescriptorRMControl( descr, rm_control ))
++        return ERROR_INVALID_DATA;
++    return ERROR_SUCCESS;
++}
++
+ /******************************************************************************
+  *  GetSecurityDescriptorSacl    (kernelbase.@)
+  */
+@@ -1228,6 +1240,17 @@ BOOL WINAPI SetSecurityDescriptorOwner( PSECURITY_DESCRIPTOR descr, PSID owner,
+     return set_ntstatus( RtlSetOwnerSecurityDescriptor( descr, owner, defaulted ));
+ }
+ 
++/******************************************************************************
++ * SetSecurityDescriptorRMControl    (kernelbase.@)
++ */
++DWORD WINAPI SetSecurityDescriptorRMControl( PSECURITY_DESCRIPTOR descr, PUCHAR rm_control )
++{
++    TRACE( "(%p, %p)\n", descr, rm_control );
++
++    RtlSetSecurityDescriptorRMControl( descr, rm_control );
++    return ERROR_SUCCESS;
++}
++
+ /**************************************************************************
+  * SetSecurityDescriptorSacl    (kernelbase.@)
+  */
+
+--- dlls/ntdll/ntdll.spec
++++ dlls/ntdll/ntdll.spec
+@@ -780,7 +780,7 @@
+ @ stdcall RtlGetProcessPreferredUILanguages(long ptr ptr ptr)
+ @ stdcall RtlGetSaclSecurityDescriptor(ptr ptr ptr ptr)
+ @ stdcall RtlGetSearchPath(ptr)
+-# @ stub RtlGetSecurityDescriptorRMControl
++@ stdcall RtlGetSecurityDescriptorRMControl(ptr ptr)
+ # @ stub RtlGetSetBootStatusData
+ @ stdcall RtlGetSystemPreferredUILanguages(long long ptr ptr ptr)
+ @ stdcall -ret64 RtlGetSystemTimePrecise()
+@@ -1041,7 +1041,7 @@
+ @ stub RtlSetPropertySetClassId
+ @ stdcall RtlSetSaclSecurityDescriptor(ptr long ptr long)
+ @ stdcall RtlSetSearchPathMode(long)
+-# @ stub RtlSetSecurityDescriptorRMControl
++@ stdcall RtlSetSecurityDescriptorRMControl(ptr ptr)
+ @ stub RtlSetSecurityObject
+ # @ stub RtlSetSecurityObjectEx
+ @ stdcall RtlSetThreadErrorMode(long ptr)
+
+--- dlls/ntdll/sec.c
++++ dlls/ntdll/sec.c
+@@ -727,6 +727,46 @@ NTSTATUS WINAPI RtlSetSaclSecurityDescriptor (
+ 	return STATUS_SUCCESS;
+ }
+ 
++/**************************************************************************
++ * RtlGetSecurityDescriptorRMControl		[NTDLL.@]
++ */
++UCHAR WINAPI RtlGetSecurityDescriptorRMControl( PSECURITY_DESCRIPTOR descr, PUCHAR rm_control )
++{
++    SECURITY_DESCRIPTOR *lpsd = descr;
++
++    TRACE( "(%p, %p)\n", descr, rm_control );
++
++    if (!(lpsd->Control & SE_RM_CONTROL_VALID))
++    {
++        *rm_control = 0;
++        return 0;
++    }
++
++    *rm_control = lpsd->Sbz1;
++    return 1;
++}
++
++/**************************************************************************
++ * RtlSetSecurityDescriptorRMControl		[NTDLL.@]
++ */
++void WINAPI RtlSetSecurityDescriptorRMControl( PSECURITY_DESCRIPTOR descr, PUCHAR rm_control )
++{
++    SECURITY_DESCRIPTOR *lpsd = descr;
++
++    TRACE( "(%p, %p)\n", descr, rm_control );
++
++    if (rm_control)
++    {
++        lpsd->Control |= SE_RM_CONTROL_VALID;
++        lpsd->Sbz1 = *rm_control;
++    }
++    else
++    {
++        lpsd->Control &= ~SE_RM_CONTROL_VALID;
++        lpsd->Sbz1 = 0;
++    }
++}
++
+ /**************************************************************************
+  * RtlGetOwnerSecurityDescriptor		[NTDLL.@]
+  */
+
+--- include/winbase.h
++++ include/winbase.h
+@@ -2074,6 +2074,7 @@ WINADVAPI  BOOL        WINAPI GetSecurityDescriptorDacl(PSECURITY_DESCRIPTOR,LPB
+ WINADVAPI  BOOL        WINAPI GetSecurityDescriptorGroup(PSECURITY_DESCRIPTOR,PSID *,LPBOOL);
+ WINADVAPI  DWORD       WINAPI GetSecurityDescriptorLength(PSECURITY_DESCRIPTOR);
+ WINADVAPI  BOOL        WINAPI GetSecurityDescriptorOwner(PSECURITY_DESCRIPTOR,PSID *,LPBOOL);
++WINADVAPI  DWORD       WINAPI GetSecurityDescriptorRMControl(PSECURITY_DESCRIPTOR,PUCHAR);
+ WINADVAPI  BOOL        WINAPI GetSecurityDescriptorSacl(PSECURITY_DESCRIPTOR,LPBOOL,PACL *,LPBOOL);
+ WINADVAPI  PSID_IDENTIFIER_AUTHORITY WINAPI GetSidIdentifierAuthority(PSID);
+ WINADVAPI  DWORD       WINAPI GetSidLengthRequired(BYTE);
+@@ -2457,6 +2458,7 @@ WINADVAPI  BOOL        WINAPI SetSecurityDescriptorControl(PSECURITY_DESCRIPTOR,
+ WINADVAPI  BOOL        WINAPI SetSecurityDescriptorDacl(PSECURITY_DESCRIPTOR,BOOL,PACL,BOOL);
+ WINADVAPI  BOOL        WINAPI SetSecurityDescriptorGroup(PSECURITY_DESCRIPTOR,PSID,BOOL);
+ WINADVAPI  BOOL        WINAPI SetSecurityDescriptorOwner(PSECURITY_DESCRIPTOR,PSID,BOOL);
++WINADVAPI  DWORD       WINAPI SetSecurityDescriptorRMControl(PSECURITY_DESCRIPTOR,PUCHAR);
+ WINADVAPI  BOOL        WINAPI SetSecurityDescriptorSacl(PSECURITY_DESCRIPTOR,BOOL,PACL,BOOL);
+ WINBASEAPI BOOL        WINAPI SetStdHandle(DWORD,HANDLE);
+ WINBASEAPI BOOL        WINAPI SetStdHandleEx(DWORD,HANDLE,HANDLE*);
+
+--- include/winternl.h
++++ include/winternl.h
+@@ -5274,6 +5274,7 @@ NTSYSAPI ULONG     WINAPI RtlGetProcessHeaps(ULONG,HANDLE*);
+ NTSYSAPI NTSTATUS  WINAPI RtlGetProcessPreferredUILanguages(DWORD,ULONG*,WCHAR*,ULONG*);
+ NTSYSAPI BOOLEAN   WINAPI RtlGetProductInfo(DWORD,DWORD,DWORD,DWORD,PDWORD);
+ NTSYSAPI NTSTATUS  WINAPI RtlGetSaclSecurityDescriptor(PSECURITY_DESCRIPTOR,PBOOLEAN,PACL *,PBOOLEAN);
++NTSYSAPI UCHAR     WINAPI RtlGetSecurityDescriptorRMControl(PSECURITY_DESCRIPTOR,PUCHAR);
+ NTSYSAPI NTSTATUS  WINAPI RtlGetSearchPath(PWSTR*);
+ NTSYSAPI NTSTATUS  WINAPI RtlGetSystemPreferredUILanguages(DWORD,ULONG,ULONG*,WCHAR*,ULONG*);
+ NTSYSAPI LONGLONG  WINAPI RtlGetSystemTimePrecise(void);
+@@ -5421,6 +5422,7 @@ NTSYSAPI void      WINAPI RtlSetLastWin32ErrorAndNtStatusFromNtStatus(NTSTATUS);
+ NTSYSAPI NTSTATUS  WINAPI RtlSetOwnerSecurityDescriptor(PSECURITY_DESCRIPTOR,PSID,BOOLEAN);
+ NTSYSAPI NTSTATUS  WINAPI RtlSetProcessPreferredUILanguages(DWORD,PCZZWSTR,ULONG*);
+ NTSYSAPI NTSTATUS  WINAPI RtlSetSaclSecurityDescriptor(PSECURITY_DESCRIPTOR,BOOLEAN,PACL,BOOLEAN);
++NTSYSAPI void      WINAPI RtlSetSecurityDescriptorRMControl(PSECURITY_DESCRIPTOR,PUCHAR);
+ NTSYSAPI NTSTATUS  WINAPI RtlSetSearchPathMode(ULONG);
+ NTSYSAPI NTSTATUS  WINAPI RtlSetThreadErrorMode(DWORD,LPDWORD);
+ NTSYSAPI NTSTATUS  WINAPI RtlSetThreadPreferredUILanguages(DWORD,PCZZWSTR,ULONG*);
+

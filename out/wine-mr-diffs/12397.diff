@@ -1,0 +1,25 @@
+# win32u: Initialize text metrics in get_text_metr_size() on failure.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12397 state=opened
+# If the font is selected but measuring it fails (for example with no font engine, as in a WoW64 setup without 32-bit FreeType), `NtGdiGetTextMetricsW()` leaves the TEXTMETRICW untouched, and `get_text_metr_size()` hands it back uninitialized.
+
+`normalize_nonclientmetrics()` then computes the menu and caption heights from stack garbage and saves them to `HKCU\Control Panel\Desktop\WindowMetrics` (e.g. `MenuHeight=6750318` in a fresh prefix), which breaks window sizes. The SM_CXMENUCHECK/SM_CYMENUCHECK paths return garbage for the same reason.
+
+This sets the same fallback values that are already used when the font can't be created or selected, so every caller gets defined metrics.
+
+This supersedes !7316 by Ruslan Garipov (@ruslangaripov), which only covers `normalize_nonclientmetrics()`. He suggested opening a separate MR in  !7316#note_155078. Thanks to him for tracking down the cause.
+--- dlls/win32u/sysparams.c
++++ dlls/win32u/sysparams.c
+@@ -5481,10 +5481,11 @@ static void get_text_metr_size( HDC hdc, LOGFONTW *lf, TEXTMETRICW *metric, UINT
+     TEXTMETRICW tm;
+     UINT ret;
+     if (!metric) metric = &tm;
++    metric->tmHeight = -1;
++    metric->tmExternalLeading = 0;
+     hfont = NtGdiHfontCreate( lf, sizeof(*lf), 0, 0, NULL );
+     if (!hfont || !(hfontsav = NtGdiSelectFont( hdc, hfont )))
+     {
+-        metric->tmHeight = -1;
+         if (psz) *psz = 10;
+         if (hfont) NtGdiDeleteObjectApp( hfont );
+         return;
+

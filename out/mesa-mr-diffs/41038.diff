@@ -1,0 +1,746 @@
+# kk: Tessellation
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/41038 state=merged
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+Marked as draft until https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/40976 is addressed since we need those changes for a conformant tessellation. After that, we can drop that commit from this MR and proceed with the merge.
+
+Implements tessellation the same way HK does. Geometry and transform feedback have been left out for 2 reasons: not a priority at the moment, and I had so much fun implementing and debugging issues that I want to leave some of that fun for later :)
+--- src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -59,6 +59,12 @@ mtl_copy_from_texture_to_texture(mtl_blit_encoder *blit_enc_handle,
+ {
+ }
+ 
++void
++mtl_memory_barrier_with_scope(mtl_compute_encoder *encoder,
++                              enum mtl_barrier_scope scope)
++{
++}
++
+ /* MTLComputeEncoder */
+ mtl_compute_encoder *
+ mtl_new_compute_command_encoder(mtl_command_buffer *cmd_buffer)
+
+--- src/kosmickrisp/bridge/mtl_encoder.h
++++ src/kosmickrisp/bridge/mtl_encoder.h
+@@ -61,6 +61,9 @@ void mtl_dispatch_threadgroups_with_indirect_buffer(
+    mtl_compute_encoder *encoder, mtl_buffer *buffer, uint32_t offset,
+    struct mtl_size local_size);
+ 
++void mtl_memory_barrier_with_scope(mtl_compute_encoder *encoder,
++                                   enum mtl_barrier_scope scope);
++
+ /* MTLRenderEncoder */
+ mtl_render_encoder *mtl_new_render_command_encoder_with_descriptor(
+    mtl_command_buffer *command_buffer, mtl_render_pass_descriptor *descriptor);
+
+--- src/kosmickrisp/bridge/mtl_encoder.m
++++ src/kosmickrisp/bridge/mtl_encoder.m
+@@ -234,6 +234,16 @@ mtl_dispatch_threadgroups_with_indirect_buffer(mtl_compute_encoder *encoder,
+    }
+ }
+ 
++void
++mtl_memory_barrier_with_scope(mtl_compute_encoder *encoder,
++                              enum mtl_barrier_scope scope)
++{
++   @autoreleasepool {
++      id<MTLComputeCommandEncoder> enc = (id<MTLComputeCommandEncoder>)encoder;
++      [enc memoryBarrierWithScope:(MTLBarrierScope)scope];
++   }
++}
++
+ /* MTLRenderEncoder */
+ 
+ /* Encoder commands */
+
+--- src/kosmickrisp/bridge/mtl_types.h
++++ src/kosmickrisp/bridge/mtl_types.h
+@@ -220,6 +220,12 @@ enum mtl_depth_clip_mode {
+    MTL_DEPTH_CLIP_MODE_CLAMP = 1,
+ };
+ 
++enum mtl_barrier_scope {
++   MTL_BARRIER_SCOPE_BUFFERS = 1 << 0,
++   MTL_BARRIER_SCOPE_TEXTURES = 1 << 1,
++   MTL_BARRIER_SCOPE_RENDER_TARGETS = 1 << 2,
++};
++
+ /** STRUCTURES */
+ struct mtl_range {
+    size_t offset;
+
+--- src/kosmickrisp/bridge/vk_to_mtl_map.c
++++ src/kosmickrisp/bridge/vk_to_mtl_map.c
+@@ -250,3 +250,16 @@ index_size_in_bytes_to_mtl_index_type(unsigned bytes)
+       UNREACHABLE("Unsupported byte size for index");
+    }
+ }
++
++unsigned
++mtl_index_type_to_size_B(enum mtl_index_type type)
++{
++   switch (type) {
++   case MTL_INDEX_TYPE_UINT16:
++      return 2u;
++   case MTL_INDEX_TYPE_UINT32:
++      return 4u;
++   default:
++      UNREACHABLE("Unhandled index type");
++   }
++}
+
+--- src/kosmickrisp/bridge/vk_to_mtl_map.h
++++ src/kosmickrisp/bridge/vk_to_mtl_map.h
+@@ -76,4 +76,6 @@ enum mtl_cull_mode vk_front_face_to_mtl_cull_mode(enum VkCullModeFlagBits mode);
+ 
+ enum mtl_index_type index_size_in_bytes_to_mtl_index_type(unsigned bytes);
+ 
++unsigned mtl_index_type_to_size_B(enum mtl_index_type type);
++
+ #endif /* KK_MTL_TO_VK_MAP_H */
+
+--- src/kosmickrisp/compiler/msl_iomap.c
++++ src/kosmickrisp/compiler/msl_iomap.c
+@@ -441,6 +441,7 @@ msl_emit_io_blocks(struct nir_to_msl_ctx *ctx, nir_shader *shader)
+       fs_output_block(shader, ctx);
+       break;
+    case MESA_SHADER_COMPUTE:
++   case MESA_SHADER_TESS_CTRL:
+       break;
+    default:
+       assert(0);
+
+--- src/kosmickrisp/compiler/msl_nir_lower_common.c
++++ src/kosmickrisp/compiler/msl_nir_lower_common.c
+@@ -574,3 +574,25 @@ msl_nir_lower_clip_cull_distance(nir_shader *nir, unsigned num_cull_distances)
+    else
+       NIR_PASS(_, nir, msl_nir_lower_clip_cull_distance_vs);
+ }
++
++static bool
++lower_instance_id(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_load_instance_id)
++      return false;
++
++   b->cursor = nir_after_instr(&intr->instr);
++   nir_def *base_instance = nir_load_base_instance(b);
++   nir_def *instance_id = nir_isub(b, &intr->def, base_instance);
++   nir_def_rewrite_uses_after(&intr->def, instance_id);
++   BITSET_SET(b->shader->info.system_values_read, SYSTEM_VALUE_BASE_INSTANCE);
++
++   return true;
++}
++
++bool
++msl_nir_lower_instance_id(nir_shader *nir)
++{
++   return nir_shader_intrinsics_pass(nir, lower_instance_id,
++                                     nir_metadata_control_flow, NULL);
++}
+
+--- src/kosmickrisp/compiler/msl_type_inference.c
++++ src/kosmickrisp/compiler/msl_type_inference.c
+@@ -796,6 +796,9 @@ emit_src_component(struct nir_to_msl_ctx *ctx, nir_src *src, unsigned comp)
+    case TYPE_GENERIC_INT:
+    case TYPE_GENERIC_INT_OR_BOOL:
+       switch (src->ssa->bit_size) {
++      case 1:
++         P(ctx, "bool(");
++         break;
+       case 8:
+          P(ctx, "uchar(");
+          break;
+
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -18,6 +18,7 @@ get_stage_string(mesa_shader_stage stage)
+    case MESA_SHADER_FRAGMENT:
+       return "fragment";
+    case MESA_SHADER_COMPUTE:
++   case MESA_SHADER_TESS_CTRL:
+       return "kernel";
+    default:
+       assert(0);
+@@ -59,6 +60,7 @@ static const char *sysval_table[SYSTEM_VALUE_MAX] = {
+    [SYSTEM_VALUE_LAYER_ID] = "uint gl_Layer [[render_target_array_index]]",
+    [SYSTEM_VALUE_SAMPLE_ID] = "uint gl_SampleID [[sample_id]]",
+    [SYSTEM_VALUE_SAMPLE_MASK_IN] = "uint gl_SampleMask [[sample_mask]]",
++   [SYSTEM_VALUE_PRIMITIVE_ID] = "uint gl_PrimitiveID [[primitive_id]]",
+    [SYSTEM_VALUE_AMPLIFICATION_ID_KK] =
+       "uint mtl_AmplificationID [[amplification_id]]",
+    [SYSTEM_VALUE_FIRST_VERTEX] = "uint gl_FirstVertex [[base_vertex]]",
+@@ -1031,6 +1033,9 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+    case nir_intrinsic_load_sample_mask_in:
+       P(ctx, "gl_SampleMask;\n");
+       break;
++   case nir_intrinsic_load_primitive_id:
++      P(ctx, "gl_PrimitiveID;\n");
++      break;
+    case nir_intrinsic_load_sample_pos:
+       P(ctx, "get_sample_position(gl_SampleID);\n");
+       break;
+@@ -2248,7 +2253,8 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
+    msl_gather_info(&ctx, options);
+ 
+    P(&ctx, "// Generated by Mesa compiler\n");
+-   if (shader->info.stage == MESA_SHADER_COMPUTE)
++   if (shader->info.stage == MESA_SHADER_COMPUTE ||
++       shader->info.stage == MESA_SHADER_TESS_CTRL)
+       P(&ctx, "#include <metal_compute>\n");
+    P(&ctx, "#include <metal_stdlib>\n");
+    P(&ctx, "using namespace metal;\n");
+
+--- src/kosmickrisp/compiler/nir_to_msl.h
++++ src/kosmickrisp/compiler/nir_to_msl.h
+@@ -79,6 +79,7 @@ bool msl_nir_fake_guard_for_discards(struct nir_shader *nir);
+ bool msl_nir_lower_sample_shading(nir_shader *nir);
+ void msl_nir_lower_clip_cull_distance(nir_shader *nir,
+                                       unsigned num_cull_distances);
++bool msl_nir_lower_instance_id(nir_shader *nir);
+ 
+ bool msl_gather_uses_per_draw_data(nir_shader *nir);
+ 
+@@ -94,7 +95,6 @@ static const nir_shader_compiler_options kk_nir_options = {
+    .lower_insert_byte = true,
+    .lower_fmod = true,
+    .discard_is_demote = true,
+-   .instance_id_includes_base_index = true,
+    .lower_device_index_to_zero = true,
+    .lower_pack_64_2x32_split = true,
+    .lower_unpack_64_2x32_split = true,
+
+--- src/kosmickrisp/libkk/kk_geometry.cl
++++ src/kosmickrisp/libkk/kk_geometry.cl
+@@ -0,0 +1,43 @@
++/*
++ * Copyright 2026 LunarG, Inc.
++ * Copyright 2026 Google LLC
++ * Copyright 2023 Alyssa Rosenzweig
++ * Copyright 2023 Valve Corporation
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "compiler/libcl/libcl_vk.h"
++#include "poly/geometry.h"
++#include "poly/tessellator.h"
++
++KERNEL(1)
++libkk_prefix_sum_tess(global struct poly_tess_params *p)
++{
++   if (cl_local_id.x != 0)
++      return;
++
++   /* The last element of an inclusive prefix sum is the total sum */
++   uint total = 0;
++
++   if (p->nr_patches > 0) {
++      for (uint32_t i = 0u; i < p->nr_patches; ++i) {
++         total += p->counts[i];
++         p->counts[i] = total;
++      }
++   }
++
++   /* Allocate 4-byte indices */
++   uint32_t elsize_B = sizeof(uint32_t);
++   uint32_t size_B = total * elsize_B;
++   uint alloc_B = poly_heap_alloc_offs(p->heap, size_B);
++   p->index_buffer = (global uint32_t *)(((uintptr_t)p->heap->base) + alloc_B);
++
++   /* ...and now we can generate the API indexed draw */
++   global uint32_t *desc = p->out_draws;
++
++   desc[0] = total;              /* count */
++   desc[1] = 1;                  /* instance_count */
++   desc[2] = alloc_B / elsize_B; /* start */
++   desc[3] = 0;                  /* index_bias */
++   desc[4] = 0;                  /* start_instance */
++}
+
+--- src/kosmickrisp/libkk/kk_tessellation.cl
++++ src/kosmickrisp/libkk/kk_tessellation.cl
+@@ -0,0 +1,93 @@
++/*
++ * Copyright 2026 LunarG, Inc.
++ * Copyright 2026 Google LLC
++ * Copyright 2023 Alyssa Rosenzweig
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "poly/geometry.h"
++#include "poly/tessellator.h"
++
++KERNEL(1)
++libkk_tess_setup_indirect(
++   global struct poly_tess_params *p,
++   global uint32_t *grids /* output: VS then TCS then tess */,
++   global struct poly_vertex_params *vp /* output */, global uint32_t *indirect,
++   uint64_t in_index_buffer, uint32_t in_index_buffer_range_el,
++   uint32_t in_index_size_B, uint64_t vertex_outputs /* bitfield */,
++
++   /* Tess control invocation counter if active, else zero */
++   global uint32_t *tcs_statistic)
++{
++   uint count = indirect[0], instance_count = indirect[1];
++   unsigned in_patches = count / p->input_patch_size;
++
++   /* TCS invocation counter increments once per-patch */
++   if (tcs_statistic) {
++      *tcs_statistic += in_patches;
++   }
++
++   size_t draw_stride = 5 * sizeof(uint32_t);
++   unsigned unrolled_patches = in_patches * instance_count;
++
++   uint32_t alloc = 0;
++   uint32_t tcs_out_offs = alloc;
++   alloc += unrolled_patches * p->tcs_stride_el * 4;
++
++   uint32_t patch_coord_offs = alloc;
++   alloc += unrolled_patches * 4;
++
++   uint32_t count_offs = alloc;
++   alloc += unrolled_patches * sizeof(uint32_t);
++
++   uint vb_offs = alloc;
++   uint vb_size = poly_tcs_in_size(count * instance_count, vertex_outputs);
++   alloc += vb_size;
++
++   /* Allocate all patch calculations in one go */
++   global uchar *blob = poly_heap_alloc(p->heap, alloc);
++
++   p->tcs_buffer = (global float *)(blob + tcs_out_offs);
++   p->patches_per_instance = in_patches;
++   p->coord_allocs = (global uint *)(blob + patch_coord_offs);
++   p->nr_patches = unrolled_patches;
++
++   vp->output_buffer = (uintptr_t)(blob + vb_offs);
++   vp->outputs = vertex_outputs;
++   p->counts = (global uint32_t *)(blob + count_offs);
++
++   if (vp) {
++      vp->verts_per_instance = count;
++   }
++
++   /* If indexing is enabled, the third word is the offset into the index buffer
++    * in elements. Apply that offset now that we have it. For a hardware
++    * indirect draw, the hardware would do this for us, but for software input
++    * assembly we need to do it ourselves.
++    *
++    * XXX: Deduplicate?
++    */
++   if (in_index_size_B) {
++      /* TODO_KOSMICKRISP Use poly_index_buffer and implement
++       * load_ro_sink_address_poly */
++      vp->index_buffer = in_index_buffer + (indirect[2] * in_index_size_B);
++
++      vp->index_buffer_range_el =
++         poly_index_buffer_range_el(in_index_buffer_range_el, indirect[2]);
++   }
++
++   /* VS grid size */
++   grids[0] = count;
++   grids[1] = instance_count;
++   grids[2] = 1;
++
++   /* TCS grid size */
++   grids[3] = in_patches * p->output_patch_size;
++   grids[4] = instance_count;
++   grids[5] = 1;
++
++   /* Tess grid size */
++   grids[6] = unrolled_patches;
++   grids[7] = 1;
++   grids[8] = 1;
++}
+
+--- src/kosmickrisp/libkk/kk_tessellator.cl
++++ src/kosmickrisp/libkk/kk_tessellator.cl
+@@ -0,0 +1,31 @@
++/*
++ * Copyright 2026 LunarG, Inc.
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "poly/cl/tessellator.h"
++
++KERNEL(1)
++libkk_tess_isoline(constant struct poly_tess_params *p,
++                   enum poly_tess_mode tess_mode)
++{
++   uint patch = cl_global_id.x;
++   poly_tess_isoline_process(p, patch, tess_mode);
++}
++
++KERNEL(1)
++libkk_tess_tri(constant struct poly_tess_params *p,
++               enum poly_tess_mode tess_mode)
++{
++   uint patch = cl_global_id.x;
++   poly_tess_tri_process(p, patch, tess_mode);
++}
++
++KERNEL(1)
++libkk_tess_quad(constant struct poly_tess_params *p,
++                enum poly_tess_mode tess_mode)
++{
++   uint patch = cl_global_id.x;
++   poly_tess_quad_process(p, patch, tess_mode);
++}
+
+--- src/kosmickrisp/libkk/kk_tessellator.h
++++ src/kosmickrisp/libkk/kk_tessellator.h
+@@ -0,0 +1,20 @@
++/*
++ * Copyright 2026 LunarG, Inc.
++ * Copyright 2026 Google LLC
++ * Copyright 2024 Valve Corporation
++ * SPDX-License-Identifier: MIT
++ */
++
++#pragma once
++
++#include "poly/tessellator.h"
++
++#define libkk_tessellate(context, grid, barrier, prim, mode, state)            \
++   if (prim == TESS_PRIMITIVE_QUADS) {                                         \
++      libkk_tess_quad(context, grid, barrier, state, mode);                    \
++   } else if (prim == TESS_PRIMITIVE_TRIANGLES) {                              \
++      libkk_tess_tri(context, grid, barrier, state, mode);                     \
++   } else {                                                                    \
++      assert(prim == TESS_PRIMITIVE_ISOLINES);                                 \
++      libkk_tess_isoline(context, grid, barrier, state, mode);                 \
++   }
+
+--- src/kosmickrisp/libkk/meson.build
++++ src/kosmickrisp/libkk/meson.build
+@@ -4,7 +4,10 @@
+ 
+ libkk_shader_files = files(
+   'kk_draws.cl',
++  'kk_geometry.cl',
+   'kk_query.cl',
++  'kk_tessellation.cl',
++  'kk_tessellator.cl',
+ )
+ 
+ libkk_spv = custom_target(
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -36,8 +36,21 @@ struct kk_root_descriptor_table {
+          uint32_t buffer_strides[KK_MAX_VBUFS];
+          uint64_t attrib_base[KK_MAX_ATTRIBS];
+          uint32_t attrib_clamps[KK_MAX_ATTRIBS];
++
++         /* Mask of outputs flowing VS->TCS, VS->GS, or TES->GS . */
++         uint64_t vertex_outputs;
++
++         /* Address of vertex param buffer if geom/tess is used, else 0 */
++         uint64_t vertex_params;
++
++         /* Address of tessellation param buffer if tessellation used, else 0 */
++         uint64_t tess_params;
++
+          float blend_constant[4];
+          float clip_z_coeff;
++         uint32_t index_size;
++         uint64_t base_vertex_addr;
++         uint64_t base_instance_addr;
+       } draw;
+       struct {
+          uint32_t base_group[3];
+@@ -69,9 +82,6 @@ struct kk_descriptor_state {
+ };
+ 
+ struct kk_per_draw_data {
+-   /* Mask of stages that need per-draw data uploaded */
+-   uint32_t upload_mask;
+-
+    uint32_t draw_id;
+ };
+ 
+@@ -149,6 +159,16 @@ struct kk_graphics_state {
+       mtl_buffer *handles[KK_MAX_VBUFS];
+    } vb;
+ 
++   /* Tessellation state */
++   struct {
++      /* Grid buffer for when the draw is indirect */
++      struct kk_ptr indirect_ptr;
++      mtl_buffer *out_draws_buffer;
++      uint64_t out_draws_offset;
++      struct kk_tess_info info;
++      enum mesa_prim prim;
++   } tess;
++
+    /* Needed by vk_command_buffer::dynamic_graphics_state */
+    struct vk_vertex_input_state _dynamic_vi;
+    struct vk_sample_locations_state _dynamic_sl;
+@@ -319,6 +339,12 @@ kk_grid_indirect(mtl_buffer *indirect, uint32_t offset)
+    };
+ }
+ 
++static bool
++kk_grid_is_indirect(struct kk_grid grid)
++{
++   return grid.mode == KK_GRID_INDIRECT;
++}
++
+ void kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
+                          bool pre_gfx, enum libkk_program idx, void *data,
+                          size_t data_size);
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+
+--- src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -802,3 +802,62 @@ kk_nir_lower_descriptors(nir_shader *nir,
+ 
+    return pass_lower_descriptors || pass_lower_ssbo;
+ }
++
++static bool
++lower_poly(struct nir_builder *b, nir_intrinsic_instr *intrin, void *data)
++{
++   switch (intrin->intrinsic) {
++   case nir_intrinsic_load_vs_outputs_poly:
++      return lower_sysval_to_root_table(b, intrin, draw.vertex_outputs);
++   case nir_intrinsic_load_vertex_param_buffer_poly:
++      return lower_sysval_to_root_table(b, intrin, draw.vertex_params);
++   case nir_intrinsic_load_tess_param_buffer_poly:
++      return lower_sysval_to_root_table(b, intrin, draw.tess_params);
++   case nir_intrinsic_load_index_size_poly:
++      return lower_sysval_to_root_table(b, intrin, draw.index_size);
++   case nir_intrinsic_load_first_vertex:
++      /* Lower only compute shaders */
++      if (*(bool *)data) {
++         uint32_t root_table_offset =
++            kk_root_descriptor_offset(draw.base_vertex_addr);
++         b->cursor = nir_instr_remove(&intrin->instr);
++         assert((root_table_offset & 3) == 0 && "aligned");
++
++         nir_def *addr = load_root(b, intrin->def.num_components, 64u,
++                                   nir_imm_int(b, root_table_offset), 4);
++
++         nir_def *val = nir_load_global(b, 1u, intrin->def.bit_size, addr);
++
++         nir_def_rewrite_uses(&intrin->def, val);
++         return true;
++      }
++      return false;
++   case nir_intrinsic_load_base_instance:
++      /* Lower only compute shaders */
++      if (*(bool *)data) {
++         uint32_t root_table_offset =
++            kk_root_descriptor_offset(draw.base_instance_addr);
++         b->cursor = nir_instr_remove(&intrin->instr);
++         assert((root_table_offset & 3) == 0 && "aligned");
++
++         nir_def *addr = load_root(b, intrin->def.num_components, 64u,
++                                   nir_imm_int(b, root_table_offset), 4);
++
++         nir_def *val = nir_load_global(b, 1u, intrin->def.bit_size, addr);
++
++         nir_def_rewrite_uses(&intrin->def, val);
++         return true;
++      }
++      return false;
++   default:
++      return false;
++   }
++}
++
++bool
++kk_nir_lower_poly(struct nir_shader *nir)
++{
++   bool is_compute = nir->info.stage == MESA_SHADER_COMPUTE;
++   return nir_shader_intrinsics_pass(nir, lower_poly, nir_metadata_control_flow,
++                                     &is_compute);
++}
+
+--- src/kosmickrisp/vulkan/kk_nir_lower_vbo.c
++++ src/kosmickrisp/vulkan/kk_nir_lower_vbo.c
+@@ -17,9 +17,6 @@
+ 
+ struct ctx {
+    struct kk_attribute *attribs;
+-   bool requires_vertex_id;
+-   bool requires_instance_id;
+-   bool requires_base_instance;
+    bool requires_robustness2;
+ };
+ 
+@@ -165,22 +162,19 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
+    nir_def *el;
+    if (attrib.instanced) {
+       if (attrib.divisor > 0) {
+-         /* Metal's instance_id has base_instance included */
+-         nir_def *instance_id =
+-            nir_isub(b, nir_load_instance_id(b), nir_load_base_instance(b));
+-         el = nir_udiv_imm(b, instance_id, attrib.divisor);
+-         ctx->requires_instance_id = true;
++         el = nir_udiv_imm(b, nir_load_instance_id(b), attrib.divisor);
++         BITSET_SET(b->shader->info.system_values_read,
++                    SYSTEM_VALUE_INSTANCE_ID);
+       } else
+          el = nir_imm_int(b, 0);
+ 
+       el = nir_iadd(b, el, nir_load_base_instance(b));
+-      ctx->requires_base_instance = true;
+ 
+       BITSET_SET(b->shader->info.system_values_read,
+                  SYSTEM_VALUE_BASE_INSTANCE);
+    } else {
+       el = nir_load_vertex_id(b);
+-      ctx->requires_vertex_id = true;
++      BITSET_SET(b->shader->info.system_values_read, SYSTEM_VALUE_VERTEX_ID);
+    }
+ 
+    /* Load the pointer of the buffer from the argument buffer */
+@@ -283,14 +277,6 @@ kk_nir_lower_vbo(nir_shader *nir, struct kk_attribute *attribs,
+       .attribs = attribs,
+       .requires_robustness2 = robustness2,
+    };
+-   bool progress =
+-      nir_shader_intrinsics_pass(nir, pass, nir_metadata_control_flow, &ctx);
+-
+-   if (ctx.requires_instance_id)
+-      BITSET_SET(nir->info.system_values_read, SYSTEM_VALUE_INSTANCE_ID);
+-   if (ctx.requires_base_instance)
+-      BITSET_SET(nir->info.system_values_read, SYSTEM_VALUE_BASE_INSTANCE);
+-   if (ctx.requires_vertex_id)
+-      BITSET_SET(nir->info.system_values_read, SYSTEM_VALUE_VERTEX_ID);
+-   return progress;
++   return nir_shader_intrinsics_pass(nir, pass, nir_metadata_control_flow,
++                                     &ctx);
+ }
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -227,6 +227,7 @@ kk_get_device_features(
+       .shaderStorageImageReadWithoutFormat = true,
+       .shaderStorageImageWriteWithoutFormat = true,
+       .shaderUniformBufferArrayDynamicIndexing = true,
++      .tessellationShader = true,
+       .textureCompressionASTC_LDR = true,
+       .textureCompressionBC = true,
+       .textureCompressionETC2 = true,
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+
+--- src/kosmickrisp/vulkan/kk_shader.h
++++ src/kosmickrisp/vulkan/kk_shader.h
+@@ -19,22 +19,52 @@
+ 
+ struct kk_cmd_buffer;
+ 
++struct kk_tess_info {
++   enum tess_primitive_mode mode : 8;
++   enum gl_tess_spacing spacing  : 8;
++   bool points;
++   bool ccw;
++};
++static_assert(sizeof(struct kk_tess_info) == 4, "packed");
++
++static struct kk_tess_info
++kk_tess_info_merge(struct kk_tess_info a, struct kk_tess_info b)
++{
++   static_assert(TESS_PRIMITIVE_UNSPECIFIED == 0, "zero state");
++   static_assert(TESS_SPACING_UNSPECIFIED == 0, "zero state");
++
++   /* Just merge by OR'ing the raw bits */
++   uint32_t x, y;
++   memcpy(&x, &a, sizeof(x));
++   memcpy(&y, &b, sizeof(y));
++
++   x |= y;
++
++   struct kk_tess_info out;
++   memcpy(&out, &x, sizeof(out));
++   return out;
++}
++
+ struct kk_shader_info {
+    mesa_shader_stage stage;
+    bool uses_per_draw_data;
++
++   /* Required for fragment shader cull distance discards. */
++   uint8_t num_cull_distances;
++
+    union {
+       /* Vertex shader is the pipeline, store all relevant data here. */
+       struct {
+-         /* Required for serialization. */
+-         char *frag_msl_code;
+-         char *frag_entrypoint_name;
++         /* Required to know which extra states does the pipeline contain for
++          * serialization. */
++         uint32_t additional_stages_bits;
++
++         uint32_t tess_local_thread_size;
+ 
+          /* Data needed to start render pass and bind pipeline. */
+          uint32_t attribs_read;
+          uint32_t sample_count;
+-
+-         /* Required for fragment shader cull distance discards. */
+-         uint8_t num_cull_distances;
++         uint64_t outputs_written;
+ 
+          /* Data needed for serialization. */
+          enum mtl_primitive_topology_class topology;
+@@ -60,6 +90,15 @@ struct kk_shader_info {
+          bool has_stencil_test;
+       } vs;
+ 
++      struct {
++         uint64_t tcs_per_vertex_outputs;
++         uint32_t tcs_output_stride;
++         uint8_t tcs_output_patch_size;
++         uint8_t tcs_nr_patch_outputs;
++
++         struct kk_tess_info info;
++      } tess;
++
+       struct {
+          struct mtl_size local_size;
+       } cs;
+@@ -70,8 +109,11 @@ struct kk_shader_info {
+ struct kk_pipeline_handles {
+    union {
+       struct {
+-         mtl_render_pipeline_state *handle;
++         mtl_render_pipeline_state *render;
++         /* Vertex, tess ctrl and tess eval at most needed before pre-render. */
++         mtl_compute_pipeline_state *pre_render[3];
+          mtl_depth_stencil_state *ds_handle;
++         uint32_t pre_render_count;
+       } gfx;
+       mtl_compute_pipeline_state *cs;
+    };
+@@ -82,8 +124,8 @@ struct kk_shader {
+ 
+    struct kk_pipeline_handles pipeline;
+    struct kk_shader_info info;
+-   const char *entrypoint_name;
+-   const char *msl_code;
++   char *msl_shaders[MESA_SHADER_STAGES];
++   char *entrypoint_names[MESA_SHADER_STAGES];
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
+@@ -111,6 +153,7 @@ kk_nir_lower_descriptors(nir_shader *nir,
+                          uint32_t set_layout_count,
+                          struct vk_descriptor_set_layout *const *set_layouts);
+ 
++bool kk_nir_lower_poly(struct nir_shader *nir);
+ bool kk_nir_lower_null_images(nir_shader *nir);
+ 
+ bool kk_nir_lower_textures(nir_shader *nir);
+

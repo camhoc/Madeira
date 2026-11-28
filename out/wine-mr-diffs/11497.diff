@@ -1,0 +1,19 @@
+# win32u: Do not discard dmPosition in add_modes
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11497 state=opened
+# When modes_count == 1, physical is set to \*modes, but this is actually not equivalent to just setting to \*current (which theoretically should be the same mode) since \*current also carries information about positioning. Strictly speaking, positioning information shouldn't be part of the supported modes.
+
+I think under all circumstances setting the physical mode to the current mode is the desired behaviour, and ensures that win32 is aware of the actual virtual monitor size.
+
+Without this change, (at least for Wayland) NtUserGetSystemMetrics(SM_CXVIRTUALSCREEN) will only return the width of the largest attached screen (same for `Y`).
+--- dlls/win32u/sysparams.c
++++ dlls/win32u/sysparams.c
+@@ -2217,7 +2217,7 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
+         modes_count = 1;
+     }
+ 
+-    physical = modes_count == 1 ? *modes : *current;
++    if (current) physical = *current;
+     if (ctx->is_primary) ctx->primary = *current;
+ 
+     detached.dmPelsWidth = 0;
+

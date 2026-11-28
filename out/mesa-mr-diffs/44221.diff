@@ -1,0 +1,57 @@
+# kk: Add a device-local-only memory type
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44221 state=opened
+# Hi, I've been poking at getting Zink to work inside a UTM VM on my M1 Pro. The setup there is Zink in the guest talking to KosmicKrisp on the host through Venus (the Vulkan-over-virtio driver that VMs use).
+
+Venus needs the guest to be able to map anything host-visible, so on the host side it imports every host-visible allocation as a host pointer. That's fine for buffers, but kk can't make heap textures out of host-pointer memory, and since kk only advertises one memory type, and it's host-visible, Zink ends up putting every image there. First blit into one of them and the render server dies.
+
+The fix is just to also advertise a plain DEVICE_LOCAL type on the same heap. MoltenVK and lavapipe both do this on unified memory, so it's the usual shape. It has to go before the host-visible one because of the spec rule that a type whose flags are a strict subset of another's must be listed first. I also made vkGetMemoryHostPointerPropertiesEXT report only the host-visible type, since that's the only one a host pointer import makes sense for.
+--- src/kosmickrisp/vulkan/kk_device_memory.c
++++ src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -79,8 +79,7 @@ kk_GetMemoryHostPointerPropertiesEXT(
+    default:
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    }
+-   pMemoryHostPointerProperties->memoryTypeBits =
+-      BITFIELD_MASK(pdev->mem_type_count);
++   pMemoryHostPointerProperties->memoryTypeBits = pdev->host_visible_mem_types;
+ 
+    return VK_SUCCESS;
+ }
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1184,13 +1184,22 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
+       .used = kk_get_sysmem_heap_used,
+    };
+ 
++   /* Must precede the host-visible type: the spec orders a type whose
++    * propertyFlags are a strict subset of another's first. */
+    pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
++      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++      .heapIndex = sysmem_heap_idx,
++   };
++
++   uint32_t host_visible_idx = pdev->mem_type_count++;
++   pdev->mem_types[host_visible_idx] = (VkMemoryType){
+       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+       .heapIndex = sysmem_heap_idx,
+    };
++   pdev->host_visible_mem_types = BITFIELD_BIT(host_visible_idx);
+ 
+    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
+    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
+
+--- src/kosmickrisp/vulkan/kk_physical_device.h
++++ src/kosmickrisp/vulkan/kk_physical_device.h
+@@ -68,6 +68,7 @@ struct kk_physical_device {
+    // TODO: add mapable VRAM heap if possible
+    struct kk_memory_heap mem_heaps[3];
+    VkMemoryType mem_types[3];
++   uint32_t host_visible_mem_types;
+    uint8_t mem_heap_count;
+    uint8_t mem_type_count;
+ 
+

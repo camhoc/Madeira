@@ -1,0 +1,74 @@
+# opengl32: Keep the Vulkan mapping of a wow64 buffer storage across map/unmap cycles.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12384 state=closed
+# Fixes https://bugs.winehq.org/show_bug.cgi?id=60354.
+
+The wow64 buffer storage path (MR !9032) maps the imported Vulkan memory on every `glMapBufferRange()` and unmaps it on every `glUnmapBuffer()`. 32-bit wined3d does not keep its buffer objects mapped (`wined3d_map_persistent()` is false there) and maps and unmaps the 64 MiB allocator chunk around every upload, so each upload becomes a `vkMapMemory2KHR()`/`vkUnmapMemory2KHR()` pair. The NVIDIA driver re-creates the mapping on every cycle with two 64 MiB `mmap()` calls (`PROT_NONE` over the range to release it, `MAP_SHARED` on `/dev/nvidiactl` to map it again) plus control ioctls.
+
+Measured with vatSys (32-bit .NET application, SharpDX Direct2D on D3D11) on an RTX 2000 Ada, driver 580.178.04, Wine 11.0 based wow64 build (the code in question is unchanged in current master); `strace -c` over 3 s on the wined3d command stream thread:
+
+| | before | after |
+|---|---:|---:|
+| `mmap` | 5760 | 206 |
+| of these 64 MiB | 5760 | 0 |
+| `ioctl` | 17861 | 2440 |
+| `openat("/dev/nvidiactl")` | 2988 | 126 |
+| time in syscalls | 2.56 s | 0.24 s |
+
+Before the change the thread spent 85 % of its time in the map/unmap cycle, and the application's display lagged by seconds behind input. Bug 60354 reports the same syscall pattern for 32-bit games on a GTX 1660 (driver 615.71.09, Wine 11.18) and attaches a diagnostic patch with the same approach (the mapping logs there count 11,963 `returning vk mapping` for 37 buffers).
+
+The first commit keeps the Vulkan mapping for the lifetime of the buffer. The 32-bit address range is already kept reserved across unmaps (`buffer_vm_alloc()` returns early when `vm_size` suffices), so no additional address space is consumed; the retained mappings only become visible as resident memory of the process.
+
+The second commit gives the `VkApplicationInfo` of the instance created for this path the correct `sType` and an `apiVersion`; the Vulkan loader printed `VkInstanceCreateInfo::pApplicationInfo::apiVersio
+--- dlls/opengl32/unix_wgl.c
++++ dlls/opengl32/unix_wgl.c
+@@ -154,7 +154,7 @@ static void free_buffer( const struct opengl_funcs *funcs, struct buffer *buffer
+ {
+     if (buffer->vk_memory)
+     {
+-        if (buffer->map_ptr) unmap_vk_buffer( buffer );
++        if (buffer->host_ptr) unmap_vk_buffer( buffer );
+         buffer->vk_device->p_vkFreeMemory( buffer->vk_device->vk_device, buffer->vk_memory, NULL );
+     }
+     if (buffer->gl_memory && funcs) funcs->p_glDeleteMemoryObjectsEXT( 1, &buffer->gl_memory );
+@@ -306,9 +306,10 @@ static BOOL initialize_vk_device( TEB *teb, const struct opengl_context *ctx )
+         };
+         VkApplicationInfo app_info =
+         {
+-            .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
++            .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+             .pEngineName = "Wine WGL",
+             .engineVersion = 1,
++            .apiVersion = VK_API_VERSION_1_0,
+         };
+         VkInstanceCreateInfo create_info =
+         {
+@@ -1500,6 +1501,17 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
+         VkResult vr;
+         struct vk_device *vk_device = buffers.vk_device;
+ 
++        /* Keep the Vulkan mapping for the lifetime of the buffer: wined3d maps
++         * and unmaps its allocator chunks around every upload, and some drivers
++         * re-create the whole mapping on every placed map and unmap. The address
++         * range stays reserved across unmaps anyway. */
++        if (buffer->host_ptr)
++        {
++            buffer->map_ptr = (char *)buffer->host_ptr + offset;
++            TRACE( "reusing vk mapping %p\n", buffer->map_ptr );
++            return buffer->map_ptr;
++        }
++
+         if (!buffer_vm_alloc( teb, buffer, buffer->size )) return NULL;
+         placed_info.pPlacedAddress = buffer->vm_ptr;
+         vr = vk_device->p_vkMapMemory2KHR( vk_device->vk_device, &map_info, &buffer->host_ptr );
+@@ -1720,7 +1732,9 @@ static BOOL wow64_unmap_buffer( TEB *teb, struct buffer *buffer )
+             set_gl_error( teb, GL_INVALID_OPERATION );
+             return FALSE;
+         }
+-        unmap_vk_buffer( buffer );
++        /* end the GL mapping but keep the Vulkan mapping, see wow64_map_buffer() */
++        buffer->map_ptr = NULL;
++        return TRUE;
+     }
+ 
+     if (buffer->copy_length)
+

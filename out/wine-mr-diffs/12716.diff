@@ -1,0 +1,692 @@
+# Add support for ARM64 on macOS
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12716 state=merged
+# This MR adds support for ARM64 Wine on macOS.
+
+Two new configure options are added: `--enable-codesign-identity` and `--enable-provisioning-profile`.
+A restricted entitlement is needed to run Wine, and an Apple developer account is needed to obtain a signing certificate and provisioning profile that must be passed to `configure`. I've created a wiki page (still something of a work-in-progress) outlining the steps: https://gitlab.winehq.org/wine/wine/-/wikis/MacOS-Building/ARM64-Provisioning-Profiles. I'll also be adding instructions to https://gitlab.winehq.org/wine/wine/-/wikis/MacOS-Building soon.
+
+Also, note that macOS 27 is required. Although the needed APIs are present in macOS 26.5, the position of the dyld shared cache prevents PAGEZERO from reserving the entire low 8GB. This can prevent particularly large, non-relocatable EXEs from loading. On macOS 27, PAGEZERO can reserve the entire low 8GB and the dyld shared cache loads elsewhere.
+--- dlls/ntdll/unix/loader.c
++++ dlls/ntdll/unix/loader.c
+@@ -389,7 +389,11 @@ static void init_paths(void)
+ 
+     if ((build_dir = remove_tail( ntdll_dir, "/dlls/ntdll" )))
+     {
++#if defined(__APPLE__) && defined(__aarch64__)
++        wineloader = build_path( build_dir, "loader/wine.app/Contents/MacOS/wine" );
++#else
+         wineloader = build_path( build_dir, "loader/wine" );
++#endif
+         alt_build_dir = realpath_dirname( build_path( build_dir, "loader-wow64" ));
+     }
+     else
+@@ -397,7 +401,11 @@ static void init_paths(void)
+         if (!(dll_dir = remove_tail( ntdll_dir, get_so_dir(current_machine) ))) dll_dir = ntdll_dir;
+         bin_dir = build_relative_path( dll_dir, LIBDIR "/wine", BINDIR );
+         data_dir = build_relative_path( dll_dir, LIBDIR "/wine", DATADIR "/wine" );
++#if defined(__APPLE__) && defined(__aarch64__)
++        wineloader = build_path( ntdll_dir, "wine.app/Contents/MacOS/wine" );
++#else
+         wineloader = build_path( ntdll_dir, "wine" );
++#endif
+     }
+ 
+     set_dll_path();
+@@ -451,6 +459,13 @@ static void preloader_exec( char **argv )
+ #endif
+     execv( argv[0], argv );
+     free( argv[0] );
++#elif defined(__APPLE__) && defined(__aarch64__)
++    posix_spawnattr_t attr;
++    posix_spawnattr_init( &attr );
++    posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETEXEC );
++    posix_spawnattr_set_4k_page_size_np( &attr );
++    posix_spawn( NULL, argv[1], NULL, &attr, argv + 1, *_NSGetEnviron() );
++    posix_spawnattr_destroy( &attr );
+ #endif
+     execv( argv[1], argv + 1 );
+ }
+
+--- dlls/ntdll/unix/signal_arm64.c
++++ dlls/ntdll/unix/signal_arm64.c
+@@ -50,6 +50,9 @@
+ #ifdef HAVE_SYS_UCONTEXT_H
+ # include <sys/ucontext.h>
+ #endif
++#ifdef __APPLE__
++# include <os/arch/arm64.h>
++#endif
+ 
+ #include "ntstatus.h"
+ #include "windef.h"
+@@ -305,6 +308,44 @@ static void restore_fpu( const CONTEXT *context, ucontext_t *sigcontext )
+ #endif
+ }
+ 
++/***********************************************************************
++ *           init_handler
++ */
++static inline struct thread_data *init_handler( ucontext_t *sigcontext )
++{
++#ifdef __APPLE__
++    /* If enabled, disable the custom x18 ABI and set the low bit of uc_link for later reference. */
++    if (os_custom_x18_abi_enabled())
++    {
++        os_set_custom_x18_abi_enabled( false );
++        sigcontext->uc_link = (void *)((uintptr_t)sigcontext->uc_link | 0x1);
++    }
++#endif
++    return get_thread_data();
++}
++
++
++/***********************************************************************
++ *           leave_handler
++ */
++static inline void leave_handler( struct thread_data *data, ucontext_t *sigcontext )
++{
++#ifdef __APPLE__
++    if (!is_inside_signal_stack( data, (void *)SP_sig(sigcontext )) &&
++        !is_inside_syscall( data, SP_sig(sigcontext )))
++    {
++        os_set_custom_x18_abi_enabled( true );
++    }
++    else
++    {
++        /* Could be returning to PE or not: restore the x18 ABI state from when the signal was raised. */
++        if ((uintptr_t)sigcontext->uc_link & 0x1)
++            os_set_custom_x18_abi_enabled( true );
++    }
++    sigcontext->uc_link = (void *)((uintptr_t)sigcontext->uc_link & ~0x1);
++#endif
++}
++
+ 
+ /***********************************************************************
+  *           save_context
+@@ -357,6 +398,7 @@ static void restore_context( struct thread_data *data, const CONTEXT *context, u
+     PSTATE_sig(sigcontext) = (PSTATE_sig(sigcontext) & ~cpsr_user_mask) | (context->Cpsr & cpsr_user_mask);
+     for (i = 0; i <= 28; i++) REGn_sig( i, sigcontext ) = context->X[i];
+     restore_fpu( context, sigcontext );
++    leave_handler( data, sigcontext );
+ }
+ 
+ 
+@@ -839,6 +881,7 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
+     SP_sig(sigcontext) = (ULONG_PTR)stack;
+     PC_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
+     REGn_sig(18, sigcontext) = (ULONG_PTR)data->teb;
++    leave_handler( data, sigcontext );
+ }
+ 
+ 
+@@ -946,6 +989,16 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
+                    "stp d12, d13, [x29, #0x80]\n\t"
+                    "stp d14, d15, [x29, #0x90]\n\t"
+                    "stp x1, x2, [x29, #0xa0]\n\t" /* ret_ptr, ret_len */
++#ifdef __APPLE__
++                   "mov x20, x0\n\t"
++                   "mov x21, x3\n\t"
++                   "mov x22, x4\n\t"
++                   "mov x0, #1\n\t"
++                   "bl " __ASM_NAME("os_set_custom_x18_abi_enabled") "\n\t"
++                   "mov x4,  x22\n\t"
++                   "mov x3,  x21\n\t"
++                   "mov x0,  x20\n\t"
++#endif
+                    "mov x18, x4\n\t"              /* teb */
+                    "mrs x1, fpcr\n\t"
+                    "mrs x2, fpsr\n\t"
+@@ -1156,7 +1209,7 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *context,
+     {
+         TRACE( "returning to user mode ip=%p ret=%08x\n", (void *)frame->pc, rec->ExceptionCode );
+         REGn_sig(0, context)  = rec->ExceptionCode;
+-        REGn_sig(18, context) = (ULONG_PTR)data->teb;
++        REGn_sig(1, context)  = (ULONG_PTR)data->teb;
+         SP_sig(context)       = (ULONG_PTR)frame;
+         PC_sig(context)       = (ULONG_PTR)__wine_syscall_dispatcher_return;
+         return TRUE;
+@@ -1173,7 +1226,7 @@ static BOOL handle_syscall_fault( struct thread_data *data, ucontext_t *context,
+ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
+     ucontext_t *sigcontext = _sigcontext;
+-    struct thread_data *data = get_thread_data();
++    struct thread_data *data = init_handler( sigcontext );
+     CONTEXT context;
+     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)PC_sig(sigcontext) };
+     DWORD64 esr = get_fault_esr( sigcontext );
+@@ -1207,7 +1260,11 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
+     rec.NumberParameters = 2;
+ 
+-    if (!virtual_handle_fault( data, &rec, (void *)SP_sig(sigcontext) )) return;
++    if (!virtual_handle_fault( data, &rec, (void *)SP_sig(sigcontext) ))
++    {
++        leave_handler( data, sigcontext );
++        return;
++    }
+     if (handle_syscall_fault( data, sigcontext, &rec )) return;
+ 
+     save_context( &context, sigcontext );
+@@ -1223,7 +1280,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ static void ill_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
+     ucontext_t *sigcontext = _sigcontext;
+-    struct thread_data *data = get_thread_data();
++    struct thread_data *data = init_handler( sigcontext );
+     CONTEXT context;
+     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION,
+                              .ExceptionAddress = (void *)PC_sig(sigcontext) };
+@@ -1238,6 +1295,7 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+             /* ignore writes to xzr */
+             if (reg != 31) REGn_sig(reg, sigcontext) = 0;
+             PC_sig(sigcontext) += 4;
++            leave_handler( data, sigcontext );
+             return;
+         }
+     }
+@@ -1255,7 +1313,7 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
+     ucontext_t *sigcontext = _sigcontext;
+-    struct thread_data *data = get_thread_data();
++    struct thread_data *data = init_handler( sigcontext );
+     CONTEXT context;
+     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION,
+                              .ExceptionAddress = (void *)PC_sig(sigcontext) };
+@@ -1322,7 +1380,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ static void fpe_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
+     ucontext_t *sigcontext = _sigcontext;
+-    struct thread_data *data = get_thread_data();
++    struct thread_data *data = init_handler( sigcontext );
+     CONTEXT context;
+     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)PC_sig(sigcontext) };
+ 
+@@ -1382,12 +1440,17 @@ static void fpe_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+  */
+ static void int_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
++    ucontext_t *sigcontext = _sigcontext;
++    struct thread_data *data = init_handler( sigcontext );
+     HANDLE handle;
+ 
+-    if (!p__wine_ctrl_routine) return;
+-    if (!NtCreateThreadEx( &handle, THREAD_ALL_ACCESS, NULL, NtCurrentProcess(),
+-                           p__wine_ctrl_routine, 0 /* CTRL_C_EVENT */, 0, 0, 0, 0, NULL ))
+-        NtClose( handle );
++    if (p__wine_ctrl_routine)
++    {
++        if (!NtCreateThreadEx( &handle, THREAD_ALL_ACCESS, NULL, NtCurrentProcess(),
++                               p__wine_ctrl_routine, 0 /* CTRL_C_EVENT */, 0, 0, 0, 0, NULL ))
++            NtClose( handle );
++    }
++    leave_handler( data, sigcontext );
+ }
+ 
+ 
+@@ -1399,7 +1462,7 @@ static void int_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
+     ucontext_t *sigcontext = _sigcontext;
+-    struct thread_data *data = get_thread_data();
++    struct thread_data *data = init_handler( sigcontext );
+     CONTEXT context;
+     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_WINE_ASSERTION,
+                              .ExceptionFlags = EXCEPTION_NONCONTINUABLE,
+@@ -1418,7 +1481,7 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ static void quit_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
+     ucontext_t *sigcontext = _sigcontext;
+-    struct thread_data *data = get_thread_data();
++    struct thread_data *data = init_handler( sigcontext );
+ 
+     if (is_inside_syscall( data, SP_sig(sigcontext) )) abort_thread(0);
+     user_mode_abort_thread( 0, get_syscall_frame( data ));
+@@ -1458,7 +1521,7 @@ static void save_syscall_entry_frame( ucontext_t *sigcontext )
+ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
+     ucontext_t *sigcontext = _sigcontext;
+-    struct thread_data *data = get_thread_data();
++    struct thread_data *data = init_handler( sigcontext );
+     CHPE_V2_CPU_AREA_INFO *chpe;
+     CONTEXT context;
+ 
+@@ -1521,7 +1584,9 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+         context.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
+         wait_suspend( &context );
+         restore_context( data, &context, sigcontext );
++        return;
+     }
++    leave_handler( data, sigcontext );
+ }
+ 
+ 
+@@ -1533,12 +1598,16 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
+     ucontext_t *sigcontext = _sigcontext;
+-    struct thread_data *data = get_thread_data();
++    struct thread_data *data = init_handler( sigcontext );
+     struct syscall_frame *frame = get_syscall_frame( data );
+     DWORD i;
+ 
+-    if (!is_inside_syscall( data, SP_sig(sigcontext) )) return;
+-    if (!frame) return;
++    if (!is_inside_syscall( data, SP_sig(sigcontext) ) ||
++        !frame)
++    {
++        leave_handler( data, sigcontext );
++        return;
++    }
+ 
+     if (is_emulated_code( frame->pc ))
+     {
+@@ -1575,6 +1644,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     sigcontext->uc_mcontext->__ns.__fpsr = frame->fpsr;
+     memcpy( sigcontext->uc_mcontext->__ns.__v, frame->v, sizeof(frame->v) );
+ #endif
++    leave_handler( data, sigcontext );
+ }
+ 
+ 
+@@ -1649,6 +1719,9 @@ void signal_init_process( TEB *teb )
+  */
+ void syscall_dispatcher_return_slowpath(void)
+ {
++#ifdef __APPLE__
++    os_set_custom_x18_abi_enabled( false );
++#endif
+     raise( SIGUSR2 );
+ }
+ 
+@@ -1813,10 +1886,25 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    __ASM_CFI(".cfi_offset 28, -0x68\n\t")
+                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_kernel_stack") ":\n\t"
+                    "mov x22, sp\n\t"
++                   "mov x24, x18\n\t"
+                    __ASM_CFI_CFA_IS_AT2(x22, 0x98, 0x02) /* frame->syscall_cfa */
++#ifdef __APPLE__
++                   "stp x0, x1, [sp, #-0x50]!\n\t"
++                   "stp x2, x3, [sp, #0x10]\n\t"
++                   "stp x4, x5, [sp, #0x20]\n\t"
++                   "stp x6, x7, [sp, #0x30]\n\t"
++                   "str x8,     [sp, #0x40]\n\t"
++                   "mov x0, xzr\n\t"
++                   "bl " __ASM_NAME("os_set_custom_x18_abi_enabled") "\n\t"
++                   "ldp x2, x3, [sp, #0x10]\n\t"
++                   "ldp x4, x5, [sp, #0x20]\n\t"
++                   "ldp x6, x7, [sp, #0x30]\n\t"
++                   "ldr x8,     [sp, #0x40]\n\t"
++                   "ldp x0, x1, [sp], #0x50\n\t"
++#endif
+                    "and x20, x8, #0xfff\n\t"    /* syscall number */
+                    "ubfx x21, x8, #12, #2\n\t"  /* syscall table number */
+-                   "ldr x16, [x18, #0x370]\n\t" /* thread_data->syscall_table */
++                   "ldr x16, [x24, #0x370]\n\t" /* thread_data->syscall_table */
+                    "add x21, x16, x21, lsl #5\n\t"
+                    "ldr x16, [x21, #16]\n\t"    /* table->ServiceLimit */
+                    "cmp x20, x16\n\t"
+@@ -1834,12 +1922,18 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "cbnz x9, 1b\n"
+                    "2:\tldr x16, [x21]\n\t"     /* table->ServiceTable */
+                    "ldr x23, [x16, x20, lsl 3]\n\t"
+-                   "ldr w11, [x18, #0x380]\n\t" /* thread_data->syscall_trace */
++                   "ldr w11, [x24, #0x380]\n\t" /* thread_data->syscall_trace */
+                    "cbnz x11, " __ASM_LOCAL_LABEL("trace_syscall") "\n\t"
+                    "blr x23\n\t"
+                    "mov sp, x22\n"
+                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
+                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
++#ifdef __APPLE__
++                   "mov x21, x0\n\t"
++                   "mov x0, #1\n\t"
++                   "bl " __ASM_NAME("os_set_custom_x18_abi_enabled") "\n\t"
++                   "mov x0, x21\n\t"
++#endif
+                    "ldr w16, [sp, #0x10c]\n\t"  /* frame->restore_flags */
+                    "tbz x16, #16, 1f\n\t"       /* RESTORE_FLAGS_EMULATION */
+                    "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n"
+@@ -1924,7 +2018,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "b " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
+ 
+ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
+-                   "ldr w11, [x18, #0x380]\n\t" /* thread_data->syscall_trace */
++                   "ldr w11, [x1, #0x380]\n\t" /* thread_data->syscall_trace */
+                    "cbnz x11, " __ASM_LOCAL_LABEL("trace_syscall_ret") "\n\t"
+                    "b " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
+ 
+@@ -1970,10 +2064,25 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    __ASM_CFI_CFA_IS_AT2(x19, 0x98, 0x02) /* frame->syscall_cfa */
+                    "ldr x16, [x0, x1, lsl 3]\n\t"
+                    "mov x0, x2\n\t"             /* args */
++#ifdef __APPLE__
++                   "mov x20, x0\n\t"
++                   "mov x21, x16\n\t"
++                   "mov x0, xzr\n\t"
++                   "bl " __ASM_NAME("os_set_custom_x18_abi_enabled") "\n\t"
++                   "mov x16, x21\n\t"
++                   "mov x0,  x20\n\t"
++#endif
+                    "blr x16\n\t"
+                    "ldr w16, [sp, #0x10c]\n\t"  /* frame->restore_flags */
+                    "cbnz w16, " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") "\n\t"
+                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
++#ifdef __APPLE__
++                   "mov x20, x0\n\t"
++                   "mov x0, #1\n\t"
++                   "bl " __ASM_NAME("os_set_custom_x18_abi_enabled") "\n\t"
++                   "mov x0,  x20\n\t"
++                   "ldp x20, x21, [sp, #0xa0]\n\t"
++#endif
+                    "ldp x18, x19, [sp, #0x90]\n\t"
+                    "ldp x16, x17, [sp, #0xf8]\n\t"
+                    /* switch to user stack */
+
+--- loader/Makefile.in
++++ loader/Makefile.in
+@@ -16,6 +16,12 @@ wine_OBJS = main.o
+ wine_DEPS = $(WINELOADER_DEPENDS)
+ wine_LDFLAGS = $(WINELOADER_LDFLAGS) $(LDEXECFLAGS) $(PTHREAD_LIBS)
+ 
++wine_app_OBJS = main.o
++wine_app_DEPS = wine_arm64_entitlements.plist
++wine_app_LDFLAGS = $(WINELOADER_LDFLAGS) $(LDEXECFLAGS) $(PTHREAD_LIBS)
++wine_app_INFO_PLIST = wine_info.plist
++wine_app_CODESIGN_FLAGS = -s "$(CODESIGN_IDENTITY)" -f --entitlements $(srcdir)/wine_arm64_entitlements.plist
++
+ wine_preloader_OBJS = preloader.o preloader_mac.o
+ wine_preloader_DEPS = $(WINELOADER_DEPENDS)
+ wine_preloader_LDFLAGS = $(WINEPRELOADER_LDFLAGS)
+
+--- loader/main.c
++++ loader/main.c
+@@ -35,33 +35,55 @@
+ # include <sys/sysctl.h>
+ #endif
+ #ifdef __APPLE__
++# include <crt_externs.h>
++# include <dlfcn.h>
+ # include <mach-o/dyld.h>
++# include <mach-o/getsect.h>
+ #endif
+ 
+ #include "main.h"
+ 
+-#if defined(__APPLE__) && defined(__x86_64__) && !defined(HAVE_WINE_PRELOADER)
++#if defined(__APPLE__) && !defined(HAVE_WINE_PRELOADER)
+ 
+-/* Not using the preloader on x86_64:
+- * Reserve the same areas as the preloader does, but using zero-fill sections
+- * (the only way to prevent system frameworks from using them, including allocations
+- * before main() runs).
++/* Not using the preloader (ARM64, or x86_64 with Xcode 15.3+):
++ * On x86_64, PAGEZERO is one 4K page and then a zero-fill WINE_RESERVE
++ * section is used to reserve the low 8GB of address space.
++ *
++ * On ARM64, PAGEZERO is used to reserve the low 8GB of address space.
+  */
++#ifdef __x86_64__
+ __asm__(".zerofill WINE_RESERVE,WINE_RESERVE");
+ static char __wine_reserve[0x1fffff000] __attribute__((section("WINE_RESERVE, WINE_RESERVE")));
++#endif
+ 
+-static const struct wine_preload_info preload_info[] =
++static struct wine_preload_info preload_info[] =
+ {
++#ifdef __x86_64__
+     { __wine_reserve,  sizeof(__wine_reserve)  }, /*         0x1000 -    0x200000000: low 8GB */
++#else
++    { (void *)0x1000, 0 },                        /*         0x1000 - end of PAGEZERO */
++#endif
+     { 0, 0 }                                      /* end of list */
+ };
+ 
+-const __attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = preload_info;
++__attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = preload_info;
+ 
+ static void init_reserved_areas(void)
+ {
+     int i;
+ 
++#ifndef __x86_64__
++    Dl_info dli;
++    /* Fill in the size of PAGEZERO */
++    if (dladdr( __func__, &dli ))
++    {
++        unsigned long size = 0;
++        getsegmentdata( dli.dli_fbase, "__PAGEZERO", &size );
++        if (size)
++            wine_main_preload_info[0].size = size - (intptr_t)wine_main_preload_info[0].addr;
++    }
++#endif
++
+     for (i = 0; wine_main_preload_info[i].size != 0; i++)
+     {
+         /* Match how the preloader maps reserved areas: */
+@@ -153,6 +175,10 @@ static void *try_dlopen( const char *argv0 )
+ 
+     if ((p = remove_tail( dir, "/loader" )))
+         path = build_path( p, "dlls/ntdll/ntdll.so" );
++#if defined(__APPLE__) && defined(__aarch64__)
++    else if ((p = remove_tail( dir, "/wine.app/Contents/MacOS" )))
++        path = build_path( p, "ntdll.so" );
++#endif
+     else
+         path = build_path( dir, "ntdll.so" );
+ 
+
+--- loader/wine_arm64_entitlements.plist
++++ loader/wine_arm64_entitlements.plist
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++	<key>com.apple.developer.cross-architecture-support</key>
++	<true/>
++</dict>
++</plist>
+
+--- tools/makedep.c
++++ tools/makedep.c
+@@ -160,6 +160,8 @@ static const char *ln_s;
+ static const char *sed_cmd;
+ static const char *wayland_scanner;
+ static const char *sarif_converter;
++static const char *provisioning_profile;
++static const char *codesign;
+ static const char *buildimage;
+ static const char *runtest;
+ static const char *install;
+@@ -1919,14 +1921,24 @@ static struct strarray get_expanded_make_var_array( const struct makefile *make,
+ 
+ 
+ /*******************************************************************
+- *         get_expanded_file_local_var
++ *         get_file_local_var
+  */
+-static struct strarray get_expanded_file_local_var( const struct makefile *make, const char *file,
+-                                                    const char *name )
++static char *get_file_local_var( const char *file, const char *name )
+ {
+     char *p, *var = strmake( "%s_%s", file, name );
+ 
+     for (p = var; *p; p++) if (!isalnum( *p )) *p = '_';
++    return var;
++}
++
++
++/*******************************************************************
++ *         get_expanded_file_local_var
++ */
++static struct strarray get_expanded_file_local_var( const struct makefile *make, const char *file,
++                                                    const char *name )
++{
++    char *var = get_file_local_var( file, name );
+     return get_expanded_make_var_array( make, var );
+ }
+ 
+@@ -4207,12 +4219,13 @@ static void output_programs( struct makefile *make )
+ 
+     STRARRAY_FOR_EACH( name, &make->programs )
+     {
+-        const char *install_dir;
++        const char *install_dir = !strcmp( make->obj_dir, "loader" ) ? arch_install_dirs[arch] : "$(bindir)";
+         char *program = strmake( "%s%s", name, exe_ext );
+         struct strarray deps = get_local_dependencies( make, name, make->in_files );
+         struct strarray ldflags  = get_expanded_file_local_var( make, name, "LDFLAGS" );
+         struct strarray objs     = get_expanded_file_local_var( make, name, "OBJS" );
+         struct strarray symlinks = get_expanded_file_local_var( make, name, "SYMLINKS" );
++        struct strarray codesign_flags = get_expanded_file_local_var( make, name, "CODESIGN_FLAGS" );
+         struct strarray all_libs = get_expanded_make_var_array( make, "UNIX_LIBS" );
+ 
+         if (!objs.count) objs = make->object_files[arch];
+@@ -4221,6 +4234,39 @@ static void output_programs( struct makefile *make )
+             strarray_add( &ldflags, "$(LDFLAGS)" );
+             strarray_addall( &all_libs, libs );
+         }
++
++        if (strendswith( name, ".app" ))  /* create a macOS app bundle */
++        {
++            struct strarray bundle_files = empty_strarray;
++            char *appdir = strmake( "%s/Contents", name );
++            char *info_plist = get_expanded_make_variable( make, get_file_local_var( name, "INFO_PLIST" ));
++
++            if (info_plist)
++            {
++                output( "%s/Info.plist:", obj_dir_path( make, appdir ) );
++                output_filename( obj_dir_path( make, info_plist ) );
++                output( "\n" );
++                output( "\t%scp %s $@\n", cmd_prefix( "GEN" ), obj_dir_path( make, info_plist ) );
++                strarray_add( &bundle_files, strmake( "%s/Info.plist", appdir ) );
++            }
++            if (provisioning_profile)
++            {
++                output( "%s/embedded.provisionprofile: %s\n", obj_dir_path( make, appdir ), provisioning_profile );
++                output( "\t%scp %s $@\n", cmd_prefix( "GEN" ), provisioning_profile );
++                strarray_add( &bundle_files, strmake( "%s/embedded.provisionprofile", appdir ) );
++            }
++            output( "%s/PkgInfo:\n", obj_dir_path( make, appdir ) );
++            output( "\t%secho -n \"APPL????\" >$@ || (rm -f $@ && false)\n", cmd_prefix( "GEN" ));
++            strarray_add( &bundle_files, strmake( "%s/PkgInfo", appdir ) );
++
++            strarray_addall( &make->all_targets[arch], bundle_files );
++            STRARRAY_FOR_EACH( file, &bundle_files )
++                install_data_file( make, name, file, strmake( "%s/%s", install_dir, appdir ), NULL );
++
++            program = strmake( "%s/MacOS/%s", appdir, replace_extension( name, ".app", "" ));
++            install_dir = strmake( "%s/%s/MacOS", install_dir, appdir );
++        }
++
+         output( "%s:", obj_dir_path( make, program ) );
+         output_filenames_obj_dir( make, objs );
+         output_filenames( deps );
+@@ -4230,6 +4276,13 @@ static void output_programs( struct makefile *make )
+         output_filenames( all_libs );
+         output_filenames( ldflags );
+         output( "\n" );
++        if (codesign && codesign_flags.count)
++        {
++            output( "\t%s%s", cmd_prefix( "GEN" ), codesign );
++            output_filenames( codesign_flags );
++            output_filename( "$@" );
++            output( "\n" );
++        }
+         strarray_add( &make->all_targets[arch], program );
+ 
+         STRARRAY_FOR_EACH( link, &symlinks )
+@@ -4239,7 +4292,6 @@ static void output_programs( struct makefile *make )
+         }
+         strarray_addall( &make->all_targets[arch], symlinks );
+ 
+-        install_dir = !strcmp( make->obj_dir, "loader" ) ? arch_install_dirs[arch] : "$(bindir)";
+         install_program( make, name, arch, program, install_dir );
+         STRARRAY_FOR_EACH( link, &symlinks )
+             install_program_symlink( make, link, obj_dir_path( make, program ),
+@@ -5151,6 +5203,8 @@ int main( int argc, char *argv[] )
+     ln_s               = get_expanded_make_variable( top_makefile, "LN_S" );
+     wayland_scanner    = get_expanded_make_variable( top_makefile, "WAYLAND_SCANNER" );
+     sarif_converter    = get_expanded_make_variable( top_makefile, "SARIF_CONVERTER" );
++    codesign           = get_expanded_make_variable( top_makefile, "CODESIGN" );
++    provisioning_profile = get_expanded_make_variable( top_makefile, "PROVISIONING_PROFILE" );
+ 
+     if (root_src_dir && !strcmp( root_src_dir, "." )) root_src_dir = NULL;
+     if (tools_dir && !strcmp( tools_dir, "." )) tools_dir = NULL;
+
+--- README.md
++++ README.md
+@@ -46,7 +46,7 @@ To compile and run Wine, you must have one of the following:
+ - FreeBSD 12.4 or later
+ - Solaris x86 9 or later
+ - NetBSD-current
+-- macOS 10.15 or later
++- macOS 10.15 or later (for x86_64), or macOS 27 (for ARM64)
+ 
+ As Wine requires kernel-level thread support to run, only the operating
+ systems mentioned above are supported.  Other operating systems which
+
+--- configure
++++ configure
+
+--- configure.ac
++++ configure.ac
+@@ -90,6 +90,9 @@ AC_ARG_WITH(system-dllpath,AS_HELP_STRING([--with-system-dllpath=PATH],[load ext
+ AC_ARG_WITH(wine-tools,AS_HELP_STRING([--with-wine-tools=DIR],[use Wine tools from directory DIR]))
+ AC_ARG_WITH(wine64,    AS_HELP_STRING([--with-wine64=DIR],[use the 64-bit Wine in DIR for a Wow64 build]))
+ 
++AC_ARG_VAR(CODESIGN_IDENTITY,[Code signing identity to use on ARM64 macOS])
++AC_ARG_VAR(PROVISIONING_PROFILE,[Path to a provisioning profile to use on ARM64 macOS])
++
+ AC_CANONICAL_HOST
+ AC_SUBST(srcdir)
+ 
+@@ -960,6 +963,7 @@ AC_SUBST(UNIXDLLFLAGS,"-fPIC")
+ AC_SUBST(UNIXLDFLAGS,["-shared -Wl,-Bsymbolic -Wl,-soname,\$(UNIXLIB)"])
+ AC_SUBST(TOP_INSTALL_LIB,"")
+ AC_SUBST(TOP_INSTALL_DEV,"")
++AC_SUBST(WINELOADER_PROGRAMS,"wine")
+ AC_SUBST(WINELOADER_LDFLAGS,"")
+ AC_SUBST(WINEPRELOADER_LDFLAGS,"")
+ LIBEXT="so"
+@@ -988,17 +992,27 @@ case $host_os in
+     AC_SUBST(SECURITY_LIBS,"-framework Security -framework CoreFoundation")
+     AC_SUBST(SYSTEMCONFIGURATION_LIBS,"-framework SystemConfiguration")
+ 
+-    WINELOADER_LDFLAGS="-Wl,-segalign,0x1000,-pagezero_size,0x1000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
+-
+     case $HOST_ARCH in
++      aarch64)
++        wine_use_preloader=no
++        WINELOADER_PROGRAMS="wine.app"
++        AS_VAR_APPEND([WINELOADER_LDFLAGS],[" -Wl,-segalign,0x4000,-pagezero_size,0x200000000"])
++        AS_VAR_APPEND([WINELOADER_LDFLAGS],[" -Wl,-no_fixup_chains"])
++        WINE_TRY_CFLAGS([-Wl,-x86_64_layout_emulation],[AS_VAR_APPEND([WINELOADER_LDFLAGS],[" -Wl,-x86_64_layout_emulation"])])
++        AS_VAR_IF([PROVISIONING_PROFILE],[],[WINE_WARNING([No provisioning profile supplied; Wine will crash on launch on an unmodified macOS system.])])
++        AC_PATH_PROG([CODESIGN],[codesign])
++        CODESIGN_IDENTITY=${CODESIGN_IDENTITY:-"-"}
++        AS_VAR_IF([CODESIGN_IDENTITY],[-],[WINE_WARNING([Using ad-hoc code-signing; Wine will crash on launch on an unmodified macOS system.])])
++        ;;
+       x86_64)
++        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-segalign,0x1000,-pagezero_size,0x1000"
++        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
+         dnl If the -no_huge linker option is present (added in Xcode 15.3), use zerofill sections instead of the preloader
+         WINE_TRY_CFLAGS([-Wl,-no_huge],
+            [wine_use_preloader=no
+             WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-no_pie,-image_base,0x200000000,-no_huge,-no_fixup_chains,-segalign,0x1000,-segaddr,WINE_RESERVE,0x1000"],
+            [wine_use_preloader=yes])
+         ;;
+-      *)    wine_use_preloader=no ;;
+     esac
+ 
+     if test "$wine_use_preloader" = "yes"
+@@ -2069,8 +2083,6 @@ fi
+ 
+ dnl **** Platform-specific checks ****
+ 
+-AC_SUBST(WINELOADER_PROGRAMS,"wine")
+-
+ case $host_os in
+   linux*)
+     if test $HOST_ARCH != unknown
+

@@ -1,0 +1,169 @@
+# ntdll,msv1_0: Add fallback paths for systems without posix_spawn().
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/10926 state=closed
+# This adds fallback implementations for posix_spawn() usage in ntdll and msv1_0.
+
+Older Android versions do not provide posix_spawn() or posix_spawnp(). The affected code paths only need simple helper process startup and only distinguish success from failure, so this keeps the existing posix_spawn() implementation where available and uses vfork() with execv()/execvp() otherwise.
+
+The ntdll loader path preserves the existing execv-style behavior for a fully built path. The msv1_0 ntlm_auth path preserves the posix_spawnp-style PATH lookup by using execvp() in the fallback.
+--- dlls/msv1_0/unixlib.c
++++ dlls/msv1_0/unixlib.c
+@@ -28,7 +28,6 @@
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include <errno.h>
+-#include <spawn.h>
+ #include <sys/wait.h>
+ #include "ntstatus.h"
+ #include "windef.h"
+@@ -36,6 +35,10 @@
+ #include "winbase.h"
+ #include "sspi.h"
+ 
++#ifdef HAVE_POSIX_SPAWN
++#include <spawn.h>
++#endif
++
+ #include "wine/debug.h"
+ #include "unixlib.h"
+ 
+@@ -161,9 +164,12 @@ static NTSTATUS ntlm_fork( void *args )
+ {
+     const struct fork_params *params = args;
+     struct ntlm_ctx *ctx = params->ctx;
+-    posix_spawn_file_actions_t file_actions;
+-    int pipe_in[2], pipe_out[2], err;
++    int pipe_in[2], pipe_out[2];
+     NTSTATUS status = STATUS_SUCCESS;
++#ifdef HAVE_POSIX_SPAWN
++    int err;
++    posix_spawn_file_actions_t file_actions;
++#endif
+ 
+ #ifdef HAVE_PIPE2
+     if (pipe2( pipe_in, O_CLOEXEC ) < 0)
+@@ -187,6 +193,7 @@ static NTSTATUS ntlm_fork( void *args )
+         fcntl( pipe_out[1], F_SETFD, FD_CLOEXEC );
+     }
+ 
++#ifdef HAVE_POSIX_SPAWN
+     posix_spawn_file_actions_init( &file_actions );
+ 
+     posix_spawn_file_actions_adddup2( &file_actions, pipe_out[0], 0 );
+@@ -207,13 +214,47 @@ static NTSTATUS ntlm_fork( void *args )
+         status = STATUS_UNSUCCESSFUL;
+     }
+ 
++    posix_spawn_file_actions_destroy( &file_actions );
++#else
++    {
++        volatile int failed = 0;
++        pid_t child = vfork();
++
++        if (!child)
++        {
++            if (dup2( pipe_out[0], 0 ) == -1 || dup2( pipe_in[1], 1 ) == -1)
++            {
++                failed = 1;
++                _exit(127);
++            }
++
++            close( pipe_out[0] );
++            close( pipe_out[1] );
++            close( pipe_in[0] );
++            close( pipe_in[1] );
++
++            execvp( params->argv[0], params->argv );
++            failed = 1;
++            _exit(127);
++        }
++
++        if (child == -1 || failed)
++        {
++            ctx->pid = -1;
++            write( pipe_in[1], "BH\n", 3 );
++            ERR_(winediag)( "Can't start ntlm_auth. "
++                            "Usually you can find it in the winbind package of your distribution.\n" );
++            status = STATUS_UNSUCCESSFUL;
++        }
++        else ctx->pid = child;
++    }
++#endif
++
+     ctx->pipe_in = pipe_in[0];
+     close( pipe_in[1] );
+     ctx->pipe_out = pipe_out[1];
+     close( pipe_out[0] );
+ 
+-    posix_spawn_file_actions_destroy( &file_actions );
+-
+     return status;
+ }
+ 
+
+--- dlls/ntdll/unix/loader.c
++++ dlls/ntdll/unix/loader.c
+@@ -30,7 +30,6 @@
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <signal.h>
+-#include <spawn.h>
+ #include <string.h>
+ #include <stdlib.h>
+ #include <sys/types.h>
+@@ -39,6 +38,9 @@
+ #include <sys/wait.h>
+ #include <unistd.h>
+ #include <dlfcn.h>
++#ifdef HAVE_POSIX_SPAWN
++#include <spawn.h>
++#endif
+ #ifdef HAVE_PWD_H
+ # include <pwd.h>
+ #endif
+@@ -249,10 +251,27 @@ static char *build_relative_path( const char *base, const char *from, const char
+ /* build a path to a binary and exec it */
+ static int build_path_and_exec( pid_t *pid, const char *dir, const char *name, char **argv )
+ {
+-    int ret;
++    int ret = 0;
+ 
+     argv[0] = build_path( dir, name );
++#ifdef HAVE_POSIX_SPAWN
+     ret = posix_spawn( pid, argv[0], NULL, NULL, argv, environ );
++#else
++    {
++        volatile int failed = 0;
++        pid_t child = vfork();
++
++        if (!child)
++        {
++            execv( argv[0], argv );
++            failed = 1;
++            _exit(127);
++        }
++
++        ret = child == -1 || failed ? 127 : 0;
++        if (!ret) *pid = child;
++    }
++#endif
+     free( argv[0] );
+     return ret;
+ }
+
+--- include/config.h.in
++++ include/config.h.in
+
+--- configure
++++ configure
+
+--- configure.ac
++++ configure.ac
+@@ -2119,6 +2119,7 @@ AC_CHECK_FUNCS(\
+ 	port_create \
+ 	posix_fadvise \
+ 	posix_fallocate \
++	posix_spawn \
+ 	prctl \
+ 	process_vm_readv \
+ 	process_vm_writev \
+

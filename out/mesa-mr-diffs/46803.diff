@@ -1,0 +1,145 @@
+# kk,wsi/metal: Support additional HDR formats / color spaces
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46803 state=opened
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+The existing logic in KosmicKrisp only supports a subset of potential HDR texture formats / color spaces, excluding common combinations such as `VK_FORMAT_A2B10G10R10_UNORM_PACK32` / `VK_COLOR_SPACE_HDR10_ST2084_EXT`. This change adds support for additional combinations.
+
+The specific set of texture formats / color spaces that Apple supports EDR with is unfortunately not well documented. There is a diagram shown in a WWDC 2022 presentation (https://developer.apple.com/videos/play/wwdc2022/10113/?time=755), though it is not an exhaustive list. I manually tested combinations of texture formats and color spaces to determine which are supported for EDR.
+
+With this change, the behavior of HDR rendering matches MoltenVK, with the exception that MoltenVK does not support HDR for `VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT`.
+--- src/vulkan/wsi/wsi_common_metal_layer.m
++++ src/vulkan/wsi/wsi_common_metal_layer.m
+@@ -69,58 +69,45 @@ get_mtl_pixel_format(VkFormat format, MTLPixelFormat *metal_format)
+ }
+ 
+ static VkResult
+-get_color_space_info(VkColorSpaceKHR color_space, CGColorSpaceRef *cg_color_space,
+-                     bool *wants_edr)
++get_color_space_info(VkColorSpaceKHR color_space, CGColorSpaceRef *cg_color_space)
+ {
+    CFStringRef color_space_name;
+    switch (color_space) {
+       case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
+          color_space_name = kCGColorSpaceSRGB;
+-         *wants_edr = false;
+          break;
+       case VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT:
+          color_space_name = kCGColorSpaceDisplayP3;
+-         *wants_edr = false;
+          break;
+       case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+          color_space_name = kCGColorSpaceExtendedLinearSRGB;
+-         *wants_edr = true;
+          break;
+       case VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT:
+          color_space_name = kCGColorSpaceLinearDisplayP3;
+-         *wants_edr = true;
+          break;
+       case VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT:
+          color_space_name = kCGColorSpaceDCIP3;
+-         *wants_edr = false;
+          break;
+       case VK_COLOR_SPACE_BT709_NONLINEAR_EXT:
+          color_space_name = kCGColorSpaceITUR_709;
+-         *wants_edr = false;
+          break;
+       case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
+          color_space_name = kCGColorSpaceLinearITUR_2020;
+-         *wants_edr = false;
+          break;
+       case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+          color_space_name = kCGColorSpaceITUR_2100_PQ;
+-         *wants_edr = true;
+          break;
+       case VK_COLOR_SPACE_HDR10_HLG_EXT:
+          color_space_name = kCGColorSpaceITUR_2100_HLG;
+-         *wants_edr = true;
+          break;
+       case VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT:
+          color_space_name = kCGColorSpaceAdobeRGB1998;
+-         *wants_edr = false;
+          break;
+       case VK_COLOR_SPACE_PASS_THROUGH_EXT:
+          color_space_name = nil;
+-         *wants_edr = false;
+          break;
+       case VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT:
+          color_space_name = kCGColorSpaceExtendedSRGB;
+-         *wants_edr = true;
+          break;
+       default:
+          return VK_ERROR_FORMAT_NOT_SUPPORTED;
+@@ -135,6 +122,51 @@ get_color_space_info(VkColorSpaceKHR color_space, CGColorSpaceRef *cg_color_spac
+    return VK_SUCCESS;
+ }
+ 
++static bool
++color_space_supports_edr_10_bit(VkColorSpaceKHR color_space)
++{
++   switch (color_space) {
++      case VK_COLOR_SPACE_HDR10_ST2084_EXT:
++      case VK_COLOR_SPACE_HDR10_HLG_EXT:
++         return true;
++      default:
++         return false;
++   }
++}
++
++static bool
++color_space_supports_edr_16_bit(VkColorSpaceKHR color_space)
++{
++   switch (color_space) {
++      case VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT:
++      case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
++      case VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT:
++      case VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT:
++      case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
++      case VK_COLOR_SPACE_HDR10_ST2084_EXT:
++      case VK_COLOR_SPACE_HDR10_HLG_EXT:
++      case VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT:
++      case VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT:
++         return true;
++      default:
++         return false;
++   }
++}
++
++static bool
++supports_edr(VkFormat format, VkColorSpaceKHR color_space)
++{
++   switch (format) {
++      case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++      case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++         return color_space_supports_edr_10_bit(color_space);
++      case VK_FORMAT_R16G16B16A16_SFLOAT:
++         return color_space_supports_edr_16_bit(color_space);
++      default:
++         return false;
++   }
++}
++
+ void
+ wsi_metal_layer_set_immediate(const CAMetalLayer *metal_layer,
+                               bool enable_immediate)
+@@ -155,8 +187,7 @@ wsi_metal_layer_configure(const CAMetalLayer *metal_layer,
+          return result;
+ 
+       CGColorSpaceRef cg_color_space;
+-      bool wants_edr;
+-      result = get_color_space_info(color_space, &cg_color_space, &wants_edr);
++      result = get_color_space_info(color_space, &cg_color_space);
+       if (result != VK_SUCCESS)
+          return result;
+ 
+@@ -174,7 +205,7 @@ wsi_metal_layer_configure(const CAMetalLayer *metal_layer,
+       metal_layer.pixelFormat = metal_format;
+ 
+       metal_layer.colorspace = cg_color_space;
+-      metal_layer.wantsExtendedDynamicRangeContent = wants_edr && vk_format_is_float(format);
++      metal_layer.wantsExtendedDynamicRangeContent = supports_edr(format, color_space);
+       /* Needs release: https://github.com/KhronosGroup/MoltenVK/issues/940 */
+       CGColorSpaceRelease(cg_color_space);
+    }
+

@@ -1,0 +1,17 @@
+# winemac.drv: Set window foreground when doing unminimization.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12233 state=merged
+# Fix a regression from 'd56f36c1 Revert "win32u: Don't forcefully activate windows before restoring them."'.
+
+Overwatch (SteamID: 2357570) depends on the wparam value in the WM_NCACTIVATE message to be non-zero when restoring from the minimized state. Before this patch, the wparam for WM_NCACTIVATE is 0 in set_active_window() because the game window hasn't become foreground. Tests show that the window should have become foreground before receiving WM_NCACTIVATE. The value for the WM_NCACTIVATE is 0x200001 according to tests, not TRUE(1) according to MSDN. However, it doesn't seem necessary to change it at the moment. This patch brings the behavior closer to the Linux path, which has gotten more test coverage.
+--- dlls/winemac.drv/window.c
++++ dlls/winemac.drv/window.c
+@@ -1910,6 +1910,8 @@ void macdrv_window_did_unminimize(HWND hwnd)
+     {
+         TRACE("restoring win %p/%p\n", hwnd, data->cocoa_window);
+         release_win_data(data);
++        if (can_window_become_foreground(hwnd))
++            NtUserSetForegroundWindowInternal(hwnd);
+         NtUserSetActiveWindow(hwnd);
+         send_message(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+         return;
+

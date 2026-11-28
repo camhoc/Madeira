@@ -1,0 +1,282 @@
+# nsiproxy.sys: Implement IPv6 route enumeration on macOS.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12712 state=closed
+# On macOS ipv6_forward_enumerate_all() has no implementation, so GetIpForwardTable2(AF_INET6) returns no rows and logs "fixme:nsi:ipv6_forward_enumerate_all not implemented".
+
+Read the IPv6 routing table with sysctl(CTL_NET, PF_ROUTE, 0, PF_INET6, NET_RT_DUMP, 0) and build one row per route message, each from its own message only. The Linux path is unchanged.
+
+Details:
+
+- A route without a netmask gets prefix length 128.
+- The scope BSD embeds in bytes 2-3 of link-local unicast and interface/link-local multicast addresses is cleared.
+- Link-local routes take their interface from that embedded scope, because rtm_index is lo0 for local-address routes.
+- Skipped: multicast-gateway routes, routes without an AF_INET6 destination, and malformed or truncated messages (logged with ERR).
+- Skipped: scoped (RTF_IFSCOPE) default routes. The kernel does not use them for unscoped lookups, and publishing them as ordinary ::/0 makes GetBestRoute2() pick an interface with no global source address.
+- Skipped: link-local routes on loopback, as Windows has none.
+- sysctl failure returns STATUS_NOT_SUPPORTED, allocation failure STATUS_NO_MEMORY.
+
+Adds test_GetIpForwardTable2_ipv6() to the iphlpapi tests. It checks family, prefix length, non-zero interface index, no embedded scope in destination or next hop, and the presence of the ::1/128 loopback route.
+--- dlls/iphlpapi/tests/iphlpapi.c
++++ dlls/iphlpapi/tests/iphlpapi.c
+@@ -3680,6 +3680,79 @@ static MIB_IPFORWARD_ROW2 *find_ipforward_row( MIB_IPFORWARD_TABLE2 *table, DWOR
+     return NULL;
+ }
+ 
++static BOOL has_embedded_scope( const IN6_ADDR *addr )
++{
++    /* BSD kernels embed the interface index in bytes 2-3 of scoped addresses. */
++    BOOL scoped = IN6_IS_ADDR_LINKLOCAL( addr ) ||
++                  (addr->u.Byte[0] == 0xff && ((addr->u.Byte[1] & 0x0f) == 1 || (addr->u.Byte[1] & 0x0f) == 2));
++
++    return scoped && (addr->u.Byte[2] || addr->u.Byte[3]);
++}
++
++static void test_GetIpForwardTable2_ipv6(void)
++{
++    MIB_IPFORWARD_TABLE2 *table;
++    BOOL found_loopback = FALSE;
++    DWORD ret;
++    ULONG i;
++
++    ret = GetIpForwardTable2( AF_INET6, &table );
++    ok( !ret, "got error %lu.\n", ret );
++    if (ret) return;
++
++    trace( "IPv6 forward table: %lu entries\n", table->NumEntries );
++    if (!table->NumEntries)
++    {
++        struct sockaddr_in6 addr = {0};
++        SOCKET sock = socket( AF_INET6, SOCK_DGRAM, IPPROTO_UDP );
++        int bound = 0;
++
++        if (sock != INVALID_SOCKET)
++        {
++            addr.sin6_family = AF_INET6;
++            addr.sin6_addr = in6addr_loopback;
++            bound = !bind( sock, (struct sockaddr *)&addr, sizeof(addr) );
++            closesocket( sock );
++        }
++        if (bound) ok( 0, "empty IPv6 forward table on a host with IPv6 loopback.\n" );
++        else skip( "No IPv6 on this host.\n" );
++        FreeMibTable( table );
++        return;
++    }
++
++    for (i = 0; i < table->NumEntries; i++)
++    {
++        const MIB_IPFORWARD_ROW2 *row = table->Table + i;
++        const IN6_ADDR *prefix = &row->DestinationPrefix.Prefix.Ipv6.sin6_addr;
++        const IN6_ADDR *next_hop = &row->NextHop.Ipv6.sin6_addr;
++
++        winetest_push_context( "%lu", i );
++
++        ok( row->DestinationPrefix.Prefix.si_family == AF_INET6, "got family %u.\n",
++            row->DestinationPrefix.Prefix.si_family );
++        ok( row->DestinationPrefix.PrefixLength <= 128, "got prefix length %u.\n",
++            row->DestinationPrefix.PrefixLength );
++        ok( row->NextHop.si_family == AF_INET6, "got next hop family %u.\n", row->NextHop.si_family );
++        ok( row->InterfaceIndex, "got zero interface index.\n" );
++        ok( !has_embedded_scope( prefix ), "got embedded scope in destination %02x%02x.\n",
++            prefix->u.Byte[2], prefix->u.Byte[3] );
++        ok( !has_embedded_scope( next_hop ), "got embedded scope in next hop %02x%02x.\n",
++            next_hop->u.Byte[2], next_hop->u.Byte[3] );
++
++        if (IN6_IS_ADDR_LOOPBACK( prefix ))
++        {
++            found_loopback = TRUE;
++            ok( row->DestinationPrefix.PrefixLength == 128, "got loopback prefix length %u.\n",
++                row->DestinationPrefix.PrefixLength );
++        }
++
++        winetest_pop_context();
++    }
++    ok( found_loopback, "loopback route not found.\n" );
++
++    FreeMibTable( table );
++}
++
+ static void test_best_routes(void)
+ {
+     static const IN6_ADDR link_local_prefix = {{ IN6ADDR_LINKLOCALPREFIX_INIT }};
+@@ -4195,6 +4268,7 @@ START_TEST(iphlpapi)
+     test_ConvertGuidToString();
+     test_compartments();
+     test_GetIpInterface();
++    test_GetIpForwardTable2_ipv6();
+     test_best_routes();
+     freeIPHlpApi();
+   }
+
+--- dlls/nsiproxy.sys/ip.c
++++ dlls/nsiproxy.sys/ip.c
+@@ -1708,7 +1708,7 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void
+     return status;
+ }
+ 
+-#ifdef __linux__
++#if defined(__linux__) || (defined(HAVE_SYS_SYSCTL_H) && defined(NET_RT_DUMP))
+ struct ipv6_route_data
+ {
+     NET_LUID luid;
+@@ -1846,6 +1846,161 @@ static NTSTATUS ipv6_forward_enumerate_all( void *key_data, UINT key_size, void
+         }
+         fclose(fp);
+     }
++#elif defined(HAVE_SYS_SYSCTL_H) && defined(NET_RT_DUMP)
++    {
++        struct ipv6_route_data entry;
++        int mib[6] = { CTL_NET, PF_ROUTE, 0, PF_INET6, NET_RT_DUMP, 0 };
++        size_t needed;
++        char *buf = NULL, *lim, *next, *addr_ptr;
++        struct rt_msghdr *rtm;
++
++        if (sysctl( mib, ARRAY_SIZE(mib), NULL, &needed, NULL, 0 ) < 0) return STATUS_NOT_SUPPORTED;
++
++        buf = malloc( needed );
++        if (!buf) return STATUS_NO_MEMORY;
++
++        if (sysctl( mib, 6, buf, &needed, NULL, 0 ) < 0)
++        {
++            free( buf );
++            return STATUS_NOT_SUPPORTED;
++        }
++
++        lim = buf + needed;
++        for (next = buf; next < lim; next += rtm->rtm_msglen)
++        {
++            int i, skip = 0;
++            sa_family_t dst_family = AF_UNSPEC;
++            char *end;
++
++            rtm = (struct rt_msghdr *)next;
++            if ((size_t)(lim - next) < sizeof(*rtm))
++            {
++                ERR( "Truncated route message, %lu bytes left.\n", (unsigned long)(lim - next) );
++                break;
++            }
++            if (rtm->rtm_msglen < sizeof(*rtm) || rtm->rtm_msglen > lim - next)
++            {
++                ERR( "Invalid route message length %u.\n", rtm->rtm_msglen );
++                break;
++            }
++            end = next + rtm->rtm_msglen;
++
++            if (rtm->rtm_type != RTM_GET)
++            {
++                WARN( "Got unexpected message type 0x%x!\n", rtm->rtm_type );
++                continue;
++            }
++
++            /* Ignore gateway routes which are multicast */
++            if ((rtm->rtm_flags & RTF_GATEWAY) && (rtm->rtm_flags & RTF_MULTICAST)) continue;
++
++            memset( &entry, 0, sizeof(entry) );
++            entry.if_index = rtm->rtm_index;
++            if (!convert_index_to_luid( entry.if_index, &entry.luid )) continue;
++            entry.protocol = (rtm->rtm_flags & RTF_GATEWAY) ? MIB_IPPROTO_NETMGMT : MIB_IPPROTO_LOCAL;
++            entry.metric = rtm->rtm_rmx.rmx_hopcount;
++
++            addr_ptr = (char *)(rtm + 1);
++
++            for (i = 1; i; i <<= 1)
++            {
++                struct sockaddr *sa;
++                struct in6_addr addr = {0};
++
++                if (!(i & rtm->rtm_addrs)) continue;
++
++                sa = (struct sockaddr *)addr_ptr;
++                if (end - addr_ptr < (ptrdiff_t)sizeof(int))
++                {
++                    ERR( "struct sockaddr starts beyond the route message, %p >= %p\n", addr_ptr, end );
++                    skip = 1;
++                    break;
++                }
++                if (addr_ptr + sa->sa_len > end)
++                {
++                    ERR( "struct sockaddr extends beyond the route message, %p > %p\n",
++                         addr_ptr + sa->sa_len, end );
++                    skip = 1;
++                    break;
++                }
++
++                if (sa->sa_len) addr_ptr += (sa->sa_len + sizeof(int)-1) & ~(sizeof(int)-1);
++                else addr_ptr += sizeof(int);
++                /* Apple's netstat prints the netmask together with the destination
++                 * and only looks at the destination's address family. The netmask's
++                 * sa_family sometimes contains the non-existent value 0xff. */
++                switch (i == RTA_NETMASK ? dst_family : sa->sa_family)
++                {
++                case AF_INET6:
++                {
++                    struct sockaddr_in6 sin6 = {0};
++                    memcpy( &sin6, sa, min( sa->sa_len, sizeof(sin6) ) );
++                    addr = sin6.sin6_addr;
++                    if (i == RTA_DST && IN6_IS_ADDR_LINKLOCAL( &addr ) && (addr.s6_addr[2] || addr.s6_addr[3]))
++                    {
++                        /* The embedded scope is the real interface; rtm_index may be lo0. */
++                        entry.if_index = (addr.s6_addr[2] << 8) | addr.s6_addr[3];
++                        if (!convert_index_to_luid( entry.if_index, &entry.luid )) skip = 1;
++                    }
++                    /* BSD embeds the interface scope in bytes 2-3 of link-local addresses. */
++                    if (i != RTA_NETMASK && (IN6_IS_ADDR_LINKLOCAL( &addr ) ||
++                        IN6_IS_ADDR_MC_LINKLOCAL( &addr ) || IN6_IS_ADDR_MC_NODELOCAL( &addr )))
++                        addr.s6_addr[2] = addr.s6_addr[3] = 0;
++                    break;
++                }
++#ifdef AF_LINK
++                case AF_LINK:
++                    if (i == RTA_GATEWAY && entry.protocol == MIB_IPPROTO_NETMGMT)
++                    {
++                        /* For direct route we may simply use dest addr as next hop */
++                        C_ASSERT(RTA_DST < RTA_GATEWAY);
++                        addr = entry.prefix;
++                        break;
++                    }
++                    /* fallthrough */
++#endif
++                default:
++                    WARN( "Received unsupported sockaddr family 0x%x\n", sa->sa_family );
++                }
++                switch (i)
++                {
++                case RTA_DST:
++                    entry.prefix = addr;
++                    dst_family = sa->sa_family;
++                    entry.loopback = IN6_IS_ADDR_LOOPBACK( &addr );
++                    break;
++                case RTA_GATEWAY: entry.next_hop = addr; break;
++                case RTA_NETMASK: entry.prefix_len = mask_v6_to_prefix( &addr ); break;
++                default:
++                    WARN( "Unexpected address type 0x%x\n", i );
++                }
++            }
++
++            if (skip || dst_family != AF_INET6) continue;
++            if (!(rtm->rtm_addrs & RTA_NETMASK)) entry.prefix_len = 128;
++#ifdef RTF_IFSCOPE
++            /* Scoped defaults such as "default fe80::%utunN" are not used for unscoped lookups. */
++            if ((rtm->rtm_flags & RTF_IFSCOPE) && !entry.prefix_len) continue;
++#endif
++            if (IN6_IS_ADDR_LINKLOCAL( &entry.prefix ))
++            {
++                /* Windows has no link-local routes on loopback. */
++                char ifname[IF_NAMESIZE], *name = if_indextoname( entry.if_index, ifname );
++                if (name && !strncmp( name, "lo", 2 )) continue;
++            }
++
++            if (num < *count)
++            {
++                ipv6_forward_fill_entry( &entry, key_data, rw_data, dynamic_data, static_data );
++                key_data = (BYTE *)key_data + key_size;
++                rw_data = (BYTE *)rw_data + rw_size;
++                dynamic_data = (BYTE *)dynamic_data + dynamic_size;
++                static_data = (BYTE *)static_data + static_size;
++            }
++            num++;
++        }
++        free( buf );
++    }
+ #else
+     FIXME( "not implemented\n" );
+     *count = 0;
+

@@ -1,0 +1,41 @@
+# freedreno: fix slot indexing in fd_set_global_binding()
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46555 state=merged
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+freedreno: fix slot indexing in fd_set_global_binding()
+
+The loop runs i over [first, first + count), then uses first + i to
+index the bindings array and i to index the caller's resources and
+handles arrays. Both are off by first: the caller passes count entries
+starting at index 0, and they belong in slots [first, first + count).
+
+With first > 0 this updates the wrong bindings slots, past the end of
+the array when it was only grown to first + count, and indexes
+resources[] and handles[] past their end while ignoring their leading
+entries.
+
+Loop over [0, count) instead, as v3d, panfrost and asahi do in the same
+dynarray-based code. rusticl, the only frontend using this hook, always
+passes first = 0, so there is no functional change today.
+
+Fixes: 5c43cf823cd ("freedreno: replace fixed array for globabl_bindings with dynamic array")
+Generated-by: LLM
+Signed-off-by: Tupili Krishna Gowtham Reddy <tupilikr@qti.qualcomm.com>
+```
+
+/cc @robclark
+--- src/gallium/drivers/freedreno/freedreno_state.c
++++ src/gallium/drivers/freedreno/freedreno_state.c
+@@ -737,7 +737,7 @@ fd_set_global_binding(struct pipe_context *pctx, unsigned first, unsigned count,
+                                 struct pipe_resource *, i) = NULL;
+    }
+ 
+-   for (unsigned i = first; i < first + count; ++i) {
++   for (unsigned i = 0; i < count; ++i) {
+       struct pipe_resource **res = util_dynarray_element(&ctx->global_bindings,
+                                                          struct pipe_resource *,
+                                                          first + i);
+

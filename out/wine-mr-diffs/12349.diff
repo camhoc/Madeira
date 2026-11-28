@@ -1,0 +1,489 @@
+# ntdll: Support sending mach ports to wineserver.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12349 state=opened
+# This is the first half of some changes to exchange mach ports with wineserver. It will be used to implement shared resources on macOS, and later, cross-process rendering.
+--- dlls/ntdll/unix/server.c
++++ dlls/ntdll/unix/server.c
+@@ -1475,17 +1475,33 @@ static int server_connect(void)
+ #include <servers/bootstrap.h>
+ 
+ extern NTSTATUS apple_spawn_main_thread(void);
++static mach_port_t wineserver_port;
+ 
+-/* send our task port to the server */
+-static void send_server_task_port(void)
++static void send_mach_port( mach_port_t port, obj_handle_t handle )
+ {
+-    mach_port_t bootstrap_port, wineserver_port;
+-    mach_msg_return_t mret;
+-    kern_return_t kret;
+-
+-    struct {
++    struct
++    {
+         mach_msg_header_t           header;
++        obj_handle_t                handle;
++        unsigned int                tid;
+     } msg;
++    mach_msg_return_t ret;
++
++    msg.header.msgh_bits        = MACH_MSGH_BITS_SET_PORTS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_COPY_SEND, 0);
++    msg.header.msgh_size        = sizeof(msg);
++    msg.header.msgh_remote_port = wineserver_port;
++    msg.header.msgh_local_port  = port;
++    msg.handle = handle;
++    msg.tid = GetCurrentThreadId();
++
++    if ((ret = mach_msg_send( &msg.header ))) server_protocol_error( "mach_msg_send failed: 0x%08x\n", ret );
++}
++
++/* send our task port to the server */
++static void init_wineserver_port(void)
++{
++    mach_port_t bootstrap_port;
++    kern_return_t kret;
+ 
+     if (task_get_bootstrap_port(mach_task_self(), &bootstrap_port) != KERN_SUCCESS) return;
+ 
+@@ -1501,17 +1517,26 @@ static void send_server_task_port(void)
+ 
+     mach_port_deallocate(mach_task_self(), bootstrap_port);
+ 
+-    msg.header.msgh_bits        = MACH_MSGH_BITS_SET_PORTS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_COPY_SEND, 0);
+-    msg.header.msgh_size        = sizeof(msg);
+-    msg.header.msgh_remote_port = wineserver_port;
+-    msg.header.msgh_local_port  = mach_task_self();
++    send_mach_port( mach_task_self(), 1 );
++}
+ 
+-    mret = mach_msg_send(&msg.header);
+-    if (mret != MACH_MSG_SUCCESS)
+-        server_protocol_error( "mach_msg_send failed: 0x%08x\n", mret );
++/***********************************************************************
++ *           wine_server_send_mach_port
++ *
++ * Send a mach port to the server.
++ */
++void wine_server_send_mach_port( mach_port_t port )
++{
++    send_mach_port( port, port );
++}
+ 
+-    mach_port_deallocate(mach_task_self(), wineserver_port);
++#else  /* __APPLE__ */
++
++void wine_server_send_mach_port( mach_port_t port )
++{
++    ERR( "mach_port_t is only supported on macOS\n" );
+ }
++
+ #endif  /* __APPLE__ */
+ 
+ 
+@@ -1740,7 +1765,7 @@ void server_init_process_done(void)
+     close( initial_cwd );
+ 
+ #ifdef __APPLE__
+-    send_server_task_port();
++    init_wineserver_port();
+     if ((status = apple_spawn_main_thread()))
+         ERR("Failed to spawn main thread, status %x\n", status);
+ #endif
+
+--- include/wine/server.h
++++ include/wine/server.h
+@@ -57,6 +57,22 @@ NTSYSAPI NTSTATUS CDECL wine_server_handle_to_fd( HANDLE handle, unsigned int ac
+ NTSYSAPI void wine_server_send_fd( int fd );
+ NTSYSAPI unsigned int wine_server_alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
+                                                            data_size_t *ret_len );
++
++#ifdef __APPLE__
++# include <mach/mach_port.h>
++# include <mach/mach_init.h>
++#else /* __APPLE__ */
++typedef int mach_port_t;
++#define MACH_PORT_NULL 0
++#define MACH_PORT_DEAD -1
++#define MACH_PORT_VALID(port) ((port) != MACH_PORT_NULL && (port) != MACH_PORT_DEAD)
++typedef mach_port_t ipc_space_t;
++static inline ipc_space_t mach_task_self(void) { return MACH_PORT_NULL; }
++static inline void mach_port_deallocate( ipc_space_t task, mach_port_t port ) { }
++#endif /* __APPLE__ */
++
++NTSYSAPI void wine_server_send_mach_port( mach_port_t port );
++
+ #endif
+ 
+ /* do a server call and set the last error code */
+
+--- server/mach.c
++++ server/mach.c
+@@ -68,11 +68,6 @@ static void mach_set_error(kern_return_t mach_error)
+     }
+ }
+ 
+-static mach_port_t get_process_port( struct process *process )
+-{
+-    return process->trace_data;
+-}
+-
+ static int is_rosetta( void )
+ {
+     static int rosetta_status, did_check = 0;
+@@ -113,42 +108,122 @@ void init_tracing_mechanism(void)
+     mach_port_deallocate( mach_task_self(), bp );
+ }
+ 
+-/* initialize the per-process tracing mechanism */
+-void init_process_tracing( struct process *process )
++static struct inflight_port *find_inflight_port( struct thread *thread, mach_port_t client )
++{
++    struct inflight_port *it, *ports = thread->inflight_ports;
++    for (it = ports; it < ports + MAX_INFLIGHT_PORTS; it++) if (it->client == client) return it;
++    return NULL;
++}
++
++/* add a mach port to the inflight list */
++static void thread_add_inflight_mach_port( struct thread *thread, mach_port_t client, mach_port_t server )
++{
++    struct inflight_port *port, new = { .client = client, .server = server };
++
++    if (!MACH_PORT_VALID(server)) return;
++    if (!MACH_PORT_VALID(client))
++    {
++        mach_port_deallocate( mach_task_self(), server );
++        return;
++    }
++
++    /* first check if we already have an entry for this port */
++    if ((port = find_inflight_port( thread, client )))
++    {
++        mach_port_deallocate( mach_task_self(), port->server );
++        *port = new;
++        return;
++    }
++
++    /* now find a free spot to store it */
++    if ((port = find_inflight_port( thread, MACH_PORT_NULL )))
++    {
++        *port = new;
++        return;
++    }
++
++    fatal_error( "%04x: inflight port array is full\n", thread->id );
++}
++
++/* receive a mach port from a client process */
++static int receive_mach_port( struct process *process )
+ {
+-    mach_msg_return_t ret;
+-    int pid;
+     struct
+     {
+         mach_msg_header_t           header;
++        obj_handle_t                handle;
++        unsigned int                tid;
+         mach_msg_trailer_t          trailer; /* only present on receive */
+     } msg;
++    struct thread *thread;
++    mach_msg_return_t ret;
++    mach_port_t port;
++
++    msg.header.msgh_bits        = 0;
++    msg.header.msgh_size        = sizeof(msg);
++    msg.header.msgh_remote_port = MACH_PORT_NULL;
++    msg.header.msgh_local_port  = server_mach_port;
++
++    if ((ret = mach_msg_receive( &msg.header )) != MACH_MSG_SUCCESS)
++    {
++        fprintf( stderr, "Protocol error: process %04x: ret 0x%08x", process->id, ret );
++        kill_process( process, 1 );
++        return -1;
++    }
++
++    /* if anything in the message is invalid, ignore it */
++    if (msg.header.msgh_size != offsetof(typeof(msg), trailer)) return 0;
++    if (!MACH_PORT_VALID(port = msg.header.msgh_remote_port)) return 0;
++
++    if (!(thread = get_thread_from_id( msg.tid )) || thread->process != process || thread->state == TERMINATED)
++    {
++        if (debug_level) fprintf( stderr, "%04x: *port* %d <- %d bad thread id\n", msg.tid, msg.handle, port );
++        mach_port_deallocate( mach_task_self(), port );
++    }
++    else
++    {
++        if (debug_level) fprintf( stderr, "%04x: *port* %d <- %d\n", thread->id, msg.handle, port );
++        thread_add_inflight_mach_port( thread, msg.handle, port );
++    }
++    if (thread) release_object( thread );
++    return 0;
++}
+ 
+-    for (;;)
++/* get an inflight mach port and purge it from the list */
++/* the mach port must be closed when no longer used */
++mach_port_t thread_get_inflight_mach_port( struct thread *thread, mach_port_t client )
++{
++    struct inflight_port *port;
++
++    if (!MACH_PORT_VALID(client)) return MACH_PORT_NULL;
++
++    do
+     {
+-        ret = mach_msg( &msg.header, MACH_RCV_MSG|MACH_RCV_TIMEOUT, 0, sizeof(msg),
+-                        server_mach_port, 0, 0 );
+-        if (ret)
++        if ((port = find_inflight_port( thread, client )))
+         {
+-            if (ret != MACH_RCV_TIMED_OUT && debug_level)
+-                fprintf( stderr, "warning: mach port receive failed with %x\n", ret );
+-            return;
++            mach_port_t ret = port->server;
++            clear_inflight_port( port );
++            return ret;
+         }
++    } while (!receive_mach_port( thread->process ));  /* in case it is still in the socket buffer */
++    return MACH_PORT_NULL;
++}
+ 
+-        /* if anything in the message is invalid, ignore it */
+-        if (msg.header.msgh_size != offsetof(typeof(msg), trailer)) continue;
+-        if (!MACH_PORT_VALID(msg.header.msgh_remote_port)) continue;
++/* initialize the per-process tracing mechanism */
++void init_process_tracing( struct process *process )
++{
++    struct thread *thread;
++    int pid;
+ 
+-        if (!pid_for_task( msg.header.msgh_remote_port, &pid ))
+-        {
+-            struct thread *thread = get_thread_from_pid( pid );
++    process->process_port = thread_get_inflight_mach_port( current, 1 );
+ 
+-            if (thread && !thread->process->trace_data)
+-                thread->process->trace_data = msg.header.msgh_remote_port;
+-            else
+-                mach_port_deallocate( mach_task_self(), msg.header.msgh_remote_port );
+-        }
++    if (pid_for_task( process->process_port, &pid ) || !(thread = get_thread_from_pid( pid )) || thread->process != process)
++    {
++        fprintf( stderr, "Protocol error: process %04x: invalid process port %d", process->id, process->process_port );
++        kill_process( process, 1 );
++        return;
+     }
++
+     /* On Mach thread priorities depend on having the process port available, so
+      * reapply all thread priorities here after process tracing is initialized */
+     set_process_base_priority( process, process->base_priority );
+@@ -157,10 +232,10 @@ void init_process_tracing( struct process *process )
+ /* terminate the per-process tracing mechanism */
+ void finish_process_tracing( struct process *process )
+ {
+-    if (process->trace_data)
++    if (process->process_port)
+     {
+-        mach_port_deallocate( mach_task_self(), process->trace_data );
+-        process->trace_data = 0;
++        mach_port_deallocate( mach_task_self(), process->process_port );
++        process->process_port = 0;
+     }
+ }
+ 
+@@ -176,7 +251,7 @@ void get_thread_context( struct thread *thread, struct context_data *context, un
+     x86_debug_state_t state;
+     mach_msg_type_number_t count = sizeof(state) / sizeof(int);
+     mach_msg_type_name_t type;
+-    mach_port_t port, process_port = get_process_port( thread->process );
++    mach_port_t port, process_port = thread->process->process_port;
+     kern_return_t ret;
+     unsigned long dr[8];
+ 
+@@ -262,7 +337,7 @@ void set_thread_context( struct thread *thread, const struct context_data *conte
+     x86_debug_state_t state;
+     mach_msg_type_number_t count = sizeof(state) / sizeof(int);
+     mach_msg_type_name_t type;
+-    mach_port_t port, process_port = get_process_port( thread->process );
++    mach_port_t port, process_port = thread->process->process_port;
+     unsigned long dr[8];
+     kern_return_t ret;
+ 
+@@ -359,7 +434,7 @@ extern int __pthread_kill( mach_port_t, int );
+ int send_thread_signal( struct thread *thread, int sig )
+ {
+     int ret = -1;
+-    mach_port_t process_port = get_process_port( thread->process );
++    mach_port_t process_port = thread->process->process_port;
+ 
+     if (thread->unix_pid != -1 && process_port)
+     {
+@@ -390,7 +465,7 @@ int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t
+ {
+     kern_return_t ret;
+     mach_vm_size_t bytes_read;
+-    mach_port_t process_port = get_process_port( process );
++    mach_port_t process_port = process->process_port;
+ 
+     if (!process_port)
+     {
+@@ -413,7 +488,7 @@ int write_process_memory( struct process *process, client_ptr_t ptr, data_size_t
+                           data_size_t *written )
+ {
+     kern_return_t ret;
+-    mach_port_t process_port = get_process_port( process );
++    mach_port_t process_port = process->process_port;
+     mach_vm_offset_t data;
+ 
+     if (written) *written = 0;
+
+--- server/object.h
++++ server/object.h
+@@ -24,6 +24,20 @@
+ #include <poll.h>
+ #include <stdbool.h>
+ #include <sys/time.h>
++
++#ifdef __APPLE__
++# include <mach/mach_port.h>
++# include <mach/mach_init.h>
++#else /* __APPLE__ */
++typedef int mach_port_t;
++#define MACH_PORT_NULL 0
++#define MACH_PORT_DEAD -1
++#define MACH_PORT_VALID(port) ((port) != MACH_PORT_NULL && (port) != MACH_PORT_DEAD)
++typedef mach_port_t ipc_space_t;
++static inline ipc_space_t mach_task_self(void) { return MACH_PORT_NULL; }
++static inline void mach_port_deallocate( ipc_space_t task, mach_port_t port ) { }
++#endif /* __APPLE__ */
++
+ #include "wine/server_protocol.h"
+ #include "wine/list.h"
+ 
+
+--- server/process.c
++++ server/process.c
+@@ -635,7 +635,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+     process->winstation      = 0;
+     process->desktop         = 0;
+     process->token           = NULL;
+-    process->trace_data      = 0;
++    process->process_port    = 0;
+     process->rawinput_devices = NULL;
+     process->rawinput_device_count = 0;
+     process->rawinput_mouse  = NULL;
+
+--- server/process.h
++++ server/process.h
+@@ -82,7 +82,7 @@ struct process
+     struct list          views;           /* list of memory views */
+     client_ptr_t         peb;             /* PEB address in client address space */
+     struct dir_cache    *dir_cache;       /* map of client-side directory cache */
+-    unsigned int         trace_data;      /* opaque data used by the process tracing mechanism */
++    mach_port_t          process_port;    /* mach port of the process task on macOS */
+     struct rawinput_device *rawinput_devices;     /* list of registered rawinput devices */
+     unsigned int         rawinput_device_count;   /* number of registered rawinput devices */
+     const struct rawinput_device *rawinput_mouse; /* rawinput mouse device, if any */
+
+--- server/procfs.c
++++ server/procfs.c
+@@ -92,6 +92,12 @@ void sigchld_callback(void)
+     assert( 0 );  /* should only be called when using ptrace */
+ }
+ 
++/* receive a mach port from a client process */
++mach_port_t thread_get_inflight_mach_port( struct thread *thread, mach_port_t client )
++{
++    return MACH_PORT_NULL; /* not supported on this platform */
++}
++
+ /* initialize the process tracing mechanism */
+ void init_tracing_mechanism(void)
+ {
+
+--- server/ptrace.c
++++ server/ptrace.c
+@@ -232,6 +232,12 @@ static inline int tkill( int tgid, int pid, int sig )
+ #endif
+ }
+ 
++/* receive a mach port from a client process */
++mach_port_t thread_get_inflight_mach_port( struct thread *thread, mach_port_t client )
++{
++    return MACH_PORT_NULL; /* not supported on this platform */
++}
++
+ /* initialize the process tracing mechanism */
+ void init_tracing_mechanism(void)
+ {
+
+--- server/thread.c
++++ server/thread.c
+@@ -247,7 +247,7 @@ static void apply_thread_priority( struct thread *thread )
+     int throughput_qos, latency_qos;
+     struct thread_extended_policy thread_extended_policy;
+     struct thread_precedence_policy thread_precedence_policy;
+-    mach_port_t thread_port, process_port = thread->process->trace_data;
++    mach_port_t thread_port, process_port = thread->process->process_port;
+     int effective_priority = get_effective_thread_priority( thread );
+ 
+     if (!process_port) return;
+@@ -390,6 +390,7 @@ static inline void init_thread_structure( struct thread *thread )
+ 
+     for (i = 0; i < MAX_INFLIGHT_FDS; i++)
+         thread->inflight[i].server = thread->inflight[i].client = -1;
++    for (i = 0; i < MAX_INFLIGHT_PORTS; i++) clear_inflight_port( thread->inflight_ports + i );
+ }
+ 
+ static inline int is_thread_suspended( struct thread *thread )
+@@ -587,6 +588,12 @@ static void cleanup_thread( struct thread *thread )
+             thread->inflight[i].client = thread->inflight[i].server = -1;
+         }
+     }
++    for (i = 0; i < MAX_INFLIGHT_PORTS; i++)
++    {
++        mach_port_t port = thread->inflight_ports[i].server;
++        if (MACH_PORT_VALID(port)) mach_port_deallocate( mach_task_self(), port );
++        clear_inflight_port( thread->inflight_ports + i );
++    }
+     free( thread->desc );
+     thread->req_data = NULL;
+     thread->reply_data = NULL;
+
+--- server/thread.h
++++ server/thread.h
+@@ -47,6 +47,20 @@ struct inflight_fd
+ };
+ #define MAX_INFLIGHT_FDS 16  /* max number of fds in flight per thread */
+ 
++/* descriptor for mach ports currently in flight from client to server */
++struct inflight_port
++{
++    mach_port_t client; /* mach port on the client side (or MACH_PORT_NULL if entry is free) */
++    mach_port_t server; /* mach port on the server side */
++};
++
++static inline void clear_inflight_port( struct inflight_port *port )
++{
++    port->client = port->server = MACH_PORT_NULL;
++}
++
++#define MAX_INFLIGHT_PORTS 16  /* max number of mach ports in flight per thread */
++
+ struct thread
+ {
+     struct object          obj;           /* object header */
+@@ -65,6 +79,7 @@ struct thread
+     struct list            system_apc;    /* queue of system async procedure calls */
+     struct list            user_apc;      /* queue of user async procedure calls */
+     struct inflight_fd     inflight[MAX_INFLIGHT_FDS];  /* fds currently in flight */
++    struct inflight_port   inflight_ports[MAX_INFLIGHT_PORTS];  /* mach ports currently in flight */
+     unsigned int           error;         /* current error code */
+     union generic_request  req;           /* current request */
+     void                  *req_data;      /* variable-size data for request */
+@@ -128,6 +143,7 @@ extern int thread_queue_apc( struct process *process, struct thread *thread, str
+ extern void thread_cancel_apc( struct thread *thread, struct object *owner, enum apc_type type );
+ extern int thread_add_inflight_fd( struct thread *thread, int client, int server );
+ extern int thread_get_inflight_fd( struct thread *thread, int client );
++extern mach_port_t thread_get_inflight_mach_port( struct thread *thread, mach_port_t client );
+ extern struct token *thread_get_impersonation_token( struct thread *thread );
+ extern int get_effective_thread_priority( struct thread *thread );
+ extern unsigned int set_thread_priority( struct thread *thread, int priority );
+

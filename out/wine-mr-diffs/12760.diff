@@ -1,0 +1,23 @@
+# ntdll: Allow seven data segments in server requests.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12760 state=closed
+# Commits [ef95772a](https://gitlab.winehq.org/wine/wine/-/commit/ef95772aee1824b184eabab3e183a263a2a7cb4b) and [9bc785a8](https://gitlab.winehq.org/wine/wine/-/commit/9bc785a86eda62ffd375397f7e083f6bc8fcec68) added separate owner and primary-group SID segments to [`NtCreateToken()`](https://gitlab.winehq.org/wine/wine/-/blob/master/dlls/ntdll/unix/security.c#L41). It can now append six nonempty data segments, or seven when a default DACL is supplied.
+
+However, [`struct __server_request_info`](https://gitlab.winehq.org/wine/wine/-/blob/master/include/wine/server.h#L40) only reserves five segment descriptors, as defined by `__SERVER_MAX_DATA`. Consequently, [`wine_server_add_data()`](https://gitlab.winehq.org/wine/wine/-/blob/master/include/wine/server.h#L77) writes beyond the end of the `data[]` array in the request object allocated on the stack by [`SERVER_START_REQ`](https://gitlab.winehq.org/wine/wine/-/blob/master/include/wine/server.h#L156).
+
+Furthermore, [`send_request()`](https://gitlab.winehq.org/wine/wine/-/blob/master/dlls/ntdll/unix/server.c#L201) allocates `struct iovec vec[__SERVER_MAX_DATA + 1]`, allowing six entries including the fixed request. These requests require seven or eight entries, causing another stack buffer overrun.
+
+Increasing `__SERVER_MAX_DATA` to seven accommodates both cases. An assertion checking `data_count` before appending a segment would also catch future capacity violations before the out-of-bounds write, provided assertions are enabled.
+
+The limit has remained at five since [6543a652](https://gitlab.winehq.org/wine/wine/-/commit/6543a6522ab0a50b955fa046397d6a2ffb7bb389), which increased it from four to five on 29 March 2002.
+--- include/wine/server.h
++++ include/wine/server.h
+@@ -35,7 +35,7 @@ struct __server_iovec
+     data_size_t  size;
+ };
+ 
+-#define __SERVER_MAX_DATA 5
++#define __SERVER_MAX_DATA 7
+ 
+ struct __server_request_info
+ {
+

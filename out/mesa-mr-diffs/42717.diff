@@ -1,0 +1,258 @@
+# spirv: record float-controls preservation requests in shader_info
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42717 state=closed
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+AI was used for the commit message and code comments.
+
+This along with !42653 are the 2 changes from common code KosmicKrisp needs to expose Vulkan 1.4 once we wrap up the last few things.
+
+```
+spirv: record float-controls preservation requests in shader_info
+
+Signed zero, Inf and NaN preservation is tracked per ALU instruction
+through nir_fp_math_control, but those bits mix shader requests with
+spec-mandated semantics and lowering artifacts: ordered comparisons
+receive the inf/nan bits in every shader, helpers such as nir_atan2
+set preserve bits internally, and the signed-zero bit is dropped on
+ops where it is meaningless.
+
+Backends that translate NIR into another source language with only
+translation-unit-level fast-math control (e.g. Metal, where fast math
+breaks NaN comparisons and Inf quantization) instead need to know
+whether the shader declared the SignedZeroInfNanPreserve execution
+mode, or requested preservation through shader_float_controls2's
+FPFastMathDefault execution mode or FPFastMathMode decorations. Only
+spirv_to_nir sees those declarations, so record them in
+shader_info::float_controls_execution_mode.
+
+Unlike the original composite bits, each reinstated bit is set when
+preservation of at least one of the three controls is requested at
+the given float width. Only explicit shader requests are recorded:
+the OpenCL environment's implicit preserve default seeded for kernels
+is not, and the per-instruction path records solely from
+FPFastMathMode-decorated instructions so builder defaults cannot leak
+across float widths (defaults are recorded once, by the execution
+mode handlers).
+
+This partially reverts commits 9da2d218041 ("vtn: implement default
+fp_math_ctrl without using execution mode") and 5e8cc19a3ba ("nir:
+remove per shader float fast math flags"): the builder-local state
+feeding the per-ALU bits is kept, the shader_info recording is
+reinstated alo
+--- src/compiler/spirv/nir_spirv.h
++++ src/compiler/spirv/nir_spirv.h
+@@ -48,7 +48,10 @@ struct spirv_to_nir_options {
+    bool create_library;
+ 
+    /* Initial value for shader_info::float_controls_execution_mode,
+-    * indicates hardware requirements rather than shader author intent
++    * indicates hardware requirements rather than shader author intent.
++    * spirv_to_nir additionally ORs the
++    * FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE bits requested by the
++    * shader into the shader_info field on top of this value.
+     */
+    uint32_t float_controls_execution_mode;
+ 
+
+--- src/compiler/spirv/spirv_to_nir.c
++++ src/compiler/spirv/spirv_to_nir.c
+@@ -6051,8 +6051,12 @@ vtn_handle_execution_mode(struct vtn_builder *b, struct vtn_value *entry_point,
+ 
+    case SpvExecutionModeSignedZeroInfNanPreserve: {
+       const struct glsl_type *type = glsl_floatN_t_type(mode->operands[0]);
+-      unsigned *fp_math_ctrl = vtn_fp_math_ctrl_for_base_type(b, glsl_get_base_type(type));
++      enum glsl_base_type base_type = glsl_get_base_type(type);
++      unsigned *fp_math_ctrl = vtn_fp_math_ctrl_for_base_type(b, base_type);
+       *fp_math_ctrl |= nir_fp_preserve_sz_inf_nan;
++
++      b->shader->info.float_controls_execution_mode |=
++         vtn_fp_preserve_info_bits_for_base_type(base_type);
+       break;
+    }
+ 
+@@ -6258,14 +6262,26 @@ vtn_handle_execution_mode_id(struct vtn_builder *b, struct vtn_value *entry_poin
+        * It's always allowed for VK/GL.
+        */
+ 
++      unsigned preserve = 0;
+       if (!(flags & SpvFPFastMathModeNotNaNMask))
+-         *fp_math_ctrl |= nir_fp_preserve_nan;
++         preserve |= nir_fp_preserve_nan;
+ 
+       if (!(flags & SpvFPFastMathModeNotInfMask))
+-         *fp_math_ctrl |= nir_fp_preserve_inf;
++         preserve |= nir_fp_preserve_inf;
+ 
+       if (!(flags & SpvFPFastMathModeNSZMask))
+-         *fp_math_ctrl |= nir_fp_preserve_signed_zero;
++         preserve |= nir_fp_preserve_signed_zero;
++
++      *fp_math_ctrl |= preserve;
++
++      /* Record only what this mode requests: for OpenCL kernels the
++       * accumulated fp_math_ctrl also holds the environment's implicit
++       * preserve default, which is not a shader request.
++       */
++      if (preserve) {
++         b->shader->info.float_controls_execution_mode |=
++            vtn_fp_preserve_info_bits_for_base_type(base_type);
++      }
+ 
+       break;
+    }
+
+--- src/compiler/spirv/vtn_alu.c
++++ src/compiler/spirv/vtn_alu.c
+@@ -392,12 +392,14 @@ vtn_nir_alu_op_for_spirv_opcode(struct vtn_builder *b,
+ static void
+ handle_fp_fast_math(struct vtn_builder *b, UNUSED struct vtn_value *val,
+                  UNUSED int member, const struct vtn_decoration *dec,
+-                 UNUSED void *_void)
++                 void *_decorated)
+ {
+    vtn_assert(dec->scope == VTN_DEC_DECORATION);
+    if (dec->decoration != SpvDecorationFPFastMathMode)
+       return;
+ 
++   *(bool *)_decorated = true;
++
+    /* Decoration overrides defaults. */
+    b->nb.fp_math_ctrl = 0;
+    if (!(dec->operands[0] & SpvFPFastMathModeAllowContractMask))
+@@ -428,27 +430,61 @@ vtn_fp_math_ctrl_for_base_type(struct vtn_builder *b, enum glsl_base_type base_t
+    }
+ }
+ 
++static enum glsl_base_type
++fp_base_type(struct vtn_type *type)
++{
++   /* Some ALU like modf and frexp return a struct of two values. */
++   if (glsl_type_is_struct(type->type))
++      return glsl_get_base_type(type->type->fields.structure[0].type);
++
++   if (glsl_type_is_cmat(type->type))
++      return glsl_get_cmat_description(type->type)->element_type;
++
++   return glsl_get_base_type(type->type);
++}
++
+ static unsigned
+ fp_math_ctrl_for_type(struct vtn_builder *b, struct vtn_type *type)
+ {
+    if (!type)
+       return nir_fp_fast_math;
+ 
+-   enum glsl_base_type base_type;
++   unsigned *fp_math_ctrl =
++      vtn_fp_math_ctrl_for_base_type(b, fp_base_type(type));
+ 
+-   /* Some ALU like modf and frexp return a struct of two values. */
+-   if (glsl_type_is_struct(type->type)) {
+-      base_type = glsl_get_base_type(type->type->fields.structure[0].type);
+-   } else if (glsl_type_is_cmat(type->type)) {
+-      struct glsl_cmat_description desc = *glsl_get_cmat_description(type->type);
+-      base_type = desc.element_type;
+-   } else {
+-      base_type = glsl_get_base_type(type->type);
+-   }
++   return fp_math_ctrl ? *fp_math_ctrl : nir_fp_fast_math;
++}
+ 
+-   unsigned *fp_math_ctrl = vtn_fp_math_ctrl_for_base_type(b, base_type);
++uint32_t
++vtn_fp_preserve_info_bits_for_base_type(enum glsl_base_type base_type)
++{
++   switch (base_type) {
++   case GLSL_TYPE_FLOAT16:
++      return FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP16;
++   case GLSL_TYPE_FLOAT:
++      return FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP32;
++   case GLSL_TYPE_DOUBLE:
++      return FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP64;
++   default:
++      /* No FLOAT_CONTROLS bits exist for bfloat16/e4m3/e5m2; preservation
++       * requests on those types are intentionally not recorded.
++       */
++      return 0;
++   }
++}
+ 
+-   return fp_math_ctrl ? *fp_math_ctrl : nir_fp_fast_math;
++/* Record fast-math restrictions requesting NaN/Inf/signed-zero preservation
++ * in shader_info so backends with only translation-unit-level fast-math
++ * control can honor them; per-instruction fp_math_ctrl bits are dropped on
++ * ops where an individual control is meaningless.
++ */
++static void
++record_fp_preserve_request(struct vtn_builder *b, unsigned fp_math_ctrl,
++                           struct vtn_type *type)
++{
++   if (type && (fp_math_ctrl & nir_fp_preserve_sz_inf_nan))
++      b->shader->info.float_controls_execution_mode |=
++         vtn_fp_preserve_info_bits_for_base_type(fp_base_type(type));
+ }
+ 
+ void
+@@ -461,10 +497,19 @@ vtn_handle_fp_fast_math(struct vtn_builder *b, struct vtn_value *dest_val, struc
+    b->nb.fp_math_ctrl = fp_math_ctrl_for_type(b, dest_val->type);
+    b->nb.fp_math_ctrl |= fp_math_ctrl_for_type(b, src0_val->type);
+ 
+-   vtn_foreach_decoration(b, dest_val, handle_fp_fast_math, NULL);
++   bool decorated = false;
++   vtn_foreach_decoration(b, dest_val, handle_fp_fast_math, &decorated);
+ 
+    if (vtn_has_decoration(b, dest_val, SpvDecorationNoContraction))
+       b->nb.fp_math_ctrl |= nir_fp_exact;
++
++   /* Default-derived requests are recorded by the execution-mode handlers;
++    * only FPFastMathMode decorations are shader requests first seen here.
++    */
++   if (decorated) {
++      record_fp_preserve_request(b, b->nb.fp_math_ctrl, dest_val->type);
++      record_fp_preserve_request(b, b->nb.fp_math_ctrl, src0_val->type);
++   }
+ }
+ 
+ nir_rounding_mode
+
+--- src/compiler/spirv/vtn_private.h
++++ src/compiler/spirv/vtn_private.h
+@@ -981,6 +981,8 @@ void vtn_handle_bitcast(struct vtn_builder *b, const uint32_t *w,
+ 
+ unsigned *vtn_fp_math_ctrl_for_base_type(struct vtn_builder *b, enum glsl_base_type base_type);
+ 
++uint32_t vtn_fp_preserve_info_bits_for_base_type(enum glsl_base_type base_type);
++
+ void vtn_handle_fp_fast_math(struct vtn_builder *b, struct vtn_value *dest_val, struct vtn_value *src0_val);
+ 
+ void vtn_handle_subgroup(struct vtn_builder *b, SpvOp opcode,
+
+--- src/compiler/shader_enums.h
++++ src/compiler/shader_enums.h
+@@ -1586,6 +1586,24 @@ enum float_controls
+    FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP16     = BITFIELD_BIT(9),
+    FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP32     = BITFIELD_BIT(10),
+    FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP64     = BITFIELD_BIT(11),
++
++   /* Set when the shader requested preservation of at least one of signed
++    * zero, Inf or NaN at the given float width, through the
++    * SignedZeroInfNanPreserve or FPFastMathDefault execution modes or an
++    * FPFastMathMode decoration. Unlike the pre-shader_float_controls2
++    * meaning, a single preserved control is enough to set the bit.
++    *
++    * Preservation is also tracked per ALU instruction via
++    * nir_fp_math_control, but those bits are dropped on instructions where
++    * an individual control is meaningless (e.g. signed zero on bool-typed
++    * comparisons). Backends that translate NIR to another source language
++    * with only translation-unit-level fast-math control (e.g. MSL) need to
++    * know whether the shader requested preservation at all, so it is also
++    * recorded here.
++    */
++   FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP16 = BITFIELD_BIT(12),
++   FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP32 = BITFIELD_BIT(13),
++   FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP64 = BITFIELD_BIT(14),
+ };
+ 
+ /**
+

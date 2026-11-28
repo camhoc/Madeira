@@ -1,0 +1,122 @@
+# win32u: Add NtGdiDdDDISetProcessSchedulingPriorityClass stub.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12800 state=opened
+# With this patch, the "STOP" button in the Steam client works again.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60642
+--- dlls/gdi32/gdi32.spec
++++ dlls/gdi32/gdi32.spec
+@@ -143,6 +143,7 @@
+ @ stdcall D3DKMTQueryVideoMemoryInfo(ptr) win32u.NtGdiDdDDIQueryVideoMemoryInfo
+ @ stdcall D3DKMTReleaseKeyedMutex(ptr) win32u.NtGdiDdDDIReleaseKeyedMutex
+ @ stdcall D3DKMTReleaseKeyedMutex2(ptr) win32u.NtGdiDdDDIReleaseKeyedMutex2
++@ stdcall D3DKMTSetProcessSchedulingPriorityClass(ptr long) win32u.NtGdiDdDDISetProcessSchedulingPriorityClass
+ @ stdcall D3DKMTSetQueuedLimit(ptr) win32u.NtGdiDdDDISetQueuedLimit
+ @ stdcall D3DKMTSetVidPnSourceOwner(ptr) win32u.NtGdiDdDDISetVidPnSourceOwner
+ @ stdcall D3DKMTShareObjects(long ptr ptr long ptr) win32u.NtGdiDdDDIShareObjects
+
+--- dlls/win32u/d3dkmt.c
++++ dlls/win32u/d3dkmt.c
+@@ -931,6 +931,15 @@ NTSTATUS WINAPI NtGdiDdDDIQueryVideoMemoryInfo( D3DKMT_QUERYVIDEOMEMORYINFO *des
+     return STATUS_SUCCESS;
+ }
+ 
++/******************************************************************************
++ *           NtGdiDdDDISetProcessSchedulingPriorityClass    (win32u.@)
++ */
++NTSTATUS WINAPI NtGdiDdDDISetProcessSchedulingPriorityClass( HANDLE process, D3DKMT_SCHEDULINGPRIORITYCLASS priority )
++{
++    FIXME( "(%p, %u): stub\n", process, priority );
++    return STATUS_NOT_IMPLEMENTED;
++}
++
+ /******************************************************************************
+  *           NtGdiDdDDISetQueuedLimit    (win32u.@)
+  */
+
+--- dlls/win32u/main.c
++++ dlls/win32u/main.c
+@@ -425,6 +425,11 @@ NTSTATUS SYSCALL_API NtGdiDdDDIReleaseKeyedMutex2( D3DKMT_RELEASEKEYEDMUTEX2 *pa
+     SYSCALL_FUNC( NtGdiDdDDIReleaseKeyedMutex2 );
+ }
+ 
++NTSTATUS SYSCALL_API NtGdiDdDDISetProcessSchedulingPriorityClass( HANDLE process, D3DKMT_SCHEDULINGPRIORITYCLASS priority )
++{
++    SYSCALL_FUNC( NtGdiDdDDISetProcessSchedulingPriorityClass );
++}
++
+ NTSTATUS SYSCALL_API NtGdiDdDDISetQueuedLimit( D3DKMT_SETQUEUEDLIMIT *desc )
+ {
+     SYSCALL_FUNC( NtGdiDdDDISetQueuedLimit );
+
+--- dlls/win32u/win32syscalls.h
++++ dlls/win32u/win32syscalls.h
+
+--- dlls/win32u/win32u.spec
++++ dlls/win32u/win32u.spec
+@@ -360,7 +360,7 @@
+ @ stub -syscall NtGdiDdDDISetMonitorColorSpaceTransform
+ @ stub -syscall NtGdiDdDDISetProcessDeviceRemovalSupport
+ @ stub -syscall NtGdiDdDDISetProcessSchedulingPriorityBand
+-@ stub -syscall NtGdiDdDDISetProcessSchedulingPriorityClass
++@ stdcall -syscall NtGdiDdDDISetProcessSchedulingPriorityClass(ptr long)
+ @ stdcall -syscall NtGdiDdDDISetQueuedLimit(ptr)
+ @ stub -syscall NtGdiDdDDISetStablePowerState
+ @ stub -syscall NtGdiDdDDISetStereoEnabled
+
+--- dlls/wow64win/gdi.c
++++ dlls/wow64win/gdi.c
+@@ -1509,6 +1509,14 @@ NTSTATUS WINAPI wow64_NtGdiDdDDIReleaseKeyedMutex2( UINT *args )
+     return status;
+ }
+ 
++NTSTATUS WINAPI wow64_NtGdiDdDDISetProcessSchedulingPriorityClass( UINT *args )
++{
++    HANDLE process = get_handle( &args );
++    D3DKMT_SCHEDULINGPRIORITYCLASS priority = get_ulong( &args );
++
++    return NtGdiDdDDISetProcessSchedulingPriorityClass( process, priority );
++}
++
+ NTSTATUS WINAPI wow64_NtGdiDdDDISetQueuedLimit( UINT *args )
+ {
+     D3DKMT_SETQUEUEDLIMIT *desc = get_ptr( &args );
+
+--- include/ddk/d3dkmthk.h
++++ include/ddk/d3dkmthk.h
+@@ -735,6 +735,16 @@ typedef struct _D3DKMT_QUERYVIDEOMEMORYINFO
+     UINT                        PhysicalAdapterIndex;
+ } D3DKMT_QUERYVIDEOMEMORYINFO;
+ 
++typedef enum _D3DKMT_SCHEDULINGPRIORITYCLASS
++{
++    D3DKMT_SCHEDULINGPRIORITYCLASS_IDLE         = 0,
++    D3DKMT_SCHEDULINGPRIORITYCLASS_BELOW_NORMAL = 1,
++    D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL       = 2,
++    D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL = 3,
++    D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH         = 4,
++    D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME     = 5,
++} D3DKMT_SCHEDULINGPRIORITYCLASS;
++
+ typedef enum _D3DKMT_QUEUEDLIMIT_TYPE
+ {
+     D3DKMT_SET_QUEUEDLIMIT_PRESENT = 1,
+@@ -1267,6 +1277,7 @@ NTSTATUS WINAPI D3DKMTQueryStatistics(D3DKMT_QUERYSTATISTICS *stats);
+ NTSTATUS WINAPI D3DKMTQueryVideoMemoryInfo(D3DKMT_QUERYVIDEOMEMORYINFO *desc);
+ NTSTATUS WINAPI D3DKMTReleaseKeyedMutex( D3DKMT_RELEASEKEYEDMUTEX *params );
+ NTSTATUS WINAPI D3DKMTReleaseKeyedMutex2( D3DKMT_RELEASEKEYEDMUTEX2 *params );
++NTSTATUS WINAPI D3DKMTSetProcessSchedulingPriorityClass( HANDLE process, D3DKMT_SCHEDULINGPRIORITYCLASS priority );
+ NTSTATUS WINAPI D3DKMTSetQueuedLimit(D3DKMT_SETQUEUEDLIMIT *desc);
+ NTSTATUS WINAPI D3DKMTSetVidPnSourceOwner(const D3DKMT_SETVIDPNSOURCEOWNER *desc);
+ NTSTATUS WINAPI D3DKMTShareObjects( UINT count, const D3DKMT_HANDLE *handles, OBJECT_ATTRIBUTES *attr, UINT access, HANDLE *handle );
+
+--- include/ntgdi.h
++++ include/ntgdi.h
+@@ -560,6 +560,7 @@ W32KAPI NTSTATUS WINAPI NtGdiDdDDIQueryStatistics( D3DKMT_QUERYSTATISTICS *stats
+ W32KAPI NTSTATUS WINAPI NtGdiDdDDIQueryVideoMemoryInfo( D3DKMT_QUERYVIDEOMEMORYINFO *desc );
+ W32KAPI NTSTATUS WINAPI NtGdiDdDDIReleaseKeyedMutex( D3DKMT_RELEASEKEYEDMUTEX *params );
+ W32KAPI NTSTATUS WINAPI NtGdiDdDDIReleaseKeyedMutex2( D3DKMT_RELEASEKEYEDMUTEX2 *params );
++W32KAPI NTSTATUS WINAPI NtGdiDdDDISetProcessSchedulingPriorityClass( HANDLE process, D3DKMT_SCHEDULINGPRIORITYCLASS priority );
+ W32KAPI NTSTATUS WINAPI NtGdiDdDDISetQueuedLimit( D3DKMT_SETQUEUEDLIMIT *desc );
+ W32KAPI NTSTATUS WINAPI NtGdiDdDDISetVidPnSourceOwner( const D3DKMT_SETVIDPNSOURCEOWNER *desc );
+ W32KAPI NTSTATUS WINAPI NtGdiDdDDIShareObjects( UINT count, const D3DKMT_HANDLE *handles, OBJECT_ATTRIBUTES *attr, UINT access, HANDLE *handle );
+

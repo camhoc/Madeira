@@ -1,0 +1,89 @@
+# ntdll: Improve NtQueryInformationThread information class handling.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12300 state=opened
+# The first commit makes NtQueryInformationThread return STATUS_INVALID_INFO_CLASS for unknown and set-only information classes, as Windows does, instead of STATUS_NOT_IMPLEMENTED.
+
+The second commit implements ThreadPerformanceCount. On Windows Server 2022 and 2025 (64-bit and WoW64 processes) the class requires a buffer of exactly sizeof(LARGE_INTEGER); otherwise STATUS_INFO_LENGTH_MISMATCH is returned and neither the buffer nor the return length is modified. It requires THREAD_QUERY_INFORMATION access: a handle with only THREAD_QUERY_LIMITED_INFORMATION gets STATUS_ACCESS_DENIED. On success eight bytes are written and the return length is set to 8. The value was zero in every successful call I observed, so the implementation returns zero.
+--- dlls/ntdll/tests/info.c
++++ dlls/ntdll/tests/info.c
+@@ -4052,6 +4052,7 @@ static void test_thread_info(void)
+ {
+     NTSTATUS status;
+     ULONG len, data;
++    LARGE_INTEGER count;
+ 
+     len = 0xdeadbeef;
+     data = 0xcccccccc;
+@@ -4076,6 +4077,35 @@ static void test_thread_info(void)
+     ok( status == STATUS_INFO_LENGTH_MISMATCH, "failed %lx\n", status );
+     ok( data == 0xcccccccc, "wrong data %lx\n", data );
+     ok( len == 0xdeadbeef, "wrong len %lu\n", len );
++
++    len = 0xdeadbeef;
++    status = pNtQueryInformationThread( GetCurrentThread(), -1,
++                                        NULL, 0, &len );
++    ok( status == STATUS_INVALID_INFO_CLASS, "failed %lx\n", status );
++    ok( len == 0xdeadbeef, "wrong len %lu\n", len );
++
++    len = 0xdeadbeef;
++    count.QuadPart = 0xcccccccc;
++    status = pNtQueryInformationThread( GetCurrentThread(), ThreadPerformanceCount,
++                                        &count, sizeof(count), &len );
++    ok( !status, "failed %lx\n", status );
++    ok( len == sizeof(count), "wrong len %lu\n", len );
++
++    len = 0xdeadbeef;
++    count.QuadPart = 0xcccccccc;
++    status = pNtQueryInformationThread( GetCurrentThread(), ThreadPerformanceCount,
++                                        &count, sizeof(count) - 1, &len );
++    ok( status == STATUS_INFO_LENGTH_MISMATCH, "failed %lx\n", status );
++    ok( count.QuadPart == 0xcccccccc, "wrong data %s\n", wine_dbgstr_longlong(count.QuadPart) );
++    ok( len == 0xdeadbeef, "wrong len %lu\n", len );
++
++    len = 0xdeadbeef;
++    count.QuadPart = 0xcccccccc;
++    status = pNtQueryInformationThread( GetCurrentThread(), ThreadPerformanceCount,
++                                        &count, sizeof(count) + 1, &len );
++    ok( status == STATUS_INFO_LENGTH_MISMATCH, "failed %lx\n", status );
++    ok( count.QuadPart == 0xcccccccc, "wrong data %s\n", wine_dbgstr_longlong(count.QuadPart) );
++    ok( len == 0xdeadbeef, "wrong len %lu\n", len );
+ }
+ 
+ static void test_debug_object(void)
+
+--- dlls/ntdll/unix/thread.c
++++ dlls/ntdll/unix/thread.c
+@@ -2462,16 +2462,31 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
+     case ThreadEnableAlignmentFaultFixup:
+         return STATUS_INVALID_INFO_CLASS;
+ 
++    case ThreadPerformanceCount:
++        if (ret_len) *(volatile ULONG *)ret_len |= 0;
++
++        if (length != sizeof(LARGE_INTEGER)) return STATUS_INFO_LENGTH_MISMATCH;
++        if (!data) return STATUS_ACCESS_VIOLATION;
++        SERVER_START_REQ( get_thread_info )
++        {
++            req->handle = wine_server_obj_handle( handle );
++            req->access = THREAD_QUERY_INFORMATION;
++            if ((status = wine_server_call( req ))) return status;
++            ((LARGE_INTEGER *)data)->QuadPart = 0;
++        }
++        SERVER_END_REQ;
++        if (ret_len) *ret_len = sizeof(LARGE_INTEGER);
++        return STATUS_SUCCESS;
++
+     case ThreadPriority:
+     case ThreadBasePriority:
+     case ThreadImpersonationToken:
+     case ThreadEventPair_Reusable:
+     case ThreadZeroTlsCell:
+-    case ThreadPerformanceCount:
+     case ThreadSetTlsArrayAddress:
+     default:
+         FIXME( "info class %d not supported yet\n", class );
+-        return STATUS_NOT_IMPLEMENTED;
++        return STATUS_INVALID_INFO_CLASS;
+     }
+ }
+ 
+

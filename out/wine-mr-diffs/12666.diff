@@ -1,0 +1,69 @@
+# server: Wake the next hardware message recipient after dequeue.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12666 state=opened
+# Found while running user32:win on OpenBSD, in the cross-process part of test_window_from_point(). The parent process creates a popup window, while a child process creates a transparent static control and buttons inside it. The window parentage automatically attaches their threads' input queues.
+
+An injected click can remain pending behind a WM_WINE_SETCURSOR message addressed to the parent. When the child examines the shared hardware queue, get_hardware_message() signals the parent and defers the child's following mouse messages to preserve input ordering.
+
+The child's message checks can consume its input changed bits while leaving its mouse wake bits set. Its subsequent MsgWaitForMultipleObjects(..., QS_ALLINPUT) waits for a new input notification. Removing the parent's cursor message makes the child's mouse messages eligible, but release_hardware_message() does not notify the child again.
+
+Without another input event, the child's 100 ms wait can therefore expire despite the pending click. This caused two assertions to fail:
+
+```
+transparent window didn't get WM_NCHITTEST message
+button under static window didn't get WM_LBUTTONUP
+```
+
+After removing a hardware message, re-evaluate the remaining messages using the existing recipient lookup. Notify the first eligible recipient in the same input queue through set_queue_bits(), restoring the relevant wake and changed bits. Stop at that recipient even when it is the current thread, so another thread is not notified for input that remains blocked behind the current thread's messages.
+
+On OpenBSD, the child woke when the parent removed its cursor message and received both expected messages. The complete user32:win run finished with no failures.
+--- server/queue.c
++++ server/queue.c
+@@ -198,6 +198,7 @@ static unsigned int cursor_history_latest;
+ 
+ static void queue_hardware_message( struct desktop *desktop, struct message *msg, int always_queue );
+ static void free_message( struct message *msg );
++static void wake_next_hardware_message( struct msg_queue *queue );
+ 
+ /* set the caret window in a given thread input, requires write lock on the thread input shared member */
+ static void set_caret_window( struct thread_input *input, input_shm_t *shared, user_handle_t win )
+@@ -1716,6 +1717,8 @@ static void release_hardware_message( struct msg_queue *queue, unsigned int hw_i
+     update_thread_input_key_state( input, msg->msg, msg->wparam );
+     list_remove( &msg->entry );
+     free_message( msg );
++
++    wake_next_hardware_message( queue );
+ }
+ 
+ static int queue_hotkey_message( struct desktop *desktop, struct message *msg )
+@@ -1796,6 +1799,30 @@ static user_handle_t find_hardware_message_window( struct desktop *desktop, stru
+     return win;
+ }
+ 
++/* Re-evaluate the next recipient after removing a hardware message. */
++static void wake_next_hardware_message( struct msg_queue *queue )
++{
++    struct thread_input *input = queue->input;
++    struct message *msg;
++    struct thread *thread;
++    user_handle_t win;
++    unsigned int msg_code;
++
++    LIST_FOR_EACH_ENTRY( msg, &input->msg_list, struct message, entry )
++    {
++        win = find_hardware_message_window( input->desktop, input, msg, &msg_code, &thread );
++        if (!thread) continue;
++        if (win && thread->queue->input == input)
++        {
++            if (thread->queue != queue)
++                set_queue_bits( thread->queue, get_hardware_msg_bit( msg->msg ) );
++            release_object( thread );
++            break;
++        }
++        release_object( thread );
++    }
++}
++
+ static struct rawinput_device *find_rawinput_device( struct process *process, unsigned int usage )
+ {
+     struct rawinput_device *device, *end;
+

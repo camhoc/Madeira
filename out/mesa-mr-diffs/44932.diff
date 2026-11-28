@@ -1,0 +1,282 @@
+# hk: Optimize external BO implicit sync under virtio
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44932 state=closed
+# hk: Optimize external BO implicit sync under virtio
+
+Under virtio, shared BOs are implicitly synchronized by the host on
+every submit that carries them, chaining each job to the previous one
+and preventing the kernel from keeping multiple jobs in flight.
+
+Only submits that wait on or signal shareable syncs (e.g. WSI) need this
+synchronization:
+- Waiting submits only need the implicit fences of the BOs (READ).
+- Signalling submits only need to publish their fence (WRITE).
+- Looped submits only wrap the first (READ) and last (WRITE) ioctl.
+
+For BOs imported from outside the driver (HK_EXTRES_FOREIGN), keep full
+implicit sync unconditionally to preserve external synchronization
+guarantees. An atomic counter (`foreign_count`) is used to completely
+skip the sync iteration on internal submits when no foreign BOs exist.
+
+Signed-off-by: s0ullight <opossum.pizazz-5h@icloud.com>
+--- src/asahi/vulkan/hk_device.h
++++ src/asahi/vulkan/hk_device.h
+@@ -103,6 +103,11 @@ struct hk_device {
+       struct u_rwlock lock;
+       struct util_dynarray list;
+       struct util_dynarray counts;
++
++      /* Number of list entries marked HK_EXTRES_FOREIGN. Updated under the
++       * write lock, read locklessly as a fast-path hint.
++       */
++      unsigned foreign_count;
+    } external_bos;
+ };
+ 
+
+--- src/asahi/vulkan/hk_device_memory.c
++++ src/asahi/vulkan/hk_device_memory.c
+@@ -50,7 +50,8 @@ hk_memory_type_flags(const VkMemoryType *type,
+ }
+ 
+ static void
+-hk_add_ext_bo_locked(struct hk_device *dev, struct agx_bo *bo)
++hk_add_ext_bo_locked(struct hk_device *dev, struct agx_bo *bo,
++                     bool imported)
+ {
+    uint32_t id = bo->uapi_handle;
+ 
+@@ -62,6 +63,11 @@ hk_add_ext_bo_locked(struct hk_device *dev, struct agx_bo *bo)
+          &dev->external_bos.list, struct asahi_ccmd_submit_res, i);
+ 
+       if (p->res_id == id) {
++         if (imported && !(p->flags & HK_EXTRES_FOREIGN)) {
++            p->flags |= HK_EXTRES_FOREIGN;
++            p_atomic_inc(&dev->external_bos.foreign_count);
++         }
++
+          ++*util_dynarray_element(&dev->external_bos.counts, unsigned, i);
+          return;
+       }
+@@ -69,18 +75,22 @@ hk_add_ext_bo_locked(struct hk_device *dev, struct agx_bo *bo)
+ 
+    struct asahi_ccmd_submit_res res = {
+       .res_id = id,
+-      .flags = ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE,
++      .flags = ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE |
++               (imported ? HK_EXTRES_FOREIGN : 0),
+    };
++   if (imported)
++      p_atomic_inc(&dev->external_bos.foreign_count);
++
+    util_dynarray_append(&dev->external_bos.list, res);
+    util_dynarray_append_typed(&dev->external_bos.counts, unsigned, 1);
+ }
+ 
+ static void
+-hk_add_ext_bo(struct hk_device *dev, struct agx_bo *bo)
++hk_add_ext_bo(struct hk_device *dev, struct agx_bo *bo, bool imported)
+ {
+    if (dev->dev.is_virtio) {
+       u_rwlock_wrlock(&dev->external_bos.lock);
+-      hk_add_ext_bo_locked(dev, bo);
++      hk_add_ext_bo_locked(dev, bo, imported);
+       u_rwlock_wrunlock(&dev->external_bos.lock);
+    }
+ }
+@@ -100,6 +110,9 @@ hk_remove_ext_bo_locked(struct hk_device *dev, struct agx_bo *bo)
+          unsigned *ctr =
+             util_dynarray_element(&dev->external_bos.counts, unsigned, i);
+          if (!--*ctr) {
++            if (p->flags & HK_EXTRES_FOREIGN)
++               p_atomic_dec(&dev->external_bos.foreign_count);
++
+             *ctr = util_dynarray_pop(&dev->external_bos.counts, unsigned);
+             *p = util_dynarray_pop(&dev->external_bos.list,
+                                    struct asahi_ccmd_submit_res);
+@@ -228,7 +241,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+       return VK_ERROR_UNKNOWN;
+ 
+    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
+-      hk_add_ext_bo(dev, mem->bo);
++      hk_add_ext_bo(dev, mem->bo, fd_info && fd_info->handleType);
+ 
+    if (fd_info && fd_info->handleType) {
+       /* From the Vulkan spec:
+
+--- src/asahi/vulkan/hk_device_memory.h
++++ src/asahi/vulkan/hk_device_memory.h
+@@ -16,6 +16,13 @@
+ struct hk_device;
+ struct hk_image_plane;
+ 
++/* Driver-private bit in asahi_ccmd_submit_res::flags (stripped before it is
++ * sent to the host) marking BOs imported from outside the driver. These always
++ * get implicit sync in both directions, as the other party may rely on it even
++ * when no shareable sync object is used.
++ */
++#define HK_EXTRES_FOREIGN 0x80000000u
++
+ struct hk_device_memory {
+    struct vk_device_memory vk;
+ 
+
+--- src/asahi/vulkan/hk_queue.c
++++ src/asahi/vulkan/hk_queue.c
+@@ -22,12 +22,14 @@
+ #include "decode.h"
+ #include "hk_cmd_buffer.h"
+ #include "hk_device.h"
++#include "hk_device_memory.h"
+ #include "hk_image.h"
+ #include "hk_physical_device.h"
+ 
+ #include <xf86drm.h>
+ #include "util/list.h"
+ #include "util/macros.h"
++#include "util/u_atomic.h"
+ #include "util/u_dynarray.h"
+ #include "vulkan/vulkan_core.h"
+ 
+@@ -258,21 +260,46 @@ max_commands_per_submit(struct hk_device *dev)
+ 
+ static VkResult
+ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
+-                    unsigned ring_idx)
++                    unsigned ring_idx, unsigned extres_flags,
++                    unsigned foreign_flags)
+ {
+    struct agx_submit_virt virt = {.ring_idx = ring_idx};
++   struct util_dynarray extres = UTIL_DYNARRAY_INIT;
+ 
+-   if (dev->dev.is_virtio) {
++   /* Skip everything when this submit has no shareable syncs and no imported
++    * BO exists on the device.
++    */
++   if (!p_atomic_read(&dev->external_bos.foreign_count))
++      foreign_flags = 0;
++
++   if (dev->dev.is_virtio && (extres_flags || foreign_flags)) {
+       u_rwlock_rdlock(&dev->external_bos.lock);
++
++      /* Restrict the implicit sync to the requested directions. Imported BOs
++       * may be implicitly synchronized with their producer/consumer without
++       * any shareable sync being involved, so they use their own mask.
++       */
++      util_dynarray_foreach(&dev->external_bos.list,
++                            struct asahi_ccmd_submit_res, res) {
++         struct asahi_ccmd_submit_res out = *res;
++         out.flags &= (res->flags & HK_EXTRES_FOREIGN) ? foreign_flags
++                                                      : extres_flags;
++         out.flags &= ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE;
++
++         if (out.flags)
++            util_dynarray_append(&extres, out);
++      }
++
++      u_rwlock_rdunlock(&dev->external_bos.lock);
++
+       virt.extres_count = util_dynarray_num_elements(
+-         &dev->external_bos.list, struct asahi_ccmd_submit_res);
+-      virt.extres = util_dynarray_begin(&dev->external_bos.list);
++         &extres, struct asahi_ccmd_submit_res);
++      virt.extres = util_dynarray_begin(&extres);
+    }
+ 
+    int ret = dev->dev.ops.submit(&dev->dev, submit, &virt);
+ 
+-   if (dev->dev.is_virtio)
+-      u_rwlock_rdunlock(&dev->external_bos.lock);
++   util_dynarray_fini(&extres);
+ 
+    /* XXX: don't trap */
+    if (ret) {
+@@ -291,7 +318,8 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
+  */
+ static VkResult
+ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
+-                    unsigned command_count, unsigned ring_idx)
++                    unsigned command_count, unsigned ring_idx,
++                    unsigned extres_flags, unsigned foreign_flags)
+ {
+    uint8_t *cmdbuf = (uint8_t *)(uintptr_t)submit->cmdbuf;
+    uint32_t offs = 0;
+@@ -364,7 +392,17 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
+          .out_sync_count = has_out_syncs ? submit->out_sync_count : 0,
+       };
+ 
+-      VkResult result = queue_submit_single(dev, &submit_ioctl, ring_idx);
++      /* The external resource sync only needs to wrap the whole submission:
++       * the first ioctl waits on the implicit fences (and, as the scheduler
++       * runs a queue's jobs in order, covers the following ones) and the last
++       * ioctl publishes the final fence.
++       */
++      const unsigned ioctl_mask =
++         (first ? ASAHI_EXTRES_READ : 0) | (last ? ASAHI_EXTRES_WRITE : 0);
++
++      VkResult result = queue_submit_single(dev, &submit_ioctl, ring_idx,
++                                            extres_flags & ioctl_mask,
++                                            foreign_flags & ioctl_mask);
+       if (result != VK_SUCCESS)
+          return result;
+ 
+@@ -733,6 +771,37 @@ hk_queue_submit_bind_sparse_memory(struct hk_device *device,
+    return VK_SUCCESS;
+ }
+ 
++/*
++ * Under virtio, shared BOs are implicitly synchronized by the host on every
++ * submit that carries them, which chains each job to the previous one and
++ * stops the kernel from keeping more than one job in flight. Only submits that
++ * wait on or signal shareable syncs (i.e. WSI) can involve them, so don't pay
++ * for it on the rest: waiting submits need the implicit fences of the BOs
++ * (READ), signalling submits need to publish their fence on them (WRITE).
++ *
++ * This only applies to BOs we exported ourselves (e.g. WSI images). BOs
++ * imported from outside keep full implicit sync on every submit, see
++ * HK_EXTRES_FOREIGN.
++ */
++static unsigned
++submit_extres_flags(struct vk_queue_submit *submit)
++{
++   const unsigned mask = VK_SYNC_IS_SHAREABLE | VK_SYNC_IS_SHARED;
++   unsigned flags = 0;
++
++   for (unsigned i = 0; i < submit->wait_count; ++i) {
++      if (submit->waits[i].sync->flags & mask)
++         flags |= ASAHI_EXTRES_READ;
++   }
++
++   for (unsigned i = 0; i < submit->signal_count; ++i) {
++      if (submit->signals[i].sync->flags & mask)
++         flags |= ASAHI_EXTRES_WRITE;
++   }
++
++   return flags;
++}
++
+ static VkResult
+ queue_submit(struct hk_device *dev, struct hk_queue *queue,
+              struct vk_queue_submit *submit)
+@@ -870,13 +939,18 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
+       .cmdbuf = (uint64_t)(uintptr_t)(payload.data),
+    };
+ 
++   const unsigned extres_flags = submit_extres_flags(submit);
++   const unsigned foreign_flags = ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE;
++
+    VkResult result;
+    if (command_count <= max_commands_per_submit(dev)) {
+-      result =
+-         queue_submit_single(dev, &submit_ioctl, queue->drm.virt_ring_idx);
++      result = queue_submit_single(dev, &submit_ioctl,
++                                   queue->drm.virt_ring_idx, extres_flags,
++                                   foreign_flags);
+    } else {
+       result = queue_submit_looped(dev, &submit_ioctl, command_count,
+-                                   queue->drm.virt_ring_idx);
++                                   queue->drm.virt_ring_idx, extres_flags,
++                                   foreign_flags);
+    }
+ 
+    util_dynarray_fini(&payload);
+

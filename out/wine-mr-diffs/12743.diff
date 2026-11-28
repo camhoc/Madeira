@@ -1,0 +1,29 @@
+# ntdll: Implement NtYieldExecution() with swtch() on macOS.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12743 state=merged
+# This is an alternative to https://gitlab.winehq.org/wine/wine/-/merge_requests/12737.
+
+In contrast to `thread_switch()` the `swtch()`([source here for both implementations for reference)](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/kern/syscall_subr.c#L122) mach trap returns false if `thread_should_yield()` is false, so the correct NTSTATUS can be reported in that case, similar to the Linux implementation.
+
+Also this does not depress thread priority in any way and just performs the yield, which matches better `NtYieldExecution()` behavior.
+--- dlls/ntdll/unix/sync.c
++++ dlls/ntdll/unix/sync.c
+@@ -56,6 +56,7 @@
+ #include <time.h>
+ #ifdef __APPLE__
+ # include <mach/mach_time.h>
++# include <mach/mach_traps.h>
+ #endif
+ #ifdef HAVE_KQUEUE
+ # include <sys/event.h>
+@@ -2397,7 +2398,9 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
+  */
+ NTSTATUS WINAPI NtYieldExecution(void)
+ {
+-#ifdef HAVE_SCHED_YIELD
++#if defined(__APPLE__)
++    return swtch() ? STATUS_SUCCESS : STATUS_NO_YIELD_PERFORMED;
++#elif defined(HAVE_SCHED_YIELD)
+ #ifdef RUSAGE_THREAD
+     struct rusage u1, u2;
+     int ret;
+

@@ -1,0 +1,999 @@
+# nir: add and use an ALU source index iterator
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/43442 state=closed
+# ### What does this MR do and why?
+
+Calls inside an ALU source loop can alias the instruction. This can prevent the compiler from hoisting the opcode and input-count loads out of the loop.
+
+Add `nir_foreach_alu_src_idx()`, which snapshots the input count in a local variable, and use it in `nir_foreach_src()`. This preserves the optimization while making the intent reusable and harder to undo accidentally.
+
+For consistency, convert all 88 matching zero-based loops over `nir_op_infos[alu->op].num_inputs` in 49 files to the shared iterator. Loops with a nonzero or dynamic starting index, and loops over a local opcode rather than an ALU instruction, retain their existing form because they do not match the iterator contract.
+
+An allocated `nir_alu_instr` has a fixed source-array size. Source visitors may rewrite references but cannot resize the instruction during traversal, so retaining the count does not weaken the traversal contract.
+
+### Performance
+
+Across 21 alternating A/B pairs of a cold, single-threaded pipeline replay, the complete MR retires 0.110% fewer CPU instructions. The 95% confidence interval is -0.114% to -0.105%. The wall-time difference remains below measurement noise.
+
+### Validation
+
+- Release build completed for all Gallium drivers and the AMD, Broadcom, Freedreno, Intel, Intel Hasvk, Microsoft experimental, Asahi, and KosmicKrisp Vulkan drivers (5,249 build steps).
+- `nir_tests` passed.
+- `nir_algebraic_parser` passed.
+- `spirv_tests` passed.
+- `ac_nir_tests` passed.
+- 899 graphics and 162 compute pipelines replayed successfully.
+- All 1,359 non-time pipeline-stat records are identical.
+--- src/amd/common/nir/ac_nir.c
++++ src/amd/common/nir/ac_nir.c
+@@ -1130,7 +1130,7 @@ ac_nir_opt_vectorize_cb(const nir_instr *instr, const void *data)
+    case nir_op_ixor:
+    case nir_op_inot:
+    case nir_op_bitfield_select:
+-      for (unsigned idx = 0; idx < nir_op_infos[alu->op].num_inputs; idx++)
++      nir_foreach_alu_src_idx(idx, alu)
+          target_width = MIN2(target_width, max_alu_src_identity_swizzle(alu, &alu->src[idx]));
+       break;
+    default:
+
+--- src/amd/common/nir/ac_nir_opt_flip_if_for_mem_loads.c
++++ src/amd/common/nir/ac_nir_opt_flip_if_for_mem_loads.c
+@@ -68,7 +68,7 @@ is_vmem_or_lds_load(nir_def *def, unsigned depth, unsigned begin, unsigned end)
+          return is_other;
+ 
+       unsigned res = 0;
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++      nir_foreach_alu_src_idx(i, alu)
+          res |= is_vmem_or_lds_load(alu->src[i].src.ssa, depth + 1, begin, end);
+       return res;
+    }
+
+--- src/amd/compiler/instruction_selection/aco_isel_setup.cpp
++++ src/amd/compiler/instruction_selection/aco_isel_setup.cpp
+@@ -520,7 +520,7 @@ init_context(isel_context* ctx, nir_shader* shader)
+                   FALLTHROUGH;
+                }
+                default:
+-                  for (unsigned i = 0; i < nir_op_infos[alu_instr->op].num_inputs; i++) {
++                  nir_foreach_alu_src_idx(i, alu_instr) {
+                      if (alu_instr->src[i].src.ssa->bit_size == 1
+                             ? nir_src_is_divergent(&alu_instr->src[i].src)
+                             : regclasses[alu_instr->src[i].src.ssa->index].type() == RegType::vgpr)
+
+--- src/amd/llvm/ac_nir_to_llvm.c
++++ src/amd/llvm/ac_nir_to_llvm.c
+@@ -493,7 +493,7 @@ static bool visit_alu(struct ac_nir_context *ctx, const nir_alu_instr *instr)
+    LLVMTypeRef def_type = get_def_type(ctx, &instr->def);
+ 
+    assert(nir_op_infos[instr->op].num_inputs <= ARRAY_SIZE(src));
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++)
++   nir_foreach_alu_src_idx(i, instr)
+       src[i] = get_alu_src(ctx, instr->src[i], nir_ssa_alu_instr_src_components(instr, i));
+ 
+    switch (instr->op) {
+@@ -803,7 +803,7 @@ static bool visit_alu(struct ac_nir_context *ctx, const nir_alu_instr *instr)
+    case nir_op_vec5:
+    case nir_op_vec8:
+    case nir_op_vec16:
+-      for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++)
++      nir_foreach_alu_src_idx(i, instr)
+          src[i] = ac_to_integer(&ctx->ac, src[i]);
+       result = ac_build_gather_values(&ctx->ac, src, num_components);
+       break;
+
+--- src/asahi/compiler/agx_nir_opt_preamble.c
++++ src/asahi/compiler/agx_nir_opt_preamble.c
+@@ -53,7 +53,7 @@ all_uses_float(nir_def *def)
+ 
+       nir_alu_instr *use_alu = nir_instr_as_alu(use_instr);
+       unsigned src_index = ~0;
+-      for (unsigned i = 0; i < nir_op_infos[use_alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, use_alu) {
+          if (&use_alu->src[i].src == use) {
+             src_index = i;
+             break;
+
+--- src/broadcom/compiler/nir_to_vir.c
++++ src/broadcom/compiler/nir_to_vir.c
+@@ -1249,7 +1249,7 @@ ntq_get_alu_parent(nir_src src)
+          * moving emission of the ALU instr down past another write of the
+          * src.
+          */
+-        for (int i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++        nir_foreach_alu_src_idx(i, instr) {
+                 if (nir_load_reg_for_def(instr->src[i].src.ssa))
+                         return NULL;
+         }
+@@ -1372,10 +1372,10 @@ ntq_emit_alu(struct v3d_compile *c, nir_alu_instr *instr)
+             instr->op == nir_op_vec3 ||
+             instr->op == nir_op_vec4) {
+                 struct qreg srcs[4];
+-                for (int i = 0; i < nir_op_infos[instr->op].num_inputs; i++)
++                nir_foreach_alu_src_idx(i, instr)
+                         srcs[i] = ntq_get_src(c, instr->src[i].src,
+                                               instr->src[i].swizzle[0]);
+-                for (int i = 0; i < nir_op_infos[instr->op].num_inputs; i++)
++                nir_foreach_alu_src_idx(i, instr)
+                         ntq_store_def(c, &instr->def, i,
+                                       vir_MOV(c, srcs[i]));
+                 return;
+@@ -1384,7 +1384,7 @@ ntq_emit_alu(struct v3d_compile *c, nir_alu_instr *instr)
+         /* General case: We can just grab the one used channel per src. */
+         assert(nir_op_infos[instr->op].num_inputs <= 3);
+         struct qreg src[3] = { 0 };
+-        for (int i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++        nir_foreach_alu_src_idx(i, instr) {
+                 src[i] = ntq_get_alu_src(c, instr, i);
+         }
+ 
+
+--- src/compiler/nir/tests/nir_algebraic_pattern_test.cpp
++++ src/compiler/nir/tests/nir_algebraic_pattern_test.cpp
+@@ -385,7 +385,7 @@ nir_algebraic_pattern_test::evaluate_expression(nir_instr *instr)
+       bit_size = alu->def.bit_size;
+ 
+    nir_const_value src[NIR_ALU_MAX_INPUTS][NIR_MAX_VEC_COMPONENTS];
+-   for (uint32_t i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       if (bit_size == 0 &&
+           !nir_alu_type_get_type_size(nir_op_infos[alu->op].input_types[i]))
+          bit_size = alu->src[i].src.ssa->bit_size;
+@@ -405,7 +405,7 @@ nir_algebraic_pattern_test::evaluate_expression(nir_instr *instr)
+       bit_size = 32;
+ 
+    nir_const_value *srcs[NIR_MAX_VEC_COMPONENTS];
+-   for (uint32_t i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++   nir_foreach_alu_src_idx(i, alu)
+       srcs[i] = src[i];
+ 
+    nir_const_value *dest = tmp_value(&alu->def);
+
+--- src/compiler/nir/nir.c
++++ src/compiler/nir/nir.c
+@@ -1640,7 +1640,7 @@ nir_src_is_always_uniform(nir_src src)
+    /* Operating together uniform expressions produces a uniform result */
+    if (nir_src_is_alu(src)) {
+       nir_alu_instr *alu = nir_src_as_alu(src);
+-      for (int i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, alu) {
+          if (!nir_src_is_always_uniform(alu->src[i].src))
+             return false;
+       }
+
+--- src/compiler/nir/nir.h
++++ src/compiler/nir/nir.h
+@@ -1686,6 +1686,17 @@ typedef struct nir_alu_instr {
+    nir_alu_src src[];
+ } nir_alu_instr;
+ 
++/** Iterate over the source indices of an ALU instruction.
++ *
++ * Keep the source count in a local variable.  In particular, this avoids
++ * repeated loads when calls in the loop body may alias the instruction and
++ * prevent the compiler from hoisting the lookup on its own.
++ */
++#define nir_foreach_alu_src_idx(src_idx, alu)                              \
++   for (unsigned src_idx = 0,                                              \
++                 _nir_num_srcs = nir_op_infos[(alu)->op].num_inputs;       \
++        src_idx < _nir_num_srcs; src_idx++)
++
+ static inline bool
+ nir_alu_instr_is_signed_zero_preserve(const nir_alu_instr *alu)
+ {
+
+--- src/compiler/nir/nir_clone.c
++++ src/compiler/nir/nir_clone.c
+@@ -274,7 +274,7 @@ clone_alu(clone_state *state, const nir_alu_instr *alu)
+ 
+    __clone_def(state, &nalu->instr, &nalu->def, &alu->def);
+ 
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       __clone_src(state, &nalu->instr, &nalu->src[i].src, &alu->src[i].src);
+       memcpy(nalu->src[i].swizzle, alu->src[i].swizzle,
+              sizeof(nalu->src[i].swizzle));
+
+--- src/compiler/nir/nir_deref.c
++++ src/compiler/nir/nir_deref.c
+@@ -953,7 +953,7 @@ opt_alu_of_cast(nir_alu_instr *alu)
+ {
+    bool progress = false;
+ 
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       if (!nir_src_is_deref(alu->src[i].src))
+          continue;
+ 
+
+--- src/compiler/nir/nir_inline_helpers.h
++++ src/compiler/nir/nir_inline_helpers.h
+@@ -54,7 +54,7 @@ nir_foreach_src(nir_instr *instr, nir_foreach_src_cb cb, void *state)
+    switch (instr->type) {
+    case nir_instr_type_alu: {
+       nir_alu_instr *alu = nir_instr_as_alu(instr);
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++      nir_foreach_alu_src_idx(i, alu)
+          if (!_nir_visit_src(&alu->src[i].src, cb, state))
+             return false;
+       break;
+
+--- src/compiler/nir/nir_inline_uniforms.c
++++ src/compiler/nir/nir_inline_uniforms.c
+@@ -142,7 +142,7 @@ collect_src_uniforms(const nir_src *src, int component,
+       }
+ 
+       /* Return true if all sources return true. */
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, alu) {
+          nir_alu_src *alu_src = alu->src + i;
+          int input_sizes = nir_op_infos[alu->op].input_sizes[i];
+ 
+
+--- src/compiler/nir/nir_instr_set.c
++++ src/compiler/nir/nir_instr_set.c
+@@ -140,7 +140,7 @@ hash_alu(uint32_t hash, const nir_alu_instr *instr)
+                              nir_ssa_alu_instr_src_components(instr, i));
+       }
+    } else {
+-      for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, instr) {
+          hash = hash_alu_src(hash, &instr->src[i],
+                              nir_ssa_alu_instr_src_components(instr, i));
+       }
+@@ -630,7 +630,7 @@ nir_instrs_equal(const nir_instr *instr1, const nir_instr *instr2)
+                return false;
+          }
+       } else {
+-         for (unsigned i = 0; i < nir_op_infos[alu1->op].num_inputs; i++) {
++         nir_foreach_alu_src_idx(i, alu1) {
+             if (!nir_alu_srcs_equal(alu1, alu2, i, i))
+                return false;
+          }
+
+--- src/compiler/nir/nir_loop_analyze.c
++++ src/compiler/nir/nir_loop_analyze.c
+@@ -214,7 +214,7 @@ is_only_uniform_src(nir_src *src)
+    case nir_instr_type_alu: {
+       /* Return true if all sources return true. */
+       nir_alu_instr *alu = nir_instr_as_alu(instr);
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, alu) {
+          if (!is_only_uniform_src(&alu->src[i].src)) {
+             result = false;
+             break;
+@@ -679,7 +679,7 @@ try_eval_const_alu(nir_const_value *dest, nir_scalar alu_s, const nir_scalar *or
+    if (!nir_alu_type_get_type_size(nir_op_infos[alu->op].output_type)) {
+       bit_size = alu->def.bit_size;
+    } else {
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, alu) {
+          if (!nir_alu_type_get_type_size(nir_op_infos[alu->op].input_types[i]))
+             bit_size = alu->src[i].src.ssa->bit_size;
+       }
+@@ -691,7 +691,7 @@ try_eval_const_alu(nir_const_value *dest, nir_scalar alu_s, const nir_scalar *or
+    nir_const_value src[NIR_MAX_VEC_COMPONENTS];
+    nir_const_value *src_ptrs[NIR_MAX_VEC_COMPONENTS];
+ 
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       nir_scalar src_s = nir_scalar_chase_alu_src(alu_s, i);
+ 
+       src_ptrs[i] = &src[i];
+@@ -1456,7 +1456,7 @@ gather_constant_fold_info(loop_info_state *state, nir_instr *instr)
+     * sources, can also be constant-folded.
+     */
+    nir_alu_instr *alu = nir_instr_as_alu(instr);
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       if(!nir_src_is_const(alu->src[i].src) &&
+          !is_const_after_unrolling(state, alu->src[i].src.ssa))
+          return;
+
+--- src/compiler/nir/nir_lower_alu_width.c
++++ src/compiler/nir/nir_lower_alu_width.c
+@@ -71,7 +71,7 @@ inst_is_vector_alu(const nir_instr *instr, const void *_state)
+ static bool
+ alu_is_swizzled_in_bounds(const nir_alu_instr *alu, unsigned width)
+ {
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       if (nir_op_infos[alu->op].input_sizes[i] == 1)
+          continue;
+ 
+
+--- src/compiler/nir/nir_lower_int64.c
++++ src/compiler/nir/nir_lower_int64.c
+@@ -997,7 +997,7 @@ static nir_def *
+ lower_int64_alu_instr(nir_builder *b, nir_alu_instr *alu)
+ {
+    nir_def *src[4];
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++   nir_foreach_alu_src_idx(i, alu)
+       src[i] = nir_ssa_for_alu_src(b, alu, i);
+ 
+    switch (alu->op) {
+
+--- src/compiler/nir/nir_lower_vec_to_regs.c
++++ src/compiler/nir/nir_lower_vec_to_regs.c
+@@ -106,7 +106,7 @@ try_coalesce(nir_builder *b, nir_def *reg, nir_alu_instr *vec,
+       /* If we are going to reswizzle the instruction, we can't have any
+        * non-per-component sources either.
+        */
+-      for (unsigned j = 0; j < nir_op_infos[src_alu->op].num_inputs; j++)
++      nir_foreach_alu_src_idx(j, src_alu)
+          if (nir_op_infos[src_alu->op].input_sizes[j] != 0)
+             return 0;
+    }
+@@ -119,7 +119,7 @@ try_coalesce(nir_builder *b, nir_def *reg, nir_alu_instr *vec,
+ 
+    /* Stash off all of the ALU instruction's swizzles. */
+    uint8_t swizzles[4][NIR_MAX_VEC_COMPONENTS];
+-   for (unsigned j = 0; j < nir_op_infos[src_alu->op].num_inputs; j++)
++   nir_foreach_alu_src_idx(j, src_alu)
+       for (unsigned i = 0; i < NIR_MAX_VEC_COMPONENTS; i++)
+          swizzles[j][i] = src_alu->src[j].swizzle[i];
+ 
+@@ -151,7 +151,7 @@ try_coalesce(nir_builder *b, nir_def *reg, nir_alu_instr *vec,
+           * to do any reswizzling
+           */
+       } else {
+-         for (unsigned j = 0; j < nir_op_infos[src_alu->op].num_inputs; j++) {
++         nir_foreach_alu_src_idx(j, src_alu) {
+             /* For channels we're extending out of nowhere, use a benign swizzle
+              * so we don't read invalid components and trip nir_validate.
+              */
+
+--- src/compiler/nir/nir_move_vec_src_uses_to_dest.c
++++ src/compiler/nir/nir_move_vec_src_uses_to_dest.c
+@@ -95,7 +95,7 @@ move_vec_src_uses_to_dest_block(nir_block *block, bool skip_const_srcs)
+        * to the destination
+        */
+       int srcs_remaining = 0;
+-      for (unsigned i = 0; i < nir_op_infos[vec->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, vec) {
+          if (skip_const_srcs && nir_src_is_const(vec->src[i].src))
+             continue;
+ 
+
+--- src/compiler/nir/nir_opt_constant_folding.c
++++ src/compiler/nir/nir_opt_constant_folding.c
+@@ -44,7 +44,7 @@ const_value_for_alu(nir_builder *b, nir_alu_instr *alu, unsigned bit_size,
+    nir_const_value *srcs[NIR_ALU_MAX_INPUTS];
+ 
+    memset(dest, 0, sizeof(dest));
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i)
++   nir_foreach_alu_src_idx(i, alu)
+       srcs[i] = src[i];
+ 
+    nir_eval_const_opcode(alu->op, dest, NULL, alu->def.num_components,
+@@ -111,7 +111,7 @@ nir_try_constant_fold_alu(nir_builder *b, nir_alu_instr *alu)
+    if (!nir_alu_type_get_type_size(nir_op_infos[alu->op].output_type))
+       bit_size = alu->def.bit_size;
+ 
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       if (bit_size == 0 &&
+           !nir_alu_type_get_type_size(nir_op_infos[alu->op].input_types[i]))
+          bit_size = alu->src[i].src.ssa->bit_size;
+@@ -155,7 +155,7 @@ nir_try_constant_fold_alu(nir_builder *b, nir_alu_instr *alu)
+    nir_def *then_const = const_value_for_alu(b, alu, bit_size, src);
+ 
+    /* Create second bcsel constant. */
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       nir_alu_instr *bcsel_alu = nir_src_as_alu(alu->src[i].src);
+       if (!bcsel_alu)
+          continue;
+
+--- src/compiler/nir/nir_opt_if.c
++++ src/compiler/nir/nir_opt_if.c
+@@ -419,7 +419,7 @@ opt_split_alu_of_phi(nir_builder *b, nir_loop *loop, nir_opt_if_options options)
+       nir_def *prev_srcs[8];     // FINISHME: Array size?
+       nir_def *continue_srcs[8]; // FINISHME: Array size?
+ 
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, alu) {
+          nir_instr *const src_instr = nir_def_instr(alu->src[i].src.ssa);
+ 
+          /* If the source is a phi in the loop header block, then the
+@@ -873,7 +873,7 @@ clone_alu_and_replace_src_defs(nir_builder *b, const nir_alu_instr *alu,
+                 alu->def.num_components,
+                 alu->def.bit_size);
+ 
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       nalu->src[i].src = nir_src_for_ssa(src_defs[i]);
+       memcpy(nalu->src[i].swizzle, alu->src[i].swizzle,
+              sizeof(nalu->src[i].swizzle));
+@@ -942,7 +942,7 @@ propagate_condition_eval(nir_builder *b, nir_if *nif, nir_src *use_src,
+       return false;
+ 
+    nir_def *def[NIR_MAX_VEC_COMPONENTS] = { 0 };
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       if (alu->src[i].src.ssa == use_src->ssa) {
+          def[i] = nir_imm_bool(b, bool_value);
+       } else {
+
+--- src/compiler/nir/nir_opt_load_store_vectorize.c
++++ src/compiler/nir/nir_opt_load_store_vectorize.c
+@@ -980,7 +980,7 @@ hoist_base_addr(nir_instr *instr, nir_instr *to_hoist)
+    if (to_hoist->type == nir_instr_type_alu) {
+       /* For ALU, recursively hoist the sources. */
+       nir_alu_instr *alu = nir_instr_as_alu(to_hoist);
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++      nir_foreach_alu_src_idx(i, alu)
+          hoist_base_addr(instr, nir_def_instr(alu->src[i].src.ssa));
+    }
+ 
+
+--- src/compiler/nir/nir_opt_rematerialize_compares.c
++++ src/compiler/nir/nir_opt_rematerialize_compares.c
+@@ -191,7 +191,7 @@ nir_opt_rematerialize_compares_impl(nir_shader *shader, nir_function_impl *impl)
+                nir_instr_insert_before(use_instr, &clone->instr);
+ 
+                nir_alu_instr *const use_alu = nir_instr_as_alu(use_instr);
+-               for (unsigned i = 0; i < nir_op_infos[use_alu->op].num_inputs; i++) {
++               nir_foreach_alu_src_idx(i, use_alu) {
+                   if (use_alu->src[i].src.ssa == &alu->def) {
+                      nir_src_rewrite(&use_alu->src[i].src, &clone->def);
+                      progress = true;
+@@ -285,7 +285,7 @@ nir_opt_rematerialize_alu_impl(nir_shader *shader, nir_function_impl *impl)
+             nir_instr_insert_before(use_instr, &clone->instr);
+ 
+             nir_alu_instr *const use_alu = nir_instr_as_alu(use_instr);
+-            for (unsigned i = 0; i < nir_op_infos[use_alu->op].num_inputs; i++) {
++            nir_foreach_alu_src_idx(i, use_alu) {
+                if (use_alu->src[i].src.ssa == &alu->def) {
+                   nir_src_rewrite(&use_alu->src[i].src, &clone->def);
+                   progress = true;
+
+--- src/compiler/nir/nir_opt_shrink_vectors.c
++++ src/compiler/nir/nir_opt_shrink_vectors.c
+@@ -321,7 +321,7 @@ opt_shrink_vectors_alu(nir_builder *b, nir_alu_instr *instr)
+       unsigned j;
+       for (j = 0; j < num_components; j++) {
+          bool duplicate_channel = true;
+-         for (unsigned k = 0; k < nir_op_infos[instr->op].num_inputs; k++) {
++         nir_foreach_alu_src_idx(k, instr) {
+             if (nir_op_infos[instr->op].input_sizes[k] != 0 ||
+                 instr->src[k].swizzle[i] != instr->src[k].swizzle[j]) {
+                duplicate_channel = false;
+@@ -338,7 +338,7 @@ opt_shrink_vectors_alu(nir_builder *b, nir_alu_instr *instr)
+ 
+       /* Otherwise, just append the value */
+       if (j == num_components) {
+-         for (int k = 0; k < nir_op_infos[instr->op].num_inputs; k++) {
++         nir_foreach_alu_src_idx(k, instr) {
+             instr->src[k].swizzle[num_components] = instr->src[k].swizzle[i];
+          }
+          if (i != num_components)
+
+--- src/compiler/nir/nir_opt_undef.c
++++ src/compiler/nir/nir_opt_undef.c
+@@ -96,7 +96,7 @@ opt_undef_vecN(nir_builder *b, nir_alu_instr *alu)
+    if (!op_is_mov_or_vec_or_pack_or_unpack(alu->op))
+       return false;
+ 
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       if (!nir_src_is_undef(alu->src[i].src))
+          return false;
+    }
+@@ -125,7 +125,7 @@ nir_get_undef_mask(nir_def *def)
+ 
+    /* nir_op_mov of undef is handled by opt_undef_vecN() */
+    if (nir_op_is_vec(alu->op)) {
+-      for (int i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, alu) {
+          if (nir_src_is_undef(alu->src[i].src)) {
+             undef |= BITSET_MASK(nir_ssa_alu_instr_src_components(alu, i)) << i;
+          }
+
+--- src/compiler/nir/nir_opt_uub.c
++++ src/compiler/nir/nir_opt_uub.c
+@@ -32,7 +32,7 @@ get_srcs(nir_alu_instr *alu, nir_scalar *srcs)
+    assert(alu->def.num_components == 1);
+    nir_scalar def = nir_get_scalar(&alu->def, 0);
+ 
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++   nir_foreach_alu_src_idx(i, alu)
+       srcs[i] = nir_scalar_chase_alu_src(def, i);
+ }
+ 
+
+--- src/compiler/nir/nir_opt_varyings.c
++++ src/compiler/nir/nir_opt_varyings.c
+@@ -4748,7 +4748,7 @@ backward_inter_shader_code_motion(struct linkage_info *linkage,
+                 * back just increases memory pressure without helping performance.
+                 */
+                unsigned input_size = 0;
+-               for (int i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++               nir_foreach_alu_src_idx(i, alu) {
+                   nir_src *src = &alu->src[i].src;
+                   input_size += nir_src_bit_size(*src) *
+                      nir_src_num_components(*src);
+
+--- src/compiler/nir/nir_opt_vectorize.c
++++ src/compiler/nir/nir_opt_vectorize.c
+@@ -318,7 +318,7 @@ instr_can_rewrite(nir_instr *instr)
+       if (nir_op_infos[alu->op].output_size != 0)
+          return false;
+ 
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, alu) {
+          if (nir_op_infos[alu->op].input_sizes[i] != 0)
+             return false;
+ 
+@@ -602,7 +602,7 @@ instr_try_combine_alu(struct set *instr_set, nir_alu_instr *alu1, nir_alu_instr
+ 
+    bool srcs_swapped = alu_srcs_match_swapped(alu1, alu2, alu1->instr.pass_flags);
+ 
+-   for (unsigned i = 0; i < nir_op_infos[alu1->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu1) {
+       unsigned alu2_src_idx = srcs_swapped && i < 2 ? 1 - i : i;
+       const nir_alu_src *alu2_src = &alu2->src[alu2_src_idx];
+ 
+
+--- src/compiler/nir/nir_print.c
++++ src/compiler/nir/nir_print.c
+@@ -540,7 +540,7 @@ print_alu_instr(nir_alu_instr *instr, print_state *state)
+       fprintf(fp, ".nuw");
+    fprintf(fp, " ");
+ 
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, instr) {
+       if (i != 0)
+          fprintf(fp, ", ");
+ 
+
+--- src/compiler/nir/nir_search.c
++++ src/compiler/nir/nir_search.c
+@@ -366,7 +366,7 @@ match_expression(const nir_algebraic_table *table, const nir_search_expression *
+          : 0;
+ 
+    bool matched = true;
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, instr) {
+       /* If src1 of the search expression is a constant, check that first since it's faster. */
+       unsigned src_idx = i < 2 ? i ^ expr->src1_is_const : i;
+ 
+
+--- src/compiler/nir/nir_softfloat.h
++++ src/compiler/nir/nir_softfloat.h
+@@ -43,7 +43,7 @@ nir_lower_softfloat_func(nir_builder *b,
+    params[0] = &ret_deref->def;
+ 
+    assert(nir_op_infos[instr->op].num_inputs + 1 == softfloat_func->num_params);
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, instr) {
+       nir_alu_type n_type =
+          nir_alu_type_get_base_type(nir_op_infos[instr->op].input_types[i]);
+       /* Add bitsize */
+
+--- src/compiler/nir/nir_split_vars.c
++++ src/compiler/nir/nir_split_vars.c
+@@ -1278,7 +1278,7 @@ get_non_self_referential_store_comps(nir_intrinsic_instr *store)
+       /* If it's a vec, discount any channels that are just loads from the
+        * same deref put in the same spot.
+        */
+-      for (unsigned i = 0; i < nir_op_infos[src_alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, src_alu) {
+          if (src_is_load_deref(src_alu->src[i].src, store->src[0]) &&
+              src_alu->src[i].swizzle[0] == i)
+             comps &= ~(1u << i);
+
+--- src/compiler/nir/nir_validate.c
++++ src/compiler/nir/nir_validate.c
+@@ -245,7 +245,7 @@ validate_alu_instr(nir_alu_instr *instr, validate_state *state)
+    validate_assert(state, instr->op < nir_num_opcodes);
+ 
+    unsigned instr_bit_size = 0;
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, instr) {
+       nir_alu_type src_type = nir_op_infos[instr->op].input_types[i];
+       unsigned src_bit_size = nir_src_bit_size(instr->src[i].src);
+       if (nir_alu_type_get_type_size(src_type)) {
+
+--- src/freedreno/ir3/ir3_nir_opt_preamble.c
++++ src/freedreno/ir3/ir3_nir_opt_preamble.c
+@@ -41,7 +41,7 @@ all_uses_float(nir_def *def, bool allow_src2)
+          return false;
+       nir_alu_instr *use_alu = nir_instr_as_alu(use_instr);
+       unsigned src_index = ~0;
+-      for  (unsigned i = 0; i < nir_op_infos[use_alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, use_alu) {
+          if (&use_alu->src[i].src == use) {
+             src_index = i;
+             break;
+@@ -393,7 +393,7 @@ ir3_def_is_rematerializable_for_preamble(nir_def *def,
+    }
+    case nir_instr_type_alu: {
+       nir_alu_instr *alu = nir_def_as_alu(def);
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, alu) {
+          if (!ir3_def_is_rematerializable_for_preamble(alu->src[i].src.ssa,
+                                                        preamble_defs))
+             return false;
+@@ -500,7 +500,7 @@ _rematerialize_def(nir_builder *b, struct hash_table *remap_ht,
+    }
+    case nir_instr_type_alu: {
+       nir_alu_instr *alu = nir_def_as_alu(def);
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++      nir_foreach_alu_src_idx(i, alu)
+          _rematerialize_def(b, remap_ht, instr_set, preamble_defs,
+                             alu->src[i].src.ssa);
+       break;
+
+--- src/gallium/auxiliary/gallivm/lp_bld_nir_aos.c
++++ src/gallium/auxiliary/gallivm/lp_bld_nir_aos.c
+@@ -521,7 +521,7 @@ visit_alu(struct lp_build_nir_aos_context *bld,
+       break;
+    }
+ 
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, instr) {
+       src[i] = get_alu_src(bld, instr->src[i], src_components);
+       src_bit_size[i] = nir_src_bit_size(instr->src[i].src);
+    }
+@@ -529,7 +529,7 @@ visit_alu(struct lp_build_nir_aos_context *bld,
+    LLVMValueRef result[NIR_MAX_VEC_COMPONENTS] = { NULL };
+    if (instr->op == nir_op_vec4 ||
+        instr->op == nir_op_vec2) {
+-      for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, instr) {
+          result[i] = cast_type(bld, src[i],
+                                nir_op_infos[instr->op].input_types[i],
+                                src_bit_size[i]);
+
+--- src/gallium/auxiliary/gallivm/lp_bld_nir_soa.c
++++ src/gallium/auxiliary/gallivm/lp_bld_nir_soa.c
+@@ -3698,7 +3698,7 @@ visit_alu(struct lp_build_nir_soa_context *bld,
+    bld->dbl_bld.type.nan_preserve |= nir_alu_instr_is_nan_preserve(instr);
+    bld->scalar_dbl_bld.type.nan_preserve |= nir_alu_instr_is_nan_preserve(instr);
+ 
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, instr) {
+       /**
+        * Get a source register value for an ALU instruction.
+        * This is where swizzles are handled.  There should be no negation
+@@ -3715,7 +3715,7 @@ visit_alu(struct lp_build_nir_soa_context *bld,
+        instr->op == nir_op_vec2 ||
+        instr->op == nir_op_vec8 ||
+        instr->op == nir_op_vec16) {
+-      for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, instr) {
+          result[i] = cast_type(bld, src[i],
+                                nir_alu_type_get_base_type(nir_op_infos[instr->op].input_types[i]),
+                                src_bit_size[i]);
+@@ -3726,7 +3726,7 @@ visit_alu(struct lp_build_nir_soa_context *bld,
+          LLVMValueRef src_chan[NIR_MAX_VEC_COMPONENTS];
+ 
+          /* Loop over instruction operands */
+-         for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++         nir_foreach_alu_src_idx(i, instr) {
+             if (num_components > 1) {
+                src_chan[i] = LLVMBuildExtractValue(gallivm->builder,
+                                                      src[i], c, "");
+
+--- src/gallium/drivers/etnaviv/etnaviv_compiler_nir_liveness.c
++++ src/gallium/drivers/etnaviv/etnaviv_compiler_nir_liveness.c
+@@ -80,7 +80,7 @@ set_src_live(nir_src *src, void *void_state)
+       /* alu op bypass */
+       nir_alu_instr *alu = nir_instr_as_alu(instr);
+       if (instr->pass_flags & BYPASS_SRC) {
+-         for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++         nir_foreach_alu_src_idx(i, alu)
+             set_src_live(&alu->src[i].src, state);
+          return true;
+       }
+
+--- src/gallium/drivers/etnaviv/etnaviv_nir_lower_source_mods.c
++++ src/gallium/drivers/etnaviv/etnaviv_nir_lower_source_mods.c
+@@ -55,7 +55,7 @@ nir_lower_to_source_mods_instr(nir_builder *b, nir_instr *instr,
+ 
+    nir_alu_instr *alu = nir_instr_as_alu(instr);
+ 
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       if (!nir_src_is_alu(alu->src[i].src))
+          continue;
+ 
+
+--- src/gallium/drivers/radeonsi/gfx/si_gfx_screen.c
++++ src/gallium/drivers/radeonsi/gfx/si_gfx_screen.c
+@@ -283,7 +283,7 @@ static bool si_alu_to_scalar_packed_math_filter(const nir_instr *instr, const vo
+       if (alu->def.bit_size == 16 && alu->def.num_components == 2 &&
+           ac_nir_op_supports_packed_math_16bit(alu)) {
+          /* ACO requires that all but the first bit of swizzle must be equal. */
+-         for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++         nir_foreach_alu_src_idx(i, alu) {
+             if ((alu->src[i].swizzle[0] >> 1) != (alu->src[i].swizzle[1] >> 1))
+                return true;
+          }
+
+--- src/gallium/drivers/vc4/vc4_program.c
++++ src/gallium/drivers/vc4/vc4_program.c
+@@ -1072,10 +1072,10 @@ ntq_emit_alu(struct vc4_compile *c, nir_alu_instr *instr)
+             instr->op == nir_op_vec3 ||
+             instr->op == nir_op_vec4) {
+                 struct qreg srcs[4];
+-                for (int i = 0; i < nir_op_infos[instr->op].num_inputs; i++)
++                nir_foreach_alu_src_idx(i, instr)
+                         srcs[i] = ntq_get_src(c, instr->src[i].src,
+                                               instr->src[i].swizzle[0]);
+-                for (int i = 0; i < nir_op_infos[instr->op].num_inputs; i++)
++                nir_foreach_alu_src_idx(i, instr)
+                         ntq_store_def(c, &instr->def, i,
+                                       qir_MOV(c, srcs[i]));
+                 return;
+@@ -1099,7 +1099,7 @@ ntq_emit_alu(struct vc4_compile *c, nir_alu_instr *instr)
+ 
+         /* General case: We can just grab the one used channel per src. */
+         struct qreg src[nir_op_infos[instr->op].num_inputs];
+-        for (int i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++        nir_foreach_alu_src_idx(i, instr) {
+                 src[i] = ntq_get_alu_src(c, instr, i);
+         }
+ 
+
+--- src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
++++ src/gallium/drivers/zink/nir_to_spirv/nir_to_spirv.c
+@@ -191,7 +191,7 @@ infer_nir_alu_type_from_use(nir_src *src)
+          atype = infer_nir_alu_type_from_uses_ssa(&alu->def);
+          break;
+       }
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, alu) {
+          if (!nir_srcs_equal(alu->src[i].src, *src))
+             continue;
+          atype = nir_op_infos[alu->op].input_types[i];
+@@ -1850,7 +1850,7 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
+    nir_alu_type stype[NIR_MAX_VEC_COMPONENTS] = {0};
+    SpvId src[NIR_MAX_VEC_COMPONENTS];
+    SpvId raw_src[NIR_MAX_VEC_COMPONENTS];
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++   nir_foreach_alu_src_idx(i, alu)
+       src[i] = get_alu_src(ctx, alu, i, &raw_src[i], &stype[i]);
+ 
+    nir_alu_type typeless_type = stype[is_bcsel];
+
+--- src/intel/compiler/brw/brw_from_nir.cpp
++++ src/intel/compiler/brw/brw_from_nir.cpp
+@@ -651,7 +651,7 @@ prepare_alu_destination_and_sources(nir_to_brw_state &ntb,
+    const intel_device_info *devinfo = ntb.devinfo;
+ 
+    bool all_sources_uniform = true;
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, instr) {
+       op[i] = get_nir_src(ntb, instr->src[i].src, -1);
+       op[i].type = brw_type_for_nir_type(devinfo,
+          (nir_alu_type)(nir_op_infos[instr->op].input_types[i] |
+@@ -707,7 +707,7 @@ prepare_alu_destination_and_sources(nir_to_brw_state &ntb,
+       result = offset(result, xbld, channel);
+    }
+ 
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, instr) {
+       assert(nir_op_infos[instr->op].input_sizes[i] < 2);
+       op[i] = offset(op[i], xbld, instr->src[i].swizzle[channel]);
+ 
+@@ -836,7 +836,7 @@ brw_from_nir_emit_alu(nir_to_brw_state &ntb, nir_alu_instr *instr,
+       break;
+ 
+    default:
+-      for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, instr) {
+          assert(brw_type_size_bytes(op[i].type) > 1);
+       }
+    }
+@@ -858,7 +858,7 @@ brw_from_nir_emit_alu(nir_to_brw_state &ntb, nir_alu_instr *instr,
+          nir_store_reg_for_def(&instr->def);
+       if (store_reg != NULL) {
+          nir_def *dest_reg = store_reg->src[1].ssa;
+-         for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++         nir_foreach_alu_src_idx(i, instr) {
+             nir_intrinsic_instr *load_reg =
+                nir_load_reg_for_def(instr->src[i].src.ssa);
+             if (load_reg == NULL)
+
+--- src/intel/compiler/brw/brw_nir_opt_systolic_vectorize.c
++++ src/intel/compiler/brw/brw_nir_opt_systolic_vectorize.c
+@@ -250,7 +250,7 @@ hoist_def(struct nir_def *def, struct nir_def *loc)
+    if (instr->type == nir_instr_type_alu) {
+       /* For ALU, recursively hoist the sources. */
+       nir_alu_instr *alu = nir_instr_as_alu(instr);
+-      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++      nir_foreach_alu_src_idx(i, alu)
+          if (!hoist_def(alu->src[i].src.ssa, loc))
+             return NULL;
+    }
+
+--- src/intel/compiler/elk/elk_fs_nir.cpp
++++ src/intel/compiler/elk/elk_fs_nir.cpp
+@@ -633,7 +633,7 @@ prepare_alu_destination_and_sources(nir_to_elk_state &ntb,
+       (nir_alu_type)(nir_op_infos[instr->op].output_type |
+                      instr->def.bit_size));
+ 
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, instr) {
+       op[i] = get_nir_src(ntb, instr->src[i].src);
+       op[i].type = elk_type_for_nir_type(devinfo,
+          (nir_alu_type)(nir_op_infos[instr->op].input_types[i] |
+@@ -673,7 +673,7 @@ prepare_alu_destination_and_sources(nir_to_elk_state &ntb,
+       result = offset(result, bld, channel);
+    }
+ 
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, instr) {
+       assert(nir_op_infos[instr->op].input_sizes[i] < 2);
+       op[i] = offset(op[i], bld, instr->src[i].swizzle[channel]);
+    }
+@@ -929,7 +929,7 @@ fs_nir_emit_alu(nir_to_elk_state &ntb, nir_alu_instr *instr,
+       break;
+ 
+    default:
+-      for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, instr) {
+          assert(type_sz(op[i].type) > 1);
+       }
+    }
+@@ -949,7 +949,7 @@ fs_nir_emit_alu(nir_to_elk_state &ntb, nir_alu_instr *instr,
+          nir_store_reg_for_def(&instr->def);
+       if (store_reg != NULL) {
+          nir_def *dest_reg = store_reg->src[1].ssa;
+-         for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++         nir_foreach_alu_src_idx(i, instr) {
+             nir_intrinsic_instr *load_reg =
+                nir_load_reg_for_def(instr->src[i].src.ssa);
+             if (load_reg == NULL)
+
+--- src/intel/compiler/elk/elk_vec4_nir.cpp
++++ src/intel/compiler/elk/elk_vec4_nir.cpp
+@@ -1069,7 +1069,7 @@ vec4_visitor::nir_emit_alu(nir_alu_instr *instr)
+    dst.writemask &= nir_component_mask(instr->def.num_components);
+ 
+    src_reg op[4];
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, instr) {
+       nir_alu_type src_type = (nir_alu_type)
+          (nir_op_infos[instr->op].input_types[i] |
+           nir_src_bit_size(instr->src[i].src));
+@@ -1081,7 +1081,7 @@ vec4_visitor::nir_emit_alu(nir_alu_instr *instr)
+    /* On Gen7 and earlier, no functionality is exposed that should allow 8-bit
+     * integer types to ever exist.
+     */
+-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++)
++   nir_foreach_alu_src_idx(i, instr)
+       assert(type_sz(op[i].type) > 1);
+ #endif
+ 
+
+--- src/intel/compiler/jay/jay_from_nir.c
++++ src/intel/compiler/jay/jay_from_nir.c
+@@ -360,7 +360,7 @@ jay_emit_alu(struct nir_to_jay_state *nj, nir_alu_instr *alu)
+    enum jay_type type = jay_type(base_type, alu->def.bit_size);
+ 
+    jay_def src[NIR_ALU_MAX_INPUTS];
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       unsigned len = nir_src_bit_size(alu->src[i].src) == 64 ? 2 : 1;
+       jay_def chans[NIR_MAX_VEC_COMPONENTS];
+       unsigned nr_chans =
+@@ -758,7 +758,7 @@ jay_emit_alu(struct nir_to_jay_state *nj, nir_alu_instr *alu)
+ 
+    default:
+       if (nir_op_is_vec(alu->op)) {
+-         for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++         nir_foreach_alu_src_idx(i, alu) {
+             unsigned len = jay_type_vector_length(type);
+             jay_copy(b, jay_extract_range(dst, len * i, len), src[i]);
+          }
+
+--- src/intel/vulkan/anv_shader_compile.c
++++ src/intel/vulkan/anv_shader_compile.c
+@@ -60,7 +60,7 @@ static bool is_simd32_shuffle(nir_intrinsic_instr *intrin)
+    if (is_alu1_iand_0x1f(alu1))
+       return true;
+ 
+-   for (uint32_t i = 0; i < nir_op_infos[alu1->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu1) {
+       if (is_alu1_iand_0x1f(nir_src_as_alu(alu1->src[i].src)))
+          return true;
+    }
+@@ -1237,7 +1237,7 @@ fixup_large_workgroup_image_coherency(nir_shader *nir)
+                return;
+ 
+             /* Check if any src is from @load_local_invocation_id. */
+-            for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++            nir_foreach_alu_src_idx(i, alu) {
+                nir_instr *parent = nir_def_instr(alu->src[i].src.ssa);
+                if (parent->type != nir_instr_type_intrinsic)
+                   continue;
+
+--- src/kosmickrisp/compiler/msl_type_inference.c
++++ src/kosmickrisp/compiler/msl_type_inference.c
+@@ -138,7 +138,7 @@ update_instr_type(struct hash_table *types, nir_instr *instr, ti_type type)
+       case nir_op_vec3:
+       case nir_op_vec4:
+          set_type(types, &alu->def, type);
+-         for (int i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++         nir_foreach_alu_src_idx(i, alu)
+             set_type(types, &alu->src[i].src, type);
+          return true;
+       default:
+
+--- src/microsoft/compiler/dxil_nir.c
++++ src/microsoft/compiler/dxil_nir.c
+@@ -995,7 +995,7 @@ dxil_nir_lower_double_math_instr(nir_builder *b,
+    b->cursor = nir_before_instr(&alu->instr);
+ 
+    bool progress = false;
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i) {
++   nir_foreach_alu_src_idx(i, alu) {
+       if (nir_alu_type_get_base_type(nir_op_infos[alu->op].input_types[i]) == nir_type_float &&
+           alu->src[i].src.ssa->bit_size == 64) {
+          unsigned num_components = nir_op_infos[alu->op].input_sizes[i];
+
+--- src/microsoft/compiler/nir_to_dxil.c
++++ src/microsoft/compiler/nir_to_dxil.c
+@@ -2894,7 +2894,7 @@ emit_alu(struct ntd_context *ctx, nir_alu_instr *alu)
+    /* other ops should be scalar */
+    const struct dxil_value *src[4];
+    assert(nir_op_infos[alu->op].num_inputs <= 4);
+-   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++   nir_foreach_alu_src_idx(i, alu) {
+       src[i] = get_alu_src(ctx, alu, i);
+       if (!src[i])
+          return false;
+
+--- src/nouveau/compiler/nak_nir_lower_non_uniform_ldcx.c
++++ src/nouveau/compiler/nak_nir_lower_non_uniform_ldcx.c
+@@ -138,7 +138,7 @@ can_hoist_def(nir_def *def, nir_block *target)
+    switch (instr->type) {
+    case nir_instr_type_alu: {
+       nir_alu_instr *alu = nir_instr_as_alu(instr);
+-      for (uint8_t i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++      nir_foreach_alu_src_idx(i, alu) {
+          if (!can_hoist_def(alu->src[i].src.ssa, target))
+             return false;
+       }
+@@ -177,7 +177,7 @@ hoist_def(nir_def *def, nir_block *target)
+    switch (instr->type) {
+    case nir_instr_type_alu: {
+       nir_alu_instr *alu = nir_instr_as_alu(instr);
+-      for (uint8_t i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++      nir_foreach_alu_src_idx(i, alu)
+          hoist_def(alu->src[i].src.ssa, target);
+       break;
+    }
+@@ -218,7 +218,7 @@ try_hoist_ldcx_handles_block(nir_block *block, struct non_uniform_section *nus)
+           * any ldcx_nv sources as also used.
+           */
+          nir_alu_instr *alu = nir_instr_as_alu(instr);
+-         for (uint8_t i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++         nir_foreach_alu_src_idx(i, alu) {
+             nir_instr *src_instr = nir_def_instr(alu->src[i].src.ssa);
+             if (src_instr->type != nir_instr_type_intrinsic)
+                continue;
+@@ -385,7 +385,7 @@ lower_ldcx_block(nir_builder *b, nir_block *block,
+              * across blocks.  Re-materialize cbufs that are used by ALU
+              * instructions in the same block.
+              */
+-            for (uint8_t i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
++            nir_foreach_alu_src_idx(i, alu)
+                progress |= try_remat_ldcx_alu_use(b, alu, i, nus);
+          }
+          break;
+
+--- src/.clang-format
++++ src/.clang-format
+@@ -106,6 +106,8 @@ ForEachMacros:
+   - U_SPARSE_BITSET_FOREACH_SET
+ 
+ # nir
++  - nir_foreach_alu_src_idx
++
+   - nir_foreach_function_temp_variable
+   - nir_foreach_function_temp_variable_safe
+   - nir_foreach_image_variable
+

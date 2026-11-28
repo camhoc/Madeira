@@ -1,0 +1,74 @@
+# kk: KK_WORKAROUND_14 only on multiplications with a constant
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45953 state=closed
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+The Apple compiler does not correctly handle multiplications with
+NaN * 0 when the 0 is written as a constant: it gives 0 instead of
+NaN. Before, KK_WORKAROUND_14 was applied to all multiplications. Now
+only to multiplications with a constant (fmul and flrp in
+nir_to_msl.c).
+
+* CTS: 5,931 float_controls2 tests. With this change, 0 failures. With
+  KK_WORKAROUND_14 disabled, 24 failures (reflect/refract with NaN),
+  which shows the tests catch the error and this change still avoids
+  it.
+* Hardware: M5 Pro, macOS 27.2.
+* Performance: in a heavy game in a PS5 emulator, the GPU takes 4.7%
+  less time per frame, with 3.7% more frames presented.
+
+Assisted-by: LLM
+Original Language: ESP
+--- docs/drivers/kosmickrisp/workarounds.rst
++++ docs/drivers/kosmickrisp/workarounds.rst
+@@ -126,6 +126,7 @@ which correctly handles the comparison.
+ | Log:
+ | 2026-07-10: Workaround implemented
+ | 2026-08-07: Modified workaround to use safe for the pragma instead of adding isNaN operations
++| 2026-11-05: Workaround applied to multiplications that have a constant (macOS 27.2)
+ 
+ KK_WORKAROUND_13
+ ----------------
+
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -272,6 +272,17 @@ alu_fcmp_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr,
+    ALU_BINOP(op);
+ }
+ 
++/* KK_WORKAROUND_14 */
++static bool
++alu_has_const_src(nir_alu_instr *instr)
++{
++   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
++      if (nir_src_is_const(instr->src[i].src))
++         return true;
++   }
++   return false;
++}
++
+ static void
+ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
+ {
+@@ -298,7 +309,8 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
+    case nir_op_fmul:
+       if (!(ctx->disabled_workarounds & BITFIELD64_BIT(14)) &&
+           (nir_alu_instr_is_inf_preserve(instr) ||
+-           nir_alu_instr_is_nan_preserve(instr)))
++           nir_alu_instr_is_nan_preserve(instr)) &&
++          alu_has_const_src(instr))
+          P(ctx, "!&buf0.contents[0] ? 1 : ")
+       ALU_BINOP("*");
+       break;
+@@ -477,7 +489,8 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
+          P(ctx, ") * (");
+          if (!(ctx->disabled_workarounds & BITFIELD64_BIT(14)) &&
+              (nir_alu_instr_is_inf_preserve(instr) ||
+-              nir_alu_instr_is_nan_preserve(instr)))
++              nir_alu_instr_is_nan_preserve(instr)) &&
++             alu_has_const_src(instr))
+             P(ctx, "!&buf0.contents[0] ? 1 : ")
+          alu_src_to_msl(ctx, instr, 2);
+          P(ctx, ")");
+

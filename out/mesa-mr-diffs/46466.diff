@@ -1,0 +1,690 @@
+# kk: Skip provably passing UBO bounds checks in compute dispatches
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46466 state=opened
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+kk: Skip provably passing UBO bounds checks in compute dispatches
+
+With robust buffer access, a UBO read at a constant offset is lowered to
+load_global_constant_bounded, which checks the offset against the size
+field of the buffer's descriptor on every invocation.  When the
+descriptor is already bound at dispatch time, that check can be decided
+on the CPU instead.
+
+For each compute shader, record every such read whose descriptor sits at
+a constant offset in a set whose address comes from the root table,
+keeping the largest offset per descriptor, and generate a second MSL
+variant in which those reads are plain load_global_constant_offset.  At
+dispatch, read each recorded descriptor from the bound set (or push
+descriptor data) and use the variant only when every size is larger
+than its largest offset.  In that case each removed check would have
+passed, so the variant performs the same reads as the checked shader.
+
+The check is skipped, and the checked shader used, for sets whose layout
+has UPDATE_AFTER_BIND or UPDATE_UNUSED_WHILE_PENDING bindings, since
+their descriptors may change before execution, and for unbound sets.
+Indirect and conditional dispatches use the same check.
+
+The variant is compiled once, on first use, on a low-priority device
+queue; until it is ready the checked pipeline is used.  The variant
+source is stored with the shader binary, and the recorded entries are
+validated when a binary is loaded.
+
+MESA_KK_DEBUG=no_proof turns this off, and MESA_KK_DEBUG=sync_proof
+compiles the variant inline on first use.
+
+Assisted-by: LLM
+```
+--- docs/drivers/kosmickrisp.rst
++++ docs/drivers/kosmickrisp.rst
+@@ -75,7 +75,7 @@ Environment variables
+ 
+ KosmicKrisp specific environment variables:
+ 
+-- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders.
++- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders. ``no_proof`` to never use the compute shader variants that skip UBO bounds checks proven at dispatch time. ``sync_proof`` to compile those variants on first use instead of in the background.
+ - ``MESA_KK_GPU_CAPTURE``: Enables Metal capture, can be controlled using debug utils labels or using ``MESA_KK_GPU_CAPTURE_IMMEDIATELY``. Set to ``1`` to activate.
+ - ``MESA_KK_GPU_CAPTURE_IMMEDIATELY``: Starts Metal capture at device creation and ends it at device destruction. Set to ``1`` to activate.
+ - ``MESA_KK_GPU_CAPTURE_DIRECTORY``: Metal capture will be saved to the specified directory. Defaults to Xcode if no path is provided.
+
+--- src/kosmickrisp/vulkan/kk_cmd_dispatch.c
++++ src/kosmickrisp/vulkan/kk_cmd_dispatch.c
+@@ -17,8 +17,13 @@
+ 
+ #include "vk_common_entrypoints.h"
+ 
++#include "util/u_atomic.h"
++
++#include <string.h>
++
+ static void
+-kk_flush_compute_state(struct kk_cmd_buffer *cmd)
++kk_flush_compute_state(struct kk_cmd_buffer *cmd,
++                       mtl_compute_pipeline_state *pipeline)
+ {
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+ 
+@@ -33,8 +38,63 @@ kk_flush_compute_state(struct kk_cmd_buffer *cmd)
+    if (desc->root.addr)
+       kk_cmd_bind_root_to_argument_table(cmd, desc->root.addr);
+ 
+-   mtl_compute_set_pipeline_state(
+-      encoder, cmd->state.shaders[MESA_SHADER_COMPUTE]->pipeline.cs);
++   mtl_compute_set_pipeline_state(encoder, pipeline);
++}
++
++/* Returns true when every UBO read listed in the shader's proof entries is in
++ * bounds for the descriptors bound now.
++ *
++ * The checked shader guards each such read with `offset < size`, where offset
++ * is a constant and size is read from the descriptor at execution time. When
++ * the descriptor's size is already larger than the largest offset, every one
++ * of those comparisons is true, so the shader without them performs exactly
++ * the same reads. This needs the descriptor memory to be the same at
++ * execution as it is now, which holds unless the layout allows updates after
++ * binding.
++ */
++static bool
++kk_proof_check(const struct kk_descriptor_state *desc,
++               const struct kk_shader *cs)
++{
++   for (uint32_t i = 0; i < cs->info.cs.proof_count; i++) {
++      const struct kk_cs_proof *p = &cs->info.cs.proofs[i];
++      const uint8_t *data;
++      size_t size;
++      if (desc->sets[p->set]) {
++         if (desc->sets[p->set]->layout->proof_unsafe)
++            return false;
++         data = desc->sets[p->set]->mapped_ptr;
++         size = desc->sets[p->set]->size;
++      } else if (desc->push[p->set] && desc->root.sets[p->set]) {
++         data = desc->push[p->set]->data;
++         size = sizeof(desc->push[p->set]->data);
++      } else {
++         return false;
++      }
++      struct kk_buffer_address d;
++      if (p->desc_offset + sizeof(d) > size)
++         return false;
++      memcpy(&d, data + p->desc_offset, sizeof(d));
++      if (d.size <= p->top)
++         return false;
++   }
++   return true;
++}
++
++static mtl_compute_pipeline_state *
++kk_proof_pick_pipeline(struct kk_cmd_buffer *cmd, struct kk_shader *cs)
++{
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   if (dev->proof.off || !cs->info.cs.proof_count ||
++       !kk_proof_check(&cmd->state.cs.descriptors, cs))
++      return cs->pipeline.cs;
++
++   mtl_compute_pipeline_state *variant = p_atomic_read(&cs->proof_pipeline);
++   if (!variant && p_atomic_read(&cs->proof_state) == KK_PROOF_IDLE) {
++      kk_shader_compile_proof_variant(dev, cs);
++      variant = p_atomic_read(&cs->proof_pipeline);
++   }
++   return variant ? variant : cs->pipeline.cs;
+ }
+ 
+ static void
+@@ -79,6 +139,7 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
+ 
+    struct kk_shader *cs = cmd->state.shaders[MESA_SHADER_COMPUTE];
+    struct mtl_size local_size = cs->info.cs.local_size;
++   mtl_compute_pipeline_state *pipeline = kk_proof_pick_pipeline(cmd, cs);
+ 
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+    if (cmd->state.cond_render.enabled) {
+@@ -97,7 +158,7 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
+       kk_predicate_compute(cmd, patched.gpu, patched.gpu);
+ 
+       /* Flush compute state after predication dispatch */
+-      kk_flush_compute_state(cmd);
++      kk_flush_compute_state(cmd, pipeline);
+       mtl_dispatch_threadgroups_with_indirect_buffer(encoder, patched.gpu,
+                                                      local_size);
+    } else {
+@@ -107,7 +168,7 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
+          .z = groupCountZ * local_size.z,
+       };
+ 
+-      kk_flush_compute_state(cmd);
++      kk_flush_compute_state(cmd, pipeline);
+       mtl_dispatch_threads(encoder, grid_size, local_size);
+    }
+ }
+@@ -128,6 +189,7 @@ kk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+ 
+    struct kk_shader *cs = cmd->state.shaders[MESA_SHADER_COMPUTE];
+    struct mtl_size local_size = cs->info.cs.local_size;
++   mtl_compute_pipeline_state *pipeline = kk_proof_pick_pipeline(cmd, cs);
+ 
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+    if (cmd->state.cond_render.enabled) {
+@@ -140,11 +202,11 @@ kk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+       kk_predicate_compute(cmd, patched.gpu, pInfo->addressRange.address);
+ 
+       /* Flush compute state after predication dispatch */
+-      kk_flush_compute_state(cmd);
++      kk_flush_compute_state(cmd, pipeline);
+       mtl_dispatch_threadgroups_with_indirect_buffer(encoder, patched.gpu,
+                                                      local_size);
+    } else {
+-      kk_flush_compute_state(cmd);
++      kk_flush_compute_state(cmd, pipeline);
+       mtl_dispatch_threadgroups_with_indirect_buffer(
+          encoder, pInfo->addressRange.address, local_size);
+    }
+
+--- src/kosmickrisp/vulkan/kk_debug.c
++++ src/kosmickrisp/vulkan/kk_debug.c
+@@ -11,6 +11,8 @@ const struct debug_named_value debug_flags[] = {
+    {"nir", KK_DEBUG_NIR},
+    {"msl", KK_DEBUG_MSL},
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
++   {"no_proof", KK_DEBUG_NO_PROOF},
++   {"sync_proof", KK_DEBUG_SYNC_PROOF},
+    {NULL, 0},
+ };
+ 
+
+--- src/kosmickrisp/vulkan/kk_debug.h
++++ src/kosmickrisp/vulkan/kk_debug.h
+@@ -12,6 +12,10 @@ enum kk_debug {
+    KK_DEBUG_MSL = 1ull << 1,
+    /* Forces robustness for all shaders */
+    KK_DEBUG_FORCE_ROBUSTNESS = 1ull << 2,
++   /* Never use compute shader variants without UBO bounds checks */
++   KK_DEBUG_NO_PROOF = 1ull << 3,
++   /* Compile those variants inline on first use instead of in the background */
++   KK_DEBUG_SYNC_PROOF = 1ull << 4,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+
+--- src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
++++ src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
+@@ -199,6 +199,10 @@ kk_CreateDescriptorSetLayout(VkDevice device,
+       if (binding_flags_info && binding_flags_info->bindingCount > 0) {
+          assert(binding_flags_info->bindingCount == pCreateInfo->bindingCount);
+          layout->binding[b].flags = binding_flags_info->pBindingFlags[info_idx];
++         if (layout->binding[b].flags &
++             (VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
++              VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT))
++            layout->proof_unsafe = true;
+       }
+ 
+       layout->binding[b].array_size = binding->descriptorCount;
+
+--- src/kosmickrisp/vulkan/kk_descriptor_set_layout.h
++++ src/kosmickrisp/vulkan/kk_descriptor_set_layout.h
+@@ -50,6 +50,10 @@ struct kk_descriptor_set_layout {
+ 
+    VkDescriptorSetLayoutCreateFlagBits flags;
+ 
++   /* Some binding's descriptors may change after the set is bound, so what a
++    * command buffer sees while recording may not hold at execution. */
++   bool proof_unsafe;
++
+    /* Size of the descriptor buffer for this descriptor set */
+    /* Does not contain the size needed for variable count descriptors */
+    uint32_t non_variable_descriptor_buffer_size;
+
+--- src/kosmickrisp/vulkan/kk_device.c
++++ src/kosmickrisp/vulkan/kk_device.c
+@@ -10,6 +10,7 @@
+ #include "kk_buffer.h"
+ #include "kk_buffer_view.h"
+ #include "kk_cmd_buffer.h"
++#include "kk_debug.h"
+ #include "kk_entrypoints.h"
+ #include "kk_image.h"
+ #include "kk_image_view.h"
+@@ -331,6 +332,16 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (result != VK_SUCCESS)
+       goto fail_sampler_heap;
+ 
++   /* Without the queue the variants are simply not used */
++   dev->proof.off = KK_DEBUG(NO_PROOF);
++   dev->proof.sync = KK_DEBUG(SYNC_PROOF);
++   if (!dev->proof.off &&
++       !util_queue_init(&dev->proof.queue, "kkproof", 64, 1,
++                        UTIL_QUEUE_INIT_RESIZE_IF_FULL |
++                           UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY,
++                        NULL))
++      dev->proof.off = true;
++
+    if (pdev->settings.gpu_capture_immediately) {
+       mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
+       dev->gpu_capture_active = true;
+@@ -377,6 +388,13 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+       mtl_stop_gpu_capture();
+    }
+ 
++   /* This waits for a running variant compile and signals the fences of the
++    * jobs still queued, so destroying a shader afterwards, including the ones
++    * meta still holds, does not wait on the queue.
++    */
++   if (!dev->proof.off)
++      util_queue_destroy(&dev->proof.queue);
++
+    /* Meta first since it may destroy Vulkan objects */
+    kk_device_finish_meta(dev);
+    kk_device_finish_lib(dev);
+
+--- src/kosmickrisp/vulkan/kk_device.h
++++ src/kosmickrisp/vulkan/kk_device.h
+@@ -19,6 +19,7 @@
+ #include "libkk_shaders.h"
+ 
+ #include "util/u_dynarray.h"
++#include "util/u_queue.h"
+ 
+ #include "vk_device.h"
+ #include "vk_meta.h"
+@@ -96,6 +97,19 @@ struct kk_device {
+ 
+    struct kk_precompiled_cache precompiled_cache;
+ 
++   /* Compute shader variants without UBO bounds checks, see
++    * kk_proof_pick_pipeline.
++    */
++   struct {
++      struct util_queue queue;
++      /* MESA_KK_DEBUG=no_proof, or the queue could not be created */
++      bool off;
++      /* MESA_KK_DEBUG=sync_proof */
++      bool sync;
++      /* A variant failed to compile and a warning was printed */
++      bool warned;
++   } proof;
++
+    bool has_queue;
+    struct kk_queue queue;
+ 
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -21,6 +21,8 @@
+ #include "kosmickrisp/bridge/vk_to_mtl_map.h"
+ #include "kosmickrisp/compiler/nir_to_msl.h"
+ 
++#include "util/u_atomic.h"
++
+ #include "nir_builder.h"
+ #include "nir_lower_blend.h"
+ 
+@@ -840,6 +842,13 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+    struct kk_pipeline_handles *pipe = &shader->pipeline;
+ 
+    if (shader->info.stage == MESA_SHADER_COMPUTE) {
++      if (p_atomic_read(&shader->proof_state) == KK_PROOF_QUEUED) {
++         util_queue_drop_job(&dev->proof.queue, &shader->proof_fence);
++         util_queue_fence_destroy(&shader->proof_fence);
++      }
++      if (shader->proof_pipeline)
++         mtl_release(shader->proof_pipeline);
++      ralloc_free(shader->proof_code);
+       mtl_release(pipe->cs);
+       pipe->cs = NULL;
+    } else if (shader->info.stage == MESA_SHADER_VERTEX) {
+@@ -991,11 +1000,135 @@ kk_nir_lower_vertex_id_zero_base(struct nir_shader *nir)
+    return progress;
+ }
+ 
++/* Is this read guarded by `constant offset < size`, where size is .z of the
++ * descriptor at a constant offset in a set whose address comes from the root
++ * table? If so, fills proof.
++ */
++static bool
++kk_proof_match(nir_intrinsic_instr *intr, struct kk_cs_proof *proof)
++{
++   if (intr->intrinsic != nir_intrinsic_load_global_constant_bounded ||
++       !nir_src_is_const(intr->src[1]))
++      return false;
++
++   nir_scalar size = nir_scalar_resolved(intr->src[2].ssa, 0);
++   if (size.comp != 2 || size.def->bit_size != 32 ||
++       !nir_scalar_is_intrinsic(size) ||
++       nir_scalar_intrinsic_op(size) !=
++          nir_intrinsic_load_global_constant_offset)
++      return false;
++   nir_intrinsic_instr *desc = nir_def_as_intrinsic(size.def);
++   if (!nir_src_is_const(desc->src[1]))
++      return false;
++
++   nir_scalar set_addr = nir_scalar_resolved(desc->src[0].ssa, 0);
++   if (!nir_scalar_is_intrinsic(set_addr) ||
++       nir_scalar_intrinsic_op(set_addr) != nir_intrinsic_load_global_constant)
++      return false;
++   nir_intrinsic_instr *load = nir_def_as_intrinsic(set_addr.def);
++
++   nir_scalar addr = nir_scalar_resolved(load->src[0].ssa, 0);
++   if (!nir_scalar_is_alu(addr) || nir_scalar_alu_op(addr) != nir_op_iadd)
++      return false;
++
++   uint64_t root_offset = UINT64_MAX;
++   bool has_root = false;
++   for (unsigned i = 0; i < 2; i++) {
++      nir_scalar s = nir_scalar_chase_alu_src(addr, i);
++      if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_u2u64)
++         s = nir_scalar_chase_alu_src(s, 0);
++      if (nir_scalar_is_const(s)) {
++         root_offset = nir_scalar_as_uint(s);
++      } else if (nir_scalar_is_intrinsic(s) &&
++                 nir_scalar_intrinsic_op(s) ==
++                    nir_intrinsic_load_buffer_ptr_kk &&
++                 nir_intrinsic_binding(nir_def_as_intrinsic(s.def)) == 0) {
++         has_root = true;
++      }
++   }
++
++   const uint64_t sets = offsetof(struct kk_root_descriptor_table, sets);
++   if (!has_root || root_offset == UINT64_MAX || root_offset < sets ||
++       (root_offset - sets) % sizeof(uint64_t) ||
++       (root_offset - sets) / sizeof(uint64_t) >= KK_MAX_SETS)
++      return false;
++
++   proof->set = (root_offset - sets) / sizeof(uint64_t);
++   proof->desc_offset = nir_src_as_uint(desc->src[1]);
++   proof->top = nir_src_as_uint(intr->src[1]);
++   return true;
++}
++
++/* Gathers one entry per descriptor. Returns 0 when there is nothing to prove
++ * or there are too many descriptors.
++ */
++static uint32_t
++kk_proof_gather(nir_shader *nir, struct kk_cs_proof *proofs)
++{
++   uint32_t count = 0;
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            struct kk_cs_proof p;
++            if (instr->type != nir_instr_type_intrinsic ||
++                !kk_proof_match(nir_instr_as_intrinsic(instr), &p))
++               continue;
++            uint32_t i;
++            for (i = 0; i < count; i++) {
++               if (proofs[i].set == p.set &&
++                   proofs[i].desc_offset == p.desc_offset)
++                  break;
++            }
++            if (i == KK_CS_PROOF_MAX)
++               return 0;
++            if (i == count) {
++               proofs[count++] = p;
++            } else {
++               proofs[i].top = MAX2(proofs[i].top, p.top);
++            }
++         }
++      }
++   }
++   return count;
++}
++
++/* Replaces each read kk_proof_match takes with the same read without the
++ * bounds check. Other reads keep their check.
++ */
++static void
++kk_proof_rewrite(nir_shader *nir)
++{
++   nir_foreach_function_impl(impl, nir) {
++      nir_builder b = nir_builder_create(impl);
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr_safe(instr, block) {
++            struct kk_cs_proof p;
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (!kk_proof_match(intr, &p))
++               continue;
++            b.cursor = nir_before_instr(instr);
++            nir_def *load = nir_load_global_constant_offset(
++               &b, intr->def.num_components, intr->def.bit_size,
++               intr->src[0].ssa, intr->src[1].ssa,
++               .access = nir_intrinsic_access(intr),
++               .align_mul = nir_intrinsic_align_mul(intr),
++               .align_offset = nir_intrinsic_align_offset(intr));
++            nir_def_replace(&intr->def, load);
++         }
++      }
++      nir_progress(true, impl, nir_metadata_control_flow);
++   }
++   NIR_PASS(_, nir, nir_opt_dce);
++}
++
+ /* Consumes nir */
+ static void
+ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+                const struct vk_graphics_pipeline_state *state,
+-               struct msl_compile_data *data, const bool apply_wa19)
++               struct msl_compile_data *data, const bool apply_wa19,
++               struct kk_shader *proof_shader)
+ {
+    NIR_PASS(_, nir, kk_nir_lower_poly);
+ 
+@@ -1030,9 +1163,35 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+       }
+    }
+ 
++   char *proof_code = NULL;
++   char *proof_entrypoint = NULL;
++   if (proof_shader) {
++      struct kk_shader_info *info = &proof_shader->info;
++      info->cs.proof_count = kk_proof_gather(nir, info->cs.proofs);
++      if (info->cs.proof_count) {
++         nir_shader *variant = nir_shader_clone(NULL, nir);
++         kk_proof_rewrite(variant);
++         proof_code = nir_to_msl(variant, &translate_options);
++         proof_entrypoint = ralloc_strdup(
++            NULL, nir_shader_get_entrypoint(variant)->function->name);
++         ralloc_free(variant);
++      }
++   }
++
+    data->code = nir_to_msl(nir, &translate_options);
+    const char *entrypoint_name = nir_shader_get_entrypoint(nir)->function->name;
+ 
++   /* The variant is compiled with the checked shader's entrypoint name */
++   if (proof_code) {
++      if (strcmp(proof_entrypoint, entrypoint_name) == 0) {
++         proof_shader->proof_code = proof_code;
++      } else {
++         proof_shader->info.cs.proof_count = 0;
++         ralloc_free(proof_code);
++      }
++      ralloc_free(proof_entrypoint);
++   }
++
+    /* We need to steal so it doesn't get destroyed with the nir. Needs to happen
+     * after nir_to_msl since that's where we rename the entrypoint.
+     */
+@@ -1162,7 +1321,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       nir->info.stage = MESA_SHADER_COMPUTE;
+       memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+       nir->xfb_info = NULL;
+-      kk_compile_msl(pdev, nir, state, &shader->gs_main, apply_wa19);
++      kk_compile_msl(pdev, nir, state, &shader->gs_main, apply_wa19, NULL);
+ 
+       /* From here on, nir is the rasterization VS of the GS */
+       nir = rast;
+@@ -1181,7 +1340,9 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+    /* KK_WORKAROUND_19 Only the stage that feeds geometry will be dispatched
+     * through the buggy Metal entry point. */
+    apply_wa19 &= next_stage == MESA_SHADER_GEOMETRY;
+-   kk_compile_msl(pdev, nir, state, &shader->msl_data[stage], apply_wa19);
++   kk_compile_msl(pdev, nir, state, &shader->msl_data[stage], apply_wa19,
++                  stage == MESA_SHADER_COMPUTE && !dev->proof.off ? shader
++                                                                  : NULL);
+ 
+    *shader_out = shader;
+ 
+@@ -1308,6 +1469,48 @@ kk_compile_compute_pipeline(struct kk_device *device,
+    return VK_SUCCESS;
+ }
+ 
++static void
++kk_proof_compile_job(void *job, UNUSED void *gdata, UNUSED int thread_index)
++{
++   struct kk_shader *shader = job;
++   struct kk_device *dev = shader->proof_dev;
++   const struct mtl_size l = shader->info.cs.local_size;
++   const struct msl_compile_data data = {
++      .code = shader->proof_code,
++      .entrypoint_name = shader->msl_data[MESA_SHADER_COMPUTE].entrypoint_name,
++   };
++   mtl_compute_pipeline_state *pipeline = NULL;
++   if (kk_compile_compute_pipeline(dev, &data, l.x * l.y * l.z, &pipeline) ==
++       VK_SUCCESS) {
++      p_atomic_set(&shader->proof_pipeline, pipeline);
++   } else if (!p_atomic_xchg(&dev->proof.warned, true)) {
++      /* The shader keeps using the checked pipeline */
++      mesa_logw("kk: failed to compile a compute shader variant without "
++                "UBO bounds checks");
++   }
++}
++
++/* Compiles the shader's variant once, inline or on the device's queue. The
++ * variant is used from the first dispatch after it is ready.
++ */
++void
++kk_shader_compile_proof_variant(struct kk_device *dev, struct kk_shader *shader)
++{
++   const uint32_t state = dev->proof.sync ? KK_PROOF_INLINE : KK_PROOF_QUEUED;
++   if (p_atomic_cmpxchg(&shader->proof_state, KK_PROOF_IDLE, state) !=
++       KK_PROOF_IDLE)
++      return;
++
++   shader->proof_dev = dev;
++   if (state == KK_PROOF_INLINE) {
++      kk_proof_compile_job(shader, NULL, 0);
++   } else {
++      util_queue_fence_init(&shader->proof_fence);
++      util_queue_add_job(&dev->proof.queue, shader, &shader->proof_fence,
++                         kk_proof_compile_job, NULL, 0);
++   }
++}
++
+ static mtl_depth_stencil_state *
+ kk_compile_ds_state(struct kk_device *device, struct kk_shader_info *info)
+ {
+@@ -1857,6 +2060,9 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
+    }
+    if (kk_has_gs_main(&shader->info))
+       kk_msl_serialize(&shader->gs_main, blob);
++   if (shader->info.stage == MESA_SHADER_COMPUTE &&
++       shader->info.cs.proof_count)
++      blob_write_string(blob, shader->proof_code);
+ 
+    return !blob->out_of_memory;
+ }
+@@ -1896,6 +2102,16 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+    if (blob->overrun)
+       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+ 
++   /* The dispatch check indexes with these */
++   if (info.stage == MESA_SHADER_COMPUTE) {
++      if (info.cs.proof_count > KK_CS_PROOF_MAX)
++         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
++      for (uint32_t i = 0; i < info.cs.proof_count; i++) {
++         if (info.cs.proofs[i].set >= KK_MAX_SETS)
++            return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
++      }
++   }
++
+    struct kk_shader *shader = vk_shader_zalloc(
+       &dev->vk, &kk_shader_ops, info.stage, pAllocator, sizeof(*shader));
+    if (shader == NULL)
+@@ -1921,6 +2137,15 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+          goto fail;
+    }
+ 
++   if (info.stage == MESA_SHADER_COMPUTE && info.cs.proof_count) {
++      const char *proof_code = blob_read_string(blob);
++      if (blob->overrun) {
++         result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
++         goto fail;
++      }
++      shader->proof_code = ralloc_strdup(NULL, proof_code);
++   }
++
+    if (info.stage == MESA_SHADER_COMPUTE) {
+       uint32_t local_size_threads = shader->info.cs.local_size.x *
+                                     shader->info.cs.local_size.y *
+
+--- src/kosmickrisp/vulkan/kk_shader.h
++++ src/kosmickrisp/vulkan/kk_shader.h
+@@ -13,6 +13,8 @@
+ 
+ #include "kosmickrisp/bridge/mtl_format.h"
+ 
++#include "util/u_queue.h"
++
+ #include "poly/nir/poly_nir.h"
+ 
+ #include "vk_pipeline_cache.h"
+@@ -47,6 +49,17 @@ kk_tess_info_merge(struct kk_tess_info a, struct kk_tess_info b)
+    return out;
+ }
+ 
++/* The UBO reads at constant offsets up to top through the descriptor at
++ * desc_offset in set are in bounds when that descriptor's size is larger than
++ * top.
++ */
++#define KK_CS_PROOF_MAX 16
++struct kk_cs_proof {
++   uint32_t set;
++   uint32_t desc_offset;
++   uint32_t top;
++};
++
+ struct kk_shader_info {
+    mesa_shader_stage stage;
+    bool uses_per_draw_data;
+@@ -109,6 +122,9 @@ struct kk_shader_info {
+ 
+       struct {
+          struct mtl_size local_size;
++         /* Non-zero only when kk_shader::proof_code exists */
++         uint32_t proof_count;
++         struct kk_cs_proof proofs[KK_CS_PROOF_MAX];
+       } cs;
+    };
+ };
+@@ -146,8 +162,28 @@ struct kk_shader {
+    /* Compute pass of a GS. Its rasterization VS is in
+     * msl_data[MESA_SHADER_GEOMETRY]. */
+    struct msl_compile_data gs_main;
++
++   /* Compute only: the same shader without the bounds checks of the reads the
++    * proof entries cover. It is compiled on first use by a dispatch that
++    * passes the check, in the background unless MESA_KK_DEBUG=sync_proof.
++    */
++   char *proof_code;
++   struct kk_device *proof_dev;
++   uint32_t proof_state; /* enum kk_proof_state */
++   mtl_compute_pipeline_state *proof_pipeline;
++   struct util_queue_fence proof_fence;
++};
++
++enum kk_proof_state {
++   KK_PROOF_IDLE,
++   /* A job owns proof_fence */
++   KK_PROOF_QUEUED,
++   KK_PROOF_INLINE,
+ };
+ 
++void kk_shader_compile_proof_variant(struct kk_device *dev,
++                                     struct kk_shader *shader);
++
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
+                                VK_OBJECT_TYPE_SHADER_EXT);
+ 
+

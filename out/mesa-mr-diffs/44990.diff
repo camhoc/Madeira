@@ -1,0 +1,674 @@
+# kk: Allow LINEAR color attachments
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44990 state=opened
+# ### What does this MR do and why?
+
+KosmicKrisp doesn't allow LINEAR images as color attachments. Vulkan requires color attachment formats to support input attachments, which KosmicKrisp reads as 2D arrays, and Metal has no LINEAR array textures.
+
+Each pipeline now picks its input attachment read at compile time, with no load or branch in the shader (`enum kk_input_read`):
+
+* **2D:** view mask 0 or `0b1`, and the last pre-rasterization stage doesn't write `Layer`. The 2D view's ID uses descriptor padding; descriptors stay 64 bytes.
+* **Array:** view mask above `0b1`. These attachments have more than one layer (VUID-VkRenderingInfo-viewMask-12403), so none is LINEAR.
+* **Both:** view mask 0 and `Layer` is written. The fragment shader compiles with each read, and draws bind the 2D one for one-layer render passes. Only those can hold a LINEAR attachment. `nir_load_single_layer_fb_kk` is the placeholder resolved per copy.
+
+Then LINEAR color formats get COLOR_ATTACHMENT and BLIT_DST.
+
+**Cost:** the "both" case compiles the fragment shader twice, only when it reads an input attachment without framebuffer fetch. In the CTS run below, none of 23,365 graphics pipelines needed it.
+
+### Testing
+
+M4 Pro, macOS 27.2, on b1a8996cb33:
+
+* **CTS 1.4.3.2**, 29,876 input attachment, multiview, local read and LINEAR cases: per case identical to main at daa925c3bc7. 16,927 pass, 12,949 skip, 0 fail.
+* **220 improvements:** NotSupported → Pass in `image.extended_usage_bit_compatibility.image_format_properties{,2}`.
+* **Benchmark**, µs per 2048² draw reading one input attachment: main 42.2, previous version 50.4, this 36.1.
+* **Layer-writing pipelines** aren't in CTS. A standalone test covers LINEAR and OPTIMAL, one and two layers, and pipeline cache reloads.
+--- src/compiler/nir/nir_divergence_analysis.c
++++ src/compiler/nir/nir_divergence_analysis.c
+@@ -882,6 +882,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
+    case nir_intrinsic_load_depth_texture_kk:
+    case nir_intrinsic_load_sampler_handle_kk:
+    case nir_intrinsic_load_viewport_z_range_kk:
++   case nir_intrinsic_load_single_layer_fb_kk:
+    case nir_intrinsic_load_texture_scale:
+    case nir_intrinsic_load_inline_data_intel:
+    case nir_intrinsic_load_push_data_intel:
+
+--- src/compiler/nir/nir_intrinsics.py
++++ src/compiler/nir/nir_intrinsics.py
+@@ -3360,3 +3360,7 @@ system_value("is_depth_clamp_emulated_kk", 1, bit_sizes=[1])
+ system_value("is_viewport_z_transform_emulated_kk", 1, bit_sizes=[1])
+ # Loads the viewport Z range for a given viewport index.
+ load("viewport_z_range_kk", [1], [], [CAN_ELIMINATE, CAN_REORDER])
++# Whether the framebuffer has a single layer. Replaced with a constant before
++# MSL translation, in one copy of the fragment shader per value.
++intrinsic("load_single_layer_fb_kk", dest_comp=1, bit_sizes=[1],
++          flags=[CAN_ELIMINATE, CAN_REORDER])
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -999,7 +999,11 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+ 
+    if (IS_SHADER_DIRTY(VERTEX)) {
+       struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+-      mtl_render_set_pipeline_state(enc, vs->pipeline.gfx.render);
++      /* See KK_INPUT_READ_BY_LAYERS. Beginning rendering dirties shaders. */
++      mtl_render_pipeline_state *render = vs->pipeline.gfx.render;
++      if (vs->pipeline.gfx.render_single_layer && gfx->render.layer_count == 1u)
++         render = vs->pipeline.gfx.render_single_layer;
++      mtl_render_set_pipeline_state(enc, render);
+       if (gfx->depth_stencil_state)
+          mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
+    }
+
+--- src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -68,9 +68,12 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
+       plane_count = view->plane_count;
+       for (uint8_t plane = 0; plane < plane_count; plane++) {
+          if (is_input_attachment) {
+-            assert(view->planes[plane].input_gpu_resource_id);
++            assert(view->planes[plane].input_gpu_resource_id ||
++                   view->planes[plane].input_2d_gpu_resource_id);
+             desc[plane].image_gpu_resource_id =
+                view->planes[plane].input_gpu_resource_id;
++            desc[plane].input_2d_gpu_resource_id =
++               view->planes[plane].input_2d_gpu_resource_id;
+          } else {
+             assert(view->planes[plane].sampled_gpu_resource_id);
+             desc[plane].image_gpu_resource_id =
+
+--- src/kosmickrisp/vulkan/kk_descriptor_types.h
++++ src/kosmickrisp/vulkan/kk_descriptor_types.h
+@@ -28,7 +28,14 @@ struct kk_sampled_image_descriptor {
+ 
+    uint16_t pad_to_64_bits;
+    uint32_t border[4];
+-   uint64_t pad_to_power_2[3];
++
++   /* Single-sample input attachments only: a 2D view of the first layer,
++    * read instead of image_gpu_resource_id by pipelines that render one layer
++    * (see kk_input_read). Linear images have no array view, so their
++    * image_gpu_resource_id is 0.
++    */
++   uint64_t input_2d_gpu_resource_id;
++   uint64_t pad_to_power_2[2];
+ };
+ 
+ static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,
+
+--- src/kosmickrisp/vulkan/kk_image.c
++++ src/kosmickrisp/vulkan/kk_image.c
+@@ -108,8 +108,7 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
+    }
+ 
+    /* We disable A8 format due to lower blend pass issues */
+-   if (va_format->color && tiling != VK_IMAGE_TILING_LINEAR &&
+-       vk_format != VK_FORMAT_A8_UNORM) {
++   if (va_format->color && vk_format != VK_FORMAT_A8_UNORM) {
+       features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
+       features |= VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
+       // TODO_KOSMICKRISP Support snorm formats once the following spec issue is
+@@ -322,15 +321,8 @@ kk_GetPhysicalDeviceImageFormatProperties2(
+        pImageFormatInfo->type == VK_IMAGE_TYPE_3D)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
+-   /* TODO_KOSMICKRISP Linear images cannot be used as color attachments as long
+-    * as input attachments are changed to arrays. Vulkan specifies that any
+-    * image format supporting the color attachment feature also supports being
+-    * used as an input attachment, and Metal disallows arrays for linear
+-    * textures.
+-    */
+    if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR &&
+-       (all_usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+-                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
++       (all_usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
+    if (ycbcr_info && pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
+
+--- src/kosmickrisp/vulkan/kk_image_layout.c
++++ src/kosmickrisp/vulkan/kk_image_layout.c
+@@ -25,8 +25,12 @@ vk_image_to_mtl_texture_type(const struct vk_image *image,
+    switch (image->image_type) {
+    case VK_IMAGE_TYPE_1D:
+    case VK_IMAGE_TYPE_2D:
+-      /* We require input attachments to be arrays */
+-      if (array_layers > 1 || (usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
++      /* We require input attachments to be arrays, except linear ones: Metal
++       * has no linear arrays, so those are read as 2D textures.
++       */
++      if (array_layers > 1 ||
++          ((usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
++           image->tiling == VK_IMAGE_TILING_OPTIMAL))
+          return samples > 1u ? MTL_TEXTURE_TYPE_2D_ARRAY_MULTISAMPLE
+                              : MTL_TEXTURE_TYPE_2D_ARRAY;
+       return samples > 1u ? MTL_TEXTURE_TYPE_2D_MULTISAMPLE
+
+--- src/kosmickrisp/vulkan/kk_image_view.c
++++ src/kosmickrisp/vulkan/kk_image_view.c
+@@ -220,7 +220,30 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+           * 0, 1) for d/s attachments and render targets cannot have swizzle
+           * according to Metal...
+           */
+-         if (view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) {
++         if ((view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
++             image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
++             view_layout.view_type != VK_IMAGE_VIEW_TYPE_3D) {
++            /* Read by pipelines that render one layer (see kk_input_read),
++             * the only ones that can read linear images. Always a view: the
++             * image's texture has no swizzle. 3D views can't be input
++             * attachments, and Metal has no 2D view of a 3D texture.
++             */
++            VkImageViewType original_type = view_layout.view_type;
++            uint32_t original_len = view_layout.array_len;
++            view_layout.view_type = VK_IMAGE_VIEW_TYPE_2D;
++            view_layout.array_len = 1u;
++            view->planes[view_plane].mtl_handle_input_2d =
++               mtl_new_texture_view_with(mtl_handle, &view_layout, true);
++            view->planes[view_plane].input_2d_gpu_resource_id =
++               mtl_texture_get_gpu_resource_id(
++                  view->planes[view_plane].mtl_handle_input_2d);
++            view_layout.view_type = original_type;
++            view_layout.array_len = original_len;
++         }
++
++         /* Metal can't view linear textures as arrays */
++         if ((view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
++             !plane->layout.linear) {
+             VkImageViewType original_type = view_layout.view_type;
+             bool requires_subresource =
+                view_layout.base_array_layer != 0 || view_layout.base_level != 0;
+@@ -245,6 +268,9 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
+                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+             view->planes[view_plane].render_is_view = requires_format_change;
+             if (requires_format_change) {
++               /* Metal can't view linear textures as arrays */
++               if (plane->layout.linear)
++                  view_layout.view_type = VK_IMAGE_VIEW_TYPE_2D;
+                view->planes[view_plane].mtl_handle_render =
+                   mtl_new_texture_view_with(mtl_handle, &view_layout, false);
+             } else /* Subresource indices will be set in attachment descriptor */
+@@ -270,6 +296,9 @@ kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
+       if (view->planes[plane].mtl_handle_input)
+          mtl_release(view->planes[plane].mtl_handle_input);
+ 
++      if (view->planes[plane].mtl_handle_input_2d)
++         mtl_release(view->planes[plane].mtl_handle_input_2d);
++
+       if (view->planes[plane].mtl_handle_render)
+          mtl_release(view->planes[plane].mtl_handle_render);
+ 
+@@ -328,6 +357,8 @@ kk_image_view_set_label(struct kk_image_view *iview, const char *label)
+          mtl_resource_set_label(iview->planes[i].mtl_handle_storage, label);
+       if (iview->planes[i].mtl_handle_subres)
+          mtl_resource_set_label(iview->planes[i].mtl_handle_subres, label);
++      if (iview->planes[i].mtl_handle_input_2d)
++         mtl_resource_set_label(iview->planes[i].mtl_handle_input_2d, label);
+       /* mtl_handle_render and mtl_handle_input might be the VkImage's handle */
+    }
+ }
+
+--- src/kosmickrisp/vulkan/kk_image_view.h
++++ src/kosmickrisp/vulkan/kk_image_view.h
+@@ -38,15 +38,20 @@ struct kk_image_view {
+       bool render_is_view;
+ 
+       /* Input attachment handle. Required since input attachments needs to be
+-       * arrays, and sampled may not be */
++       * arrays, and sampled may not be. NULL for linear images, which Metal
++       * can't view as arrays */
+       mtl_texture *mtl_handle_input;
+ 
++      /* Single-sample input attachments only: a 2D view of the first layer */
++      mtl_texture *mtl_handle_input_2d;
++
+       /* Used if view has to create its own alias of a specific subresource */
+       mtl_texture *mtl_handle_subres;
+ 
+       uint64_t sampled_gpu_resource_id;
+       uint64_t storage_gpu_resource_id;
+       uint64_t input_gpu_resource_id;
++      uint64_t input_2d_gpu_resource_id;
+    } planes[3];
+ };
+ 
+
+--- src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -27,6 +27,7 @@ struct lower_descriptors_ctx {
+    const struct kk_descriptor_set_layout *set_layouts[KK_MAX_SETS];
+ 
+    bool clamp_desc_array_bounds;
++   enum kk_input_read input_read;
+    nir_address_format ubo_addr_format;
+    nir_address_format ssbo_addr_format;
+ };
+@@ -550,6 +551,10 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+    {
+       unsigned offs =
+          offsetof(struct kk_sampled_image_descriptor, image_gpu_resource_id);
++      if ((tex->backend_flags & KK_TEXTURE_FLAG_INPUT_SELECTED) &&
++          !tex->is_array)
++         offs = offsetof(struct kk_sampled_image_descriptor,
++                         input_2d_gpu_resource_id);
+ 
+       nir_def *resource_addr = load_resource_addr(
+          b, 1, 64, nir_src_as_deref(nir_src_for_ssa(texture)),
+@@ -606,6 +611,61 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+    return true;
+ }
+ 
++/* Picks each input attachment read as a texture's 2D or array read, see
++ * kk_input_read.
++ */
++static bool
++lower_input_attachment_select(nir_builder *b, nir_tex_instr *tex, void *_data)
++{
++   const struct lower_descriptors_ctx *ctx = _data;
++
++   if (ctx->input_read == KK_INPUT_READ_ARRAY || tex->op != nir_texop_txf ||
++       !tex->is_array || tex->is_shadow ||
++       (tex->backend_flags & KK_TEXTURE_FLAG_INPUT_SELECTED))
++      return false;
++
++   nir_deref_instr *deref = nir_get_tex_deref(tex, nir_tex_src_texture_deref);
++   if (!deref ||
++       glsl_get_sampler_dim(deref->type) != GLSL_SAMPLER_DIM_SUBPASS)
++      return false;
++
++   b->cursor = nir_before_instr(&tex->instr);
++
++   if (ctx->input_read == KK_INPUT_READ_2D) {
++      int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
++      tex->backend_flags |= KK_TEXTURE_FLAG_INPUT_SELECTED;
++      tex->is_array = false;
++      tex->coord_components = 2;
++      nir_src_rewrite(&tex->src[coord].src,
++                      nir_trim_vector(b, tex->src[coord].src.ssa, 2));
++      return true;
++   }
++
++   nir_tex_instr *tex_array =
++      nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
++   tex_array->backend_flags |= KK_TEXTURE_FLAG_INPUT_SELECTED;
++
++   nir_tex_instr *tex_2d =
++      nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
++   tex_2d->backend_flags |= KK_TEXTURE_FLAG_INPUT_SELECTED;
++   tex_2d->is_array = false;
++   tex_2d->coord_components = 2;
++   int coord = nir_tex_instr_src_index(tex_2d, nir_tex_src_coord);
++   /* Not inserted yet, so its sources aren't on any use list. */
++   tex_2d->src[coord].src =
++      nir_src_for_ssa(nir_trim_vector(b, tex->src[coord].src.ssa, 2));
++
++   /* Constant by the time the shader is translated, so one side folds away */
++   nir_push_if(b, nir_load_single_layer_fb_kk(b));
++   nir_builder_instr_insert(b, &tex_2d->instr);
++   nir_push_else(b, NULL);
++   nir_builder_instr_insert(b, &tex_array->instr);
++   nir_pop_if(b, NULL);
++
++   nir_def_replace(&tex->def, nir_if_phi(b, &tex_2d->def, &tex_array->def));
++   return true;
++}
++
+ static bool
+ try_lower_descriptors_instr(nir_builder *b, nir_instr *instr, void *_data)
+ {
+@@ -778,7 +838,8 @@ bool
+ kk_nir_lower_descriptors(nir_shader *nir,
+                          const struct vk_pipeline_robustness_state *rs,
+                          uint32_t set_layout_count,
+-                         struct vk_descriptor_set_layout *const *set_layouts)
++                         struct vk_descriptor_set_layout *const *set_layouts,
++                         enum kk_input_read input_read)
+ {
+    struct lower_descriptors_ctx ctx = {
+       .clamp_desc_array_bounds =
+@@ -787,6 +848,7 @@ kk_nir_lower_descriptors(nir_shader *nir,
+          rs->uniform_buffers !=
+             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED ||
+          rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED,
++      .input_read = input_read,
+       .ssbo_addr_format = kk_buffer_addr_format(rs->storage_buffers),
+       .ubo_addr_format = kk_buffer_addr_format(rs->uniform_buffers),
+    };
+@@ -797,6 +859,9 @@ kk_nir_lower_descriptors(nir_shader *nir,
+          ctx.set_layouts[s] = vk_to_kk_descriptor_set_layout(set_layouts[s]);
+    }
+ 
++   bool pass_input_select = nir_shader_tex_pass(
++      nir, lower_input_attachment_select, nir_metadata_none, &ctx);
++
+    /* First lower everything but complex SSBOs, then lower complex SSBOs.
+     *
+     * TODO: See if we can unify this, not sure if the fast path matters on
+@@ -808,7 +873,7 @@ kk_nir_lower_descriptors(nir_shader *nir,
+    bool pass_lower_ssbo = nir_shader_intrinsics_pass(
+       nir, lower_ssbo_descriptor, nir_metadata_control_flow, &ctx);
+ 
+-   return pass_lower_descriptors || pass_lower_ssbo;
++   return pass_input_select || pass_lower_descriptors || pass_lower_ssbo;
+ }
+ 
+ static bool
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -687,7 +687,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
+              uint32_t set_layout_count,
+              struct vk_descriptor_set_layout *const *set_layouts,
+              const struct vk_graphics_pipeline_state *state,
+-             enum kk_feature_key features)
++             enum kk_feature_key features, enum kk_input_read input_read)
+ {
+    struct kk_physical_device *pdev = kk_device_physical(dev);
+ 
+@@ -808,7 +808,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
+     * the lower descriptor pass
+     */
+    NIR_PASS(_, nir, kk_nir_lower_descriptors, rs, set_layout_count,
+-            set_layouts);
++            set_layouts, input_read);
+ 
+    /* KK_WORKAROUND_16 - must be called after kk_nir_lower_descriptors(), which
+     * lowers all image intrinsics to be bindless */
+@@ -852,6 +852,9 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+ 
+       /* Graphics pipeline. */
+       mtl_release(pipe->gfx.render);
++      if (pipe->gfx.render_single_layer)
++         mtl_release(pipe->gfx.render_single_layer);
++      pipe->gfx.render_single_layer = NULL;
+       if (pipe->gfx.ds_handle)
+          mtl_release(pipe->gfx.ds_handle);
+       pipe->gfx.render = NULL;
+@@ -875,6 +878,9 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+    ralloc_free((void *)shader->gs_main.entrypoint_name);
+    ralloc_free((void *)shader->gs_main.code);
+ 
++   ralloc_free((void *)shader->fs_single_layer.entrypoint_name);
++   ralloc_free((void *)shader->fs_single_layer.code);
++
+    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
+ }
+ 
+@@ -1175,7 +1181,8 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       msl_nir_lower_clip_cull_distance(nir, 0);
+       /* Descriptors were lowered with the GS, this lowers the system values
+        * the hardware vertex lowering added */
+-      NIR_PASS(_, nir, kk_nir_lower_descriptors, robustness, 0, NULL);
++      NIR_PASS(_, nir, kk_nir_lower_descriptors, robustness, 0, NULL,
++               KK_INPUT_READ_2D);
+    }
+ 
+    /* KK_WORKAROUND_19 Only the stage that feeds geometry will be dispatched
+@@ -1273,7 +1280,8 @@ get_empty_nir(struct kk_device *dev, mesa_shader_stage stage,
+       .null_uniform_buffer_descriptor = false,
+       .null_storage_buffer_descriptor = false,
+    };
+-   kk_lower_nir(dev, nir, false, &no_robustness, 0u, NULL, state, features);
++   kk_lower_nir(dev, nir, false, &no_robustness, 0u, NULL, state, features,
++                KK_INPUT_READ_2D);
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+ 
+    return nir;
+@@ -1484,6 +1492,11 @@ gather_graphics_pipeline_create_info(
+          kk_msl_copy(&vs->gs_main, &s->gs_main);
+          gs = s;
+       }
++
++      if (s->info.has_fs_single_layer) {
++         kk_msl_copy(&vs->fs_single_layer, &s->fs_single_layer);
++         info->has_fs_single_layer = true;
++      }
+    }
+ 
+    uint8_t topology = state->ia->primitive_topology;
+@@ -1623,6 +1636,28 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+    if (pipe->gfx.render == NULL)
+       result = VK_ERROR_INVALID_SHADER_NV;
+ 
++   if (result == VK_SUCCESS && vs->info.has_fs_single_layer) {
++      mtl_library *single_layer_library = mtl_new_library(
++         device->mtl_compiler_handle, vs->fs_single_layer.code,
++         pdev->info.msl_version, MTL_MATH_MODE_FAST,
++         MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
++      if (single_layer_library == NULL) {
++         result = VK_ERROR_INVALID_SHADER_NV;
++      } else {
++         mtl_function_descriptor *single_layer_function =
++            mtl_new_library_function_descriptor(
++               single_layer_library, vs->fs_single_layer.entrypoint_name);
++         mtl_render_pipeline_descriptor_set_fragment_shader(
++            pipeline_descriptor, single_layer_function);
++         pipe->gfx.render_single_layer = mtl_new_render_pipeline(
++            device->mtl_compiler_handle, pipeline_descriptor);
++         if (pipe->gfx.render_single_layer == NULL)
++            result = VK_ERROR_INVALID_SHADER_NV;
++         mtl_release(single_layer_function);
++         mtl_release(single_layer_library);
++      }
++   }
++
+    mtl_release(pipeline_descriptor);
+    mtl_release(fragment_function);
+    mtl_release(fragment_library);
+@@ -1692,6 +1727,18 @@ kk_forward_gs_primitive_id(nir_shader *gs, nir_shader *fs)
+    gs->info.outputs_written |= BITFIELD64_BIT(slot);
+ }
+ 
++static bool
++resolve_single_layer_fb(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_load_single_layer_fb_kk)
++      return false;
++
++   const bool *single_layer = data;
++   b->cursor = nir_before_instr(&intr->instr);
++   nir_def_replace(&intr->def, nir_imm_bool(b, *single_layer));
++   return true;
++}
++
+ static VkResult
+ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+                    struct vk_shader_compile_info *infos,
+@@ -1711,6 +1758,24 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+    nir_shader *nir_shaders[shader_count + 1u];
+    struct kk_shader *shaders[shader_count + 1u];
+ 
++   /* Whole pipelines are compiled together, so the layers they render are
++    * known: the view mask's, or the ones a pre-rasterization stage picks.
++    */
++   enum kk_input_read input_read = KK_INPUT_READ_2D;
++   uint32_t view_mask = state && state->mv ? state->mv->view_mask : 0u;
++   if (view_mask > 1u) {
++      input_read = KK_INPUT_READ_ARRAY;
++   } else if (!view_mask) {
++      /* The last pre-rasterization stage picks the layer */
++      for (uint32_t i = shader_count; i-- > 0u;) {
++         if (infos[i].stage == MESA_SHADER_FRAGMENT)
++            continue;
++         if (infos[i].nir->info.outputs_written & VARYING_BIT_LAYER)
++            input_read = KK_INPUT_READ_BY_LAYERS;
++         break;
++      }
++   }
++
+    /* Lower shaders, notably lowering IO. This is a prerequisite for intershader
+     * optimization. */
+    const struct vk_pipeline_robustness_state *vertex_robustness = &rs_none;
+@@ -1725,7 +1790,8 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+ 
+       msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
+       kk_lower_nir(dev, nir, emulated_stage, info->robustness,
+-                   info->set_layout_count, info->set_layouts, state, features);
++                   info->set_layout_count, info->set_layouts, state, features,
++                   input_read);
+ 
+       if (nir->info.stage == MESA_SHADER_VERTEX)
+          vertex_robustness = info->robustness;
+@@ -1763,6 +1829,26 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+    nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
+                          UINT32_MAX, nir_opts, NULL);
+ 
++   /* Split a fragment shader that reads input attachments by the
++    * framebuffer's layers into one per layer count.
++    */
++   nir_shader *fs_single_layer = NULL;
++   if (input_read == KK_INPUT_READ_BY_LAYERS) {
++      nir_shader *fs = nir_shaders[total_shaders - 1u];
++      bool single_layer = false;
++      fs_single_layer = nir_shader_clone(NULL, fs);
++      if (nir_shader_intrinsics_pass(fs, resolve_single_layer_fb,
++                                     nir_metadata_control_flow,
++                                     &single_layer)) {
++         single_layer = true;
++         nir_shader_intrinsics_pass(fs_single_layer, resolve_single_layer_fb,
++                                    nir_metadata_control_flow, &single_layer);
++      } else {
++         ralloc_free(fs_single_layer);
++         fs_single_layer = NULL;
++      }
++   }
++
+    for (uint32_t i = 0; i < total_shaders; i++) {
+       struct kk_shader *prev_stage = i > 0 ? shaders[i - 1] : NULL;
+       result =
+@@ -1777,6 +1863,7 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+          /* Clean up all the NIR after this point */
+          for (uint32_t j = i + 1; j < total_shaders; j++)
+             ralloc_free(nir_shaders[j]);
++         ralloc_free(fs_single_layer);
+ 
+          /* Memset the output array */
+          memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
+@@ -1785,12 +1872,29 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+       }
+    }
+ 
++   if (fs_single_layer) {
++      struct kk_shader *fs = shaders[total_shaders - 1u];
++      struct kk_shader *single_layer;
++      result = kk_compile_shader(dev, fs_single_layer,
++                                 shaders[total_shaders - 2u], vertex_robustness,
++                                 state, pAllocator, &single_layer, apply_wa19);
++      if (result == VK_SUCCESS) {
++         fs->fs_single_layer = single_layer->msl_data[MESA_SHADER_FRAGMENT];
++         fs->info.has_fs_single_layer = true;
++         single_layer->msl_data[MESA_SHADER_FRAGMENT] =
++            (struct msl_compile_data){0};
++         kk_shader_destroy(&dev->vk, single_layer, pAllocator);
++      }
++   }
++
+    /* Compile pipeline:
+     * 1. Compute pipeline
+     * 2. Graphics with all stages (since we don't support GPL nor shader
+     * objects for now). This will be addressed later.
+     */
+-   if (shaders[0]->vk.stage == MESA_SHADER_COMPUTE) {
++   if (result != VK_SUCCESS) {
++      /* Cleaned up below */
++   } else if (shaders[0]->vk.stage == MESA_SHADER_COMPUTE) {
+       struct kk_shader *s = shaders[0];
+       uint32_t local_size_threads = s->info.cs.local_size.x *
+                                     s->info.cs.local_size.y *
+@@ -1857,6 +1961,8 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
+    }
+    if (kk_has_gs_main(&shader->info))
+       kk_msl_serialize(&shader->gs_main, blob);
++   if (shader->info.has_fs_single_layer)
++      kk_msl_serialize(&shader->fs_single_layer, blob);
+ 
+    return !blob->out_of_memory;
+ }
+@@ -1921,6 +2027,12 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+          goto fail;
+    }
+ 
++   if (info.has_fs_single_layer) {
++      result = kk_msl_deserialize(blob, &shader->fs_single_layer);
++      if (result != VK_SUCCESS)
++         goto fail;
++   }
++
+    if (info.stage == MESA_SHADER_COMPUTE) {
+       uint32_t local_size_threads = shader->info.cs.local_size.x *
+                                     shader->info.cs.local_size.y *
+
+--- src/kosmickrisp/vulkan/kk_shader.h
++++ src/kosmickrisp/vulkan/kk_shader.h
+@@ -57,6 +57,10 @@ struct kk_shader_info {
+    /* Outputs a VS, or a TES followed by a GS, writes for the next stage */
+    uint64_t outputs_written;
+ 
++   /* A fragment shader, and the VS holding its pipeline, has a variant for
++    * single-layer framebuffers (see KK_INPUT_READ_BY_LAYERS) */
++   bool has_fs_single_layer;
++
+    union {
+       /* Vertex shader is the pipeline, store all relevant data here. */
+       struct {
+@@ -122,6 +126,9 @@ struct kk_pipeline_handles {
+    union {
+       struct {
+          mtl_render_pipeline_state *render;
++         /* Bound instead of render when the framebuffer has one layer, if
++          * the fragment shader has that variant */
++         mtl_render_pipeline_state *render_single_layer;
+          /* VS, TCS, TES and the GS compute pass at most run before the render
+           * pipeline. */
+          mtl_compute_pipeline_state *pre_render[4];
+@@ -146,6 +153,9 @@ struct kk_shader {
+    /* Compute pass of a GS. Its rasterization VS is in
+     * msl_data[MESA_SHADER_GEOMETRY]. */
+    struct msl_compile_data gs_main;
++   /* Fragment shader for single-layer framebuffers, if info.has_fs_single_layer
++    */
++   struct msl_compile_data fs_single_layer;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
+@@ -167,11 +177,29 @@ kk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
+    }
+ }
+ 
++/* How input attachments read as textures are read. They're 2D arrays, but
++ * Metal can't view linear textures as arrays, so linear images only have a 2D
++ * view. Every single-sample input attachment has one.
++ */
++enum kk_input_read {
++   /* The pipeline only renders layer 0 */
++   KK_INPUT_READ_2D,
++   /* Views past the first need attachments with more layers than a linear
++    * image has */
++   KK_INPUT_READ_ARRAY,
++   /* A pre-rasterization stage picks the layer. Only a single-layer
++    * framebuffer can hold a linear image, and only its layer 0 is defined.
++    * The fragment shader is compiled both ways and the draw picks one.
++    */
++   KK_INPUT_READ_BY_LAYERS,
++};
++
+ bool
+ kk_nir_lower_descriptors(nir_shader *nir,
+                          const struct vk_pipeline_robustness_state *rs,
+                          uint32_t set_layout_count,
+-                         struct vk_descriptor_set_layout *const *set_layouts);
++                         struct vk_descriptor_set_layout *const *set_layouts,
++                         enum kk_input_read input_read);
+ 
+ /* KK_WORKAROUND_18 */
+ bool kk_nir_add_device_barrier_workaround(nir_shader *nir);
+@@ -186,6 +214,8 @@ bool kk_nir_lower_fs_multiview(nir_shader *nir, uint32_t view_mask);
+ 
+ /* Indicates that the sampler should be overridden to clamp to 0 instead of 1 */
+ #define KK_TEXTURE_FLAG_CLAMP_TO_0 (1 << 0)
++/* Input attachment read already picked as its array or 2D read */
++#define KK_TEXTURE_FLAG_INPUT_SELECTED (1 << 1)
+ 
+ bool kk_nir_lower_custom_border(nir_shader *nir);
+ bool kk_nir_lower_image_view_min_lod(nir_shader *nir);
+

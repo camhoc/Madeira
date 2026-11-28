@@ -1,0 +1,30 @@
+# kk: Correctly select access qualifier for global atomics
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/43979 state=closed
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+```
+kk: Correctly select access qualifier for global atomics
+
+Signed-off-by: Aitor Camacho <aitor@lunarg.com>
+```
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -1388,10 +1388,14 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+       break;
+    }
+    case nir_intrinsic_global_atomic:
+-      atomic_to_msl(ctx, instr, "device", false);
++      atomic_to_msl(ctx, instr,
++                    global_access_qualifier(ctx, nir_intrinsic_access(instr)),
++                    false);
+       break;
+    case nir_intrinsic_global_atomic_swap:
+-      atomic_swap_to_msl(ctx, instr, "device", false);
++      atomic_swap_to_msl(
++         ctx, instr, global_access_qualifier(ctx, nir_intrinsic_access(instr)),
++         false);
+       break;
+    case nir_intrinsic_shared_atomic:
+       atomic_to_msl(ctx, instr, "threadgroup", true);
+

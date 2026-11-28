@@ -1,0 +1,157 @@
+# ntdll: Reuse free blocks of partially used LFH groups.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12472 state=opened
+# Once every block in an LFH group is allocated, the group is taken off its bin, and it only comes back when all 31 blocks have been freed. So if a single block in the group lives for a long time, the other 30 can be freed but never handed out again, and the heap just keeps growing.
+
+This shows up in EVE Online, where heap growth with five clients drops from about 292 MiB an hour to about 28 MiB an hour with this change. Windows does reuse these blocks.
+
+The fix puts the group back in its bin on the first free instead of the last one. Setting the block's free bit and clearing GROUP_FLAG_FREE happens in a single compare-exchange, so only one thread ends up relinking the group, and it always has at least one free block when it goes back.
+
+Since the bin can now hold partly used groups, the thread that frees the last block doesn't own the group anymore and can't release it. Surplus empty groups are released in heap_acquire_bin_group() when they get popped instead.
+
+The downside is that if an application stops allocating a given size, the empty groups for that size stay around until allocations of that size start taking groups from the bin again, or until the heap is destroyed. Before, they were released right away. If that's a problem I can look at trimming a few groups on free.
+
+The new test fails without the fix and passes with it. The kernel32 heap tests pass on 64-bit and 32-bit. I also ran a stress test with 8 threads for 10 seconds, with cross-thread frees on two LFH heaps: about 150 million allocate/free pairs each for the 64-bit and 32-bit builds, with no corrupted blocks and HeapValidate passing.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60589
+--- dlls/kernel32/tests/heap.c
++++ dlls/kernel32/tests/heap.c
+@@ -1261,6 +1261,48 @@ static void test_HeapCreate(void)
+     CloseHandle( thread );
+ }
+ 
++static int __cdecl compare_ptr( const void *a, const void *b )
++{
++    const ULONG_PTR x = *(const ULONG_PTR *)a, y = *(const ULONG_PTR *)b;
++    return x < y ? -1 : x > y;
++}
++
++static void test_lfh_reuse(void)
++{
++    static void *ptrs[0x2000], *freed[0x2000];
++    SIZE_T size = 24 + 2 * sizeof(void *);
++    ULONG compat_info = 2, count = 0, reused = 0, i;
++    HANDLE heap;
++    BOOL ret;
++
++    heap = HeapCreate( 0, 0, 0 );
++    ok( !!heap, "HeapCreate failed, error %lu\n", GetLastError() );
++    ret = pHeapSetInformation( heap, HeapCompatibilityInformation, &compat_info, sizeof(compat_info) );
++    ok( ret, "HeapSetInformation failed, error %lu\n", GetLastError() );
++
++    for (i = 0; i < ARRAY_SIZE(ptrs); i++) ptrs[i] = pHeapAlloc( heap, 0, size );
++
++    /* keep every 31st block allocated, so that no LFH group becomes entirely free */
++    for (i = 0; i < ARRAY_SIZE(ptrs); i++)
++    {
++        if (!(i % 31)) continue;
++        freed[count++] = ptrs[i];
++        HeapFree( heap, 0, ptrs[i] );
++    }
++    qsort( freed, count, sizeof(*freed), compare_ptr );
++
++    /* freed blocks of partially used groups are reused for new allocations */
++    for (i = 0; i < ARRAY_SIZE(ptrs); i++)
++    {
++        void *ptr = pHeapAlloc( heap, 0, size );
++        if (bsearch( &ptr, freed, count, sizeof(*freed), compare_ptr )) reused++;
++    }
++    ok( reused >= count * 3 / 4, "got %lu reused blocks out of %lu\n", reused, count );
++
++    ret = HeapDestroy( heap );
++    ok( ret, "HeapDestroy failed, error %lu\n", GetLastError() );
++}
++
+ 
+ struct mem_entry
+ {
+@@ -3877,6 +3919,7 @@ START_TEST(heap)
+     }
+ 
+     test_HeapCreate();
++    test_lfh_reuse();
+     test_GlobalAlloc();
+     test_LocalAlloc();
+ 
+
+--- dlls/ntdll/heap.c
++++ dlls/ntdll/heap.c
+@@ -1866,31 +1866,32 @@ static struct group *heap_acquire_bin_group( struct heap *heap, ULONG flags, SIZ
+     if ((group = InterlockedExchangePointer( (void *)bin_get_affinity_group( bin, affinity ), NULL )))
+         return group;
+ 
+-    if ((entry = RtlInterlockedPopEntrySList( &bin->groups )))
+-        return CONTAINING_RECORD( entry, struct group, entry );
++    while ((entry = RtlInterlockedPopEntrySList( &bin->groups )))
++    {
++        group = CONTAINING_RECORD( entry, struct group, entry );
++
++        /* release fully freed groups if the bin has enough of them */
++        if (ReadAcquire( &group->free_bits ) != ~GROUP_FLAG_FREE) return group;
++        if (RtlQueryDepthSList( &bin->groups ) <= ARRAY_SIZE(affinity_mapping)) return group;
++
++        group_release( heap, flags, bin, group );
++    }
+ 
+     return group_allocate( heap, flags, block_size );
+ }
+ 
+-/* release a thread owned and fully freed group to the bin shared group, or free its memory */
+-static NTSTATUS heap_release_bin_group( struct heap *heap, ULONG flags, struct bin *bin, struct group *group )
++/* release a thread owned group with free blocks to its affinity group, or to the bin shared groups */
++static void heap_release_bin_group( struct bin *bin, struct group *group )
+ {
+     ULONG affinity = group->affinity;
+ 
+     /* using InterlockedExchangePointer here would possibly return a group that has used blocks,
+-     * we prefer keeping our fully freed group instead for reduced memory consumption.
++     * we prefer keeping our group instead for reduced memory consumption.
+      */
+     if (!InterlockedCompareExchangePointer( (void *)bin_get_affinity_group( bin, affinity ), group, NULL ))
+-        return STATUS_SUCCESS;
++        return;
+ 
+-    /* try re-using the block group instead of releasing it */
+-    if (RtlQueryDepthSList( &bin->groups ) <= ARRAY_SIZE(affinity_mapping))
+-    {
+-        RtlInterlockedPushEntrySList( &bin->groups, &group->entry );
+-        return STATUS_SUCCESS;
+-    }
+-
+-    return group_release( heap, flags, bin, group );
++    RtlInterlockedPushEntrySList( &bin->groups, &group->entry );
+ }
+ 
+ static struct block *find_free_bin_block( struct heap *heap, ULONG flags, SIZE_T block_size, struct bin *bin )
+@@ -1950,7 +1951,7 @@ static NTSTATUS heap_free_block_lfh( struct heap *heap, ULONG flags, struct bloc
+     struct bin *bin, *last = heap->bins + BLOCK_SIZE_BIN_COUNT - 1;
+     SIZE_T i, block_size = block_get_size( block );
+     struct group *group = block_get_group( block );
+-    NTSTATUS status = STATUS_SUCCESS;
++    LONG old, prev;
+ 
+     if (!(block_get_flags( block ) & BLOCK_FLAG_LFH)) return STATUS_UNSUCCESSFUL;
+ 
+@@ -1963,15 +1964,14 @@ static NTSTATUS heap_free_block_lfh( struct heap *heap, ULONG flags, struct bloc
+     block_set_flags( block, (BYTE)~BLOCK_FLAG_LFH, BLOCK_FLAG_FREE );
+     mark_block_free( block + 1, (char *)block + block_size - (char *)(block + 1), flags );
+ 
+-    /* if this was the last used block in a group and GROUP_FLAG_FREE was set */
+-    if (InterlockedOr( &group->free_bits, 1 << i ) == ~(1 << i))
+-    {
+-        /* thread now owns the group, and can release it to its bin */
+-        group->free_bits = ~GROUP_FLAG_FREE;
+-        status = heap_release_bin_group( heap, flags, bin, group );
+-    }
++    /* set the block free bit, and clear GROUP_FLAG_FREE if the group was unlinked */
++    old = ReadNoFence( &group->free_bits );
++    while ((prev = InterlockedCompareExchange( &group->free_bits, (old | (1 << i)) & ~GROUP_FLAG_FREE, old )) != old)
++        old = prev;
+ 
+-    return status;
++    /* thread now owns the group, and can put it back in its bin */
++    if (old & GROUP_FLAG_FREE) heap_release_bin_group( bin, group );
++    return STATUS_SUCCESS;
+ }
+ 
+ static void bin_try_enable( struct heap *heap, struct bin *bin )
+

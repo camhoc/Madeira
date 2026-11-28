@@ -1,0 +1,112 @@
+# server: Return a device path for ProcessImageFileName.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11829 state=opened
+# NtQueryInformationProcess(ProcessImageFileName) returns a device path on
+Windows, for instance \Device\HarddiskVolume1\windows\system32\notepad.exe,
+while ProcessImageFileNameWin32 returns the DOS path.  Wine returned the NT
+path with the \??\ prefix in both cases.
+
+Resolve the \??\X: drive symlink to its target instead.  The test in
+dlls/ntdll/tests/info.c already covered this and was marked todo_wine.
+--- dlls/ntdll/tests/info.c
++++ dlls/ntdll/tests/info.c
+@@ -2397,7 +2397,6 @@ static void test_query_process_image_file_name(void)
+     ok( status == STATUS_SUCCESS, "Expected STATUS_SUCCESS, got %08lx\n", status);
+     ok( buffer->MaximumLength == buffer->Length + sizeof(WCHAR), "got %u, %u.\n", buffer->Length, buffer->MaximumLength );
+     ok ( !buffer->Buffer[buffer->Length / sizeof(WCHAR)], "got %#x.\n", buffer->Buffer[buffer->Length / sizeof(WCHAR)] );
+-    todo_wine
+     ok(!memcmp(buffer->Buffer, deviceW, sizeof(deviceW)),
+         "Expected image name to begin with \\Device\\, got %s\n",
+         wine_dbgstr_wn(buffer->Buffer, buffer->Length / sizeof(WCHAR)));
+
+--- dlls/ntdll/unix/process.c
++++ dlls/ntdll/unix/process.c
+@@ -1442,7 +1442,6 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
+         break;
+ 
+     case ProcessImageFileName:
+-        /* FIXME: Should return a device path */
+     case ProcessImageFileNameWin32:
+         SERVER_START_REQ( get_process_image_name )
+         {
+
+--- server/object.h
++++ server/object.h
+@@ -367,6 +367,7 @@ extern struct type_descr no_type;
+ extern struct type_descr objtype_type;
+ extern struct type_descr directory_type;
+ extern struct type_descr symlink_type;
++extern const WCHAR *get_symlink_target( struct object *obj, data_size_t *len );
+ extern struct type_descr token_type;
+ extern struct type_descr job_type;
+ extern struct type_descr process_type;
+
+--- server/process.c
++++ server/process.c
+@@ -1525,13 +1525,37 @@ DECL_HANDLER(get_process_image_name)
+     if (process->image)
+     {
+         struct unicode_str name = { process->image, process->imagelen };
++        WCHAR *resolved = NULL;
++
+         /* skip the \??\ prefix */
+         if (req->win32 && name.len > 6 * sizeof(WCHAR) && name.str[5] == ':')
+         {
+             name.str += 4;
+             name.len -= 4 * sizeof(WCHAR);
+         }
+-        /* FIXME: else resolve symlinks in NT path */
++        else if (!req->win32 && name.len > 6 * sizeof(WCHAR) && name.str[5] == ':')
++        {
++            /* resolve the \??\X: drive symlink, e.g.
++             * \??\C:\windows\foo.exe -> \Device\HarddiskVolume1\windows\foo.exe */
++            struct unicode_str drive = { name.str, 6 * sizeof(WCHAR) };
++            struct object *obj = lookup_named_object( NULL, drive, OBJ_OPENLINK, NULL );
++
++            if (obj)
++            {
++                data_size_t target_len;
++                const WCHAR *target = get_symlink_target( obj, &target_len );
++
++                if (target && (resolved = mem_alloc( target_len + name.len )))
++                {
++                    memcpy( resolved, target, target_len );
++                    memcpy( resolved + target_len / sizeof(WCHAR),
++                            name.str + 6, name.len - 6 * sizeof(WCHAR) );
++                    name.str = resolved;
++                    name.len = target_len + name.len - 6 * sizeof(WCHAR);
++                }
++                release_object( obj );
++            }
++        }
+ 
+         reply->len = name.len;
+         if (name.len <= get_reply_max_size())
+@@ -1541,6 +1565,7 @@ DECL_HANDLER(get_process_image_name)
+             if (req->win32 && name.len > sizeof(WCHAR) && ptr[1] == '?') ptr[1] = '\\';
+         }
+         else set_error( STATUS_BUFFER_TOO_SMALL );
++        free( resolved );
+     }
+     else set_error( STATUS_INVALID_HANDLE );
+     release_object( process );
+
+--- server/symlink.c
++++ server/symlink.c
+@@ -73,6 +73,16 @@ static const struct object_ops symlink_ops =
+     .destroy     = symlink_destroy,
+ };
+ 
++/* retrieve a symlink's target, or NULL if the object is not a symlink */
++const WCHAR *get_symlink_target( struct object *obj, data_size_t *len )
++{
++    struct symlink *symlink = (struct symlink *)obj;
++
++    if (obj->ops != &symlink_ops) return NULL;
++    *len = symlink->len;
++    return symlink->target;
++}
++
+ static void symlink_dump( struct object *obj, int verbose )
+ {
+     struct symlink *symlink = (struct symlink *)obj;
+

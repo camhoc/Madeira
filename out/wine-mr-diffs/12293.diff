@@ -1,0 +1,18 @@
+# ntdll: Align the page protection table allocation.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12293 state=closed
+# Commit https://gitlab.winehq.org/wine/wine/-/commit/52857120a9a5c22095580232b2982f6e45043077 (landed in 11.19) caused a regression which made Wine crash [here](https://gitlab.winehq.org/wine/wine/-/blob/master/dlls/ntdll/unix/virtual.c#L279) on some ARM64 Linux hosts. This was because the page protection table wasn't a multiple of the host page size. 
+
+Therefore, round the allocation for the page protection table, like it was before that refactor. This resolves the issue in my testing.
+--- dlls/ntdll/unix/virtual.c
++++ dlls/ntdll/unix/virtual.c
+@@ -3565,7 +3565,8 @@ void virtual_init(void)
+ 
+ #ifdef _WIN64
+     pages_vprot_size = ((size_t)host_addr_space_limit >> page_shift >> pages_vprot_shift) + 1;
+-    pages_vprot = anon_mmap_alloc( pages_vprot_size * sizeof(*pages_vprot), PROT_READ | PROT_WRITE );
++    pages_vprot = anon_mmap_alloc( ROUND_SIZE( 0, pages_vprot_size * sizeof(*pages_vprot), host_page_mask ),
++                                  PROT_READ | PROT_WRITE );
+ #else
+     pages_vprot = anon_mmap_alloc( 1U << (32 - page_shift), PROT_READ | PROT_WRITE );
+ #endif
+

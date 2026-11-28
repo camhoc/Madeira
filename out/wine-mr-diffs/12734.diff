@@ -1,0 +1,595 @@
+# windows.storage: Add StorageFile with GetFileFromPathAsync() and the basic IStorageItem properties.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12734 state=closed
+# Wine has no Windows.Storage.StorageFile class; IStorageFileStatics is only forward-declared. Apps that get a path from a file picker and turn it into a StorageFile therefore fail at activation. Minecraft Bedrock's "Import world" is one of them: after the picker returns, it calls StorageFile.GetFileFromPathAsync() on the chosen path and then reads the item's Path and Name.
+
+This MR adds the class in C to windows.storage:
+
+- The IDL gets IStorageFileStatics and the types its signatures need, and StorageFile is declared with its statics and as agile.
+- Tests come first, with todo_wine that the later commits remove.
+- A runtimeclass stub registers StorageFile and returns the statics.
+- GetFileFromPathAsync() runs on the thread pool like the other async operations here, using an IAsyncOperation\<IInspectable \*\> helper taken from windows.devices.radios. An empty or relative path fails with E_INVALIDARG, a missing file with the Win32 error, and a directory with ERROR_DIRECTORY.
+- Name, Path, Attributes, DateCreated and IsOfType() on IStorageItem, and FileType and ContentType on IStorageFile. Everything else stays a FIXME stub.
+
+The error codes for relative, empty and directory paths, and returning an empty ContentType when the extension has no "Content Type" value, were picked without checking on Windows. E_INVALIDARG for a relative path matches the "Value does not fall within the expected range" error .NET reports in that case.
+
+I tested on macOS with both 64-bit and 32-bit (wow64) builds. The windows.storage tests pass at every commit with no skips. On the final tree, windows.storage.applicationdata, windows.applicationmodel, ole32 compobj/marshal and combase roapi/string pass too. I also broke the code on purpose ten ways (wrong error for a NULL out pointer, no relative-path or directory check, wrong error for a missing file, wrong Name, Path, IsOfType, Attributes, DateCreated and ContentType), and the tests caught each one.
+
+I also ran Minecraft Bedrock with this ser
+--- dlls/windows.storage/tests/storage.c
++++ dlls/windows.storage/tests/storage.c
+@@ -29,7 +29,9 @@
+ #define WIDL_using_Windows_Foundation
+ #define WIDL_using_Windows_Foundation_Collections
+ #include "windows.foundation.h"
++#define WIDL_using_Windows_Storage
+ #define WIDL_using_Windows_Storage_Streams
++#include "windows.storage.h"
+ #include "windows.storage.streams.h"
+ #include "robuffer.h"
+ 
+@@ -526,6 +528,183 @@ static void test_InMemoryRandomAccessStream(void)
+     ok( ref == 0, "got ref %ld.\n", ref );
+ }
+ 
++DEFINE_ASYNC_COMPLETED_HANDLER( async_storage_file_handler, IAsyncOperationCompletedHandler_StorageFile, IAsyncOperation_StorageFile )
++
++#define get_file_from_path( a, b, c, d ) get_file_from_path_( __LINE__, a, b, c, d )
++static void get_file_from_path_( unsigned int line, IStorageFileStatics *statics, const WCHAR *path, HRESULT expect_hr,
++                                 IStorageFile **file )
++{
++    IAsyncOperation_StorageFile *operation = NULL;
++    HSTRING str;
++    HRESULT hr;
++    DWORD ret;
++
++    *file = NULL;
++
++    hr = WindowsCreateString( path, wcslen( path ), &str );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = IStorageFileStatics_GetFileFromPathAsync( statics, str, &operation );
++    WindowsDeleteString( str );
++    ok_(__FILE__, line)( hr == S_OK, "got hr %#lx.\n", hr );
++    if (FAILED(hr)) return;
++
++    ret = await_IAsyncOperation_StorageFile( operation, 5000 );
++    ok_(__FILE__, line)( !ret, "await returned %#lx.\n", ret );
++    check_async_info_( line, operation, expect_hr == S_OK ? Completed : Error, expect_hr );
++
++    hr = IAsyncOperation_StorageFile_GetResults( operation, file );
++    ok_(__FILE__, line)( hr == expect_hr, "got hr %#lx.\n", hr );
++    if (expect_hr == S_OK) ok_(__FILE__, line)( *file != NULL, "got NULL file.\n" );
++    else if (*file)
++    {
++        IStorageFile_Release( *file );
++        *file = NULL;
++    }
++
++    IAsyncOperation_StorageFile_Release( operation );
++}
++
++#define check_hstring( a, b ) check_hstring_( __LINE__, a, b )
++static void check_hstring_( unsigned int line, HSTRING str, const WCHAR *expect )
++{
++    const WCHAR *buffer = WindowsGetStringRawBuffer( str, NULL );
++    ok_(__FILE__, line)( !wcscmp( buffer, expect ), "got %s, expected %s.\n", debugstr_w( buffer ), debugstr_w( expect ) );
++    WindowsDeleteString( str );
++}
++
++static void test_StorageFile(void)
++{
++    static const WCHAR *storage_file_name = L"Windows.Storage.StorageFile";
++    IStorageFileStatics *statics = (void *)0xdeadbeef;
++    IActivationFactory *factory = (void *)0xdeadbeef;
++    WCHAR dir[MAX_PATH], path[MAX_PATH], cwd[MAX_PATH];
++    WIN32_FILE_ATTRIBUTE_DATA data;
++    SYSTEMTIME system_time = {2037, 1, 4, 1};
++    IStorageItem *item;
++    IStorageFile *file;
++    FILETIME write_time;
++    FileAttributes attributes;
++    DateTime date;
++    boolean is_type;
++    HSTRING str;
++    HANDLE handle;
++    DWORD written, len;
++    HRESULT hr;
++
++    hr = WindowsCreateString( storage_file_name, wcslen( storage_file_name ), &str );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    hr = RoGetActivationFactory( str, &IID_IActivationFactory, (void **)&factory );
++    WindowsDeleteString( str );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    if (FAILED(hr)) return;
++
++    check_interface( factory, &IID_IUnknown, FALSE );
++    check_interface( factory, &IID_IInspectable, FALSE );
++    check_interface( factory, &IID_IAgileObject, TRUE /* Supported after Windows 10 1607 */ );
++
++    hr = IActivationFactory_QueryInterface( factory, &IID_IStorageFileStatics, (void **)&statics );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++
++    len = GetTempPathW( ARRAY_SIZE(dir), dir );
++    ok( len && len < ARRAY_SIZE(dir), "GetTempPathW returned %lu.\n", len );
++    len = GetLongPathNameW( dir, dir, ARRAY_SIZE(dir) );
++    ok( len && len < ARRAY_SIZE(dir), "GetLongPathNameW returned %lu.\n", len );
++    wcscpy( path, dir );
++    wcscat( path, L"wine_storagefile_test.txt" );
++
++    handle = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
++    ok( handle != INVALID_HANDLE_VALUE, "CreateFileW failed, error %lu.\n", GetLastError() );
++    ok( WriteFile( handle, "wine", 4, &written, NULL ), "WriteFile failed, error %lu.\n", GetLastError() );
++    ok( SystemTimeToFileTime( &system_time, &write_time ), "SystemTimeToFileTime failed.\n" );
++    ok( SetFileTime( handle, NULL, NULL, &write_time ), "SetFileTime failed, error %lu.\n", GetLastError() );
++    CloseHandle( handle );
++
++    get_file_from_path( statics, path, S_OK, &file );
++    if (file)
++    {
++        check_interface( file, &IID_IStorageItem, FALSE );
++        check_interface( file, &IID_IAgileObject, FALSE );
++
++        str = NULL;
++        hr = IStorageFile_GetRuntimeClassName( file, &str );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        check_hstring( str, storage_file_name );
++
++        hr = IStorageFile_QueryInterface( file, &IID_IStorageItem, (void **)&item );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++
++        str = NULL;
++        hr = IStorageItem_get_Name( item, &str );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        check_hstring( str, L"wine_storagefile_test.txt" );
++
++        str = NULL;
++        hr = IStorageItem_get_Path( item, &str );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        check_hstring( str, path );
++
++        is_type = 2;
++        hr = IStorageItem_IsOfType( item, StorageItemTypes_File, &is_type );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        ok( is_type == TRUE, "got %d.\n", is_type );
++        is_type = 2;
++        hr = IStorageItem_IsOfType( item, StorageItemTypes_Folder, &is_type );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        ok( is_type == FALSE, "got %d.\n", is_type );
++
++        attributes = FileAttributes_ReadOnly | FileAttributes_Directory;
++        hr = IStorageItem_get_Attributes( item, &attributes );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        ok( !(attributes & (FileAttributes_ReadOnly | FileAttributes_Directory)), "got %#x.\n", attributes );
++
++        ok( GetFileAttributesExW( path, GetFileExInfoStandard, &data ), "GetFileAttributesExW failed, error %lu.\n", GetLastError() );
++        date.UniversalTime = 0;
++        hr = IStorageItem_get_DateCreated( item, &date );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        ok( date.UniversalTime == (((INT64)data.ftCreationTime.dwHighDateTime << 32) | data.ftCreationTime.dwLowDateTime),
++                      "got %I64d.\n", date.UniversalTime );
++
++        str = NULL;
++        hr = IStorageFile_get_FileType( file, &str );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        check_hstring( str, L".txt" );
++
++        str = NULL;
++        hr = IStorageFile_get_ContentType( file, &str );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        check_hstring( str, L"text/plain" );
++
++        ok( SetFileAttributesW( path, FILE_ATTRIBUTE_READONLY ), "SetFileAttributesW failed, error %lu.\n", GetLastError() );
++        attributes = FileAttributes_ReadOnly;
++        hr = IStorageItem_get_Attributes( item, &attributes );
++        ok( hr == S_OK, "got hr %#lx.\n", hr );
++        ok( !(attributes & FileAttributes_ReadOnly), "got %#x.\n", attributes );
++        SetFileAttributesW( path, FILE_ATTRIBUTE_NORMAL );
++
++        IStorageItem_Release( item );
++        IStorageFile_Release( file );
++    }
++
++    wcscpy( cwd, dir );
++    wcscat( cwd, L"wine_storagefile_missing.txt" );
++    get_file_from_path( statics, cwd, HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND), &file );
++
++    GetCurrentDirectoryW( ARRAY_SIZE(cwd), cwd );
++    SetCurrentDirectoryW( dir );
++    get_file_from_path( statics, L"wine_storagefile_test.txt", E_INVALIDARG, &file );
++    SetCurrentDirectoryW( cwd );
++
++    get_file_from_path( statics, L"", E_INVALIDARG, &file );
++
++    dir[wcslen( dir ) - 1] = 0;
++    get_file_from_path( statics, dir, E_INVALIDARG, &file );
++
++    ok( DeleteFileW( path ), "DeleteFileW failed, error %lu.\n", GetLastError() );
++
++    IStorageFileStatics_Release( statics );
++    IActivationFactory_Release( factory );
++}
++
+ START_TEST(storage)
+ {
+     HRESULT hr;
+@@ -535,6 +714,7 @@ START_TEST(storage)
+ 
+     test_RandomAccessStreamReference();
+     test_InMemoryRandomAccessStream();
++    test_StorageFile();
+ 
+     RoUninitialize();
+ }
+
+--- dlls/windows.storage/Makefile.in
++++ dlls/windows.storage/Makefile.in
+@@ -1,9 +1,10 @@
+ MODULE  = windows.storage.dll
+-IMPORTS = shell32 combase
++IMPORTS = advapi32 shell32 combase
+ 
+ SOURCES = \
+ 	async.c \
+ 	async_private.idl \
+ 	classes.idl \
+ 	main.c \
++	storagefile.c \
+ 	streams.c
+
+--- dlls/windows.storage/async.c
++++ dlls/windows.storage/async.c
+@@ -374,6 +374,155 @@ static HRESULT async_info_create( IUnknown *invoker, IUnknown *param, async_oper
+     return S_OK;
+ }
+ 
++struct async_inspectable
++{
++    IAsyncOperation_IInspectable IAsyncOperation_IInspectable_iface;
++    IAsyncInfoImpl *IAsyncInfoImpl_inner;
++    LONG ref;
++    const GUID *iid;
++};
++
++static inline struct async_inspectable *impl_from_IAsyncOperation_IInspectable( IAsyncOperation_IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_inspectable, IAsyncOperation_IInspectable_iface );
++}
++
++static HRESULT WINAPI async_inspectable_QueryInterface( IAsyncOperation_IInspectable *iface, REFIID iid, void **out )
++{
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, impl->iid ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncOperation_IInspectable_iface) );
++        return S_OK;
++    }
++
++    return IAsyncInfoImpl_QueryInterface( impl->IAsyncInfoImpl_inner, iid, out );
++}
++
++static ULONG WINAPI async_inspectable_AddRef( IAsyncOperation_IInspectable *iface )
++{
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI async_inspectable_Release( IAsyncOperation_IInspectable *iface )
++{
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        /* guard against re-entry if inner releases an outer iface */
++        InterlockedIncrement( &impl->ref );
++        IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
++        free( impl );
++    }
++
++    return ref;
++}
++
++static HRESULT WINAPI async_inspectable_GetIids( IAsyncOperation_IInspectable *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_inspectable_GetRuntimeClassName( IAsyncOperation_IInspectable *iface, HSTRING *class_name )
++{
++    return WindowsCreateString( L"Windows.Foundation.IAsyncOperation`1<IInspectable>",
++                                ARRAY_SIZE(L"Windows.Foundation.IAsyncOperation`1<IInspectable>"),
++                                class_name );
++}
++
++static HRESULT WINAPI async_inspectable_GetTrustLevel( IAsyncOperation_IInspectable *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_inspectable_put_Completed( IAsyncOperation_IInspectable *iface, IAsyncOperationCompletedHandler_IInspectable *bool_handler )
++{
++    IAsyncOperationCompletedHandlerImpl *handler = (IAsyncOperationCompletedHandlerImpl *)bool_handler;
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return IAsyncInfoImpl_put_Completed( impl->IAsyncInfoImpl_inner, handler );
++}
++
++static HRESULT WINAPI async_inspectable_get_Completed( IAsyncOperation_IInspectable *iface, IAsyncOperationCompletedHandler_IInspectable **bool_handler )
++{
++    IAsyncOperationCompletedHandlerImpl **handler = (IAsyncOperationCompletedHandlerImpl **)bool_handler;
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return IAsyncInfoImpl_get_Completed( impl->IAsyncInfoImpl_inner, handler );
++}
++
++static HRESULT WINAPI async_inspectable_GetResults( IAsyncOperation_IInspectable *iface, IInspectable **results )
++{
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++    PROPVARIANT result = {.vt = VT_UNKNOWN};
++    HRESULT hr;
++
++    TRACE( "iface %p, results %p.\n", iface, results );
++
++    if (SUCCEEDED(hr = IAsyncInfoImpl_get_Result( impl->IAsyncInfoImpl_inner, &result )))
++    {
++        if ((*results = (IInspectable *)result.punkVal)) IInspectable_AddRef( *results );
++        PropVariantClear( &result );
++    }
++
++    return hr;
++}
++
++static const struct IAsyncOperation_IInspectableVtbl async_inspectable_vtbl =
++{
++    /* IUnknown methods */
++    async_inspectable_QueryInterface,
++    async_inspectable_AddRef,
++    async_inspectable_Release,
++    /* IInspectable methods */
++    async_inspectable_GetIids,
++    async_inspectable_GetRuntimeClassName,
++    async_inspectable_GetTrustLevel,
++    /* IAsyncOperation<IInspectable> */
++    async_inspectable_put_Completed,
++    async_inspectable_get_Completed,
++    async_inspectable_GetResults,
++};
++
++HRESULT async_operation_inspectable_create( const GUID *iid, IUnknown *invoker, IUnknown *param, async_operation_callback callback,
++                                            IAsyncOperation_IInspectable **out )
++{
++    struct async_inspectable *impl;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncOperation_IInspectable_iface.lpVtbl = &async_inspectable_vtbl;
++    impl->ref = 1;
++    impl->iid = iid;
++
++    if (FAILED(hr = async_info_create( invoker, param, callback, (IInspectable *)&impl->IAsyncOperation_IInspectable_iface, &impl->IAsyncInfoImpl_inner )) ||
++        FAILED(hr = IAsyncInfoImpl_Start( impl->IAsyncInfoImpl_inner )))
++    {
++        if (impl->IAsyncInfoImpl_inner) IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
++        free( impl );
++        return hr;
++    }
++
++    *out = &impl->IAsyncOperation_IInspectable_iface;
++    TRACE( "created IAsyncOperation_IInspectable %p\n", *out );
++    return S_OK;
++}
++
+ #define DEFINE_IASYNCOPERATIONWITHPROGRESS( iface_type, progress_type, completed_type, cs_type_str, impl_type,      \
+         result_type, propvar_type, propvar_name, creation_fn )                                                      \
+ static inline struct impl_type *impl_from_##iface_type( iface_type *iface )                                         \
+
+--- dlls/windows.storage/classes.idl
++++ dlls/windows.storage/classes.idl
+@@ -29,6 +29,10 @@ import "windowscontracts.idl";
+ import "windows.system.idl";
+ import "windows.storage.idl";
+ 
++namespace Windows.Storage {
++    runtimeclass StorageFile;
++}
++
+ namespace Windows.Storage.Streams {
+     runtimeclass RandomAccessStreamReference;
+     runtimeclass InMemoryRandomAccessStream;
+
+--- dlls/windows.storage/main.c
++++ dlls/windows.storage/main.c
+@@ -40,6 +40,8 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+         IActivationFactory_QueryInterface( random_access_stream_reference_factory, &IID_IActivationFactory, (void **)factory );
+     if (!wcscmp( buffer, RuntimeClass_Windows_Storage_Streams_InMemoryRandomAccessStream ))
+         IActivationFactory_QueryInterface( memory_stream_activation_factory, &IID_IActivationFactory, (void **)factory );
++    if (!wcscmp( buffer, RuntimeClass_Windows_Storage_StorageFile ))
++        IActivationFactory_QueryInterface( storage_file_factory, &IID_IActivationFactory, (void **)factory );
+ 
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+
+--- dlls/windows.storage/private.h
++++ dlls/windows.storage/private.h
+@@ -41,6 +41,8 @@
+ #include "robuffer.h"
+ #include "async_private.h"
+ 
++HRESULT async_operation_inspectable_create( const GUID *iid, IUnknown *invoker, IUnknown *param, async_operation_callback callback,
++                                            IAsyncOperation_IInspectable **out );
+ HRESULT async_operation_buffer_uint32_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+         IAsyncOperationWithProgress_IBuffer_UINT32 **out );
+ HRESULT async_operation_uint32_uint32_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+@@ -48,6 +50,7 @@ HRESULT async_operation_uint32_uint32_create( IUnknown *invoker, IUnknown *param
+ 
+ extern IActivationFactory *random_access_stream_reference_factory;
+ extern IActivationFactory *memory_stream_activation_factory;
++extern IActivationFactory *storage_file_factory;
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+
+--- dlls/windows.storage/storagefile.c
++++ dlls/windows.storage/storagefile.c
+
+--- include/windows.storage.idl
++++ include/windows.storage.idl
+@@ -49,6 +49,7 @@ namespace Windows.Storage {
+     typedef enum NameCollisionOption NameCollisionOption;
+     typedef enum StorageDeleteOption StorageDeleteOption;
+     typedef enum StorageItemTypes StorageItemTypes;
++    typedef enum StreamedFileFailureMode StreamedFileFailureMode;
+ 
+     interface IApplicationData;
+     interface IApplicationData2;
+@@ -71,6 +72,7 @@ namespace Windows.Storage {
+     interface IStorageFolderStatics;
+     interface IStorageFolderStatics2;
+     interface IStorageItem;
++    interface IStreamedFileDataRequest;
+ 
+     runtimeclass ApplicationData;
+     runtimeclass ApplicationDataContainer;
+@@ -80,6 +82,7 @@ namespace Windows.Storage {
+     runtimeclass StorageFolder;
+     runtimeclass StorageFile;
+     runtimeclass StorageStreamTransaction;
++    runtimeclass StreamedFileDataRequest;
+ 
+     declare {
+         interface Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.Storage.ApplicationDataContainer *>;
+@@ -242,6 +245,16 @@ namespace Windows.Storage {
+         File   = 0x1,
+         Folder = 0x2,
+     };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum StreamedFileFailureMode
++    {
++        Failed               = 0,
++        CurrentlyUnavailable = 1,
++        Incomplete           = 2,
++    };
+ #endif
+ 
+     [
+@@ -250,6 +263,14 @@ namespace Windows.Storage {
+     ]
+     delegate HRESULT ApplicationDataSetVersionHandler([in] Windows.Storage.SetVersionRequest *version);
+ 
++#ifndef _WINDOWS_APPLICATIONDATA
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        uuid(fef6a824-2fe1-4d07-a35b-b77c50b5f4cc)
++    ]
++    delegate HRESULT StreamedFileDataRequestedHandler([in] Windows.Storage.StreamedFileDataRequest *stream);
++#endif
++
+     [
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+         exclusiveto(Windows.Storage.ApplicationData),
+@@ -526,6 +547,47 @@ namespace Windows.Storage {
+         HRESULT MoveAndReplaceAsync([in] Windows.Storage.IStorageFile *file, [out, retval] Windows.Foundation.IAsyncAction **operation);
+     }
+ 
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Storage.StorageFile),
++        uuid(5984c710-daf2-43c8-8bb4-a4d3eacfd03f)
++    ]
++    interface IStorageFileStatics : IInspectable
++    {
++        HRESULT GetFileFromPathAsync(
++            [in] HSTRING path,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++        HRESULT GetFileFromApplicationUriAsync(
++            [in] Windows.Foundation.Uri *uri,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++        HRESULT CreateStreamedFileAsync(
++            [in] HSTRING display_name_with_extension,
++            [in] Windows.Storage.StreamedFileDataRequestedHandler *data_requested,
++            [in] Windows.Storage.Streams.IRandomAccessStreamReference *thumbnail,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++        HRESULT ReplaceWithStreamedFileAsync(
++            [in] Windows.Storage.IStorageFile *file_to_replace,
++            [in] Windows.Storage.StreamedFileDataRequestedHandler *data_requested,
++            [in] Windows.Storage.Streams.IRandomAccessStreamReference *thumbnail,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++        HRESULT CreateStreamedFileFromUriAsync(
++            [in] HSTRING display_name_with_extension,
++            [in] Windows.Foundation.Uri *uri,
++            [in] Windows.Storage.Streams.IRandomAccessStreamReference *thumbnail,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++        HRESULT ReplaceWithStreamedFileFromUriAsync(
++            [in] Windows.Storage.IStorageFile *file_to_replace,
++            [in] Windows.Foundation.Uri *uri,
++            [in] Windows.Storage.Streams.IRandomAccessStreamReference *thumbnail,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++    }
++
+     [
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+         uuid(72d1cb78-b3ef-4f75-a80b-6fd9dae2944b)
+@@ -605,6 +667,16 @@ namespace Windows.Storage {
+         [propget] HRESULT Stream([out, retval] Windows.Storage.Streams.IRandomAccessStream **value);
+         HRESULT CommitAsync([out, retval] Windows.Foundation.IAsyncAction **operation);
+     }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Storage.StreamedFileDataRequest),
++        uuid(1673fcce-dabd-4d50-beee-180b8a8191b6)
++    ]
++    interface IStreamedFileDataRequest : IInspectable
++    {
++        HRESULT FailAndClose([in] Windows.Storage.StreamedFileFailureMode failure_mode);
++    }
+ #endif
+ 
+     [
+@@ -668,7 +740,8 @@ namespace Windows.Storage {
+ 
+     [
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+-        /* static(Windows.Storage.IStorageFileStatics, Windows.Foundation.UniversalApiContract, 1.0), */
++        marshaling_behavior(agile),
++        static(Windows.Storage.IStorageFileStatics, Windows.Foundation.UniversalApiContract, 1.0)
+         /* static(Windows.Storage.IStorageFileStatics2, Windows.Foundation.UniversalApiContract, 10.0) */
+     ]
+     runtimeclass StorageFile
+@@ -711,5 +784,15 @@ namespace Windows.Storage {
+         [default] interface Windows.Storage.IStorageStreamTransaction;
+         interface Windows.Foundation.IClosable;
+     }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass StreamedFileDataRequest
++    {
++        [default] interface Windows.Storage.Streams.IOutputStream;
++        interface Windows.Foundation.IClosable;
++        interface Windows.Storage.IStreamedFileDataRequest;
++    }
+ #endif
+ }
+

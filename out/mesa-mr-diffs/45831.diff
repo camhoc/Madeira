@@ -1,0 +1,1357 @@
+# Draft: kk: support VK_EXT_vertex_input_dynamic_state
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45831 state=opened
+# This series implements `VK_EXT_vertex_input_dynamic_state` in KosmicKrisp using per-layout vertex input prologs linked into the render pipeline through `MTL4StaticLinkingDescriptor`. For each layout, the driver builds small prolog functions with the attribute formats, input rates, and divisors baked in as constants, while offsets and strides remain in the root descriptor table so layouts that differ only in those can share a pipeline.
+
+To avoid stalling command recording when a new layout is first used, specialized pipelines compile on a background device queue while draws fall back to a generic linked pipeline compiled up front. For deterministic testing, `MESA_KK_DEBUG=vi_prolog_sync` waits for the specialized pipeline and `MESA_KK_DEBUG=vi_prolog_generic` keeps using the generic one. Vertex shaders emulated as compute before tessellation or geometry are compiled ahead of time and define the generic prologs inline.
+
+The branch is split into six bisectable commits covering the NIR intrinsic, Metal bridge linking, compiler support, prolog fetch, background compilation, and a final four-line commit advertising the extension. If you prefer to review and land the first five commits as groundwork ahead of `VK_EXT_shader_object`, I am happy to hold back the final commit.
+
+Tested on an Apple A18 Pro running macOS 27.2. On the Vulkan CTS vertex-input and robustness groups, the series adds 556 new passes with no regressions against `main` (results are attached in the comments). In VS-bound draws from 1 to 16 attributes, fetch cost stays within 1% of static vertex input; the main tradeoff is compiling the generic pipeline at creation time (258 ms cold at 16 attributes, compared with 148 ms for five static pipelines).
+
+All commits carry `Generated-by: LLM`.
+--- src/compiler/nir/nir_divergence_analysis.c
++++ src/compiler/nir/nir_divergence_analysis.c
+@@ -898,6 +898,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
+    case nir_intrinsic_load_urb_lsc_intel:
+    case nir_intrinsic_load_buffer_ptr_kk:
+    case nir_intrinsic_load_per_draw_ptr_kk:
++   case nir_intrinsic_load_vi_prolog_kk:
+    case nir_intrinsic_load_texture_handle_kk:
+    case nir_intrinsic_load_depth_texture_kk:
+    case nir_intrinsic_load_sampler_handle_kk:
+
+--- src/compiler/nir/nir_intrinsics.py
++++ src/compiler/nir/nir_intrinsics.py
+@@ -3344,6 +3344,11 @@ intrinsic("is_null_descriptor", src_comp=[-1], dest_comp=1, flags=[CAN_ELIMINATE
+ load("buffer_ptr_kk", [], [BINDING], [CAN_ELIMINATE, CAN_REORDER])
+ # Represents a pointer to the start of the per-draw data buffer
+ load("per_draw_ptr_kk", [], [], [CAN_ELIMINATE, CAN_REORDER])
++# Vertex attribute fetched by a vertex input prolog linked at pipeline creation.
++# BASE is the attribute slot, DEST_TYPE the base type the shader reads.
++# src[] = { root table address, vertex ID, instance ID, base instance }.
++intrinsic("load_vi_prolog_kk", [1, 1, 1, 1], 4, [BASE, DEST_TYPE],
++          flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[32])
+ # Opaque texture<T> handle, with DEST_TYPE representing T
+ load("texture_handle_kk", [1], [DEST_TYPE, IMAGE_DIM, IMAGE_ARRAY, ACCESS, FLAGS], [CAN_ELIMINATE])
+ # Same as above but for depth<T> textures, T is always float
+
+--- src/kosmickrisp/bridge/stubs/mtl_compiler.c
++++ src/kosmickrisp/bridge/stubs/mtl_compiler.c
+@@ -99,3 +99,16 @@ mtl_new_render_pipeline(mtl_compiler *compiler,
+ {
+    return NULL;
+ }
++
++mtl_render_pipeline_descriptor *
++mtl_render_pipeline_descriptor_copy(mtl_render_pipeline_descriptor *descriptor)
++{
++   return NULL;
++}
++
++void
++mtl_render_pipeline_descriptor_set_vertex_linked_functions(
++   mtl_render_pipeline_descriptor *descriptor,
++   mtl_function_descriptor **functions, uint32_t count)
++{
++}
+
+--- src/kosmickrisp/bridge/mtl_compiler.h
++++ src/kosmickrisp/bridge/mtl_compiler.h
+@@ -60,6 +60,14 @@ void mtl_render_pipeline_descriptor_set_rasterization_enabled(
+ void mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(
+    mtl_render_pipeline_descriptor *descriptor, uint32_t count);
+ 
++mtl_render_pipeline_descriptor *
++mtl_render_pipeline_descriptor_copy(mtl_render_pipeline_descriptor *descriptor);
++
++/* Statically links functions that the vertex function declares extern. */
++void mtl_render_pipeline_descriptor_set_vertex_linked_functions(
++   mtl_render_pipeline_descriptor *descriptor,
++   mtl_function_descriptor **functions, uint32_t count);
++
+ /* Render pipeline */
+ mtl_render_pipeline_state *
+ mtl_new_render_pipeline(mtl_compiler *compiler,
+
+--- src/kosmickrisp/bridge/mtl_compiler.m
++++ src/kosmickrisp/bridge/mtl_compiler.m
+@@ -10,6 +10,7 @@
+ #include <Metal/MTL4ComputePipeline.h>
+ #include <Metal/MTL4LibraryDescriptor.h>
+ #include <Metal/MTL4LibraryFunctionDescriptor.h>
++#include <Metal/MTL4LinkingDescriptor.h>
+ #include <Metal/MTL4RenderPipeline.h>
+ #include <Metal/MTLDevice.h>
+ 
+@@ -183,6 +184,32 @@ mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(mtl_render_pip
+    }
+ }
+ 
++mtl_render_pipeline_descriptor *
++mtl_render_pipeline_descriptor_copy(mtl_render_pipeline_descriptor *descriptor)
++{
++   @autoreleasepool {
++      MTL4RenderPipelineDescriptor *desc =
++         (MTL4RenderPipelineDescriptor *)descriptor;
++      return [desc copy];
++   }
++}
++
++void
++mtl_render_pipeline_descriptor_set_vertex_linked_functions(
++   mtl_render_pipeline_descriptor *descriptor,
++   mtl_function_descriptor **functions, uint32_t count)
++{
++   @autoreleasepool {
++      MTL4RenderPipelineDescriptor *desc =
++         (MTL4RenderPipelineDescriptor *)descriptor;
++      MTL4StaticLinkingDescriptor *linking =
++         [[MTL4StaticLinkingDescriptor new] autorelease];
++      linking.functionDescriptors = [NSArray arrayWithObjects:(id *)functions
++                                                        count:count];
++      desc.vertexStaticLinkingDescriptor = linking;
++   }
++}
++
+ /* Render pipeline */
+ mtl_render_pipeline_state *
+ mtl_new_render_pipeline(mtl_compiler *compiler, mtl_render_pass_descriptor *descriptor)
+
+--- src/kosmickrisp/compiler/msl_type_inference.c
++++ src/kosmickrisp/compiler/msl_type_inference.c
+@@ -381,6 +381,12 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
+    case nir_intrinsic_load_buffer_ptr_kk:
+       set_type(types, &instr->def, TYPE_UINT);
+       break;
++   case nir_intrinsic_load_vi_prolog_kk:
++      set_type(types, &instr->def,
++               ti_type_from_nir(nir_intrinsic_dest_type(instr)));
++      for (unsigned i = 0; i < 4; i++)
++         set_type(types, &instr->src[i], TYPE_UINT);
++      break;
+    // The defs of these instructions don't participate in type inference
+    // but their sources are pointers (i.e. uints).
+    case nir_intrinsic_load_texture_handle_kk:
+
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -1093,6 +1093,44 @@ global_access_qualifier(struct nir_to_msl_ctx *ctx,
+    return access & ACCESS_COHERENT ? "coherent device" : "device";
+ }
+ 
++const char *
++msl_vi_prolog_type(nir_alu_type type)
++{
++   switch (nir_alu_type_get_base_type(type)) {
++   case nir_type_int:
++      return "int4";
++   case nir_type_uint:
++      return "uint4";
++   default:
++      return "float4";
++   }
++}
++
++/* Declare the vertex input prolog functions this shader calls. Their
++ * definitions are linked into the render pipeline. */
++static void
++emit_vi_prolog_decls(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
++{
++   uint64_t declared = 0;
++   nir_foreach_block(block, impl) {
++      nir_foreach_instr(instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++         if (intr->intrinsic != nir_intrinsic_load_vi_prolog_kk)
++            continue;
++         unsigned slot = nir_intrinsic_base(intr);
++         if (declared & BITFIELD64_BIT(slot))
++            continue;
++         declared |= BITFIELD64_BIT(slot);
++         P(ctx,
++           "[[visible]] extern %s " MSL_VI_PROLOG_NAME
++           "(ulong, uint, uint, uint);\n",
++           msl_vi_prolog_type(nir_intrinsic_dest_type(intr)), slot);
++      }
++   }
++}
++
+ static void
+ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+ {
+@@ -1110,6 +1148,15 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+       P_IND(ctx, "t%d = ", instr->def.index);
+    }
+    switch (instr->intrinsic) {
++   case nir_intrinsic_load_vi_prolog_kk:
++      P(ctx, MSL_VI_PROLOG_NAME "(", nir_intrinsic_base(instr));
++      for (unsigned i = 0; i < 4; i++) {
++         if (i)
++            P(ctx, ", ");
++         src_to_msl(ctx, &instr->src[i]);
++      }
++      P(ctx, ");\n");
++      break;
+    case nir_intrinsic_decl_reg: {
+       const char *reg_type = msl_uint_type(nir_intrinsic_bit_size(instr),
+                                            nir_intrinsic_num_components(instr));
+@@ -2516,6 +2563,11 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
+       P(&ctx, "#include <metal_compute>\n");
+    P(&ctx, "#include <metal_stdlib>\n");
+    P(&ctx, "using namespace metal;\n");
++   if (options->vi_prolog) {
++      P(&ctx, "%s", options->vi_prolog);
++   } else {
++      emit_vi_prolog_decls(&ctx, impl);
++   }
+ 
+    msl_emit_constant_data(&ctx, shader);
+ 
+
+--- src/kosmickrisp/compiler/nir_to_msl.h
++++ src/kosmickrisp/compiler/nir_to_msl.h
+@@ -10,6 +10,11 @@
+ 
+ #define MSL_MAX_SAMPLERS 4096
+ 
++/* Vertex input prolog functions, one per attribute slot, called by vertex
++ * shaders lowered with load_vi_prolog_kk. */
++#define MSL_VI_PROLOG_NAME "kk_vi_%u"
++const char *msl_vi_prolog_type(nir_alu_type type);
++
+ enum pipe_format;
+ struct vk_input_attachment_location_state;
+ struct vk_color_attachment_location_state;
+@@ -23,6 +28,10 @@ struct nir_to_msl_options {
+     * the render target has. This leads to an incorrect calculation of the
+     * component count for the render target formats. */
+    uint8_t rts_component_count[MAX_DRAW_BUFFERS];
++
++   /* Definitions of the vertex input prolog functions. When NULL, they are
++    * declared extern and linked into the pipeline. */
++   const char *vi_prolog;
+ };
+ 
+ /* Assumes nir_shader_gather_info has been called beforehand. */
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -36,6 +36,11 @@ struct kk_root_descriptor_table {
+          uint32_t buffer_strides[KK_MAX_VBUFS];
+          uint64_t attrib_base[KK_MAX_ATTRIBS];
+          uint32_t attrib_clamps[KK_MAX_ATTRIBS];
++         /* Dynamic vertex input layout, for the generic vertex input
++          * prologs (see kk_vi_prolog.c) */
++         uint32_t attrib_format[KK_MAX_ATTRIBS];
++         uint32_t attrib_divisor[KK_MAX_ATTRIBS];
++         uint32_t attrib_stride[KK_MAX_ATTRIBS];
+ 
+          float blend_constant[4];
+          float clip_z_coeff;
+@@ -149,6 +154,10 @@ struct kk_graphics_state {
+    struct kk_per_draw_data per_draw_data;
+ 
+    mtl_depth_stencil_state *depth_stencil_state;
++   /* Render pipeline bound on the current encoder */
++   mtl_render_pipeline_state *render_pipeline;
++   /* The bound layout's own pipeline is still compiling */
++   bool vi_prolog_pending;
+    mtl_render_pass_descriptor *render_pass_descriptor;
+    bool is_depth_stencil_dynamic;
+    bool is_cull_front_and_back;
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -15,6 +15,8 @@
+ #include "kk_image_view.h"
+ #include "kk_physical_device.h"
+ #include "kk_query_pool.h"
++#include "kk_shader.h"
++#include "kk_vi_prolog.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ #include "kosmickrisp/bridge/vk_to_mtl_map.h"
+@@ -997,10 +999,26 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
+       mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
+    }
+ 
+-   if (IS_SHADER_DIRTY(VERTEX)) {
+-      struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+-      mtl_render_set_pipeline_state(enc, vs->pipeline.gfx.render);
+-      if (gfx->depth_stencil_state)
++   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++   /* While a layout's pipeline compiles, draws use the generic one; check
++    * again on every draw until it is ready. */
++   bool vi_prolog_dirty =
++      vs->info.vs.vi_prolog &&
++      (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) || gfx->vi_prolog_pending);
++   if (IS_SHADER_DIRTY(VERTEX) || vi_prolog_dirty) {
++      mtl_render_pipeline_state *pipeline = vs->pipeline.gfx.render;
++      gfx->vi_prolog_pending = false;
++      if (vs->info.vs.vi_prolog) {
++         struct kk_vi_prolog_key key;
++         kk_vi_prolog_key_init(&key, &vs->info, dyn->vi);
++         pipeline =
++            kk_vi_prolog_pipeline(device, vs, &key, &gfx->vi_prolog_pending);
++      }
++      if (IS_SHADER_DIRTY(VERTEX) || pipeline != gfx->render_pipeline) {
++         mtl_render_set_pipeline_state(enc, pipeline);
++         gfx->render_pipeline = pipeline;
++      }
++      if (IS_SHADER_DIRTY(VERTEX) && gfx->depth_stencil_state)
+          mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
+    }
+ 
+@@ -1485,20 +1503,39 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+    }
+ 
+    if (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
+-       IS_DIRTY(VI_BINDING_STRIDES) || gfx->dirty & KK_DIRTY_VB) {
++       IS_DIRTY(VI_BINDING_STRIDES) || gfx->dirty & KK_DIRTY_VB ||
++       IS_SHADER_DIRTY(VERTEX)) {
+       struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++      bool dynamic_vi = vs->info.vs.dynamic_vi;
+       unsigned slot = 0;
+       u_foreach_bit(i, vs->info.vs.attribs_read) {
+          if (dyn->vi->attributes_valid & BITFIELD_BIT(i)) {
+             struct vk_vertex_attribute_state attr = dyn->vi->attributes[i];
+             struct kk_addr_range vb = gfx->vb.addr_range[attr.binding];
++            enum pipe_format format = vk_format_to_pipe_format(attr.format);
++            uint32_t stride = dyn->vi_binding_strides[attr.binding];
+ 
+             desc->root.draw.attrib_clamps[slot] = kk_calculate_vbo_clamp(
+-               vb.addr, 0, vk_format_to_pipe_format(attr.format), vb.range,
+-               dyn->vi_binding_strides[attr.binding], attr.offset,
++               vb.addr, 0, format, vb.range, stride, attr.offset,
+                &desc->root.draw.attrib_base[slot]);
+-            desc->root.draw.buffer_strides[attr.binding] =
+-               dyn->vi_binding_strides[attr.binding];
++            desc->root.draw.buffer_strides[attr.binding] = stride;
++
++            if (dynamic_vi) {
++               const struct vk_vertex_binding_state *binding =
++                  &dyn->vi->bindings[attr.binding];
++               uint32_t fmt = kk_vbo_encode_format(format);
++               if (binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE)
++                  fmt |= KK_VBO_FMT_INSTANCED;
++               desc->root.draw.attrib_format[slot] = fmt;
++               desc->root.draw.attrib_divisor[slot] = binding->divisor;
++               desc->root.draw.attrib_stride[slot] = stride;
++            }
++         } else if (dynamic_vi) {
++            desc->root.draw.attrib_format[slot] = 0;
++            desc->root.draw.attrib_divisor[slot] = 0;
++            desc->root.draw.attrib_stride[slot] = 0;
++            desc->root.draw.attrib_clamps[slot] = 0;
++            desc->root.draw.attrib_base[slot] = 0;
+          }
+          slot++;
+       }
+
+--- src/kosmickrisp/vulkan/kk_debug.c
++++ src/kosmickrisp/vulkan/kk_debug.c
+@@ -11,6 +11,8 @@ const struct debug_named_value debug_flags[] = {
+    {"nir", KK_DEBUG_NIR},
+    {"msl", KK_DEBUG_MSL},
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
++   {"vi_prolog_sync", KK_DEBUG_VI_PROLOG_SYNC},
++   {"vi_prolog_generic", KK_DEBUG_VI_PROLOG_GENERIC},
+    {NULL, 0},
+ };
+ 
+
+--- src/kosmickrisp/vulkan/kk_debug.h
++++ src/kosmickrisp/vulkan/kk_debug.h
+@@ -12,6 +12,11 @@ enum kk_debug {
+    KK_DEBUG_MSL = 1ull << 1,
+    /* Forces robustness for all shaders */
+    KK_DEBUG_FORCE_ROBUSTNESS = 1ull << 2,
++   /* Wait for a new vertex input layout's pipeline instead of drawing with
++    * the generic one while it compiles */
++   KK_DEBUG_VI_PROLOG_SYNC = 1ull << 3,
++   /* Always draw dynamic vertex input with the generic pipeline */
++   KK_DEBUG_VI_PROLOG_GENERIC = 1ull << 4,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+
+--- src/kosmickrisp/vulkan/kk_device.c
++++ src/kosmickrisp/vulkan/kk_device.c
+@@ -331,6 +331,14 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (result != VK_SUCCESS)
+       goto fail_sampler_heap;
+ 
++   if (!util_queue_init(
++          &dev->vi_prolog_queue, "kk_vi_prolog", 64, 1,
++          UTIL_QUEUE_INIT_RESIZE_IF_FULL | UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY,
++          NULL)) {
++      result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++      goto fail_lib;
++   }
++
+    if (pdev->settings.gpu_capture_immediately) {
+       mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
+       dev->gpu_capture_active = true;
+@@ -340,6 +348,8 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    return VK_SUCCESS;
+ 
++fail_lib:
++   kk_device_finish_lib(dev);
+ fail_sampler_heap:
+    kk_destroy_sampler_heap(dev, &dev->samplers);
+ fail_query_table:
+@@ -379,6 +389,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+ 
+    /* Meta first since it may destroy Vulkan objects */
+    kk_device_finish_meta(dev);
++   util_queue_destroy(&dev->vi_prolog_queue);
+    kk_device_finish_lib(dev);
+    kk_query_table_finish(dev, &dev->occlusion_queries);
+    kk_destroy_sampler_heap(dev, &dev->samplers);
+
+--- src/kosmickrisp/vulkan/kk_device.h
++++ src/kosmickrisp/vulkan/kk_device.h
+@@ -19,6 +19,7 @@
+ #include "libkk_shaders.h"
+ 
+ #include "util/u_dynarray.h"
++#include "util/u_queue.h"
+ 
+ #include "vk_device.h"
+ #include "vk_meta.h"
+@@ -106,6 +107,10 @@ struct kk_device {
+    util_once_flag heap_init_once;
+ 
+    bool gpu_capture_active;
++
++   /* Compiles render pipelines for new vertex input layouts in the
++    * background, see kk_vi_prolog.c */
++   struct util_queue vi_prolog_queue;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+
+--- src/kosmickrisp/vulkan/kk_nir_lower_vbo.c
++++ src/kosmickrisp/vulkan/kk_nir_lower_vbo.c
+@@ -280,3 +280,109 @@ kk_nir_lower_vbo(nir_shader *nir, struct kk_attribute *attribs,
+    return nir_shader_intrinsics_pass(nir, pass, nir_metadata_control_flow,
+                                      &ctx);
+ }
++
++uint32_t
++kk_vbo_encode_format(enum pipe_format format)
++{
++   if (format == PIPE_FORMAT_NONE || !kk_vbo_supports_format(format))
++      return 0;
++
++   const struct util_format_description *desc = util_format_description(format);
++   int idx = util_format_get_first_non_void_channel(format);
++   if (idx < 0)
++      return 0;
++
++   struct util_format_channel_description chan = desc->channel[idx];
++   enum kk_vbo_type type;
++   switch (chan.type) {
++   case UTIL_FORMAT_TYPE_UNSIGNED:
++      type = chan.normalized     ? KK_VBO_TYPE_UNORM
++             : chan.pure_integer ? KK_VBO_TYPE_UINT
++                                 : KK_VBO_TYPE_USCALED;
++      break;
++   case UTIL_FORMAT_TYPE_SIGNED:
++      type = chan.normalized     ? KK_VBO_TYPE_SNORM
++             : chan.pure_integer ? KK_VBO_TYPE_SINT
++                                 : KK_VBO_TYPE_SSCALED;
++      break;
++   case UTIL_FORMAT_TYPE_FLOAT:
++      type = KK_VBO_TYPE_SFLOAT;
++      break;
++   default:
++      return 0;
++   }
++
++   uint32_t fmt = KK_VBO_FMT_VALID | (type << KK_VBO_FMT_TYPE_SHIFT);
++
++   if (is_rg11_b10(desc)) {
++      fmt |= KK_VBO_FMT_RG11B10F | (2u << KK_VBO_FMT_SIZE_SHIFT);
++   } else if (is_rgb10_a2(desc)) {
++      fmt |= KK_VBO_FMT_RGB10A2 | (2u << KK_VBO_FMT_SIZE_SHIFT);
++   } else {
++      fmt |= util_logbase2(chan.size / 8) << KK_VBO_FMT_SIZE_SHIFT;
++      fmt |= (desc->nr_channels - 1) << KK_VBO_FMT_COUNT_SHIFT;
++   }
++
++   for (unsigned c = 0; c < 4; ++c) {
++      assert(desc->swizzle[c] <= PIPE_SWIZZLE_1);
++      fmt |= (uint32_t)desc->swizzle[c] << (KK_VBO_FMT_SWIZZLE_SHIFT + c * 3);
++   }
++
++   return fmt;
++}
++
++struct prolog_ctx {
++   uint32_t int_slots;
++   uint32_t uint_slots;
++};
++
++static bool
++pass_prolog(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_load_input)
++      return false;
++
++   const struct prolog_ctx *ctx = data;
++   b->cursor = nir_instr_remove(&intr->instr);
++
++   nir_src *offset_src = nir_get_io_offset_src(intr);
++   assert(nir_src_is_const(*offset_src) && "no attribute indirects");
++   unsigned index = nir_intrinsic_base(intr) + nir_src_as_uint(*offset_src);
++
++   nir_alu_type type = nir_type_float32;
++   if (ctx->int_slots & BITFIELD_BIT(index))
++      type = nir_type_int32;
++   else if (ctx->uint_slots & BITFIELD_BIT(index))
++      type = nir_type_uint32;
++   bool is_int = type != nir_type_float32;
++
++   BITSET_SET(b->shader->info.system_values_read, SYSTEM_VALUE_INSTANCE_ID);
++   BITSET_SET(b->shader->info.system_values_read, SYSTEM_VALUE_BASE_INSTANCE);
++   BITSET_SET(b->shader->info.system_values_read, SYSTEM_VALUE_VERTEX_ID);
++
++   nir_def *root = nir_load_buffer_ptr_kk(b, 1, 64, .binding = 0);
++   nir_def *memory = nir_load_vi_prolog_kk(
++      b, root, nir_load_vertex_id(b), nir_load_instance_id(b),
++      nir_load_base_instance(b), .base = index, .dest_type = type);
++
++   nir_def *channels[4];
++   for (unsigned i = 0; i < intr->num_components; i++) {
++      nir_def *ch = nir_channel(b, memory, nir_intrinsic_component(intr) + i);
++      if (intr->def.bit_size != 32)
++         ch = is_int ? nir_u2uN(b, ch, intr->def.bit_size)
++                     : nir_f2fN(b, ch, intr->def.bit_size);
++      channels[i] = ch;
++   }
++   nir_def_rewrite_uses(&intr->def, nir_vec(b, channels, intr->num_components));
++   return true;
++}
++
++bool
++kk_nir_lower_vbo_prolog(nir_shader *nir, uint32_t int_slots,
++                        uint32_t uint_slots)
++{
++   assert(nir->info.stage == MESA_SHADER_VERTEX);
++
++   struct prolog_ctx ctx = {int_slots, uint_slots};
++   return nir_shader_intrinsics_pass(nir, pass_prolog, nir_metadata_none, &ctx);
++}
+
+--- src/kosmickrisp/vulkan/kk_nir_lower_vbo.h
++++ src/kosmickrisp/vulkan/kk_nir_lower_vbo.h
+@@ -40,6 +40,36 @@ bool kk_nir_lower_vbo(nir_shader *shader, struct kk_attribute *attribs,
+ 
+ bool kk_vbo_supports_format(enum pipe_format format);
+ 
++enum kk_vbo_type {
++   KK_VBO_TYPE_UNORM = 0,
++   KK_VBO_TYPE_SNORM = 1,
++   KK_VBO_TYPE_USCALED = 2,
++   KK_VBO_TYPE_SSCALED = 3,
++   KK_VBO_TYPE_UINT = 4,
++   KK_VBO_TYPE_SINT = 5,
++   KK_VBO_TYPE_SFLOAT = 6,
++};
++
++#define KK_VBO_FMT_SIZE_SHIFT    0
++#define KK_VBO_FMT_SIZE_MASK     0x3
++#define KK_VBO_FMT_COUNT_SHIFT   2
++#define KK_VBO_FMT_COUNT_MASK    0x3
++#define KK_VBO_FMT_TYPE_SHIFT    4
++#define KK_VBO_FMT_TYPE_MASK     0x7
++#define KK_VBO_FMT_RGB10A2       (1u << 7)
++#define KK_VBO_FMT_RG11B10F      (1u << 8)
++#define KK_VBO_FMT_INSTANCED     (1u << 9)
++#define KK_VBO_FMT_VALID         (1u << 10)
++#define KK_VBO_FMT_SWIZZLE_SHIFT 11
++#define KK_VBO_FMT_SWIZZLE_MASK  0x7
++
++uint32_t kk_vbo_encode_format(enum pipe_format format);
++
++/* Fetch each attribute slot by calling the vertex input prolog function for
++ * that slot. int_slots and uint_slots select the return type per slot. */
++bool kk_nir_lower_vbo_prolog(nir_shader *shader, uint32_t int_slots,
++                             uint32_t uint_slots);
++
+ #ifdef __cplusplus
+ } /* extern C */
+-#endif
+\ No newline at end of file
++#endif
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -206,6 +206,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_swapchain_maintenance1 = true,
+ #endif
+       .EXT_vertex_attribute_robustness = true,
++      .EXT_vertex_input_dynamic_state = true,
+ 
+       .GOOGLE_decorate_string = true,
+       .GOOGLE_hlsl_functionality1 = true,
+@@ -516,6 +517,9 @@ kk_get_device_features(
+       /* VK_EXT_vertex_attribute_robustness */
+       .vertexAttributeRobustness = true,
+ 
++      /* VK_EXT_vertex_input_dynamic_state */
++      .vertexInputDynamicState = true,
++
+       /* EXT_ycbcr_2plane_444_formats */
+       .ycbcr2plane444Formats = true,
+    };
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -15,6 +15,7 @@
+ #include "kk_nir_lower_vbo.h"
+ #include "kk_physical_device.h"
+ #include "kk_sampler.h"
++#include "kk_vi_prolog.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ #include "kosmickrisp/bridge/ns_process_info.h"
+@@ -101,8 +102,16 @@ has_static_depth_stencil_state(const struct vk_graphics_pipeline_state *state)
+       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_STENCIL_WRITE_MASK));
+ }
+ 
++static bool
++kk_vi_is_static(const struct vk_graphics_pipeline_state *state)
++{
++   return state && state->vi &&
++          !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI);
++}
++
+ struct kk_vs_key {
+    bool is_points;
++   bool dynamic_vi;
+    struct vk_vertex_input_state vi;
+ };
+ 
+@@ -111,9 +120,11 @@ kk_populate_vs_key(struct kk_vs_key *key,
+                    const struct vk_graphics_pipeline_state *state)
+ {
+    memset(key, 0, sizeof(*key));
+-   key->is_points =
+-      (state->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
+-   key->vi = *state->vi;
++   key->is_points = state->ia && state->ia->primitive_topology ==
++                                    VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++   key->dynamic_vi = !kk_vi_is_static(state);
++   if (!key->dynamic_vi)
++      key->vi = *state->vi;
+ }
+ 
+ struct kk_fs_key {
+@@ -356,7 +367,8 @@ kk_is_possible_both_depth_clip_clamp(
+ 
+ static void
+ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
+-                const struct vk_pipeline_robustness_state *rs)
++                const struct vk_pipeline_robustness_state *rs,
++                const struct kk_shader_info *info)
+ {
+    assert(!(nir->info.inputs_read & BITFIELD64_MASK(VERT_ATTRIB_GENERIC0)) &&
+           "Fixed-function attributes not used in Vulkan");
+@@ -365,6 +377,16 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
+    /* Fold constant offset srcs for IO. */
+    NIR_PASS(_, nir, nir_opt_constant_folding);
+ 
++   if (info->vs.dynamic_vi) {
++      NIR_PASS(_, nir, kk_nir_lower_vbo_prolog, info->vs.vi_int_slots,
++               info->vs.vi_uint_slots);
++      return;
++   }
++
++   bool robustness2 =
++      rs->vertex_inputs ==
++      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2;
++
+    struct kk_attribute attributes[KK_MAX_ATTRIBS] = {};
+    uint64_t attribs_read = nir->info.inputs_read >> VERT_ATTRIB_GENERIC0;
+    u_foreach_bit(i, state->vi->attributes_valid) {
+@@ -384,9 +406,6 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
+       attributes[slot].instanced =
+          binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
+    }
+-   bool robustness2 =
+-      rs->vertex_inputs ==
+-      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2;
+    NIR_PASS(_, nir, kk_nir_lower_vbo, attributes, robustness2);
+ }
+ 
+@@ -851,6 +870,7 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
+       pipe->gfx.pre_render_count = 0u;
+ 
+       /* Graphics pipeline. */
++      kk_vi_prologs_destroy(shader);
+       mtl_release(pipe->gfx.render);
+       if (pipe->gfx.ds_handle)
+          mtl_release(pipe->gfx.ds_handle);
+@@ -890,6 +910,36 @@ gather_vs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+    return false;
+ }
+ 
++struct vs_input_types {
++   uint32_t attribs_read;
++   uint32_t int_slots;
++   uint32_t uint_slots;
++};
++
++static bool
++gather_vs_input_types(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_load_input)
++      return false;
++
++   struct vs_input_types *types = data;
++   unsigned attrib =
++      nir_intrinsic_io_semantics(intr).location - VERT_ATTRIB_GENERIC0;
++   /* Slots are compacted the way kk_lower_vs_vbo numbers them */
++   unsigned slot = util_bitcount(types->attribs_read & BITFIELD_MASK(attrib));
++   switch (nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr))) {
++   case nir_type_int:
++      types->int_slots |= BITFIELD_BIT(slot);
++      break;
++   case nir_type_uint:
++      types->uint_slots |= BITFIELD_BIT(slot);
++      break;
++   default:
++      break;
++   }
++   return false;
++}
++
+ static bool
+ fs_uses_flat_varying(nir_shader *nir)
+ {
+@@ -917,6 +967,23 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
+    if (nir->info.stage == MESA_SHADER_VERTEX) {
+       nir_shader_intrinsics_pass(nir, gather_vs_inputs, nir_metadata_all,
+                                  &shader->info.vs.attribs_read);
++      shader->info.vs.dynamic_vi = !kk_vi_is_static(state);
++      /* Only a VS that rasterizes gets its prologs linked per layout at draw
++       * time. A VS emulated as compute is compiled up front, so it gets the
++       * prologs that read the layout from the root table in its own source.
++       * With no attributes there is nothing to fetch. */
++      shader->info.vs.vi_prolog = shader->info.vs.dynamic_vi &&
++                                  shader->info.vs.attribs_read &&
++                                  nir->info.next_stage == MESA_SHADER_FRAGMENT;
++      if (shader->info.vs.dynamic_vi) {
++         struct vs_input_types types = {
++            .attribs_read = shader->info.vs.attribs_read,
++         };
++         nir_shader_intrinsics_pass(nir, gather_vs_input_types,
++                                    nir_metadata_all, &types);
++         shader->info.vs.vi_int_slots = types.int_slots;
++         shader->info.vs.vi_uint_slots = types.uint_slots & ~types.int_slots;
++      }
+       shader->info.outputs_written = nir->info.outputs_written;
+    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+       /* Some meta shaders like vk-meta-resolve will have depth_layout as NONE
+@@ -995,7 +1062,8 @@ kk_nir_lower_vertex_id_zero_base(struct nir_shader *nir)
+ static void
+ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+                const struct vk_graphics_pipeline_state *state,
+-               struct msl_compile_data *data, const bool apply_wa19)
++               const char *vi_prolog, struct msl_compile_data *data,
++               const bool apply_wa19)
+ {
+    NIR_PASS(_, nir, kk_nir_lower_poly);
+ 
+@@ -1005,6 +1073,7 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+    struct nir_to_msl_options translate_options = {
+       .mem_ctx = NULL,
+       .disabled_workarounds = pdev->settings.disabled_workarounds,
++      .vi_prolog = vi_prolog,
+    };
+ 
+    if (!apply_wa19)
+@@ -1084,7 +1153,10 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+    if (stage == MESA_SHADER_VERTEX) {
+       /* VBO lowering needs to go here otherwise, the linking step removes all
+        * inputs since we read vertex attributes from UBOs. */
+-      kk_lower_vs_vbo(nir, state, robustness);
++      shader->info.vs.vi_robust2 =
++         robustness->vertex_inputs ==
++         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2;
++      kk_lower_vs_vbo(nir, state, robustness, &shader->info);
+       if (next_stage != MESA_SHADER_FRAGMENT) {
+          /* TODO_KOSMICKRISP: Poly lowering breaks with vectorized I/O less than
+           * 32-bit, which we support. Lower vertex outputs to scalar. */
+@@ -1162,7 +1234,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       nir->info.stage = MESA_SHADER_COMPUTE;
+       memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+       nir->xfb_info = NULL;
+-      kk_compile_msl(pdev, nir, state, &shader->gs_main, apply_wa19);
++      kk_compile_msl(pdev, nir, state, NULL, &shader->gs_main, apply_wa19);
+ 
+       /* From here on, nir is the rasterization VS of the GS */
+       nir = rast;
+@@ -1181,7 +1253,15 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+    /* KK_WORKAROUND_19 Only the stage that feeds geometry will be dispatched
+     * through the buggy Metal entry point. */
+    apply_wa19 &= next_stage == MESA_SHADER_GEOMETRY;
+-   kk_compile_msl(pdev, nir, state, &shader->msl_data[stage], apply_wa19);
++   /* A VS emulated as compute calls prologs that read the layout from the
++    * root table, defined in its own source. */
++   char *vi_prolog = NULL;
++   if (shader->info.stage == MESA_SHADER_VERTEX && shader->info.vs.dynamic_vi &&
++       shader->info.vs.attribs_read && !shader->info.vs.vi_prolog)
++      vi_prolog = kk_vi_prolog_source(NULL, &shader->info, NULL, false);
++   kk_compile_msl(pdev, nir, state, vi_prolog, &shader->msl_data[stage],
++                  apply_wa19);
++   ralloc_free(vi_prolog);
+ 
+    *shader_out = shader;
+ 
+@@ -1618,10 +1698,17 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+          pipeline_descriptor, vs->info.vs.sample_count);
+    }
+ 
+-   pipe->gfx.render =
+-      mtl_new_render_pipeline(device->mtl_compiler_handle, pipeline_descriptor);
+-   if (pipe->gfx.render == NULL)
+-      result = VK_ERROR_INVALID_SHADER_NV;
++   if (vs->info.vs.vi_prolog) {
++      /* The vertex function calls prolog functions that only exist once the
++       * vertex input layout is known. Render pipelines are created at draw
++       * time from this descriptor. */
++      result = kk_vi_prologs_create(device, vs, pipeline_descriptor);
++   } else {
++      pipe->gfx.render = mtl_new_render_pipeline(device->mtl_compiler_handle,
++                                                 pipeline_descriptor);
++      if (pipe->gfx.render == NULL)
++         result = VK_ERROR_INVALID_SHADER_NV;
++   }
+ 
+    mtl_release(pipeline_descriptor);
+    mtl_release(fragment_function);
+
+--- src/kosmickrisp/vulkan/kk_shader.h
++++ src/kosmickrisp/vulkan/kk_shader.h
+@@ -68,6 +68,15 @@ struct kk_shader_info {
+ 
+          /* Data needed to start render pass and bind pipeline. */
+          uint32_t attribs_read;
++         bool dynamic_vi;
++         /* Dynamic vertex input is fetched by a prolog linked into a render
++          * pipeline per vertex input layout. */
++         bool vi_prolog;
++         bool vi_robust2;
++         /* Attribute slots (compacted attribs_read indices) the shader reads
++          * as signed or unsigned integers; the rest are float. */
++         uint32_t vi_int_slots;
++         uint32_t vi_uint_slots;
+          uint32_t sample_count;
+ 
+          /* Data needed for serialization. */
+@@ -146,6 +155,9 @@ struct kk_shader {
+    /* Compute pass of a GS. Its rasterization VS is in
+     * msl_data[MESA_SHADER_GEOMETRY]. */
+    struct msl_compile_data gs_main;
++   /* Render pipelines per vertex input layout, for vertex shaders with
++    * info.vs.vi_prolog. */
++   struct kk_vi_prologs *vi_prologs;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
+
+--- src/kosmickrisp/vulkan/kk_vi_prolog.c
++++ src/kosmickrisp/vulkan/kk_vi_prolog.c
+@@ -0,0 +1,420 @@
++/*
++ * Copyright 2026 Nilton Perim Neto
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Vertex input prologs for VK_EXT_vertex_input_dynamic_state.
++ *
++ * A vertex shader compiled without a static vertex input layout calls one
++ * extern function per attribute slot, kk_vi_<slot>(). Once the layout is
++ * known at draw time, the functions are generated with the format, input rate
++ * and divisor as constants, compiled as a small library and statically linked
++ * into a render pipeline with the shader's vertex and fragment functions. The
++ * Metal compiler can then fold the format decode like the static path does.
++ * Pipelines are cached per shader and layout.
++ *
++ * A vertex shader emulated as compute before tessellation or geometry is
++ * compiled up front, so its own source defines kk_vi_<slot>() reading the
++ * format, input rate and divisor from the root table instead.
++ */
++
++#include "kk_vi_prolog.h"
++
++#include "kk_cmd_buffer.h"
++#include "kk_debug.h"
++#include "kk_device.h"
++#include "kk_physical_device.h"
++#include "kk_shader.h"
++
++#include "kosmickrisp/bridge/mtl_bridge.h"
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++#include "util/hash_table.h"
++#include "util/ralloc.h"
++#include "util/simple_mtx.h"
++#include "util/string_buffer.h"
++#include "util/u_atomic.h"
++#include "util/u_math.h"
++#include "vk_format.h"
++#include "vk_graphics_state.h"
++
++/* A render pipeline for one layout, compiled on the device's vi_prolog
++ * queue. */
++struct kk_vi_prolog_variant {
++   struct kk_vi_prolog_key key;
++   struct kk_device *dev;
++   struct kk_shader *vs;
++   /* Signalled when the compile job finished, for destruction */
++   struct util_queue_fence ready;
++   /* Set with release semantics once pipeline is final; pipeline is NULL if
++    * the compile failed */
++   bool done;
++   mtl_render_pipeline_state *pipeline;
++};
++
++struct kk_vi_prologs {
++   simple_mtx_t lock;
++   /* struct kk_vi_prolog_key -> struct kk_vi_prolog_variant */
++   struct hash_table *variants;
++   mtl_render_pipeline_descriptor *descriptor;
++   /* Linked with prologs that read the layout from the root table. Used
++    * while a layout's own pipeline is compiling. */
++   mtl_render_pipeline_state *generic;
++};
++
++void
++kk_vi_prolog_key_init(struct kk_vi_prolog_key *key,
++                      const struct kk_shader_info *info,
++                      const struct vk_vertex_input_state *vi)
++{
++   memset(key, 0, sizeof(*key));
++
++   unsigned slot = 0;
++   u_foreach_bit(i, info->vs.attribs_read) {
++      if (vi->attributes_valid & BITFIELD_BIT(i)) {
++         const struct vk_vertex_attribute_state *attr = &vi->attributes[i];
++         const struct vk_vertex_binding_state *binding =
++            &vi->bindings[attr->binding];
++         uint32_t fmt =
++            kk_vbo_encode_format(vk_format_to_pipe_format(attr->format));
++         if (binding->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE) {
++            fmt |= KK_VBO_FMT_INSTANCED;
++            key->divisor[slot] = binding->divisor;
++         }
++         key->format[slot] = fmt;
++      }
++      slot++;
++   }
++}
++
++static uint32_t
++key_hash(const void *key)
++{
++   return _mesa_hash_data(key, sizeof(struct kk_vi_prolog_key));
++}
++
++static bool
++key_equal(const void *a, const void *b)
++{
++   return memcmp(a, b, sizeof(struct kk_vi_prolog_key)) == 0;
++}
++
++/* Format decode shared by all slots. fmt is a literal in specialized prologs,
++ * so after inlining every branch on it folds away. */
++static void
++print_decode_helpers(struct _mesa_string_buffer *buf)
++{
++#define DEFINE(name)                                                           \
++   _mesa_string_buffer_printf(buf, "#define " #name " %uu\n", name)
++   DEFINE(KK_VBO_FMT_VALID);
++   DEFINE(KK_VBO_FMT_INSTANCED);
++   DEFINE(KK_VBO_FMT_RGB10A2);
++   DEFINE(KK_VBO_FMT_RG11B10F);
++   DEFINE(KK_VBO_FMT_SIZE_SHIFT);
++   DEFINE(KK_VBO_FMT_SIZE_MASK);
++   DEFINE(KK_VBO_FMT_COUNT_SHIFT);
++   DEFINE(KK_VBO_FMT_COUNT_MASK);
++   DEFINE(KK_VBO_FMT_TYPE_SHIFT);
++   DEFINE(KK_VBO_FMT_TYPE_MASK);
++   DEFINE(KK_VBO_FMT_SWIZZLE_SHIFT);
++   DEFINE(KK_VBO_FMT_SWIZZLE_MASK);
++   DEFINE(KK_VBO_TYPE_UNORM);
++   DEFINE(KK_VBO_TYPE_SNORM);
++   DEFINE(KK_VBO_TYPE_USCALED);
++   DEFINE(KK_VBO_TYPE_SSCALED);
++   DEFINE(KK_VBO_TYPE_SINT);
++#undef DEFINE
++
++   _mesa_string_buffer_append(
++      buf,
++      "static inline uint4 kk_vi_raw(ulong addr, uint fmt, bool fetch) {\n"
++      "   uint4 v = uint4(0);\n"
++      "   if (!fetch) return v;\n"
++      "   uint n = ((fmt >> KK_VBO_FMT_COUNT_SHIFT) & KK_VBO_FMT_COUNT_MASK) + 1;\n"
++      "   uint size = (fmt >> KK_VBO_FMT_SIZE_SHIFT) & KK_VBO_FMT_SIZE_MASK;\n"
++      "   if (size == 2) {\n"
++      "      constant uint *p = (constant uint *)addr;\n"
++      "      v.x = p[0]; if (n > 1) v.y = p[1]; if (n > 2) v.z = p[2]; if (n > 3) v.w = p[3];\n"
++      "   } else if (size == 1) {\n"
++      "      constant ushort *p = (constant ushort *)addr;\n"
++      "      v.x = p[0]; if (n > 1) v.y = p[1]; if (n > 2) v.z = p[2]; if (n > 3) v.w = p[3];\n"
++      "   } else {\n"
++      "      constant uchar *p = (constant uchar *)addr;\n"
++      "      v.x = p[0]; if (n > 1) v.y = p[1]; if (n > 2) v.z = p[2]; if (n > 3) v.w = p[3];\n"
++      "   }\n"
++      "   return v;\n"
++      "}\n"
++      "static inline uint4 kk_vi_unpack(uint4 v, uint fmt) {\n"
++      "   if (fmt & KK_VBO_FMT_RGB10A2)\n"
++      "      return (uint4(v.x) >> uint4(0, 10, 20, 30)) & uint4(1023, 1023, 1023, 3);\n"
++      "   return v;\n"
++      "}\n"
++      "static inline int4 kk_vi_signed(uint4 v, uint fmt) {\n"
++      "   if (fmt & KK_VBO_FMT_RGB10A2)\n"
++      "      return as_type<int4>(v << uint4(22, 22, 22, 30)) >> uint4(22, 22, 22, 30);\n"
++      "   uint size = (fmt >> KK_VBO_FMT_SIZE_SHIFT) & KK_VBO_FMT_SIZE_MASK;\n"
++      "   if (size == 0) return int4(as_type<char4>(uchar4(v)));\n"
++      "   if (size == 1) return int4(as_type<short4>(ushort4(v)));\n"
++      "   return as_type<int4>(v);\n"
++      "}\n"
++      "static inline float4 kk_vi_float(uint4 raw, uint fmt) {\n"
++      "   uint4 u = kk_vi_unpack(raw, fmt);\n"
++      "   uint type = (fmt >> KK_VBO_FMT_TYPE_SHIFT) & KK_VBO_FMT_TYPE_MASK;\n"
++      "   bool packed = (fmt & KK_VBO_FMT_RGB10A2) != 0;\n"
++      "   bool is8 = ((fmt >> KK_VBO_FMT_SIZE_SHIFT) & KK_VBO_FMT_SIZE_MASK) == 0;\n"
++      "   switch (type) {\n"
++      "   case KK_VBO_TYPE_UNORM:\n"
++      "      return float4(u) * (packed ? float4(1.0f/1023.0f, 1.0f/1023.0f, 1.0f/1023.0f, 1.0f/3.0f) : is8 ? float4(1.0f/255.0f) : float4(1.0f/65535.0f));\n"
++      "   case KK_VBO_TYPE_SNORM:\n"
++      "      return max(float4(kk_vi_signed(u, fmt)) * (packed ? float4(1.0f/511.0f, 1.0f/511.0f, 1.0f/511.0f, 1.0f) : is8 ? float4(1.0f/127.0f) : float4(1.0f/32767.0f)), -1.0f);\n"
++      "   case KK_VBO_TYPE_USCALED: return float4(u);\n"
++      "   case KK_VBO_TYPE_SSCALED: return float4(kk_vi_signed(u, fmt));\n"
++      "   default:\n"
++      "      if (fmt & KK_VBO_FMT_RG11B10F)\n"
++      "         return float4(float3(as_type<half3>(ushort3((raw.x & 0x7ffu) << 4, (raw.x & 0x3ff800u) >> 7, (raw.x & 0xffc00000u) >> 17))), 0.0f);\n"
++      "      if (((fmt >> KK_VBO_FMT_SIZE_SHIFT) & KK_VBO_FMT_SIZE_MASK) == 1)\n"
++      "         return float4(as_type<half4>(ushort4(raw)));\n"
++      "      return as_type<float4>(raw);\n"
++      "   }\n"
++      "}\n");
++}
++
++static void
++print_prolog(struct _mesa_string_buffer *buf, unsigned slot, nir_alu_type type,
++             bool robust2, bool linked, const struct kk_vi_prolog_key *key)
++{
++   const char *t = msl_vi_prolog_type(type);
++   _mesa_string_buffer_printf(buf,
++                              "%s %s " MSL_VI_PROLOG_NAME
++                              "(ulong root, uint vid, uint iid, uint bi) {\n",
++                              linked ? "[[visible]]" : "static inline", t,
++                              slot);
++
++   if (key) {
++      if (!(key->format[slot] & KK_VBO_FMT_VALID)) {
++         _mesa_string_buffer_printf(buf, "   return %s(0, 0, 0, 1);\n}\n", t);
++         return;
++      }
++      _mesa_string_buffer_printf(buf,
++                                 "   const uint fmt = %uu;\n"
++                                 "   const uint divisor = %uu;\n",
++                                 key->format[slot], key->divisor[slot]);
++   } else {
++      _mesa_string_buffer_printf(
++         buf,
++         "   const uint fmt = *(constant uint *)(root + %zu);\n"
++         "   const uint divisor = *(constant uint *)(root + %zu);\n"
++         "   if (!(fmt & KK_VBO_FMT_VALID)) return %s(0, 0, 0, 1);\n",
++         offsetof(struct kk_root_descriptor_table, draw.attrib_format[slot]),
++         offsetof(struct kk_root_descriptor_table, draw.attrib_divisor[slot]),
++         t);
++   }
++
++   _mesa_string_buffer_printf(
++      buf,
++      "   uint el = (fmt & KK_VBO_FMT_INSTANCED) ?\n"
++      "      (divisor == 0u ? 0u : iid / divisor) + bi : vid;\n"
++      "   ulong base = *(constant ulong *)(root + %zu);\n"
++      "   uint stride = *(constant uint *)(root + %zu);\n",
++      offsetof(struct kk_root_descriptor_table, draw.attrib_base[slot]),
++      offsetof(struct kk_root_descriptor_table, draw.attrib_stride[slot]));
++   if (robust2) {
++      _mesa_string_buffer_printf(
++         buf, "   bool fetch = el <= *(constant uint *)(root + %zu);\n",
++         offsetof(struct kk_root_descriptor_table, draw.attrib_clamps[slot]));
++   } else {
++      _mesa_string_buffer_append(buf, "   bool fetch = true;\n");
++   }
++   _mesa_string_buffer_append(
++      buf,
++      "   uint4 raw = kk_vi_raw(base + ulong(el * stride), fmt, fetch);\n");
++
++   if (type == nir_type_float32) {
++      _mesa_string_buffer_append(buf, "   float4 v = kk_vi_float(raw, fmt);\n");
++   } else {
++      _mesa_string_buffer_printf(
++         buf,
++         "   uint4 u = kk_vi_unpack(raw, fmt);\n"
++         "   %s v = %s(((fmt >> KK_VBO_FMT_TYPE_SHIFT) & KK_VBO_FMT_TYPE_MASK) == "
++         "KK_VBO_TYPE_SINT ? as_type<uint4>(kk_vi_signed(u, fmt)) : u);\n",
++         t, t);
++   }
++   _mesa_string_buffer_printf(
++      buf,
++      "   uint4 swz = (uint4(fmt) >> uint4(KK_VBO_FMT_SWIZZLE_SHIFT, "
++      "KK_VBO_FMT_SWIZZLE_SHIFT + 3, KK_VBO_FMT_SWIZZLE_SHIFT + 6, "
++      "KK_VBO_FMT_SWIZZLE_SHIFT + 9)) & uint4(KK_VBO_FMT_SWIZZLE_MASK);\n"
++      "   %s out = %s(v.x);\n"
++      "   out = select(out, %s(v.y), swz == uint4(1));\n"
++      "   out = select(out, %s(v.z), swz == uint4(2));\n"
++      "   out = select(out, %s(v.w), swz == uint4(3));\n"
++      "   out = select(out, %s(0), swz == uint4(4));\n"
++      "   return select(out, %s(1), swz == uint4(5));\n"
++      "}\n",
++      t, t, t, t, t, t, t);
++}
++
++char *
++kk_vi_prolog_source(void *mem_ctx, const struct kk_shader_info *info,
++                    const struct kk_vi_prolog_key *key, bool linked)
++{
++   struct _mesa_string_buffer *buf = _mesa_string_buffer_create(NULL, 8192);
++   if (linked)
++      _mesa_string_buffer_append(buf, "#include <metal_stdlib>\n"
++                                      "using namespace metal;\n");
++   print_decode_helpers(buf);
++
++   unsigned slots = util_bitcount(info->vs.attribs_read);
++   for (unsigned slot = 0; slot < slots; slot++) {
++      nir_alu_type type = nir_type_float32;
++      if (info->vs.vi_int_slots & BITFIELD_BIT(slot))
++         type = nir_type_int32;
++      else if (info->vs.vi_uint_slots & BITFIELD_BIT(slot))
++         type = nir_type_uint32;
++      print_prolog(buf, slot, type, info->vs.vi_robust2, linked, key);
++   }
++
++   char *source = ralloc_strdup(mem_ctx, buf->buf);
++   _mesa_string_buffer_destroy(buf);
++   return source;
++}
++
++static mtl_render_pipeline_state *
++compile_pipeline(struct kk_device *dev, struct kk_shader *vs,
++                 mtl_render_pipeline_descriptor *base,
++                 const struct kk_vi_prolog_key *key)
++{
++   struct kk_physical_device *pdev = kk_device_physical(dev);
++   const struct kk_shader_info *info = &vs->info;
++   unsigned slots = util_bitcount(info->vs.attribs_read);
++
++   char *source = kk_vi_prolog_source(NULL, info, key, true);
++   if (KK_DEBUG(MSL))
++      mesa_logi("%s\n", source);
++   mtl_library *library = mtl_new_library(
++      dev->mtl_compiler_handle, source, pdev->info.msl_version,
++      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
++   ralloc_free(source);
++   if (!library)
++      return NULL;
++
++   mtl_function_descriptor *functions[KK_MAX_ATTRIBS];
++   for (unsigned slot = 0; slot < slots; slot++) {
++      char name[16];
++      snprintf(name, sizeof(name), MSL_VI_PROLOG_NAME, slot);
++      functions[slot] = mtl_new_library_function_descriptor(library, name);
++   }
++
++   mtl_render_pipeline_descriptor *descriptor =
++      mtl_render_pipeline_descriptor_copy(base);
++   mtl_render_pipeline_descriptor_set_vertex_linked_functions(descriptor,
++                                                              functions, slots);
++   mtl_render_pipeline_state *pipeline =
++      mtl_new_render_pipeline(dev->mtl_compiler_handle, descriptor);
++
++   mtl_release(descriptor);
++   for (unsigned slot = 0; slot < slots; slot++)
++      mtl_release(functions[slot]);
++   mtl_release(library);
++   return pipeline;
++}
++
++VkResult
++kk_vi_prologs_create(struct kk_device *dev, struct kk_shader *vs,
++                     mtl_render_pipeline_descriptor *descriptor)
++{
++   assert(vs->info.vs.attribs_read);
++
++   struct kk_vi_prologs *p = rzalloc(NULL, struct kk_vi_prologs);
++   if (!p)
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   p->variants = _mesa_hash_table_create(p, key_hash, key_equal);
++   if (!p->variants) {
++      ralloc_free(p);
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++   }
++
++   /* The pipeline that works for every layout is compiled with the shader,
++    * so draws never wait for a compile. */
++   p->generic = compile_pipeline(dev, vs, descriptor, NULL);
++   if (!p->generic) {
++      ralloc_free(p);
++      return VK_ERROR_INVALID_SHADER_NV;
++   }
++
++   simple_mtx_init(&p->lock, mtx_plain);
++   p->descriptor = mtl_render_pipeline_descriptor_copy(descriptor);
++   vs->vi_prologs = p;
++   return VK_SUCCESS;
++}
++
++void
++kk_vi_prologs_destroy(struct kk_shader *vs)
++{
++   struct kk_vi_prologs *p = vs->vi_prologs;
++   if (!p)
++      return;
++
++   hash_table_foreach(p->variants, entry) {
++      struct kk_vi_prolog_variant *variant = entry->data;
++      util_queue_fence_wait(&variant->ready);
++      util_queue_fence_destroy(&variant->ready);
++      mtl_release(variant->pipeline);
++   }
++   mtl_release(p->generic);
++   mtl_release(p->descriptor);
++   simple_mtx_destroy(&p->lock);
++   ralloc_free(p);
++   vs->vi_prologs = NULL;
++}
++
++static void
++compile_variant(void *job, void *gdata, int thread_index)
++{
++   struct kk_vi_prolog_variant *variant = job;
++   variant->pipeline =
++      compile_pipeline(variant->dev, variant->vs,
++                       variant->vs->vi_prologs->descriptor, &variant->key);
++   p_atomic_set(&variant->done, true);
++}
++
++mtl_render_pipeline_state *
++kk_vi_prolog_pipeline(struct kk_device *dev, struct kk_shader *vs,
++                      const struct kk_vi_prolog_key *key, bool *pending)
++{
++   struct kk_vi_prologs *p = vs->vi_prologs;
++   uint32_t hash = key_hash(key);
++
++   *pending = false;
++   if (KK_DEBUG(VI_PROLOG_GENERIC))
++      return p->generic;
++
++   simple_mtx_lock(&p->lock);
++   struct hash_entry *entry =
++      _mesa_hash_table_search_pre_hashed(p->variants, hash, key);
++   struct kk_vi_prolog_variant *variant = entry ? entry->data : NULL;
++   if (!variant) {
++      variant = rzalloc(p, struct kk_vi_prolog_variant);
++      if (variant) {
++         variant->key = *key;
++         variant->dev = dev;
++         variant->vs = vs;
++         util_queue_fence_init(&variant->ready);
++         _mesa_hash_table_insert_pre_hashed(p->variants, hash, &variant->key,
++                                            variant);
++         util_queue_add_job(&dev->vi_prolog_queue, variant, &variant->ready,
++                            compile_variant, NULL, 0);
++      }
++   }
++   simple_mtx_unlock(&p->lock);
++
++   if (variant && KK_DEBUG(VI_PROLOG_SYNC))
++      util_queue_fence_wait(&variant->ready);
++
++   if (variant && p_atomic_read(&variant->done))
++      return variant->pipeline ? variant->pipeline : p->generic;
++
++   *pending = variant != NULL;
++   return p->generic;
++}
+
+--- src/kosmickrisp/vulkan/kk_vi_prolog.h
++++ src/kosmickrisp/vulkan/kk_vi_prolog.h
+@@ -0,0 +1,51 @@
++/*
++ * Copyright 2026 Nilton Perim Neto
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef KK_VI_PROLOG_H
++#define KK_VI_PROLOG_H 1
++
++#include "kk_nir_lower_vbo.h"
++#include "kk_private.h"
++
++#include "kosmickrisp/bridge/mtl_types.h"
++
++struct kk_device;
++struct kk_shader;
++struct kk_shader_info;
++struct vk_vertex_input_state;
++
++/* Vertex input layout as seen by one vertex shader, indexed by attribute slot
++ * (compacted attribs_read index). */
++struct kk_vi_prolog_key {
++   /* kk_vbo_encode_format() | KK_VBO_FMT_INSTANCED, 0 if not bound */
++   uint32_t format[KK_MAX_ATTRIBS];
++   uint32_t divisor[KK_MAX_ATTRIBS];
++};
++
++void kk_vi_prolog_key_init(struct kk_vi_prolog_key *key,
++                           const struct kk_shader_info *info,
++                           const struct vk_vertex_input_state *vi);
++
++/* MSL source of the prolog functions for every slot the shader reads. With a
++ * NULL key, the functions read the layout from the root table instead. A
++ * linked source is a library of its own; otherwise it is meant to be placed
++ * in the vertex shader's source. */
++char *kk_vi_prolog_source(void *mem_ctx, const struct kk_shader_info *info,
++                          const struct kk_vi_prolog_key *key, bool linked);
++
++/* Keeps a copy of descriptor, which has the vertex and fragment functions and
++ * every other pipeline state set. */
++VkResult kk_vi_prologs_create(struct kk_device *dev, struct kk_shader *vs,
++                              mtl_render_pipeline_descriptor *descriptor);
++void kk_vi_prologs_destroy(struct kk_shader *vs);
++
++/* Render pipeline for vs with key's layout. The first use of a layout starts
++ * compiling its pipeline in the background and returns the generic one, with
++ * *pending set until the layout's own pipeline is ready. */
++mtl_render_pipeline_state *
++kk_vi_prolog_pipeline(struct kk_device *dev, struct kk_shader *vs,
++                      const struct kk_vi_prolog_key *key, bool *pending);
++
++#endif /* KK_VI_PROLOG_H */
+
+--- src/kosmickrisp/vulkan/meson.build
++++ src/kosmickrisp/vulkan/meson.build
+@@ -108,6 +108,7 @@ kk_files = files(
+   'kk_sampler.c',
+   'kk_shader.h',
+   'kk_shader.c',
++  'kk_vi_prolog.c',
+   'kk_sync.h',
+   'kk_sync.c',
+   'kk_wsi.h',
+

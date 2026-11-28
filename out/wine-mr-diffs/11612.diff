@@ -1,0 +1,181 @@
+# wined3d: Support WINE_D3D_CONFIG=no_create_flags=0x800 and any flags
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11612 state=closed
+# This MR is a continuation/preservation of original more expansive patch from MR-11398 which was minimized to only support D3D11_CREATE_DEVICE_VIDEO_SUPPORT instead of all d3d/ddraw device creation flags:
+- https://gitlab.winehq.org/wine/wine/-/merge_requests/11398#note_148286
+
+The primary use case is to support `WINE_D3D_CONFIG=no_create_flags=0x800` to force UnityPlayer.dll to fallback to software video decoding.
+
+However the patch also supports all other d3d/ddraw device creation flags if ever needed for debugging purposes.
+
+I will test it for other bugs to determine if it may have wider scope to further prove it's use case as a useful convenience tool that may allow users to discover fixes, workarounds, or causes of bugs by minimizing dev skills otherwise required.
+
+Perhaps to be considered more worthy for merge a design spec should be provided to clarify how to mitigate potential risks raised by MR-11398.
+
+Concerns were raised that expanding support for d3d create flag overrides may open the door for too many other overrides such as feature levels, format supports, etc which may be considered leading to maintenance nightmares.
+
+Therefore deliberate planning for how to deal with such cases as a guide may be needed before these changes may be considered ready for merge.
+
+In the meantime it exists open for feedback/discussion and for anyone who may find it convenient.
+
+Maybe its considered appropriate enough as is to include for wine-staging without requiring the other requirements to be fulfilled first.
+--- dlls/d3d8/device.c
++++ dlls/d3d8/device.c
+@@ -3707,7 +3707,7 @@ HRESULT device_init(struct d3d8_device *device, struct d3d8 *parent, struct wine
+     wined3d_output = parent->wined3d_outputs[output_idx];
+     wined3d_adapter = wined3d_output_get_adapter(wined3d_output);
+     if (FAILED(hr = wined3d_device_create(wined3d, wined3d_adapter, wined3d_device_type_from_d3d(device_type),
+-            focus_window, flags, 4, feature_levels, ARRAY_SIZE(feature_levels),
++            focus_window, flags, flags, 4, feature_levels, ARRAY_SIZE(feature_levels),
+             &device->device_parent, &device->wined3d_device)))
+     {
+         WARN("Failed to create wined3d device, hr %#lx.\n", hr);
+
+--- dlls/d3d9/device.c
++++ dlls/d3d9/device.c
+@@ -4785,7 +4785,7 @@ HRESULT device_init(struct d3d9_device *device, struct d3d9 *parent, struct wine
+     wined3d_mutex_lock();
+     wined3d_adapter = wined3d_output_get_adapter(parent->wined3d_outputs[output_idx]);
+     if (FAILED(hr = wined3d_device_create(wined3d, wined3d_adapter, wined3d_device_type_from_d3d(device_type),
+-            focus_window, flags, 4, feature_levels, ARRAY_SIZE(feature_levels),
++            focus_window, flags, flags, 4, feature_levels, ARRAY_SIZE(feature_levels),
+             &device->device_parent, &device->wined3d_device)))
+     {
+         WARN("Failed to create wined3d device, hr %#lx.\n", hr);
+
+--- dlls/ddraw/ddraw.c
++++ dlls/ddraw/ddraw.c
+@@ -5169,7 +5169,7 @@ HRESULT ddraw_init(struct ddraw *ddraw, DWORD flags, enum wined3d_device_type de
+     }
+ 
+     if (FAILED(hr = wined3d_device_create(ddraw->wined3d, ddraw->wined3d_adapter, device_type,
+-            NULL, 0, DDRAW_STRIDE_ALIGNMENT, feature_levels, ARRAY_SIZE(feature_levels),
++            NULL, 0, ddraw->flags, DDRAW_STRIDE_ALIGNMENT, feature_levels, ARRAY_SIZE(feature_levels),
+             &ddraw->device_parent, &ddraw->wined3d_device)))
+     {
+         WARN("Failed to create a wined3d device, hr %#lx.\n", hr);
+
+--- dlls/dxgi/device.c
++++ dlls/dxgi/device.c
+@@ -485,7 +485,7 @@ static const struct IWineDXGISwapChainFactoryVtbl dxgi_swapchain_factory_vtbl =
+ };
+ 
+ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *layer,
+-        IDXGIFactory *factory, IDXGIAdapter *adapter,
++        IDXGIFactory *factory, IDXGIAdapter *adapter, unsigned int flags,
+         const D3D_FEATURE_LEVEL *feature_levels, unsigned int level_count)
+ {
+     struct wined3d_device_parent *wined3d_device_parent;
+@@ -539,9 +539,8 @@ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *l
+     }
+     wined3d_device_parent = IWineDXGIDeviceParent_get_wined3d_device_parent(dxgi_device_parent);
+     IWineDXGIDeviceParent_Release(dxgi_device_parent);
+-
+     if (FAILED(hr = wined3d_device_create(dxgi_factory->wined3d,
+-            dxgi_adapter->wined3d_adapter, WINED3D_DEVICE_TYPE_HAL, NULL, 0, 4,
++            dxgi_adapter->wined3d_adapter, WINED3D_DEVICE_TYPE_HAL, NULL, 0, flags, 4,
+             (const enum wined3d_feature_level *)feature_levels, level_count,
+             wined3d_device_parent, &device->wined3d_device)))
+     {
+
+--- dlls/dxgi/dxgi_main.c
++++ dlls/dxgi/dxgi_main.c
+@@ -191,7 +191,7 @@ HRESULT WINAPI DXGID3D10CreateDevice(HMODULE d3d10core, IDXGIFactory *factory, I
+         return E_OUTOFMEMORY;
+     }
+ 
+-    hr = dxgi_device_init(dxgi_device, &d3d10_layer, factory, adapter, feature_levels, level_count);
++    hr = dxgi_device_init(dxgi_device, &d3d10_layer, factory, adapter, flags, feature_levels, level_count);
+     if (FAILED(hr))
+     {
+         WARN("Failed to initialize device, hr %#lx.\n", hr);
+
+--- dlls/dxgi/dxgi_private.h
++++ dlls/dxgi/dxgi_private.h
+@@ -138,7 +138,7 @@ struct dxgi_device
+ };
+ 
+ HRESULT dxgi_device_init(struct dxgi_device *device, struct dxgi_device_layer *layer,
+-        IDXGIFactory *factory, IDXGIAdapter *adapter,
++        IDXGIFactory *factory, IDXGIAdapter *adapter, unsigned int flags,
+         const D3D_FEATURE_LEVEL *feature_levels, unsigned int level_count);
+ 
+ /* IDXGIOutput */
+
+--- dlls/wined3d/directx.c
++++ dlls/wined3d/directx.c
+@@ -2783,8 +2783,8 @@ HRESULT CDECL wined3d_get_device_caps(const struct wined3d_adapter *adapter,
+ }
+ 
+ HRESULT CDECL wined3d_device_create(struct wined3d *wined3d, struct wined3d_adapter *adapter,
+-        enum wined3d_device_type device_type, HWND focus_window, uint32_t flags, BYTE surface_alignment,
+-        const enum wined3d_feature_level *feature_levels, unsigned int feature_level_count,
++        enum wined3d_device_type device_type, HWND focus_window, uint32_t flags, uint32_t orig_flags,
++        BYTE surface_alignment, const enum wined3d_feature_level *feature_levels, unsigned int feature_level_count,
+         struct wined3d_device_parent *device_parent, struct wined3d_device **device)
+ {
+     struct wined3d_device *object;
+@@ -2795,6 +2795,14 @@ HRESULT CDECL wined3d_device_create(struct wined3d *wined3d, struct wined3d_adap
+             wined3d, adapter, device_type, focus_window, flags, surface_alignment,
+             feature_levels, feature_level_count, device_parent, device);
+ 
++    /* Unity uses shared resources if D3D11_CREATE_DEVICE_VIDEO_SUPPORT succeeds,
++     * so allow failing for now */
++    if (orig_flags != (orig_flags & ~wined3d_settings.no_create_flags))
++    {
++        FIXME("Failing for device create flags 0x%x forced unsupported.\n", wined3d_settings.no_create_flags);
++        return E_FAIL;
++    }
++
+     if (FAILED(hr = adapter->adapter_ops->adapter_create_device(wined3d, adapter,
+             device_type, focus_window, flags, surface_alignment,
+             feature_levels, feature_level_count, device_parent, &object)))
+
+--- dlls/wined3d/wined3d.spec
++++ dlls/wined3d/wined3d.spec
+@@ -65,7 +65,7 @@
+ @ cdecl wined3d_device_apply_stateblock(ptr ptr)
+ @ cdecl wined3d_device_begin_scene(ptr)
+ @ cdecl wined3d_device_clear(ptr long ptr long ptr float long)
+-@ cdecl wined3d_device_create(ptr ptr long ptr long long ptr long ptr ptr)
++@ cdecl wined3d_device_create(ptr ptr long ptr long long long ptr long ptr ptr)
+ @ cdecl wined3d_device_decref(ptr)
+ @ cdecl wined3d_device_end_scene(ptr)
+ @ cdecl wined3d_device_evict_managed_resources(ptr)
+
+--- dlls/wined3d/wined3d_main.c
++++ dlls/wined3d/wined3d_main.c
+@@ -344,6 +344,8 @@ static BOOL wined3d_dll_init(HINSTANCE hInstDLL)
+     {
+         if (!get_config_key_dword(hkey, appkey, env, "csmt", &wined3d_settings.cs_multithreaded))
+             ERR_(winediag)("Setting multithreaded command stream to %#x.\n", wined3d_settings.cs_multithreaded);
++        if (!get_config_key_dword(hkey, appkey, env, "no_create_flags", &wined3d_settings.no_create_flags))
++            ERR_(winediag)("Force D3D device creation without support for flags %#x.\n", wined3d_settings.no_create_flags);        
+         if (!get_config_key_dword(hkey, appkey, env, "MaxVersionGL", &tmpvalue))
+         {
+             ERR_(winediag)("Setting maximum allowed wined3d GL version to %u.%u.\n",
+
+--- dlls/wined3d/wined3d_private.h
++++ dlls/wined3d/wined3d_private.h
+@@ -466,6 +466,7 @@ struct wined3d_settings
+ {
+     unsigned int cs_multithreaded;
+     unsigned int max_gl_version;
++    unsigned int no_create_flags;
+     unsigned short pci_vendor_id;
+     unsigned short pci_device_id;
+     /* Memory tracking and object counting. */
+
+--- include/wine/wined3d.h
++++ include/wine/wined3d.h
+@@ -2429,8 +2429,8 @@ HRESULT __cdecl wined3d_device_begin_scene(struct wined3d_device *device);
+ HRESULT __cdecl wined3d_device_clear(struct wined3d_device *device, unsigned int rect_count, const RECT *rects,
+         uint32_t flags, const struct wined3d_color *color, float z, unsigned int stencil);
+ HRESULT __cdecl wined3d_device_create(struct wined3d *wined3d, struct wined3d_adapter *adapter,
+-        enum wined3d_device_type device_type, HWND focus_window, unsigned int behaviour_flags, BYTE surface_alignment,
+-        const enum wined3d_feature_level *feature_levels, unsigned int feature_level_count,
++        enum wined3d_device_type device_type, HWND focus_window, unsigned int behaviour_flags, unsigned int orig_flags,
++        BYTE surface_alignment, const enum wined3d_feature_level *feature_levels, unsigned int feature_level_count,
+         struct wined3d_device_parent *device_parent, struct wined3d_device **device);
+ ULONG __cdecl wined3d_device_decref(struct wined3d_device *device);
+ HRESULT __cdecl wined3d_device_end_scene(struct wined3d_device *device);
+

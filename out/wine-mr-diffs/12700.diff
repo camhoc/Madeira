@@ -1,0 +1,70 @@
+# ntdll/tests: Some more tests related to NT file names.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12700 state=merged
+# 
+--- dlls/ntdll/tests/file.c
++++ dlls/ntdll/tests/file.c
+
+--- dlls/ntdll/tests/om.c
++++ dlls/ntdll/tests/om.c
+@@ -1131,6 +1131,7 @@ static void test_name_limits(void)
+ 
+ static void test_directory(void)
+ {
++    static const WCHAR embedded_null[] = L"\\BaseNamedObjects\\test\0dir";
+     NTSTATUS status;
+     UNICODE_STRING str;
+     OBJECT_ATTRIBUTES attr;
+@@ -1182,6 +1183,40 @@ static void test_directory(void)
+     pNtClose(h);
+     pNtClose(dir1);
+ 
++    RtlInitUnicodeString(&str, L"\\BaseNamedObjects\\*?</>|\"");
++    status = pNtCreateDirectoryObject( &h, DIRECTORY_QUERY, &attr );
++    ok( status == STATUS_SUCCESS, "Failed to create directory %08lx\n", status );
++    status = pNtOpenDirectoryObject( &dir1, DIRECTORY_QUERY, &attr );
++    ok( status == STATUS_SUCCESS, "Failed to open directory %08lx\n", status );
++    pNtClose(h);
++    pNtClose(dir1);
++
++    RtlInitUnicodeString(&str, L"\\BaseNamedObjects\\.");
++    status = pNtCreateDirectoryObject( &h, DIRECTORY_QUERY, &attr );
++    ok( status == STATUS_SUCCESS, "Failed to create directory %08lx\n", status );
++    status = pNtOpenDirectoryObject( &dir1, DIRECTORY_QUERY, &attr );
++    ok( status == STATUS_SUCCESS, "Failed to open directory %08lx\n", status );
++    pNtClose(h);
++    pNtClose(dir1);
++
++    RtlInitUnicodeString(&str, L"\\BaseNamedObjects\\..");
++    status = pNtCreateDirectoryObject( &h, DIRECTORY_QUERY, &attr );
++    ok( status == STATUS_SUCCESS, "Failed to create directory %08lx\n", status );
++    status = pNtOpenDirectoryObject( &dir1, DIRECTORY_QUERY, &attr );
++    ok( status == STATUS_SUCCESS, "Failed to open directory %08lx\n", status );
++    pNtClose(h);
++    pNtClose(dir1);
++
++    RtlInitUnicodeString(&str, L"\\BaseNamedObjects\\.\\subdir");
++    status = pNtCreateDirectoryObject( &h, DIRECTORY_QUERY, &attr );
++    ok( status == STATUS_OBJECT_PATH_NOT_FOUND, "Failed to create directory %08lx\n", status );
++    RtlInitUnicodeString(&str, L"\\BaseNamedObjects\\..\\subdir");
++    status = pNtCreateDirectoryObject( &h, DIRECTORY_QUERY, &attr );
++    ok( status == STATUS_OBJECT_PATH_NOT_FOUND, "Failed to create directory %08lx\n", status );
++    str.Buffer = (WCHAR *)embedded_null;
++    str.Length = str.MaximumLength = ARRAY_SIZE(embedded_null);
++    status = pNtCreateDirectoryObject( &h, DIRECTORY_QUERY, &attr );
++    ok( status == STATUS_OBJECT_NAME_INVALID, "Failed to create directory %08lx\n", status );
+ 
+     /* Use of root directory */
+ 
+
+--- dlls/wow64/file.c
++++ dlls/wow64/file.c
+@@ -833,7 +833,7 @@ NTSTATUS WINAPI wow64_NtSetInformationFile( UINT *args )
+             name.Length = info32->FileNameLength;
+             InitializeObjectAttributes( &attr, &name, 0, LongToHandle( info32->RootDirectory ), 0 );
+             get_file_redirect( &attr );
+-            size = offsetof( FILE_RENAME_INFORMATION, FileName[name.Length/sizeof(WCHAR)] );
++            size = max( sizeof(*info), offsetof( FILE_RENAME_INFORMATION, FileName[name.Length/sizeof(WCHAR)] ));
+             info = Wow64AllocateTemp( size );
+             info->Flags           = info32->Flags;
+             info->RootDirectory   = attr.RootDirectory;
+

@@ -1,0 +1,23 @@
+# crypt32: Check CertAddEncodedCertificateToStore() return value in  sync_trusted_roots_from_known_locations()
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12565 state=merged
+# Immediately after calling `CertAddEncodedCertificateToStore`, Wine frees the `cert` variable with `CertFreeCertificateContext` . When the call to `CertAddEncodedCertificateToStore` fails for whatever reason, `cert` will be pointing to the previous certificate in the loop (or NULL if it's the first cert), which causes a crash.
+
+I came across this bug because signing in to Steam under a VPN caused Wine to crash on my MacOS computer. I also found [this Reddit thread](https://www.reddit.com/r/macgaming/comments/1uppozn/warning_macos_27_db3_breaks_steam_native_and_in/) in which a user ran into the same situation, though with a different VPN.
+
+For what it's worth, in my case the issue was that the root certificate added by the VPN has an expiration date of `0001-01-01` . My understanding is that this is invalid under Windows, but I can imagine a scenario where we would want to add support for it in Wine anyway. Since I'm not an expert, I'm ok with just fixing the actual crash for now :)
+--- dlls/crypt32/rootstore.c
++++ dlls/crypt32/rootstore.c
+@@ -715,7 +715,11 @@ static void sync_trusted_roots_from_known_locations( HKEY key, HCERTSTORE cached
+             continue;
+         }
+ 
+-        CertAddEncodedCertificateToStore( cached, X509_ASN_ENCODING, params.buffer, needed, CERT_STORE_ADD_ALWAYS, &cert );
++        if (!CertAddEncodedCertificateToStore( cached, X509_ASN_ENCODING, params.buffer, needed, CERT_STORE_ADD_ALWAYS, &cert ))
++        {
++            WARN( "adding root cert failed: %08lx\n", GetLastError() );
++            continue;
++        }
+         is_new = 1;
+         if (!CertSetCertificateContextProperty( cert, CERT_FIRST_USER_PROP_ID, 0, &exists_blob ))
+             ERR("Failed to set property.\n");
+

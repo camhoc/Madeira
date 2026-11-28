@@ -1,0 +1,967 @@
+# d2d1: Implement ID2D1DeviceContext6::DrawSvgDocument via librsvg for x86_64
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/10156 state=closed
+# d2d1: Implement ID2D1DeviceContext6::DrawSvgDocument via librsvg
+
+This patch implements SVG document rendering in Wine's d2d1 by loading librsvg and Cairo on the unix side via the unixlib thunk mechanism.
+
+How it works:
+
+* d2d_svg_document_create reads the SVG data from the provided IStream, passes it to the unix side where librsvg parses it into an RsvgHandle
+* DrawSvgDocument renders the SVG into a pixel buffer using Cairo, creates a staging D2D1 bitmap from the result, and draws it into the device context
+* The unix lib is only initialized and used on 64-bit builds; 32-bit builds return E_NOTIMPL
+
+FPU note: Cairo's fsin leaves the x87 PE (Precision Exception) flag set after rendering. On systems where threads inherit FPU state from their parent with unmasked exceptions (CW=0x0040), this causes SIGFPE in newly created threads. fninit is called after each render to reset x87 state. This was observed in Solid Edge 2026 using Gecko-based UI components.
+
+Testing: A conformance test is included that verifies basic SVG document creation and rendering into a bitmap render target. Tested on Windows 10 1809+ and Wine. Windows 10 1507 and earlier do not support CreateSvgDocument and are skipped gracefully. Windows 8.1 does not support ID2D1DeviceContext6 and is also skipped. [Test Bot Job for this patch](https://testbot.winehq.org/JobDetails.pl?Key=162021)
+--- dlls/d2d1/tests/d2d1.c
++++ dlls/d2d1/tests/d2d1.c
+@@ -17858,6 +17858,123 @@ static void test_glyph_run_world_bounds(BOOL d3d11)
+     release_test_context(&ctx);
+ }
+ 
++static void test_draw_svg_document(BOOL d3d11)
++{
++    ID2D1DeviceContext6 *context = NULL;
++    ID2D1DeviceContext6 *ctx6 = NULL;
++    ID2D1Factory1 *factory = NULL;
++    IDXGIDevice *dxgi_device = NULL;
++    ID3D11Device *d3d_device = NULL;
++    ID2D1Device *device = NULL;
++    ID2D1Bitmap1 *target = NULL;
++    ID2D1SvgDocument *svg = NULL;
++    IStream *stream = NULL;
++    D2D1_BITMAP_PROPERTIES1 props;
++    D2D1_SIZE_F viewport;
++    D2D1_SIZE_U pixel_size;
++    LARGE_INTEGER zero = {0};
++    HRESULT hr;
++
++    static const char svg_data[] =
++        "<svg width=\"100\" height=\"100\" "
++        "xmlns=\"http://www.w3.org/2000/svg\">"
++        "<rect width=\"100\" height=\"100\" fill=\"red\"/>"
++        "</svg>";
++
++    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
++            &IID_ID2D1Factory1, NULL, (void **)&factory);
++    ok(hr == S_OK, "Failed to create factory, hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
++            D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
++            D3D11_SDK_VERSION, &d3d_device, NULL, NULL);
++    ok(hr == S_OK, "Failed to create D3D11 device, hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    hr = ID3D11Device_QueryInterface(d3d_device,
++            &IID_IDXGIDevice, (void **)&dxgi_device);
++    ok(hr == S_OK, "Failed to get IDXGIDevice, hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    hr = ID2D1Factory1_CreateDevice(factory, dxgi_device, &device);
++    ok(hr == S_OK, "Failed to create D2D device, hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    hr = ID2D1Device_CreateDeviceContext(device,
++            D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
++            (ID2D1DeviceContext **)&context);
++    if (FAILED(hr) || !context)
++    {
++        skip("ID2D1DeviceContext6 not available.\n");
++        goto done;
++    }
++    /* Verify ID2D1DeviceContext6 is actually supported*/
++    hr = ID2D1DeviceContext_QueryInterface((ID2D1DeviceContext *)context,
++            &IID_ID2D1DeviceContext6, (void **)&ctx6);
++    ID2D1DeviceContext6_Release(context);
++    context = NULL;
++    if(FAILED(hr))
++    {
++        skip("ID2D1DeviceContext6 not available.\n");
++        goto done;
++    }
++    context = ctx6;
++    /* Create a bitmap render target */
++    pixel_size.width = 100;
++    pixel_size.height = 100;
++    memset(&props, 0, sizeof(props));
++    props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
++    props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
++    hr = ID2D1DeviceContext6_CreateBitmap(context, pixel_size, NULL, 0,
++            &props, &target);
++    ok(hr == S_OK, "Failed to create bitmap, hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    ID2D1DeviceContext6_SetTarget(context, (ID2D1Image *)target);
++
++    /* Create SVG stream */
++    hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
++    ok(hr == S_OK, "Failed to create stream, hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    hr = IStream_Write(stream, svg_data, sizeof(svg_data) - 1, NULL);
++    ok(hr == S_OK, "Failed to write SVG data, hr %#lx.\n", hr);
++
++    IStream_Seek(stream, zero, STREAM_SEEK_SET, NULL);
++
++    viewport.width = 100.0f;
++    viewport.height = 100.0f;
++
++    hr = ID2D1DeviceContext6_CreateSvgDocument(context, stream, viewport, &svg);
++    if (hr == E_NOTIMPL || hr == E_NOINTERFACE)
++    {
++    skip("CreateSvgDocument not available.\n");
++    goto done;
++    }
++    ok(hr == S_OK, "Failed to create SVG document, hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    ok(svg != NULL, "Expected valid SVG document.\n");
++
++    ID2D1DeviceContext6_BeginDraw(context);
++    ID2D1DeviceContext6_DrawSvgDocument(context, svg);
++    hr = ID2D1DeviceContext6_EndDraw(context, NULL, NULL);
++    ok(hr == S_OK || hr == D2DERR_RECREATE_TARGET,
++            "Unexpected EndDraw hr %#lx.\n", hr);
++
++done:
++    if (svg) ID2D1Resource_Release((ID2D1Resource *)svg);
++    if (target) ID2D1Bitmap1_Release(target);
++    if (stream) IStream_Release(stream);
++    if (context) ID2D1DeviceContext6_Release(context);
++    if (device) ID2D1Device_Release(device);
++    if (dxgi_device) IDXGIDevice_Release(dxgi_device);
++    if (d3d_device) ID3D11Device_Release(d3d_device);
++    if (factory) ID2D1Factory1_Release(factory);
++}
++
+ START_TEST(d2d1)
+ {
+     HMODULE d2d1_dll = GetModuleHandleA("d2d1.dll");
+@@ -17981,6 +18098,6 @@ START_TEST(d2d1)
+     queue_d3d10_test(test_path_geometry_stream);
+     queue_d3d10_test(test_transformed_geometry);
+     queue_d3d10_test(test_glyph_run_world_bounds);
+-
++    queue_test(test_draw_svg_document);
+     run_queued_tests();
+ }
+
+--- dlls/d2d1/Makefile.in
++++ dlls/d2d1/Makefile.in
+@@ -1,24 +1,28 @@
+ MODULE    = d2d1.dll
+ IMPORTLIB = d2d1
+ IMPORTS   = d3d10_1 dxguid uuid gdi32 user32 advapi32 d3dcompiler
++UNIX_LIBS = -lm
++UNIXLIB   = d2d1.so
+ DELAYIMPORTS = dwrite xmllite ole32
+ 
+ VER_FILEDESCRIPTION_STR = "Wine Direct2D"
+ VER_PRODUCTVERSION      = 6,2,9200,16765
+ 
+ SOURCES = \
+-	bitmap.c \
+-	bitmap_render_target.c \
+-	brush.c \
+-	command_list.c \
+-	dc_render_target.c \
+-	device.c \
+-	effect.c \
+-	factory.c \
+-	geometry.c \
+-	hwnd_render_target.c \
+-	layer.c \
+-	mesh.c \
+-	state_block.c \
+-	stroke.c \
+-	wic_render_target.c
++        bitmap.c \
++        bitmap_render_target.c \
++        brush.c \
++        command_list.c \
++        dc_render_target.c \
++        device.c \
++        effect.c \
++        factory.c \
++        geometry.c \
++        hwnd_render_target.c \
++        layer.c \
++        mesh.c \
++        state_block.c \
++        svg.c \
++        stroke.c \
++        unixlib.c \
++        wic_render_target.c
+\ No newline at end of file
+
+--- dlls/d2d1/d2d1_private.h
++++ dlls/d2d1/d2d1_private.h
+@@ -36,6 +36,7 @@
+ #endif
+ #include "dwrite_2.h"
+ 
++
+ enum d2d_brush_type
+ {
+     D2D_BRUSH_TYPE_SOLID,
+@@ -223,6 +224,7 @@ struct d2d_device_context
+     struct d2d_indexed_objects vertex_buffers;
+ };
+ 
++
+ HRESULT d2d_d3d_create_render_target(struct d2d_device *device, IDXGISurface *surface, IUnknown *outer_unknown,
+         const struct d2d_device_context_ops *ops, const D2D1_RENDER_TARGET_PROPERTIES *desc,
+         void **render_target);
+@@ -248,6 +250,19 @@ struct d2d_wic_render_target
+     unsigned int bpp;
+ };
+ 
++struct d2d_svg_document{
++    ID2D1Resource ID2D1Resource_iface;
++    LONG refcount;
++    ID2D1Factory *factory;
++    void *rsvg_handle;
++    D2D1_SIZE_F viewport_size;
++};
++
++static inline struct d2d_svg_document *impl_from_ID2D1Resource(ID2D1Resource *iface)
++{
++    return CONTAINING_RECORD(iface, struct d2d_svg_document, ID2D1Resource_iface);
++}
++
+ HRESULT d2d_wic_render_target_init(struct d2d_wic_render_target *render_target, ID2D1Factory1 *factory,
+         ID3D10Device1 *d3d_device, IWICBitmap *bitmap, const D2D1_RENDER_TARGET_PROPERTIES *desc);
+ 
+@@ -631,6 +646,9 @@ void d2d_transformed_geometry_init(struct d2d_geometry *geometry, ID2D1Factory *
+         ID2D1Geometry *src_geometry, const D2D_MATRIX_3X2_F *transform);
+ HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *factory,
+         D2D1_FILL_MODE fill_mode, ID2D1Geometry **src_geometries, unsigned int geometry_count);
++HRESULT d2d_svg_document_create(struct d2d_device_context *context, IStream *stream,
++        D2D1_SIZE_F viewport_size, ID2D1SvgDocument **document);
++
+ struct d2d_geometry *unsafe_impl_from_ID2D1Geometry(ID2D1Geometry *iface);
+ 
+ struct d2d_geometry_realization
+
+--- dlls/d2d1/device.c
++++ dlls/d2d1/device.c
+@@ -19,8 +19,16 @@
+ #include "d2d1_private.h"
+ #include <d3dcompiler.h>
+ 
++#ifndef __i386__
++#include "unixlib.h"
++#endif
++
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
+ 
++#ifndef __i386__
++#define UNIX_CALL(func, params) WINE_UNIX_CALL(unix_ ## func, params)
++#endif
++
+ #define INITIAL_CLIP_STACK_SIZE 4
+ 
+ static const D2D1_MATRIX_3X2_F identity =
+@@ -3127,16 +3135,142 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_GetSvgGlyphImage(ID2D1Device
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateSvgDocument(ID2D1DeviceContext6 *iface,
+         IStream *input_xml_stream, D2D1_SIZE_F viewport_size, ID2D1SvgDocument **svg_document)
+ {
+-    FIXME("iface %p, input_xml_stream %p, svg_document %p stub!\n", iface, input_xml_stream,
+-            svg_document);
+ 
+-    return E_NOTIMPL;
++struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++
++    TRACE("iface %p, input_xml_stream %p, viewport_size {%.8e, %.8e}, svg_document %p. \n",
++            iface, input_xml_stream, viewport_size.width, viewport_size.height, svg_document);
++
++    return d2d_svg_document_create(context, input_xml_stream, viewport_size, svg_document);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_DrawSvgDocument(ID2D1DeviceContext6 *iface,
+         ID2D1SvgDocument *svg_document)
+ {
+-    FIXME("iface %p, svg_document %p stub!\n", iface, svg_document);
++#ifdef __i386__
++    FIXME("SVG rendering is not supported on 32-bit\n");
++#else
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    struct d2d_svg_document *svg_doc;
++    struct rsvg_render_params params;
++    ID2D1Bitmap *staging_bitmap = NULL;
++    void *pixels = NULL;
++    D2D1_RECT_F dest_rect;
++    D2D1_SIZE_U pixel_size;
++    D2D1_SIZE_F view_size;
++    D2D1_BITMAP_PROPERTIES props = {0};
++    UINT32 stride;
++    HRESULT hr;
++    NTSTATUS status;
++
++    TRACE("DrawSvgDocument START: svg_document=%p unixlib=%p\n", svg_document, wine_dbgstr_longlong(__wine_unixlib_handle));
++
++    if(!svg_document)
++    {
++        ERR("Invalid svg_document %p\n",svg_document);
++        return;
++    }
++
++    if(!__wine_unixlib_handle)
++    {
++        ERR("Unix lib not available\n");
++        return;
++    }
++
++    /* Get internal SVG document structure */
++    svg_doc = impl_from_ID2D1Resource((ID2D1Resource *)svg_document);
++    if(svg_doc == NULL)
++    {
++        FIXME("Couldn't get d2d_svg_document struct from ID2D1SvgDocument\n");
++        return;
++    }
++
++    /* Set bitmap size and view size */
++    view_size = svg_doc->viewport_size;
++
++    if(view_size.width <= 0.1f || view_size.height <= 0.1f)
++    {
++        ERR("Invalid view size must be non zero. %fx%f\n", view_size.width, view_size.height);
++        return;
++    }
++
++    TRACE("Setting up pixel size and stride.\n");
++
++    pixel_size.width = (UINT32)max(1.0f, ceilf(view_size.width * context->desc.dpiX / 96.0f));
++    pixel_size.height = (UINT32)max(1.0f, ceilf(view_size.height * context->desc.dpiY / 96.0f));
++    stride = pixel_size.width * 4;
++
++    TRACE("pixel size: %u x %u, view size: %f x %f, stride: %u.\n", pixel_size.width, pixel_size.height, view_size.width, view_size.height, stride);
++
++    TRACE("Allocating heap memory for pixel buffer.\n");
++    /* Set up pixel buffer */
++    pixels = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, stride * pixel_size.height);
++    if(!pixels)
++    {
++        ERR("Couldn't allocate pixel buffer for SVG rendering. Requested size: %u\n", (stride * pixel_size.height));
++        return;
++    }
++
++    TRACE("Setting up rendering parameters.\n");
++    /* Set up render params */
++    params.handle = svg_doc->rsvg_handle;
++    params.pixels = pixels;
++    params.width = pixel_size.width;
++    params.height = pixel_size.height;
++    params.stride = stride;
++    params.svg_width = svg_doc->viewport_size.width;
++    params.svg_height = svg_doc->viewport_size.height;
++
++    /* unix lib call to render with cairo directly to buffer */
++    TRACE("Calling Unix librsvg thunk\n");
++
++    status = UNIX_CALL(rsvg_render, &params);
++
++    TRACE("UNIX_CALL returned status=%08lx\n", status);
++    if(status)
++    {
++        ERR("Failed to render SVG: %08lx\n", status);
++        return;
++    }
++
++    TRACE("Successfully rendered SVG document\n");
++
++    /* Create bitmap properties */
++    TRACE("Setting up CreateBitmap function properties.\n");
++    props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
++    props.dpiX = context->desc.dpiX;
++    props.dpiY = context->desc.dpiY;
++
++    hr = ID2D1RenderTarget_CreateBitmap((ID2D1RenderTarget *)iface, pixel_size, pixels, stride, &props, &staging_bitmap);
++
++    if(FAILED(hr))
++    {
++        ERR("Failed to create staging bitmap: %lx\n", hr);
++        return;
++    }
++
++    dest_rect.left = 0.0f;
++    dest_rect.top = 0.0f;
++    dest_rect.right = view_size.width;
++    dest_rect.bottom = view_size.height;
++
++    TRACE("Destination rect properties: left: %f, right:%f, top:%f, bottom:%f\n",dest_rect.left, dest_rect.right, dest_rect.top, dest_rect.bottom);
++
++    d2d_device_context_draw_bitmap(context, staging_bitmap, &dest_rect, 1.0f,
++                                    D2D1_INTERPOLATION_MODE_LINEAR, NULL, NULL, NULL);
++
++    TRACE("Bitmap drawn to target rect\n");
++
++    TRACE("Cleaning up\n");
++
++    ID2D1Bitmap_Release(staging_bitmap);
++    HeapFree(GetProcessHeap(), 0, pixels);
++    /* Reset x87 FPU state after Cairo rendering. Cairo's fsin leaves the PE
++     * (Precision Exception) flag set, which causes SIGFPE when inherited by
++     * new threads running unmasked exceptions (CW=0x0040).*/
++    __asm__ volatile ("fninit");
++#endif
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateColorContextFromDxgiColorSpace(
+
+--- dlls/d2d1/factory.c
++++ dlls/d2d1/factory.c
+@@ -17,11 +17,16 @@
+  */
+ 
+ #define D2D1_INIT_GUID
++
+ #include "d2d1_private.h"
+ 
+ #include "xmllite.h"
+ #include "wine/list.h"
+ 
++#ifndef __i386__
++#include "wine/unixlib.h"
++#endif
++
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
+ 
+@@ -1696,6 +1701,11 @@ static void d2d_settings_init(void)
+ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
+ {
+     if (reason == DLL_PROCESS_ATTACH)
++    {
+         d2d_settings_init();
++#ifndef __i386__
++        __wine_init_unix_call();
++#endif
++    }
+     return TRUE;
+ }
+
+--- dlls/d2d1/svg.c
++++ dlls/d2d1/svg.c
+@@ -0,0 +1,180 @@
++/*
++ * Copyright 2025 Jakub Woźniak
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++/* This is the PE (Windows) side of the SVG implementation.
++ * It does NOT call dlopen directly - instead it calls into
++ * unixlib.c via the Wine unix call mechanism. */
++
++#include "d2d1_private.h"
++#include "unixlib.h"
++
++/* Shorthand macro for calling into our Unix lib */
++#define UNIX_CALL(func, params) WINE_UNIX_CALL(unix_ ## func, params)
++
++WINE_DEFAULT_DEBUG_CHANNEL(d2d);
++
++/* Heap helpers */
++static inline void *heap_alloc(size_t size)
++{
++    return HeapAlloc(GetProcessHeap(), 0, size);
++}
++
++static inline void *heap_alloc_zero(size_t size)
++{
++    return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size);
++}
++
++static inline BOOL heap_free(void *ptr)
++{
++    return HeapFree(GetProcessHeap(), 0, ptr);
++}
++
++/* COM interface implementation */
++
++static HRESULT STDMETHODCALLTYPE d2d_svg_document_QueryInterface(ID2D1Resource *iface,
++        REFIID iid, void **out)
++{
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_ID2D1Resource)
++            || IsEqualGUID(iid, &IID_IUnknown))
++    {
++        ID2D1Resource_AddRef(iface);
++        *out = iface;
++        return S_OK;
++    }
++
++    FIXME("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE d2d_svg_document_AddRef(ID2D1Resource *iface)
++{
++    struct d2d_svg_document *document = impl_from_ID2D1Resource(iface);
++    ULONG refcount = InterlockedIncrement(&document->refcount);
++
++    TRACE("%p increasing refcount to %lu.\n", iface, refcount);
++    return refcount;
++}
++
++static ULONG STDMETHODCALLTYPE d2d_svg_document_Release(ID2D1Resource *iface)
++{
++    struct d2d_svg_document *document = impl_from_ID2D1Resource(iface);
++    ULONG refcount = InterlockedDecrement(&document->refcount);
++
++    TRACE("%p decreasing refcount to %lu.\n", iface, refcount);
++
++    if (!refcount)
++    {
++        /* Free the librsvg handle via the unix lib */
++        if (document->rsvg_handle && __wine_unixlib_handle)
++        {
++            struct rsvg_free_params params;
++            params.handle = document->rsvg_handle;
++            UNIX_CALL(rsvg_free_handle, &params);
++        }
++        if (document->factory)
++            ID2D1Factory_Release(document->factory);
++        heap_free(document);
++    }
++
++    return refcount;
++}
++
++static void STDMETHODCALLTYPE d2d_svg_document_GetFactory(ID2D1Resource *iface,
++        ID2D1Factory **factory)
++{
++    struct d2d_svg_document *document = impl_from_ID2D1Resource(iface);
++    TRACE("iface %p, factory %p.\n", iface, factory);
++    *factory = document->factory;
++    ID2D1Factory_AddRef(*factory);
++}
++
++static const ID2D1ResourceVtbl d2d_svg_document_vtbl =
++{
++    d2d_svg_document_QueryInterface,
++    d2d_svg_document_AddRef,
++    d2d_svg_document_Release,
++    d2d_svg_document_GetFactory,
++};
++
++HRESULT d2d_svg_document_create(struct d2d_device_context *context, IStream *stream,
++        D2D1_SIZE_F viewport_size, ID2D1SvgDocument **document)
++{
++    struct rsvg_create_params params;
++    struct d2d_svg_document *object;
++    STATSTG stat;
++    void *buffer;
++    ULONG read_len;
++    NTSTATUS status;
++
++    TRACE("context %p, stream %p, viewport_size {%.8e, %.8e}, document %p.\n",
++            context, stream, viewport_size.width, viewport_size.height, document);
++
++    /* Check unix lib is available */
++    if (!__wine_unixlib_handle)
++    {
++        WARN("Unix lib not available, SVG not supported\n");
++        return E_NOTIMPL;
++    }
++
++    /* Read the SVG stream into a buffer */
++    if (FAILED(IStream_Stat(stream, &stat, STATFLAG_NONAME)))
++    {
++        ERR("Failed to stat stream\n");
++        return E_FAIL;
++    }
++
++    buffer = heap_alloc(stat.cbSize.QuadPart);
++    if (!buffer)
++        return E_OUTOFMEMORY;
++
++    if (FAILED(IStream_Read(stream, buffer, stat.cbSize.QuadPart, &read_len)))
++    {
++        ERR("Failed to read stream\n");
++        heap_free(buffer);
++        return E_FAIL;
++    }
++
++    /* Ask the Unix side to parse the SVG with librsvg */
++    params.data   = buffer;
++    params.size   = read_len;
++    params.handle = NULL;
++
++    status = UNIX_CALL(rsvg_create_handle, &params);
++    heap_free(buffer);
++
++    if (status)
++    {
++        ERR("Unix lib failed to create rsvg handle: %08lx\n", status);
++        return E_FAIL;
++    }
++
++    /* Allocate our COM object */
++    if (!(object = heap_alloc_zero(sizeof(*object))))
++    {
++        /* Free the rsvg handle we just created */
++        struct rsvg_free_params free_params;
++        free_params.handle = params.handle;
++        UNIX_CALL(rsvg_free_handle, &free_params);
++        return E_OUTOFMEMORY;
++    }
++
++    object->ID2D1Resource_iface.lpVtbl = &d2d_svg_document_vtbl;
++    object->refcount       = 1;
++    object->viewport_size  = viewport_size;
++    object->rsvg_handle    = params.handle;
++    object->factory        = context->factory;
++    ID2D1Factory_AddRef(object->factory);
++
++    TRACE("Created SVG document %p with rsvg handle %p.\n", object, params.handle);
++    *document = (ID2D1SvgDocument *)&object->ID2D1Resource_iface;
++    return S_OK;
++}
+\ No newline at end of file
+
+--- dlls/d2d1/unixlib.c
++++ dlls/d2d1/unixlib.c
+@@ -0,0 +1,278 @@
++/*
++ * Copyright 2025 Jakub Woźniak
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++/* This file is compiled as NATIVE LINUX CODE (not Windows PE code).
++ * The #pragma makedep unix tells the Wine build system to compile
++ * this file without -mabi=ms and other Windows ABI flags.
++ * This means dlopen/dlsym work correctly here. */
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++#include <stdarg.h>
++#include <dlfcn.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "wine/debug.h"
++#include "unixlib.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(d2d);
++
++/* Opaque librsvg types - we don't need the real headers */
++typedef void RsvgHandle;
++typedef void GError;
++
++/* librsvg function pointer types */
++typedef RsvgHandle *(*rsvg_handle_new_from_data_t)(const unsigned char *data,
++        size_t data_len, GError **error);
++typedef void (*g_object_unref_t)(void *object);
++typedef void (*g_error_free_t)(GError *error);
++typedef void (*rsvg_handle_render_document_t)(RsvgHandle*, void*, void*, void*);
++typedef void*(*cairo_image_surface_create_for_data_t)(unsigned char*, int, int, int, int);
++typedef void*(*cairo_create_t)(void*);
++typedef void (*cairo_destroy_t)(void*);
++typedef void (*cairo_surface_destroy_t)(void*);
++typedef void (*cairo_scale_t)(void*, double, double);
++typedef struct{
++    double x;
++    double y;
++    double width;
++    double height;
++} RsvgRectangle;
++/* Loaded library and function pointers */
++static void *libcairo = NULL;
++static cairo_image_surface_create_for_data_t p_cairo_image_surface_create_for_data;
++static cairo_create_t p_cairo_create;
++static cairo_destroy_t p_cairo_destroy;
++static cairo_surface_destroy_t p_cairo_surface_destroy;
++static cairo_scale_t p_cairo_scale;
++
++static void *librsvg_so = NULL;
++static rsvg_handle_new_from_data_t p_rsvg_handle_new_from_data = NULL;
++static rsvg_handle_render_document_t p_rsvg_handle_render_document;
++static g_object_unref_t            p_g_object_unref            = NULL;
++static g_error_free_t              p_g_error_free              = NULL;
++
++static BOOL load_librsvg(void)
++{
++    if (librsvg_so) return TRUE;
++
++    /* dlopen works here because this file is compiled as native Linux code */
++    librsvg_so = dlopen("librsvg-2.so.2", RTLD_NOW);
++    if (!librsvg_so)
++    {
++        ERR("Failed to load librsvg-2.so.2: %s\n", dlerror());
++        return FALSE;
++    }
++
++    p_rsvg_handle_new_from_data = dlsym(librsvg_so, "rsvg_handle_new_from_data");
++    p_g_object_unref            = dlsym(librsvg_so, "g_object_unref");
++    p_g_error_free              = dlsym(librsvg_so, "g_error_free");
++    p_rsvg_handle_render_document = dlsym(librsvg_so, "rsvg_handle_render_document");
++
++    if (!p_rsvg_handle_new_from_data || !p_g_object_unref || !p_g_error_free || !p_rsvg_handle_render_document)
++    {
++        ERR("Failed to find required librsvg symbols\n");
++        dlclose(librsvg_so);
++        librsvg_so = NULL;
++        return FALSE;
++    }
++
++    TRACE("librsvg loaded successfully!\n");
++    return TRUE;
++}
++
++static BOOL load_cairo(void){
++
++    if(libcairo) return TRUE;
++
++    libcairo = dlopen("libcairo.so.2", RTLD_NOW);
++
++    if(!libcairo)
++    {
++        ERR("Failed to load libcairo: %s\n", dlerror());
++        return FALSE;
++    }
++
++    p_cairo_image_surface_create_for_data = dlsym(libcairo, "cairo_image_surface_create_for_data");
++    p_cairo_create = dlsym(libcairo, "cairo_create");
++    p_cairo_destroy = dlsym(libcairo, "cairo_destroy");
++    p_cairo_surface_destroy = dlsym(libcairo, "cairo_surface_destroy");
++    p_cairo_scale = dlsym(libcairo, "cairo_scale");
++
++    if(!p_cairo_image_surface_create_for_data || !p_cairo_create)
++    {
++        ERR("Failed to find Cairo symbols\n");
++        dlclose(libcairo);
++        libcairo = NULL;
++        return FALSE;
++    }
++
++    TRACE("Cairo loaded successfully!\n");
++    return TRUE;
++}
++
++/* Called from PE side via UNIX_CALL(rsvg_create_handle, &params) */
++static NTSTATUS rsvg_create_handle(void *args)
++{
++    struct rsvg_create_params *params = args;
++    void *error = NULL;
++
++    params->handle = NULL;
++
++    if (!load_librsvg())
++        return STATUS_NOT_SUPPORTED;
++
++    params->handle = p_rsvg_handle_new_from_data(params->data, params->size, &error);
++
++    if (!params->handle)
++    {
++        ERR("librsvg failed to parse SVG data\n");
++        if (error) p_g_error_free(error);
++        return STATUS_UNSUCCESSFUL;
++    }
++
++    TRACE("Created rsvg handle %p\n", params->handle);
++    return STATUS_SUCCESS;
++}
++
++/* Called from PE side via UNIX_CALL(rsvg_free_handle, &params) */
++static NTSTATUS rsvg_free_handle(void *args)
++{
++    struct rsvg_free_params *params = args;
++
++    if (params->handle && p_g_object_unref)
++        p_g_object_unref(params->handle);
++
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS rsvg_render(void *args){
++    struct rsvg_render_params *params = args;
++    void *surface = NULL, *cr = NULL;
++    RsvgRectangle viewport;
++    double scale_x, scale_y;
++    NTSTATUS ret = STATUS_SUCCESS;
++
++    TRACE("rsvg_render called: handle=%p, pixels:%p, %ux%u stride=%u\n",
++          params->handle, params->pixels, params->width, params->height, params->stride);
++
++    if(!params->handle || !params->pixels)
++    {
++        ERR("Invalid parameters: handle:%p pixels:%p\n", params->handle, params->pixels);
++        ret = STATUS_INVALID_PARAMETER;
++        goto done;
++    }
++
++    if(params->svg_width <= 0.01 && params->svg_height <= 0.01)
++    {
++        ERR("Invalid viewport: %fx%f\n", params->svg_width, params->svg_height);
++        ret = STATUS_INVALID_PARAMETER;
++        goto done;
++    }
++
++    if(params->width == 0 || params->height == 0 || params->stride == 0)
++    {
++        ERR("Invalid dimensions: %ux%u stride=%u\n",params->width, params->height, params->stride);
++        ret = STATUS_INVALID_PARAMETER;
++        goto done;
++    }
++
++    if(!load_librsvg() || !load_cairo())
++    {
++        ret = STATUS_NOT_SUPPORTED;
++        goto done;
++    }
++
++    if(!p_rsvg_handle_render_document)
++    {
++        ERR("rsvg_handle_render_document symbol not found\n");
++        ret = STATUS_NOT_SUPPORTED;
++        goto done;
++    }
++
++    TRACE("Creating cairo surface...\n");
++
++    /* Create Cairo surface wrapping D2D bitmap pixels in CAIRO_FORMAT_ARGB32 */
++    surface = p_cairo_image_surface_create_for_data(
++        params->pixels,
++        0,  /* CAIRO_FORMAT_ARGB32 */
++        params->width,
++        params->height,
++        params->stride
++    );
++
++    if(!surface)
++    {
++        ERR("Failed to create Cairo surface\n");
++        ret = STATUS_UNSUCCESSFUL;
++        goto done;
++    }
++
++    TRACE("Creating cairo context...\n");
++
++    cr = p_cairo_create(surface);
++    if(!cr){
++        p_cairo_surface_destroy(surface);
++        ret = STATUS_UNSUCCESSFUL;
++        goto done;
++    }
++
++    /* explicit double cast for precision*/
++    scale_x = (double)params->width / params->svg_width;
++    scale_y = (double)params->height / params->svg_height;
++
++    if(scale_x <= 0.0 || scale_x > 1000.0 || scale_y <= 0.0 || scale_y > 1000.0)
++    {
++        ERR("Invalid scale values: %fx%f\n",scale_x,scale_y);
++        ret = STATUS_INVALID_PARAMETER;
++        goto done;
++    }
++
++    TRACE("Scaling and rendering...\n");
++
++    p_cairo_scale(cr, scale_x, scale_y);
++
++
++    TRACE("Preparing Rsvg viewport...\n");
++
++    viewport.x = 0;
++    viewport.y = 0;
++    viewport.width = (double)params->svg_width;
++    viewport.height = (double)params->svg_height;
++
++
++    TRACE("Calling rsvg_handle_render_document...\n");
++
++    p_rsvg_handle_render_document(params->handle, cr, &viewport, NULL);
++
++done:
++    TRACE("Cleaning up...\n");
++
++    if(cr) p_cairo_destroy(cr);
++    if(surface) p_cairo_surface_destroy(surface);
++
++    /* Reset x87 FPU state after Cairo rendering. Cairo's fsin leaves the PE
++     * (Precision Exception) flag set, which causes SIGFPE when inherited by
++     * new threads running unmasked exceptions (CW=0x0040).*/
++    __asm__ volatile ("fninit");
++    return ret;
++}
++
++/* This table MUST match the order of enum d2d1_unix_funcs in unixlib.h */
++const unixlib_entry_t __wine_unix_call_funcs[] =
++{
++    rsvg_create_handle,  /* unix_rsvg_create_handle */
++    rsvg_free_handle,    /* unix_rsvg_free_handle   */
++    rsvg_render,         /* unix_rsvg_render        */
++};
+\ No newline at end of file
+
+--- dlls/d2d1/unixlib.h
++++ dlls/d2d1/unixlib.h
+@@ -0,0 +1,48 @@
++/*
++ * Copyright 2025 Jakub Woźniak
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef __D2D1_UNIXLIB_H
++#define __D2D1_UNIXLIB_H
++
++#include "wine/unixlib.h"
++
++/* Commands that the PE side can call into the Unix side */
++enum d2d1_unix_funcs
++{
++    unix_rsvg_create_handle,
++    unix_rsvg_free_handle,
++    unix_rsvg_render,
++};
++
++/* Parameters for creating an SVG handle from raw data */
++struct rsvg_create_params
++{
++    const unsigned char *data;  /* in:  SVG XML data */
++    ULONG               size;   /* in:  size of data */
++    void               *handle; /* out: RsvgHandle* on success */
++};
++
++/* Parameters for freeing an SVG handle */
++struct rsvg_free_params
++{
++    void *handle; /* in: RsvgHandle* to free */
++};
++
++struct rsvg_render_params
++{
++    void *handle;       // in: RsvgHandle*
++    void *pixels;       // in: pointer to bitmap pixels
++    double svg_width;   // in: viewport width
++    double svg_height;  // in: viewport height
++    UINT32 width;       // in: bitmap width
++    UINT32 height;      // in: bitmap height
++    UINT32 stride;      // in: bytes per row
++    UINT32 padding;
++};
++#endif /* __D2D1_UNIXLIB_H */
+\ No newline at end of file
+

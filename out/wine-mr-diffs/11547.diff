@@ -1,0 +1,55 @@
+# ntdll: Map high-entropy ASLR executables at a high address.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11547 state=closed
+# Wine only relocates DLLs, so executables are mapped at their preferred ImageBase. Windows relocates executables that opt into ASLR like any other image, and maps the ones with IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA in the 0x7ff6...-0x7ff8... range.
+
+This assigns such executables an address from that range in map_image_view(), before the preferred base is tried, and falls back to the existing behaviour if the range is unavailable. Only images that set the flag are affected.
+
+Verified with a minimal executable linked with --dynamicbase --high-entropy-va and the same preferred base as the game below: it maps at 0x140000000 on master and at 0x7ff600000000 with this change.
+
+Found with Rainbow Six Siege (appid 359550), whose anti-tamper layer depends on landing there: mapped at 0x140000000 it dereferences a non-canonical pointer and crashes seconds after startup.
+
+```
+EXCEPTION_ACCESS_VIOLATION, read at 0xFFFFFFFFFFFFFFFF
+RIP = RainbowSix.exe+0x5F35B64, RCX = 0xD2729D1609B37359
+```
+
+Downstream report: https://github.com/ValveSoftware/wine/pull/344
+--- dlls/ntdll/unix/unix_private.h
++++ dlls/ntdll/unix/unix_private.h
+@@ -57,6 +57,10 @@ static const BOOL is_win64 = (sizeof(void *) > sizeof(int));
+ static const ULONG_PTR limit_2g = (ULONG_PTR)1 << 31;
+ static const ULONG_PTR limit_4g = (ULONG_PTR)((ULONGLONG)1 << 32);
+ 
++/* range used on Windows for executables with high-entropy ASLR */
++static const ULONG_PTR high_entropy_low  = (ULONG_PTR)((ULONGLONG)0x7ff6 << 32);
++static const ULONG_PTR high_entropy_high = (ULONG_PTR)((ULONGLONG)0x7ff8 << 32);
++
+ static inline BOOL is_machine_64bit( WORD machine )
+ {
+     return (machine == IMAGE_FILE_MACHINE_AMD64 || machine == IMAGE_FILE_MACHINE_ARM64);
+
+--- dlls/ntdll/unix/virtual.c
++++ dlls/ntdll/unix/virtual.c
+@@ -3351,6 +3351,21 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
+     limit_low = max( limit_low, (ULONG_PTR)address_space_start );  /* make sure the DOS area remains free */
+     if (!limit_high) limit_high = (ULONG_PTR)user_space_limit;
+ 
++    /* executables that opt into high-entropy ASLR are mapped high, like on Windows */
++
++    if (is_win64 && !(image_info->image_charact & IMAGE_FILE_DLL) &&
++        (image_info->image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated) &&
++        (image_info->dll_charact & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA))
++    {
++        start = max( limit_low, high_entropy_low );
++        end = min( limit_high, high_entropy_high );
++        if (start < end)
++        {
++            status = map_view( view_ret, NULL, size, 0, vprot, start, end, 0 );
++            if (!status) return status;
++        }
++    }
++
+     /* first try the specified base */
+ 
+     if (image_info->map_addr)
+

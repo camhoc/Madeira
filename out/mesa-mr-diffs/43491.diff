@@ -1,0 +1,459 @@
+# kk: Route presentation through Metal3 due to window server crash
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/43491 state=closed
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+Ugly hack, but at least we don't crash the whole window system logging out users. I'm pretty sure this is an OS bug but haven't added the workaround flag for now since I'd like to investigate a little further (and Apple seems to be quite responsive with the report on this one). Maybe we can roll this back eventually.
+
+```
+kk: Route present through Metal3 to avoid window server crash
+    
+If we use Metal4 for presentation the window server will crash with faster
+GPUs such as M4 Max or M5 Pro. The reason it's not well understood but all
+points to a Metal bug. This commit routes the presentation command through
+Metal3 which doesn't have the mentioned crash
+    
+Signed-off-by: Aitor Camacho <aitor@lunarg.com>
+```
+
+```
+wsi/metal: Flag to understand if WSI needs to call present on drawable
+
+Signed-off-by: Aitor Camacho <aitor@lunarg.com>
+```
+--- src/kosmickrisp/bridge/stubs/mtl3_backend.c
++++ src/kosmickrisp/bridge/stubs/mtl3_backend.c
+@@ -0,0 +1,58 @@
++/*
++ * Copyright 2026 LunarG, Inc.
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "mtl3_backend.h"
++
++/* MTLCommandQueue */
++mtl_command_queue *
++mtl_new_command_queue(mtl_device *device)
++{
++   return NULL;
++}
++
++mtl_command_buffer *
++mtl3_new_command_buffer(mtl_command_queue *queue)
++{
++   return NULL;
++}
++
++void
++mtl3_encode_wait_for_event(mtl_command_buffer *cmd, mtl_event *event,
++                           uint64_t value)
++{
++}
++
++void
++mtl3_encode_signal_for_event(mtl_command_buffer *cmd, mtl_event *event,
++                             uint64_t value)
++{
++}
++
++void
++mtl3_copy_from_texture_to_texture(mtl_command_buffer *cmd, mtl_texture *src,
++                                  size_t src_slice, size_t src_level,
++                                  struct mtl_origin src_origin,
++                                  struct mtl_size src_size, mtl_texture *dst,
++                                  size_t dst_slice, size_t dst_level,
++                                  struct mtl_origin dst_origin)
++{
++}
++
++void
++mtl3_add_completed_handler(mtl_command_buffer *cmd, void (*callback)(void *),
++                           void *data)
++{
++}
++
++void
++mtl3_present_drawable(mtl_command_buffer *cmd, void *drawable)
++{
++}
++
++void
++mtl3_commit(mtl_command_buffer *cmd)
++{
++}
+
+--- src/kosmickrisp/bridge/meson.build
++++ src/kosmickrisp/bridge/meson.build
+@@ -24,6 +24,7 @@ if host_machine.system() == 'darwin'
+     'mtl_sampler.m',
+     'mtl_sync.m',
+     'mtl_texture.m',
++    'mtl3_backend.m',
+     'ns_process_info.m',
+   )
+ else
+@@ -42,6 +43,7 @@ else
+     'stubs/mtl_sampler.c',
+     'stubs/mtl_sync.c',
+     'stubs/mtl_texture.c',
++    'stubs/mtl3_backend.c',
+     'stubs/ns_process_info.c',
+   )
+ endif
+
+--- src/kosmickrisp/bridge/mtl3_backend.h
++++ src/kosmickrisp/bridge/mtl3_backend.h
+@@ -0,0 +1,32 @@
++/*
++ * Copyright 2026 LunarG, Inc.
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef KK_MTL3_BACKEND_H
++#define KK_MTL3_BACKEND_H 1
++
++#include "mtl_types.h"
++
++#include <inttypes.h>
++
++mtl_command_queue *mtl3_new_command_queue(mtl_device *device);
++mtl_command_buffer *mtl3_new_command_buffer(mtl_command_queue *queue);
++void mtl3_encode_wait_for_event(mtl_command_buffer *cmd, mtl_event *event,
++                                uint64_t value);
++void mtl3_encode_signal_for_event(mtl_command_buffer *cmd, mtl_event *event,
++                                  uint64_t value);
++void mtl3_copy_from_texture_to_texture(
++   mtl_command_buffer *cmd, mtl_texture *src, size_t src_slice,
++   size_t src_level, struct mtl_origin src_origin, struct mtl_size src_size,
++   mtl_texture *dst, size_t dst_slice, size_t dst_level,
++   struct mtl_origin dst_origin);
++
++void mtl3_add_completed_handler(mtl_command_buffer *cmd,
++                                void (*callback)(void *), void *data);
++
++void mtl3_present_drawable(mtl_command_buffer *cmd, void *drawable);
++void mtl3_commit(mtl_command_buffer *cmd);
++
++#endif /* KK_MTL3_BACKEND_H */
+
+--- src/kosmickrisp/bridge/mtl3_backend.m
++++ src/kosmickrisp/bridge/mtl3_backend.m
+@@ -0,0 +1,115 @@
++/*
++ * Copyright 2026 LunarG, Inc.
++ * Copyright 2026 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "mtl3_backend.h"
++
++#include <Metal/MTLDevice.h>
++#include <Metal/MTLCommandQueue.h>
++#import <QuartzCore/CAMetalLayer.h>
++
++/* MTLCommandQueue */
++mtl_command_queue *
++mtl3_new_command_queue(mtl_device *device)
++{
++   @autoreleasepool {
++      id<MTLDevice> dev = (id<MTLDevice>)device;
++      return [dev newCommandQueueWithMaxCommandBufferCount:256];
++   }
++}
++
++mtl_command_buffer *
++mtl3_new_command_buffer(mtl_command_queue *queue)
++{
++   @autoreleasepool {
++      id<MTLCommandQueue> q = (id<MTLCommandQueue>)queue;
++      return [[q commandBuffer] retain];
++   }
++}
++
++void
++mtl3_encode_wait_for_event(mtl_command_buffer *cmd, mtl_event *event,
++                           uint64_t value)
++{
++   @autoreleasepool {
++      id<MTLCommandBuffer> c = (id<MTLCommandBuffer>)cmd;
++      id<MTLEvent> e = (id<MTLEvent>)event;
++      return [c encodeWaitForEvent:e value:value];
++   }
++}
++
++void
++mtl3_encode_signal_for_event(mtl_command_buffer *cmd, mtl_event *event,
++                             uint64_t value)
++{
++   @autoreleasepool {
++      id<MTLCommandBuffer> c = (id<MTLCommandBuffer>)cmd;
++      id<MTLEvent> e = (id<MTLEvent>)event;
++      return [c encodeSignalEvent:e value:value];
++   }
++}
++
++void
++mtl3_copy_from_texture_to_texture(mtl_command_buffer *cmd, mtl_texture *src,
++                                  size_t src_slice, size_t src_level,
++                                  struct mtl_origin src_origin,
++                                  struct mtl_size src_size, mtl_texture *dst,
++                                  size_t dst_slice, size_t dst_level,
++                                  struct mtl_origin dst_origin)
++{
++   @autoreleasepool {
++      id<MTLCommandBuffer> c = (id<MTLCommandBuffer>)cmd;
++      id<MTLBlitCommandEncoder> enc = [c blitCommandEncoder];
++
++      MTLOrigin mtl_src_origin = MTLOriginMake(src_origin.x, src_origin.y, src_origin.z);
++      MTLSize mtl_src_size = MTLSizeMake(src_size.x, src_size.y, src_size.z);
++      MTLOrigin mtl_dst_origin = MTLOriginMake(dst_origin.x, dst_origin.y, dst_origin.z);
++      id<MTLTexture> mtl_dst_tex = (id<MTLTexture>)dst;
++      id<MTLTexture> mtl_src_tex = (id<MTLTexture>)src;
++      [enc copyFromTexture:mtl_src_tex
++               sourceSlice:src_slice
++               sourceLevel:src_level
++              sourceOrigin:mtl_src_origin
++                sourceSize:mtl_src_size
++                 toTexture:mtl_dst_tex
++          destinationSlice:dst_slice
++          destinationLevel:dst_level
++         destinationOrigin:mtl_dst_origin];
++      [enc endEncoding];
++   }
++}
++
++void
++mtl3_add_completed_handler(mtl_command_buffer *cmd, void (*callback)(void *),
++                           void *data)
++{
++   @autoreleasepool {
++      id<MTLCommandBuffer> c = (id<MTLCommandBuffer>)cmd;
++      [c addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++        callback(data);
++        [cb release];
++      }];
++   }
++}
++
++void
++mtl3_present_drawable(mtl_command_buffer *cmd, void *drawable)
++{
++   @autoreleasepool {
++      id<MTLCommandBuffer> c = (id<MTLCommandBuffer>)cmd;
++      id<CAMetalDrawable> d = (id<CAMetalDrawable>)drawable;
++
++      [c presentDrawable:d];
++   }
++}
++
++void
++mtl3_commit(mtl_command_buffer *cmd)
++{
++   @autoreleasepool {
++      id<MTLCommandBuffer> c = (id<MTLCommandBuffer>)cmd;
++      [c commit];
++   }
++}
+
+--- src/kosmickrisp/bridge/mtl_bridge.h
++++ src/kosmickrisp/bridge/mtl_bridge.h
+@@ -21,6 +21,7 @@
+ 
+ #include "mtl_types.h"
+ 
++#include "mtl3_backend.h"
+ #include "mtl_argument_table.h"
+ #include "mtl_buffer.h"
+ #include "mtl_command_buffer.h"
+
+--- src/kosmickrisp/vulkan/kk_queue.c
++++ src/kosmickrisp/vulkan/kk_queue.c
+@@ -17,6 +17,80 @@
+ 
+ #include "vk_cmd_queue.h"
+ 
++static void
++metal3_presentation_callback(void *data)
++{
++   mtl_release(data);
++}
++
++static void
++metal3_submit(struct kk_queue *queue, struct vk_queue_submit *submit)
++{
++   mtl_command_buffer *cmd = mtl3_new_command_buffer(queue->mtl3_handle);
++   for (struct vk_sync_wait *wait = submit->waits,
++                            *end = submit->waits + submit->wait_count;
++        wait != end; ++wait) {
++      struct kk_sync_timeline *sync =
++         container_of(wait->sync, struct kk_sync_timeline, base);
++      mtl3_encode_wait_for_event(cmd, sync->mtl_handle, wait->wait_value);
++   }
++
++   /* We know present command buffers only contain a few pipeline barriers and a
++    * single copy command, find the single copy command in the command buffer. */
++   struct kk_cmd_buffer *cmd_buffer =
++      container_of(submit->command_buffers[0], struct kk_cmd_buffer, vk);
++   struct vk_cmd_queue *cmd_queue = &cmd_buffer->vk.cmd_queue;
++   list_for_each_entry(struct vk_cmd_queue_entry, command, &cmd_queue->cmds,
++                       cmd_link) {
++      switch (command->type) {
++      case VK_CMD_COPY_IMAGE: {
++         const struct vk_cmd_copy_image *copy = &command->u.copy_image;
++         VK_FROM_HANDLE(kk_image, src, copy->src_image);
++         VK_FROM_HANDLE(kk_image, dst, copy->dst_image);
++         for (uint32_t i = 0u; i < copy->region_count; ++i) {
++            const VkImageCopy *region = &copy->regions[i];
++            const VkExtent3D extent_px =
++               vk_image_sanitize_extent(&src->vk, region->extent);
++            size_t src_slice = region->srcSubresource.baseArrayLayer;
++            size_t src_level = region->srcSubresource.mipLevel;
++            struct mtl_origin src_origin =
++               vk_offset_3d_to_mtl_origin(&region->srcOffset);
++            struct mtl_size size = {.x = extent_px.width,
++                                    .y = extent_px.height,
++                                    .z = extent_px.depth};
++            size_t dst_slice = region->dstSubresource.baseArrayLayer;
++            size_t dst_level = region->dstSubresource.mipLevel;
++            struct mtl_origin dst_origin =
++               vk_offset_3d_to_mtl_origin(&region->dstOffset);
++
++            mtl3_copy_from_texture_to_texture(cmd, src->planes[0].mtl_handle,
++                                              src_slice, src_level, src_origin,
++                                              size, dst->planes[0].mtl_handle,
++                                              dst_slice, dst_level, dst_origin);
++         }
++         break;
++      }
++      default:
++         break;
++      }
++   }
++
++   mtl3_present_drawable(cmd, cmd_buffer->drawable);
++
++   for (uint32_t i = 0u; i < submit->signal_count; ++i) {
++      struct vk_sync_signal *signal = &submit->signals[i];
++      struct kk_sync_timeline *sync =
++         container_of(signal->sync, struct kk_sync_timeline, base);
++      mtl3_encode_signal_for_event(cmd, sync->mtl_handle, signal->signal_value);
++   }
++
++   mtl3_add_completed_handler(cmd, metal3_presentation_callback,
++                              cmd_buffer->drawable);
++   cmd_buffer->drawable = NULL;
++
++   mtl3_commit(cmd);
++}
++
+ static void
+ commit_callback(struct mtl_feedback_data *data)
+ {
+@@ -44,15 +118,10 @@ rerecord_cmd_buffer(struct kk_cmd_buffer *cmd)
+    kk_device_make_resources_resident(dev);
+ }
+ 
+-static VkResult
+-kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
++static void
++metal4_submit(struct kk_queue *queue, struct vk_queue_submit *submit)
+ {
+-   struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
+    struct kk_device *dev = kk_queue_device(queue);
+-
+-   if (vk_queue_is_lost(&queue->vk))
+-      return VK_ERROR_DEVICE_LOST;
+-
+    for (struct vk_sync_wait *wait = submit->waits,
+                             *end = submit->waits + submit->wait_count;
+         wait != end; ++wait) {
+@@ -109,6 +178,25 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+       mtl_signal_event(queue->mtl_handle, sync->mtl_handle,
+                        signal->signal_value);
+    }
++}
++
++static VkResult
++kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
++{
++   struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
++
++   if (vk_queue_is_lost(&queue->vk))
++      return VK_ERROR_DEVICE_LOST;
++
++   /* Queue presents only have a single command buffer that contains the
++    * drawable */
++   if (submit->command_buffer_count == 1 &&
++       (container_of(submit->command_buffers[0], struct kk_cmd_buffer, vk))
++          ->drawable) {
++      metal3_submit(queue, submit);
++   } else {
++      metal4_submit(queue, submit);
++   }
+ 
+    return VK_SUCCESS;
+ }
+@@ -149,6 +237,7 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+    queue->mtl_handle = mtl_new_command_queue(dev->mtl_handle);
+    mtl_command_queue_add_residency_set(queue->mtl_handle,
+                                        dev->residency_set.handle);
++   queue->mtl3_handle = mtl3_new_command_queue(dev->mtl_handle);
+    queue->commit_options = mtl_new_commit_options();
+ 
+    queue->vk.driver_submit = kk_queue_submit;
+@@ -162,6 +251,7 @@ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
+    mtl_command_queue_remove_residency_set(queue->mtl_handle,
+                                           dev->residency_set.handle);
+    mtl_release(queue->commit_options);
++   mtl_release(queue->mtl3_handle);
+    mtl_release(queue->mtl_handle);
+    vk_queue_finish(&queue->vk);
+ }
+
+--- src/kosmickrisp/vulkan/kk_queue.h
++++ src/kosmickrisp/vulkan/kk_queue.h
+@@ -16,6 +16,7 @@
+ 
+ struct kk_queue {
+    struct vk_queue vk;
++   struct mtl_command_queue *mtl3_handle;
+    struct mtl_command_queue *mtl_handle;
+    mtl_commit_options *commit_options;
+ };
+
+--- src/kosmickrisp/vulkan/kk_wsi.c
++++ src/kosmickrisp/vulkan/kk_wsi.c
+@@ -113,7 +113,6 @@ kk_init_wsi(struct kk_physical_device *pdev)
+ 
+    wsi->metal.bind_drawable_to_vkimage = kk_bind_drawable_to_vkimage;
+    wsi->metal.encode_drawable_present = kk_encode_drawable_present;
+-   wsi->metal.get_mtl4_command_queue = kk_get_mtl4_command_queue;
+    wsi->get_blit_queue = kk_get_blit_queue;
+ 
+    pdev->vk.wsi_device = wsi;
+
+--- src/vulkan/wsi/wsi_common.h
++++ src/vulkan/wsi/wsi_common.h
+@@ -156,6 +156,7 @@ struct wsi_device {
+       /* Does not transfer the ownership to the command buffer. The command
+        * buffer must retain the drawable to ensure lifespan. */
+       void (*encode_drawable_present)(VkCommandBuffer cmd, void *drawable);
++      bool requires_drawable_present;
+    } metal;
+ 
+ 
+
+--- src/vulkan/wsi/wsi_common_metal.c
++++ src/vulkan/wsi/wsi_common_metal.c
+@@ -674,7 +674,7 @@ wsi_metal_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+          image->base.cpu_map,
+          chain->extent.width, chain->extent.height,
+          image->base.row_pitches[0]);
+-   } else {
++   } else if (wsi_chain->wsi->metal.requires_drawable_present) {
+       /* Blit is already recorded, just present now */
+       wsi_metal_layer_present(&image->drawable);
+    }
+

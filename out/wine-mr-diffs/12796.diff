@@ -1,0 +1,254 @@
+# gdiplus: More optimizations for SOFTWARE_GdipFillPathAntialiased
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12796 state=opened
+# * Perform alpha calculation and premultiplication in one pass.
+
+* When supported, use SSE2 intrinsics to perform the above operation.
+
+* When we are drawing (rendering?) to a non-image graphics context, write pixels directly to the DIB section that `alpha_blend_pixels_hrgn`/`alpha_blend_hdc_pixels` end up creating. This avoids reallocating another bitmap buffer and an additional memcpy.
+--- dlls/gdiplus/gdiplus.c
++++ dlls/gdiplus/gdiplus.c
+@@ -54,6 +54,8 @@ static void WINAPI NotificationUnhook(ULONG_PTR token)
+     TRACE("%Id\n", token);
+ }
+ 
++BOOL sse2_supported = FALSE;
++
+ /*****************************************************
+  *      DllMain
+  */
+@@ -66,6 +68,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved)
+     case DLL_PROCESS_ATTACH:
+         DisableThreadLibraryCalls( hinst );
+         init_generic_string_formats();
++        sse2_supported = IsProcessorFeaturePresent( PF_XMMI64_INSTRUCTIONS_AVAILABLE );
+         break;
+ 
+     case DLL_PROCESS_DETACH:
+
+--- dlls/gdiplus/gdiplus_private.h
++++ dlls/gdiplus/gdiplus_private.h
+@@ -731,4 +731,6 @@ static inline void set_rect(GpRectF *rect, REAL x, REAL y, REAL width, REAL heig
+     rect->Height = height;
+ }
+ 
++extern BOOL sse2_supported;
++
+ #endif
+
+--- dlls/gdiplus/graphics.c
++++ dlls/gdiplus/graphics.c
+@@ -20,6 +20,9 @@
+ #include <math.h>
+ #include <limits.h>
+ #include <assert.h>
++#ifdef __SSE2__
++#include <immintrin.h>
++#endif
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -4648,11 +4651,96 @@ static void bitmap_scanline_span_fill(GpBitmap *dst_bitmap, const DWORD *src_row
+     }
+ }
+ 
++static inline void apply_coverage_premul_simple(DWORD *pixels, const BYTE *coverage, INT n, UINT shift)
++{
++    INT i;
++
++    for (i = 0; i < n; i++)
++    {
++        DWORD px = pixels[i], a = ((px >> 24) * (DWORD)coverage[i] + (1u << (shift - 1))) >> shift,
++              b = ((px & 0xff) * a + 127) / 255, g = (((px >> 8) & 0xff) * a + 127) / 255,
++              r = (((px >> 16) & 0xff) * a + 127) / 255;
++        pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
++    }
++}
++
++#ifdef __SSE2__
++static inline void apply_coverage_premul_sse2(DWORD *pixels, const BYTE *coverage, INT n, UINT shift)
++{
++    const __m128i zero = _mm_setzero_si128(), round = _mm_set1_epi32(1 << (shift - 1)),
++                  shift_count = _mm_cvtsi32_si128(shift), c127 = _mm_set1_epi16(127),
++                  div_255 = _mm_set1_epi16((INT16)0x8081), rgb_mask = _mm_set1_epi32(0x00ffffff);
++    INT i;
++
++    for (i = 0; i + 4 <= n; i += 4)
++    {
++        __m128i c4, prev_alpha, new_alpha, a2, alpha_lo, alpha_hi, px_lo, px_hi, out,
++            px = _mm_loadu_si128((__m128i *)(pixels + i));
++
++        /* Load 4 coverage bytes for the next 4 pixels into bits [31..0]*/
++        c4 = _mm_loadu_si32(coverage + i);
++        /* Broadcast the coverage into the lower byte of every 32-bit lane */
++        c4 = _mm_unpacklo_epi16(_mm_unpacklo_epi8(c4, zero), zero);
++
++        /* Get the previous alpha value (pixels[i] >> 24) */
++        prev_alpha = _mm_srli_epi32(px, 24);
++        /* Equivalent to new_alpha = (prev_alpha + coverage[i] + ss_x) + ss_x*ss_y / 2*/
++        new_alpha = _mm_madd_epi16(prev_alpha, c4);
++        new_alpha = _mm_srl_epi32(_mm_add_epi32(new_alpha, round), shift_count);
++
++        /* Broadcast each alpha across the 4 channels (16-bit lanes) of its pixel
++         * [000000(A0),000000(A1),000000(A2),000000(A3)] -> [00(A0)00(A0),00(A1)00(A1),00(A2)00(A2),00(A3)00(A3)]
++         */
++        a2 = _mm_or_si128(new_alpha, _mm_slli_epi32(new_alpha, 16));
++        /* alpha_lo = [00(A0)00(A0), 00(A0)00(A0), 00(A1)00(A1), 00(A1)00(A1)]*/
++        alpha_lo = _mm_unpacklo_epi32(a2, a2);
++        /* alpha_hi = [00(A2)00(A2), 00(A2)00(A2), 00(A3)00(A3), 00(A3)00(A3)] */
++        alpha_hi = _mm_unpackhi_epi32(a2, a2);
++
++        /* Pixels are [0..31], [32..63], [64..95], [96..128]
++         * px_lo = [00(B0)00(G0), 00(R0)00(A0), 00(B1)00(G1), 00(R1)00(A1)]
++         */
++        px_lo = _mm_unpacklo_epi8(px, zero);
++        /* px_hi = [00(B2)00(G2),00(R2)00(A2),00(B3)00(G3),00(R3)00(A3)]*/
++        px_hi = _mm_unpackhi_epi8(px, zero);
++
++        /* Multiple each 16-bit channel by the new alpha value, add 127 to round.
++         * Channel and alpha can be max 255, so the result wouldn't exceed 255 * 255 + 127 = 65152 */
++        px_lo = _mm_add_epi16(_mm_mullo_epi16(px_lo, alpha_lo), c127);
++        px_hi = _mm_add_epi16(_mm_mullo_epi16(px_hi, alpha_hi), c127);
++        /* (ch * 0x8081) >> 23 gets us the same result as integer division by 255 */
++        px_lo = _mm_srli_epi16(_mm_mulhi_epu16(px_lo, div_255), 7);
++        px_hi = _mm_srli_epi16(_mm_mulhi_epu16(px_hi, div_255), 7);
++
++        /* Pack the premultiplied values into their respective pixel lanes */
++        out = _mm_packus_epi16(px_lo, px_hi);
++        /* Set the alpha-byte of each pixel lane to new_alpha */
++        out = _mm_or_si128(_mm_and_si128(out, rgb_mask), _mm_slli_epi32(new_alpha, 24));
++        _mm_storeu_si128((__m128i *)(pixels + i), out);
++    }
++    apply_coverage_premul_simple(pixels + i, coverage + i, n - i, shift);
++}
++#endif
++
++static void apply_coverage_premul(DWORD *pixels, const BYTE *coverage, INT n, UINT shift)
++{
++#ifdef __SSE2__
++    if (sse2_supported)
++        apply_coverage_premul_sse2(pixels, coverage, n, shift);
++    else
++        apply_coverage_premul_simple(pixels, coverage, n, shift);
++#else
++    apply_coverage_premul_simple(pixels, coverage, n, shift);
++#endif
++}
++
+ static GpStatus SOFTWARE_GdipFillPathAntialiased(GpGraphics *graphics, GpBrush *brush, GpPath *path)
+ {
+     const INT ss_x = 8, ss_y = graphics->smoothing == SmoothingModeAntiAlias8x8 ? 8 : 4;
++    const UINT shift = (graphics->smoothing == SmoothingModeAntiAlias8x8) ? 6 : 5;
+     struct region_element element = { RegionDataPath };
+     struct span_list spans = { 0 };
++    const BOOL is_image = !!graphics->image;
+     REAL offset, left, top, right, bottom;
+     GpRectF bounds, device_bounds;
+     BYTE *coverage, *buf = NULL;
+@@ -4662,8 +4750,11 @@ static GpStatus SOFTWARE_GdipFillPathAntialiased(GpGraphics *graphics, GpBrush *
+     RECT sample_rect;
+     GpRect rect;
+     size_t i;
++    INT hdc_level = 0;
+     /* Difference array to calculate final pixel coverage from the high resolution spans */
+     INT8 *diff;
++    HDC hdc = NULL, hdc_dib = NULL;
++    HBITMAP hbitmap = NULL;
+ 
+     stat = gdi_transform_acquire(graphics);
+     if (stat != Ok)
+@@ -4700,14 +4791,63 @@ static GpStatus SOFTWARE_GdipFillPathAntialiased(GpGraphics *graphics, GpBrush *
+     SetRect(&sample_rect, 0, 0, rect.Width * ss_x, rect.Height * ss_y);
+     GdipSetMatrixElements(&transform, ss_x, 0.0, 0.0, ss_y, -rect.X * ss_x, -rect.Y * ss_y);
+ 
+-    buf = calloc(rect.Width * rect.Height, sizeof(*pixels) + sizeof(*coverage) + sizeof(*diff));
++    if (!is_image)
++    {
++        BITMAPINFOHEADER bih = {0};
++
++        stat = gdi_dc_acquire(graphics, &hdc);
++        if (stat != Ok)
++            goto done;
++
++        hdc_level = SaveDC(hdc);
++        stat = update_clip_hrgn(graphics);
++        if (stat != Ok)
++        {
++            RestoreDC(hdc, hdc_level);
++            gdi_dc_release(graphics, hdc);
++            goto done;
++        }
++
++        ExtSelectClipRgn(hdc, graphics->clip_hrgn, RGN_COPY);
++
++        hdc_dib = CreateCompatibleDC(0);
++        bih.biSize = sizeof(BITMAPINFOHEADER);
++        bih.biWidth = rect.Width;
++        bih.biHeight = -rect.Height;
++        bih.biPlanes = 1;
++        bih.biBitCount = 32;
++        bih.biCompression = BI_RGB;
++        hbitmap = CreateDIBSection(hdc_dib, (BITMAPINFO *)&bih, DIB_RGB_COLORS, (void **)&pixels, NULL, 0);
++        if (!hbitmap || !pixels)
++        {
++            DeleteDC(hdc_dib);
++            RestoreDC(hdc, hdc_level);
++            gdi_dc_release(graphics, hdc);
++            goto done;
++        }
++
++        coverage = buf = calloc(rect.Width * rect.Height, sizeof(*coverage) + sizeof(*diff));
++        if (!buf)
++        {
++            DeleteObject(hbitmap);
++            DeleteDC(hdc_dib);
++            RestoreDC(hdc, hdc_level);
++            gdi_dc_release(graphics, hdc);
++        }
++        else
++            SelectObject(hdc_dib, hbitmap);
++    }
++    else
++    {
++        buf = calloc(rect.Width * rect.Height, sizeof(*pixels) + sizeof(*coverage) + sizeof(*diff));
++        pixels = (DWORD *)buf;
++        coverage = (BYTE *)(pixels + (rect.Width * rect.Height));
++    }
+     if (!buf)
+     {
+         stat = OutOfMemory;
+         goto done;
+     }
+-    pixels = (DWORD *)buf;
+-    coverage = (BYTE *)(pixels + (rect.Width * rect.Height));
+     diff = (INT8 *)(coverage + (rect.Width * rect.Height));
+     if (stat == Ok)
+         stat = GdipTransformPath(element.elementdata.path, &transform);
+@@ -4752,12 +4892,24 @@ static GpStatus SOFTWARE_GdipFillPathAntialiased(GpGraphics *graphics, GpBrush *
+ 
+                 /* The prefix sum represents how many supersampled scanlines cover each original pixel */
+                 pfx_sum += diff[j];
+-                pixels[j] = (pixels[j] & 0xffffff) | (((pixels[j] >> 24) * (coverage[j] + pfx_sum * ss_x) + ss_x * ss_y / 2) / (ss_x * ss_y) << 24);
++                coverage[j] += pfx_sum * ss_x;
+             }
++            apply_coverage_premul(pixels + (size_t)y * rect.Width, coverage + (size_t)y * rect.Width, rect.Width,
++                                  shift);
+         }
+ 
+-        stat = alpha_blend_pixels(graphics, rect.X, rect.Y, (BYTE *)pixels, rect.Width, rect.Height,
+-            rect.Width * 4, PixelFormat32bppARGB);
++        if (is_image)
++            stat = alpha_blend_pixels(graphics, rect.X, rect.Y, (BYTE *)pixels, rect.Width, rect.Height, rect.Width * 4,
++                                      PixelFormat32bppPARGB);
++        else
++            gdi_alpha_blend(graphics, rect.X, rect.Y, rect.Width, rect.Height, hdc_dib, 0, 0, rect.Width, rect.Height);
++    }
++    if (!is_image)
++    {
++        DeleteObject(hbitmap);
++        DeleteDC(hdc_dib);
++        RestoreDC(hdc, hdc_level);
++        gdi_dc_release(graphics, hdc);
+     }
+ 
+ done:
+

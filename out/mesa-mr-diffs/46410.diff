@@ -1,0 +1,90 @@
+# kk: rework workaround 10 and disable 17
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46410 state=merged
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+```
+kk: rework workaround 10 and disable 17
+
+The known true value in workaround 10 is placed after the condition to
+avoid an interaction with workaround 6 and 17 crashing the Metal compiler.
+After this rework workaround 17 is no longer needed.
+
+Fixes: 39f9d1f8e48 ("kk: Use constant address space for load_global_constant_offset")
+Signed-off-by: Aitor Camacho <aitor@lunarg.com>
+```
+
+Need to run this through all hardware before merging
+--- docs/drivers/kosmickrisp/workarounds.rst
++++ docs/drivers/kosmickrisp/workarounds.rst
+@@ -88,10 +88,13 @@ KK_WORKAROUND_17
+ | CTS test failure: ``dEQP-VK.spirv_assembly.instruction.compute.float_controls2.fp*.input_args.tanh_testedWithout_NotNaN_arg1_nan_arg2_one_res_nan_*``
+ | Comments:
+ 
+-Same issue as KK_WORKAROUND_14 but we need to add ``isNan`` to fix it
++Same issue as KK_WORKAROUND_14 but we need to add ``isNan`` to fix it.
++
++No longer needed after KK_WORKAROUND_10 swapped the true value to be last.
+ 
+ | Log:
+ | 2026-08-10: Workaround implemented
++| 2026-11-17: Disabled after WA10 rework
+ 
+ KK_WORKAROUND_16
+ ----------------
+@@ -211,9 +214,14 @@ handle ``bcsel`` and the compiled shader misbehaves while the ``ior`` version
+ does not. This is worked around by adding a known true value to the conditional
+ of the ``bcsel``.
+ 
++The known true value is placed after the condition to avoid an interaction with
++KK_WORKAROUND_6 and KK_WORKAROUND_17 leading to compiler crashes in tests:
++``dEQP-VK.robustness.image_robustness.*.notemplate.r*32f.unroll.nonvolatile.sampled_image.no_fmt_qual.img.samples_1.2d_array.frag``
++
+ | Log:
+ | 2026-05-14: Workaround implemented
+ | 2026-11-05: Workaround disabled on M3+
++| 2026-11-17: Swapped conditional so that the true value is last
+ 
+ KK_WORKAROUND_9
+ ---------------
+
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -637,11 +637,12 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
+       P(ctx, " ? 1.0 : 0.0");
+       break;
+    case nir_op_bcsel:
+-      /* KK_WORKAROUND_10 All shaders will have buf0 bound */
++      alu_src_to_msl(ctx, instr, 0);
++      /* KK_WORKAROUND_10 All shaders will have buf0 bound. Must come after the
++       * condition, see docs. */
+       if (!(ctx->disabled_workarounds & BITFIELD_BIT(10)) &&
+           ctx->shader->info.stage == MESA_SHADER_COMPUTE)
+-         P(ctx, "(ulong)&buf0.contents[0] && ");
+-      alu_src_to_msl(ctx, instr, 0);
++         P(ctx, " && (ulong)&buf0.contents[0]");
+       P(ctx, " ? ");
+       alu_src_to_msl(ctx, instr, 1);
+       P(ctx, " : ");
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1118,6 +1118,9 @@ kk_parse_environment_options(struct kk_physical_device *pdev)
+       settings->disabled_workarounds |= BITFIELD64_BIT(index);
+    }
+ 
++   /* No longer needed workarounds (to be deleted in code eventually) */
++   settings->disabled_workarounds |= BITFIELD64_BIT(17);
++
+    /* Workarounds resolved on macOS 27 */
+    if (ns_is_os_version_at_least(27, 0, 0)) {
+       /* 1-6 */
+@@ -1126,7 +1129,6 @@ kk_parse_environment_options(struct kk_physical_device *pdev)
+       settings->disabled_workarounds |= BITFIELD64_BIT(8);
+       settings->disabled_workarounds |= BITFIELD64_BIT(11);
+       settings->disabled_workarounds |= BITFIELD64_BIT(12);
+-      settings->disabled_workarounds |= BITFIELD64_BIT(17);
+       settings->disabled_workarounds |= BITFIELD64_BIT(18);
+    }
+    /* M5 only workarounds */
+

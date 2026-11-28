@@ -1,0 +1,106 @@
+# kernelbase: Preserve GetLastError in path helpers on long-path failure.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11629 state=closed
+# Title: kernelbase: Preserve GetLastError in path helpers on long-path failure.
+
+Component: kernelbase / shlwapi
+Branch: fix/pathcombine-gelasterror (from fork, into wine/wine master)
+Commits:
+1. shlwapi/tests: Require GetLastError preservation on failing path ops.
+2. kernelbase: Preserve GetLastError in PathCombineA on failure.
+
+Failure mechanism
+
+PathCombineA and PathAppendA internally run their input through
+MultiByteToWideChar (and, on success, WideCharToMultiByte). When an input is
+longer than MAX_PATH, the ANSI thunk fails and MultiByteToWideChar sets
+GetLastError to ERROR_INSUFFICIENT_BUFFER (122). The wrappers then return NULL
+without restoring it, leaking that internal error to the caller even though
+Windows leaves the caller's last-error untouched on these failure paths.
+
+Semantic change
+
+PathCombineA / PathAppendA (and PathCombineW) should only touch the thread's
+last-error where Windows does. On every failure path where the ANSI conversion
+fails or the combined path is too long, the wrappers now restore GetLastError to
+the value the caller set. No return value, destination fill order, or
+canonicalization behavior is changed.
+
+Preserved invariant
+
+- Successful composition still returns non-NULL and fills the destination
+  exactly as before.
+- Failure still returns NULL / FALSE and empties the destination buffer.
+- Only the thread's last-error on those failure paths is left unmodified,
+  matching Windows.
+
+Testing
+
+dlls/shlwapi/tests/path.c already covers all four failure shapes (file too long,
+directory too long, path too long, append string too long) using
+SetLastError(0xdeadbeef) followed by GetLastError() == 0xdeadbeef; these were
+marked todo_wine. The todo_wine markers are removed. On master the test fails
+with "got 122"; with this change it passes. The same calls were also exercised
+on the Windows CRT (x64), where GetLastError is indeed left untouched. The
+shlwapi path conformance test passes headless.
+
+Notes
+
+There is no Bugzilla entry to cite; this 
+--- dlls/kernelbase/path.c
++++ dlls/kernelbase/path.c
+@@ -1455,6 +1455,7 @@ WCHAR * WINAPI PathCombineW(WCHAR *dst, const WCHAR *dir, const WCHAR *file)
+ 
+ LPSTR WINAPI PathCombineA(char *dst, const char *dir, const char *file)
+ {
++    DWORD saved_err = GetLastError();
+     WCHAR dstW[MAX_PATH], dirW[MAX_PATH], fileW[MAX_PATH];
+ 
+     TRACE("%p, %s, %s\n", dst, wine_dbgstr_a(dir), wine_dbgstr_a(file));
+@@ -1477,6 +1478,7 @@ LPSTR WINAPI PathCombineA(char *dst, const char *dir, const char *file)
+             return dst;
+ fail:
+     dst[0] = 0;
++    SetLastError( saved_err );
+     return NULL;
+ }
+ 
+
+--- dlls/shlwapi/tests/path.c
++++ dlls/shlwapi/tests/path.c
+@@ -719,7 +719,7 @@ static void test_PathCombineA(void)
+     ok(str == NULL, "Expected str == NULL, got %p\n", str);
+     ok(!dest[0] || broken(!lstrcmpA(dest, "control")), /* Win95 and some W2K */
+        "Expected 0 length, got %i\n", lstrlenA(dest));
+-    todo_wine ok(GetLastError() == 0xdeadbeef, "Expected 0xdeadbeef, got %ld\n", GetLastError());
++    ok(GetLastError() == 0xdeadbeef, "Expected 0xdeadbeef, got %ld\n", GetLastError());
+ 
+     /* try a directory longer than MAX_PATH */
+     SetLastError(0xdeadbeef);
+@@ -728,7 +728,7 @@ static void test_PathCombineA(void)
+     ok(str == NULL, "Expected str == NULL, got %p\n", str);
+     ok(!dest[0] || broken(!lstrcmpA(dest, "control")), /* Win95 and some W2K */
+        "Expected 0 length, got %i\n", lstrlenA(dest));
+-    todo_wine ok(GetLastError() == 0xdeadbeef, "Expected 0xdeadbeef, got %ld\n", GetLastError());
++    ok(GetLastError() == 0xdeadbeef, "Expected 0xdeadbeef, got %ld\n", GetLastError());
+ 
+     memset(one, 'b', HALF_LEN);
+     memset(two, 'c', HALF_LEN);
+@@ -906,7 +906,7 @@ static void test_PathAppendA(void)
+     SetLastError(0xdeadbeef);
+     res = PathAppendA(too_long, "two\\three");
+     ok(!res, "Expected failure\n");
+-    todo_wine ok(GetLastError() == 0xdeadbeef, "Expected 0xdeadbeef, got %ld\n", GetLastError());
++    ok(GetLastError() == 0xdeadbeef, "Expected 0xdeadbeef, got %ld\n", GetLastError());
+     ok(!too_long[0] || broken(lstrlenA(too_long) == (LONG_LEN - 1)), /* Win95 and some W2K */
+        "Expected length of too_long to be zero, got %i\n", lstrlenA(too_long));
+ 
+@@ -917,7 +917,7 @@ static void test_PathAppendA(void)
+     SetLastError(0xdeadbeef);
+     res = PathAppendA(path, too_long);
+     ok(!res, "Expected failure\n");
+-    todo_wine ok(GetLastError() == 0xdeadbeef, "Expected 0xdeadbeef, got %ld\n", GetLastError());
++    ok(GetLastError() == 0xdeadbeef, "Expected 0xdeadbeef, got %ld\n", GetLastError());
+     ok(!path[0] || broken(!lstrcmpA(path, "C:\\one")), /* Win95 and some W2K */
+        "Expected length of path to be zero, got %i\n", lstrlenA(path));
+ 
+

@@ -1,0 +1,246 @@
+# ntdll: Return STATUS_INVALID_IMAGE_FORMAT if the resource doesn't belong to the given module.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11642 state=opened
+# 
+--- dlls/kernel32/tests/Makefile.in
++++ dlls/kernel32/tests/Makefile.in
+@@ -1,5 +1,5 @@
+ TESTDLL   = kernel32.dll
+-IMPORTS   = user32 advapi32
++IMPORTS   = user32 advapi32 version
+ 
+ SOURCES = \
+ 	actctx.c \
+
+--- dlls/kernel32/tests/resource.c
++++ dlls/kernel32/tests/resource.c
+@@ -815,6 +815,51 @@ static void test_mui(void)
+     RemoveDirectoryW( L"en-US" );
+ }
+ 
++static void test_load_resource(void)
++{
++    VS_FIXEDFILEINFO *file_info;
++    HMODULE module;
++    HGLOBAL data;
++    UINT length;
++    HRSRC rsrc;
++    void *ptr;
++
++    module = LoadLibraryA( "kernel32.dll" );
++    ok( !!module, "Failed to load library %#lx.\n", GetLastError() );
++
++    rsrc = FindResourceW( NULL, MAKEINTRESOURCEW(VS_VERSION_INFO), (LPCWSTR)RT_VERSION );
++    ok( !!rsrc, "Resource not found %#lx.\n", GetLastError() );
++    SetLastError( 0xdeadbeef );
++    data = LoadResource( module, rsrc );
++    ok( GetLastError() == ERROR_BAD_EXE_FORMAT, "Got wrong last error %#lx.\n", GetLastError() );
++    ok( !data, "Loaded data %p.\n", data );
++    SetLastError( 0xdeadbeef );
++    data = LoadResource( GetModuleHandleW( NULL ), rsrc );
++    ok( !!data, "Failed to load resource %#lx.\n", GetLastError() );
++    ptr = LockResource( data );
++    ok( !!ptr, "LockResource failed.\n" );
++    ok( !!VerQueryValueA( ptr, "\\", (void **)&file_info, &length ),
++            "VerQueryValueA failed %#lx.\n", GetLastError() );
++    ok( file_info->dwFileType == VFT_APP, "Got file type %lx.\n", file_info->dwFileType );
++
++    rsrc = FindResourceW( module, MAKEINTRESOURCEW(VS_VERSION_INFO), (LPCWSTR)RT_VERSION );
++    ok( !!rsrc, "Resource not found %#lx.\n", GetLastError() );
++    SetLastError( 0xdeadbeef );
++    data = LoadResource( GetModuleHandleW( NULL ), rsrc );
++    ok( GetLastError() == ERROR_BAD_EXE_FORMAT, "Got wrong last error %#lx.\n", GetLastError() );
++    ok( !data, "Loaded data %p.\n", data );
++    SetLastError( 0xdeadbeef );
++    data = LoadResource( module, rsrc );
++    ok( !!data, "Failed to load resource %#lx.\n", GetLastError() );
++    ptr = LockResource( data );
++    ok( !!ptr, "LockResource failed.\n" );
++    ok( !!VerQueryValueA( ptr, "\\", (void **)&file_info, &length ),
++            "VerQueryValueA failed %#lx.\n", GetLastError() );
++    ok( file_info->dwFileType == VFT_DLL, "Got file type %lx.\n", file_info->dwFileType );
++
++    FreeLibrary( module );
++}
++
+ START_TEST(resource)
+ {
+     DWORD i;
+@@ -848,4 +893,5 @@ START_TEST(resource)
+     }
+     test_find_resource();
+     test_mui();
++    test_load_resource();
+ }
+
+--- dlls/kernel32/tests/resource.rc
++++ dlls/kernel32/tests/resource.rc
+@@ -18,6 +18,11 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#define VER_FILEDESCRIPTION_STR "Wine tests for kernel32"
++#define VER_INTERNALNAME_STR "kernel32_test.exe"
++#define VER_FILETYPE VFT_APP
++
++#include "common.ver"
+ #include "windef.h"
+ 
+ 1 MENU LANGUAGE LANG_GERMAN, SUBLANG_DEFAULT
+
+--- dlls/ntdll/tests/Makefile.in
++++ dlls/ntdll/tests/Makefile.in
+@@ -1,5 +1,5 @@
+ TESTDLL   = ntdll.dll
+-IMPORTS   = user32 advapi32
++IMPORTS   = user32 advapi32 version
+ 
+ SOURCES = \
+ 	alpc.c \
+@@ -18,6 +18,7 @@ SOURCES = \
+ 	pipe.c \
+ 	port.c \
+ 	reg.c \
++	resource.rc \
+ 	rtl.c \
+ 	rtlbitmap.c \
+ 	rtlstr.c \
+
+--- dlls/ntdll/tests/resource.rc
++++ dlls/ntdll/tests/resource.rc
+@@ -0,0 +1,23 @@
++/*
++ * Copyright 2026 Jactry Zeng for CodeWeavers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define VER_FILEDESCRIPTION_STR "Wine tests for ntdll"
++#define VER_INTERNALNAME_STR "ntdll_test.exe"
++#define VER_FILETYPE VFT_APP
++
++#include "common.ver"
+
+--- dlls/ntdll/tests/rtl.c
++++ dlls/ntdll/tests/rtl.c
+@@ -30,6 +30,8 @@
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winreg.h"
++#include "winuser.h"
++#include "winver.h"
+ #include "winternl.h"
+ #include "in6addr.h"
+ #include "inaddr.h"
+@@ -123,7 +125,10 @@ static void      (WINAPI *pRtlInitializeGenericTable)(RTL_GENERIC_TABLE *, PRTL_
+ static void *    (WINAPI *pRtlFindExportedRoutineByName)(HMODULE,const char *);
+ static void *    (WINAPI *pRtlLookupElementGenericTable)(PRTL_GENERIC_TABLE, void *);
+ static ULONG     (WINAPI *pRtlNumberGenericTableElements)(PRTL_GENERIC_TABLE);
++static NTSTATUS  (WINAPI *pLdrAccessResource)(HMODULE, const IMAGE_RESOURCE_DATA_ENTRY *, void **, ULONG *);
+ static NTSTATUS  (WINAPI *pLdrEnumerateLoadedModules)(void *, void *, void *);
++static NTSTATUS  (WINAPI *pLdrFindResource_U)(HMODULE, const LDR_RESOURCE_INFO *, ULONG,
++                                              const IMAGE_RESOURCE_DATA_ENTRY **);
+ static NTSTATUS  (WINAPI *pLdrRegisterDllNotification)(ULONG, PLDR_DLL_NOTIFICATION_FUNCTION, void *, void **);
+ static NTSTATUS  (WINAPI *pLdrUnregisterDllNotification)(void *);
+ static VOID      (WINAPI *pRtlGetDeviceFamilyInfoEnum)(ULONGLONG *,DWORD *,DWORD *);
+@@ -197,7 +202,9 @@ static void InitFunctionPtrs(void)
+         pRtlFindExportedRoutineByName = (void *)GetProcAddress(hntdll, "RtlFindExportedRoutineByName");
+         pRtlLookupElementGenericTable = (void *)GetProcAddress(hntdll, "RtlLookupElementGenericTable");
+         pRtlNumberGenericTableElements = (void *)GetProcAddress(hntdll, "RtlNumberGenericTableElements");
++        pLdrAccessResource = (void *)GetProcAddress(hntdll, "LdrAccessResource");
+         pLdrEnumerateLoadedModules = (void *)GetProcAddress(hntdll, "LdrEnumerateLoadedModules");
++        pLdrFindResource_U = (void *)GetProcAddress(hntdll, "LdrFindResource_U");
+         pLdrRegisterDllNotification = (void *)GetProcAddress(hntdll, "LdrRegisterDllNotification");
+         pLdrUnregisterDllNotification = (void *)GetProcAddress(hntdll, "LdrUnregisterDllNotification");
+         pRtlCreateServiceSid = (void *)GetProcAddress(hntdll, "RtlCreateServiceSid");
+@@ -5543,6 +5550,52 @@ static void test_pointer_encoding(void)
+     ok( v == expected, "got %p, expected %p.\n", v, expected );
+ }
+ 
++static void test_resource_access(void)
++{
++    const IMAGE_RESOURCE_DATA_ENTRY *rsrc = NULL;
++    VS_FIXEDFILEINFO *file_info;
++    LDR_RESOURCE_INFO info;
++    NTSTATUS status;
++    HMODULE module;
++    UINT length;
++    void *data;
++
++    module = LoadLibraryA( "ntdll.dll" );
++    ok( !!module, "Failed to load library %#lx.\n", GetLastError() );
++
++    info.Type = (ULONG_PTR)RT_VERSION;
++    info.Name = (ULONG_PTR)VS_VERSION_INFO;
++    info.Language = MAKELANGID( LANG_NEUTRAL, SUBLANG_NEUTRAL );
++    status = pLdrFindResource_U( GetModuleHandleW( NULL ), &info, 3, &rsrc );
++    ok( !status && !!rsrc, "Got %#lx.\n", status );
++    data = (void *)0xdeadbeef;
++    status = pLdrAccessResource( module, rsrc, &data, NULL );
++    ok( status == STATUS_INVALID_IMAGE_FORMAT, "Got %#lx.\n", status );
++    ok( data == (void *)0xdeadbeef, "Got data %p.\n", data );
++    data = NULL;
++    status = pLdrAccessResource( GetModuleHandleW( NULL ), rsrc, &data, NULL );
++    ok( !status && !!data, "Got %#lx.\n", status );
++    ok( !!VerQueryValueA( data, "\\", (void **)&file_info, &length ),
++            "VerQueryValueA failed %#lx.\n", GetLastError() );
++    ok( file_info->dwFileType == VFT_APP, "Got file type %lx.\n", file_info->dwFileType );
++
++    rsrc = NULL;
++    status = pLdrFindResource_U( module, &info, 3, &rsrc );
++    ok( !status && !!rsrc, "Got %#lx.\n", status );
++    data = (void *)0xdeadbeef;
++    status = pLdrAccessResource( GetModuleHandleW( NULL ), rsrc, &data, NULL );
++    ok( status == STATUS_INVALID_IMAGE_FORMAT, "Got %#lx.\n", status );
++    ok( data == (void *)0xdeadbeef, "Got data %p.\n", data );
++    data = NULL;
++    status = pLdrAccessResource( module, rsrc, &data, NULL );
++    ok( !status && !!data, "Got %#lx.\n", status );
++    ok( !!VerQueryValueA( data, "\\", (void **)&file_info, &length ),
++            "VerQueryValueA failed %#lx.\n", GetLastError() );
++    ok( file_info->dwFileType == VFT_DLL, "Got file type %lx.\n", file_info->dwFileType );
++
++    FreeLibrary( module );
++}
++
+ START_TEST(rtl)
+ {
+     InitFunctionPtrs();
+@@ -5614,4 +5667,5 @@ START_TEST(rtl)
+     test_RtlCreateServiceSid();
+     test_RtlDeriveCapabilitySidsFromName();
+     test_pointer_encoding();
++    test_resource_access();
+ }
+
+--- dlls/ntdll/resource.c
++++ dlls/ntdll/resource.c
+@@ -319,10 +319,15 @@ static inline NTSTATUS access_resource( HMODULE hmod, const IMAGE_RESOURCE_DATA_
+ 
+     __TRY
+     {
++        const void *root;
+         ULONG dirsize;
+ 
+-        if (!RtlImageDirectoryEntryToData( hmod, TRUE, IMAGE_DIRECTORY_ENTRY_RESOURCE, &dirsize ))
++        root = RtlImageDirectoryEntryToData( hmod, TRUE, IMAGE_DIRECTORY_ENTRY_RESOURCE, &dirsize );
++        if (!root)
+             status = STATUS_RESOURCE_DATA_NOT_FOUND;
++        else if ((ULONG_PTR)entry < (ULONG_PTR)root || dirsize < sizeof(*entry) ||
++                (ULONG_PTR)entry - (ULONG_PTR)root > dirsize - sizeof(*entry))
++            status = STATUS_INVALID_IMAGE_FORMAT;
+         else
+         {
+             if (ptr)
+

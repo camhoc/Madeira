@@ -1,0 +1,73 @@
+# ntdll: Preserve return length for invalid information classes.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12298 state=opened
+# NtQuerySystemInformation() and NtQueryInformationProcess() leave ReturnLength unchanged on Windows when returning STATUS_INVALID_INFO_CLASS for an unknown information class. Wine currently overwrites it with zero.
+
+Return directly for these cases to preserve ReturnLength, and add regression tests for both functions.
+
+The Windows behavior was verified on Windows Server 2022 and Windows Server 2025 using a standalone test program compiled for both 32-bit and 64-bit Windows.
+--- dlls/ntdll/tests/info.c
++++ dlls/ntdll/tests/info.c
+@@ -150,6 +150,13 @@ static void test_query_basic(void)
+     ok( status == STATUS_INVALID_INFO_CLASS || status == STATUS_NOT_IMPLEMENTED /* vista */,
+         "Expected STATUS_INVALID_INFO_CLASS or STATUS_NOT_IMPLEMENTED, got %08lx\n", status);
+ 
++    ReturnLength = 0xdeadbeef;
++    status = pNtQuerySystemInformation(-1, NULL, 0, &ReturnLength);
++    ok( status == STATUS_INVALID_INFO_CLASS || status == STATUS_NOT_IMPLEMENTED /* vista */,
++        "Expected STATUS_INVALID_INFO_CLASS or STATUS_NOT_IMPLEMENTED, got %08lx\n", status);
++    ok( ReturnLength == 0xdeadbeef,
++        "ReturnLength changed unexpectedly to %#lx\n", ReturnLength);
++
+     /* Use an existing class but with a zero-length buffer */
+     status = pNtQuerySystemInformation(SystemBasicInformation, NULL, 0, NULL);
+     ok( status == STATUS_INFO_LENGTH_MISMATCH, "Expected STATUS_INFO_LENGTH_MISMATCH, got %08lx\n", status);
+@@ -1856,6 +1863,13 @@ static void test_query_process_basic(void)
+     ok( status == STATUS_INVALID_INFO_CLASS || status == STATUS_NOT_IMPLEMENTED /* vista */,
+         "Expected STATUS_INVALID_INFO_CLASS or STATUS_NOT_IMPLEMENTED, got %08lx\n", status);
+ 
++    ReturnLength = 0xdeadbeef;
++    status = NtQueryInformationProcess(GetCurrentProcess(), -1, NULL, 0, &ReturnLength);
++    ok( status == STATUS_INVALID_INFO_CLASS || status == STATUS_NOT_IMPLEMENTED /* vista */,
++        "Expected STATUS_INVALID_INFO_CLASS or STATUS_NOT_IMPLEMENTED, got %08lx\n", status);
++    ok( ReturnLength == 0xdeadbeef,
++        "ReturnLength changed unexpectedly to %#lx\n", ReturnLength);
++
+     status = NtQueryInformationProcess(NULL, ProcessBasicInformation, NULL, 0, NULL);
+     ok( status == STATUS_INFO_LENGTH_MISMATCH, "Expected STATUS_INFO_LENGTH_MISMATCH, got %08lx\n", status);
+ 
+
+--- dlls/ntdll/unix/process.c
++++ dlls/ntdll/unix/process.c
+@@ -1078,8 +1078,7 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
+ #define UNIMPLEMENTED_INFO_CLASS(c) \
+     case c: \
+         FIXME( "(process=%p) Unimplemented information class: " #c "\n", handle); \
+-        ret = STATUS_INVALID_INFO_CLASS; \
+-        break
++        return STATUS_INVALID_INFO_CLASS
+ 
+ /**********************************************************************
+  *           NtQueryInformationProcess  (NTDLL.@)
+@@ -1589,8 +1588,7 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
+     default:
+         FIXME("(%p,info_class=%d,%p,0x%08x,%p) Unknown information class\n",
+               handle, class, info, size, ret_len );
+-        ret = STATUS_INVALID_INFO_CLASS;
+-        break;
++        return STATUS_INVALID_INFO_CLASS;
+     }
+ 
+     if (ret_len) *ret_len = len;
+
+--- dlls/ntdll/unix/system.c
++++ dlls/ntdll/unix/system.c
+@@ -4116,7 +4116,7 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
+          * STATUS_NOT_IMPLEMENTED or STATUS_INVALID_INFO_CLASS
+          * in 95% of the cases it's STATUS_INVALID_INFO_CLASS, so use this as the default
+          */
+-        ret = STATUS_INVALID_INFO_CLASS;
++        return STATUS_INVALID_INFO_CLASS;
+     }
+ 
+     if (ret_size) *ret_size = len;
+

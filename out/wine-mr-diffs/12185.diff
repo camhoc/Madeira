@@ -1,0 +1,78 @@
+# ntdll: Fixed compile time issue in signal_x86_64 on OpenBSD
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12185 state=closed
+# This MR fixes a single file compile time issues on OpenBSD in ntdll:unix/signal_x86_64.c
+
+I have:
+
+1. Run a bodged local solution that starts and launches wine on OpenBSD VM. This change is required on a path to have Wine running under OpenBSD.
+2. Rerun make on a fresh clone of the repo, confirmed that Linux build (I am on bazzite) works, while OpenBSD build (VM under QEMU) breaks down at least in this file.
+3. Made minimal fix that solves just this problem and in my opinion does not break existing logic.
+4. Rerun make on that branch for Linux (it still works), and OpenBSD (this file disappeared from the list of errors).
+5. Launched Notepad on Linux - it works
+
+Pretty much same process as with the previous PR.
+
+I do have a question about that FIXME I added - I wanted file to compile without errors, and I'd have to go back to it anyways. A "normal" fix for absence of %gs on OpenBSD would involve handling %gs faults, pointing it at %fs:teb tls offset, and then patching it in place. That PR will take time.
+--- dlls/ntdll/unix/signal_x86_64.c
++++ dlls/ntdll/unix/signal_x86_64.c
+@@ -266,6 +266,46 @@ __ASM_GLOBAL_FUNC( modify_ldt,
+ #define FPU_sig(context)    ((void *)((context)->uc_mcontext.__fpregs))
+ #define XState_sig(context) NULL
+ 
++#elif defined (__OpenBSD__)
++
++#include <machine/trap.h>
++
++/* OpenBSD names T_MCHK and T_XMMFLT differently */
++#define T_MCHK      T_MCA
++#define T_XMMFLT    T_XMM
++
++/* OpenBSD has no nested uc_mcontext and stores registers directly.
++ * Other than that, it is a copy of FreeBSD
++ */
++#define RAX_sig(context)     ((context)->sc_rax)
++#define RBX_sig(context)     ((context)->sc_rbx)
++#define RCX_sig(context)     ((context)->sc_rcx)
++#define RDX_sig(context)     ((context)->sc_rdx)
++#define RSI_sig(context)     ((context)->sc_rsi)
++#define RDI_sig(context)     ((context)->sc_rdi)
++#define RBP_sig(context)     ((context)->sc_rbp)
++#define R8_sig(context)      ((context)->sc_r8)
++#define R9_sig(context)      ((context)->sc_r9)
++#define R10_sig(context)     ((context)->sc_r10)
++#define R11_sig(context)     ((context)->sc_r11)
++#define R12_sig(context)     ((context)->sc_r12)
++#define R13_sig(context)     ((context)->sc_r13)
++#define R14_sig(context)     ((context)->sc_r14)
++#define R15_sig(context)     ((context)->sc_r15)
++#define CS_sig(context)      ((context)->sc_cs)
++#define DS_sig(context)      ((context)->sc_ds)
++#define ES_sig(context)      ((context)->sc_es)
++#define FS_sig(context)      ((context)->sc_fs)
++#define GS_sig(context)      ((context)->sc_gs)
++#define SS_sig(context)      ((context)->sc_ss)
++#define EFL_sig(context)     ((context)->sc_rflags)
++#define RIP_sig(context)     ((context)->sc_rip)
++#define RSP_sig(context)     ((context)->sc_rsp)
++#define TRAP_sig(context)    ((context)->sc_trapno)
++#define ERROR_sig(context)   ((context)->sc_err)
++#define FPU_sig(context)     ((void *)((context)->sc_fpstate))
++#define XState_sig(context)  NULL
++
+ #elif defined (__APPLE__)
+ 
+ #include <i386/user_ldt.h>
+@@ -2914,6 +2954,12 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
+     sysarch( X86_64_SET_GSBASE, &teb );
+ #elif defined (__APPLE__)
+     thread_data->pthread_teb = mac_thread_gsbase();
++#elif defined (__OpenBSD__)
++    /* FIXME: placeholder. OpenBSD has no ability to set %gs in userland.
++     * This has to be emulated later. At this moment we want ntdll to compile for OpenBSD
++     */
++# warning OpenBSD: %gs cannot be set (placeholder)
++    FIXME( "%%gs not set to TEB %p on OpenBSD\n", teb );
+ #else
+ # error Please define setting %gs for your architecture
+ #endif
+

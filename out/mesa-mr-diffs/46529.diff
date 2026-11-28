@@ -1,0 +1,713 @@
+# Draft kk: MetalFX temporal upscaling for Vulkan DLSS games on KosmicKrisp
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46529 state=opened
+# ### What does this MR do and why?
+
+This RFC shares a working prototype that enables MetalFX temporal upscaling (`MTL4FXTemporalScaler`) behind a game's Vulkan DLSS option on KosmicKrisp under Wine/macOS, opt-in via `MESA_KK_MFX=1` (completely inert when unset).
+
+Because `winevulkan` only thunks registered Vulkan extensions, the Windows NGX stand-in cannot call a private extension directly. Instead, this prototype uses `vkCmdPushConstants` / `vkCmdPushConstants2KHR` with a reserved pipeline-layout sentinel (`0x4D564B4D46583100`) and an 88-byte payload carrying the 4 `VkImage` handles (`color`, `depth`, `motion`, `output`), jitter, motion-vector scale, content dimensions, and reset/depth-inverted flags. KosmicKrisp intercepts that magic layout in `exposed_dispatch_table` (so it never enters Mesa's command-enqueue path) and encodes `MTL4FXTemporalScaler` bracketed by fenced, non-empty compute encoders.
+
+**Why this is Draft / RFC:** a magic `VkPipelineLayout` value with raw `VkImage` handles in push-constant data is a private ABI and not suitable for upstream Mesa. I'm opening this to:
+
+1. Share the working `MTL4FXTemporalScaler` integration and Wine/NGX findings with the community.
+2. Ask the KosmicKrisp maintainers whether a proper registered `VK_MESA_*` upscaling extension would be welcome upstream (which would also need `winevulkan` support).
+
+## **Companion pieces (separate repo, not in Mesa)**
+
+To test or run this with a real Vulkan DLSS game (tested on _Enshrouded_ under Wine/Mach9):
+
+* **Host Vulkan layer (`nvlayer`):** reports an NVIDIA vendor/device ID (`0x10DE`/`0x2704`) and, with `NVLAYER_NVX=1`, advertises and stubs `VK_NVX_binary_import` and `VK_NVX_image_view_handle` so the game enables DLSS.
+* **Windows NGX stand-in (`ngxcore` → `nvngx.dll`):** implements the Vulkan NGX entry points and `NVSDK_NGX_Parameter` MSVC vtable, and emits the magic `vkCmdPushConstants` call in `EvaluateFeature`.
+* **Companion repository:** https://github.com/nivogli/vk-ngx-metal
+--- src/kosmickrisp/bridge/stubs/mtl_metalfx.c
++++ src/kosmickrisp/bridge/stubs/mtl_metalfx.c
+@@ -0,0 +1,21 @@
++/*
++ * Copyright 2026 Sercan Firat, Nivogli
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "mtl_metalfx.h"
++
++bool
++mtl_metalfx_temporal_encode(struct mtl_metalfx_cache **cache,
++                            mtl_device *device, mtl_compiler *compiler,
++                            mtl_command_buffer *cmd_buf, mtl_fence *fence,
++                            const struct mtl_metalfx_params *params,
++                            unsigned encode_number, bool verbose)
++{
++   return false;
++}
++
++void
++mtl_metalfx_cache_destroy(struct mtl_metalfx_cache **cache)
++{
++}
+
+--- src/kosmickrisp/bridge/meson.build
++++ src/kosmickrisp/bridge/meson.build
+@@ -19,6 +19,7 @@ if host_machine.system() == 'darwin'
+     'mtl_device.m',
+     'mtl_encoder.m',
+     'mtl_heap.m',
++    'mtl_metalfx.m',
+     'mtl_render_state.m',
+     'mtl_residency_set.m',
+     'mtl_sampler.m',
+@@ -37,6 +38,7 @@ else
+     'stubs/mtl_device.c',
+     'stubs/mtl_encoder.c',
+     'stubs/mtl_heap.c',
++    'stubs/mtl_metalfx.c',
+     'stubs/mtl_render_state.c',
+     'stubs/mtl_residency_set.c',
+     'stubs/mtl_sampler.c',
+@@ -47,6 +49,7 @@ else
+ endif
+ 
+ mtl_bridge_dependencies = [
++  idep_mesautil,
+   idep_vulkan_lite_runtime_headers,
+   idep_vulkan_util
+ ]
+
+--- src/kosmickrisp/bridge/mtl_metalfx.h
++++ src/kosmickrisp/bridge/mtl_metalfx.h
+@@ -0,0 +1,41 @@
++/*
++ * Copyright 2026 Sercan Firat, Nivogli
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef MTL_METALFX_H
++#define MTL_METALFX_H 1
++
++#include "mtl_types.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++
++struct mtl_metalfx_cache;
++
++struct mtl_metalfx_params {
++   mtl_texture *color;
++   mtl_texture *depth;
++   mtl_texture *motion;
++   mtl_texture *output;
++   uint32_t content_width, content_height;
++   uint32_t out_width, out_height;
++   float jitter_x, jitter_y;
++   float motion_scale_x, motion_scale_y;
++   float pre_exposure;
++   bool reset;
++   bool depth_reversed;
++};
++
++/* Encodes a MetalFX temporal scale into cmd_buf. *cache holds keyed scalers
++ * (never released during encode, destroyed on device teardown). Returns false
++ * and encodes nothing if MetalFX can't take these textures. */
++bool mtl_metalfx_temporal_encode(struct mtl_metalfx_cache **cache,
++                                 mtl_device *device, mtl_compiler *compiler,
++                                 mtl_command_buffer *cmd_buf, mtl_fence *fence,
++                                 const struct mtl_metalfx_params *params,
++                                 unsigned encode_number, bool verbose);
++
++void mtl_metalfx_cache_destroy(struct mtl_metalfx_cache **cache);
++
++#endif /* MTL_METALFX_H */
+
+--- src/kosmickrisp/bridge/mtl_metalfx.m
++++ src/kosmickrisp/bridge/mtl_metalfx.m
+@@ -0,0 +1,298 @@
++/*
++ * Copyright 2026 Sercan Firat, Nivogli
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "mtl_metalfx.h"
++
++#define MESA_LOG_TAG "kk-metalfx"
++#include "util/log.h"
++
++#include <Metal/MTL4CommandBuffer.h>
++#include <Metal/Metal.h>
++#include <MetalFX/MetalFX.h>
++
++#include <dlfcn.h>
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++struct mtl_metalfx_key {
++   uint32_t input_width;
++   uint32_t input_height;
++   uint32_t output_width;
++   uint32_t output_height;
++   MTLPixelFormat color_format;
++   MTLPixelFormat depth_format;
++   MTLPixelFormat motion_format;
++   MTLPixelFormat output_format;
++   bool dynamic;
++};
++
++struct mtl_metalfx_entry {
++   struct mtl_metalfx_key key;
++   id<MTL4FXTemporalScaler> scaler;
++   bool failed;
++};
++
++struct mtl_metalfx_cache {
++   struct mtl_metalfx_entry *entries;
++   size_t count;
++   size_t capacity;
++   id<MTL4FXTemporalScaler> last_scaler;
++   uint32_t logged_usage;
++};
++
++/* Loaded on first use, so a driver that never upscales never loads MetalFX. */
++static Class
++metalfx_descriptor_class(void)
++{
++   static Class cls;
++   static dispatch_once_t once;
++   dispatch_once(&once, ^{
++      dlopen("/System/Library/Frameworks/MetalFX.framework/MetalFX", RTLD_LAZY);
++      cls = NSClassFromString(@"MTLFXTemporalScalerDescriptor");
++      if (!cls)
++         mesa_loge("MetalFX framework/MTLFXTemporalScalerDescriptor unavailable, no scaling");
++   });
++   return cls;
++}
++
++static bool
++metalfx_usage_ok(struct mtl_metalfx_cache *c, unsigned role_bit, const char *name,
++                 id<MTLTexture> tex, MTLTextureUsage need)
++{
++   if ((tex.usage & need) == need)
++      return true;
++   if (!(c->logged_usage & (1u << role_bit))) {
++      c->logged_usage |= (1u << role_bit);
++      mesa_logw("%s usage 0x%lx lacks 0x%lx, no scaling", name,
++                (unsigned long)tex.usage, (unsigned long)need);
++   }
++   return false;
++}
++
++static uint32_t
++clamp_content_dim(uint32_t content, uint32_t input_max, uint32_t output_dim,
++                  float min_scale, float max_scale)
++{
++   uint32_t lo = 1;
++   uint32_t hi = input_max;
++   if (max_scale > 0.0f) {
++      uint32_t min_dim = (uint32_t)ceilf((float)output_dim / max_scale);
++      if (min_dim > lo)
++         lo = min_dim;
++   }
++   if (min_scale > 0.0f) {
++      uint32_t max_dim = (uint32_t)floorf((float)output_dim / min_scale);
++      if (max_dim < hi)
++         hi = max_dim;
++   }
++   if (lo > hi)
++      return input_max;
++   if (content < lo)
++      return lo;
++   if (content > hi)
++      return hi;
++   return content;
++}
++
++static struct mtl_metalfx_entry *
++cache_find(struct mtl_metalfx_cache *c, const struct mtl_metalfx_key *key)
++{
++   for (size_t i = 0; i < c->count; i++) {
++      if (memcmp(&c->entries[i].key, key, sizeof(*key)) == 0)
++         return &c->entries[i];
++   }
++   return NULL;
++}
++
++static struct mtl_metalfx_entry *
++cache_insert(struct mtl_metalfx_cache *c, const struct mtl_metalfx_key *key,
++             id<MTL4FXTemporalScaler> scaler)
++{
++   if (c->count == c->capacity) {
++      size_t new_cap = c->capacity ? c->capacity * 2 : 4;
++      struct mtl_metalfx_entry *new_entries =
++         realloc(c->entries, new_cap * sizeof(*new_entries));
++      if (!new_entries)
++         return NULL;
++      c->entries = new_entries;
++      c->capacity = new_cap;
++   }
++   struct mtl_metalfx_entry *e = &c->entries[c->count++];
++   e->key = *key;
++   e->scaler = scaler;
++   e->failed = (scaler == nil);
++   return e;
++}
++
++bool
++mtl_metalfx_temporal_encode(struct mtl_metalfx_cache **cache,
++                            mtl_device *device, mtl_compiler *compiler,
++                            mtl_command_buffer *cmd_buf, mtl_fence *fence,
++                            const struct mtl_metalfx_params *p, unsigned n,
++                            bool verbose)
++{
++   @autoreleasepool {
++      id<MTLDevice> dev = (id<MTLDevice>)device;
++      id<MTLTexture> color = (id<MTLTexture>)p->color;
++      id<MTLTexture> depth = (id<MTLTexture>)p->depth;
++      id<MTLTexture> motion = (id<MTLTexture>)p->motion;
++      id<MTLTexture> output = (id<MTLTexture>)p->output;
++      Class cls = metalfx_descriptor_class();
++      if (!cls)
++         return false;
++
++      if (!*cache) {
++         *cache = calloc(1, sizeof(**cache));
++         if (!*cache)
++            return false;
++      }
++      struct mtl_metalfx_cache *c = *cache;
++
++      if ((p->out_width && p->out_width != output.width) ||
++          (p->out_height && p->out_height != output.height)) {
++         mesa_logw_once("requested output %ux%u differs from output texture %lux%lu",
++                        p->out_width, p->out_height,
++                        (unsigned long)output.width, (unsigned long)output.height);
++      }
++
++      const bool dynamic =
++         p->content_width != color.width || p->content_height != color.height;
++
++      const struct mtl_metalfx_key key = {
++         .input_width = (uint32_t)color.width,
++         .input_height = (uint32_t)color.height,
++         .output_width = (uint32_t)output.width,
++         .output_height = (uint32_t)output.height,
++         .color_format = color.pixelFormat,
++         .depth_format = depth.pixelFormat,
++         .motion_format = motion.pixelFormat,
++         .output_format = output.pixelFormat,
++         .dynamic = dynamic,
++      };
++
++      bool fresh = false;
++      struct mtl_metalfx_entry *entry = cache_find(c, &key);
++      if (!entry) {
++         MTLFXTemporalScalerDescriptor *d = [[cls alloc] init];
++         d.inputWidth = key.input_width;
++         d.inputHeight = key.input_height;
++         d.outputWidth = key.output_width;
++         d.outputHeight = key.output_height;
++         d.colorTextureFormat = key.color_format;
++         d.depthTextureFormat = key.depth_format;
++         d.motionTextureFormat = key.motion_format;
++         d.outputTextureFormat = key.output_format;
++         d.autoExposureEnabled = NO;
++         if (dynamic) {
++            d.inputContentPropertiesEnabled = YES;
++            d.inputContentMinScale = [cls supportedInputContentMinScaleForDevice:dev];
++            d.inputContentMaxScale = [cls supportedInputContentMaxScaleForDevice:dev];
++         }
++         id<MTL4FXTemporalScaler> created =
++            [d newTemporalScalerWithDevice:dev compiler:(id<MTL4Compiler>)compiler];
++         [d release];
++         entry = cache_insert(c, &key, created);
++         if (!entry) {
++            [created release];
++            return false;
++         }
++         fresh = true;
++         if (created) {
++            mesa_logi("temporal scaler %ux%u color %lu depth %lu motion %lu -> %ux%u fmt %lu%s: created",
++                      key.input_width, key.input_height,
++                      (unsigned long)key.color_format,
++                      (unsigned long)key.depth_format,
++                      (unsigned long)key.motion_format,
++                      key.output_width, key.output_height,
++                      (unsigned long)key.output_format,
++                      dynamic ? " dynamic" : "");
++         } else {
++            mesa_loge("temporal scaler %ux%u color %lu depth %lu motion %lu -> %ux%u fmt %lu%s: FAILED",
++                      key.input_width, key.input_height,
++                      (unsigned long)key.color_format,
++                      (unsigned long)key.depth_format,
++                      (unsigned long)key.motion_format,
++                      key.output_width, key.output_height,
++                      (unsigned long)key.output_format,
++                      dynamic ? " dynamic" : "");
++         }
++      }
++
++      if (entry->failed || !entry->scaler)
++         return false;
++
++      id<MTL4FXTemporalScaler> t = entry->scaler;
++
++      if (!metalfx_usage_ok(c, 0, "color", color, t.colorTextureUsage) ||
++          !metalfx_usage_ok(c, 1, "depth", depth, t.depthTextureUsage) ||
++          !metalfx_usage_ok(c, 2, "motion", motion, t.motionTextureUsage) ||
++          !metalfx_usage_ok(c, 3, "output", output, t.outputTextureUsage))
++         return false;
++
++      uint32_t content_w = p->content_width;
++      uint32_t content_h = p->content_height;
++      if (dynamic) {
++         float min_s = [cls supportedInputContentMinScaleForDevice:dev];
++         float max_s = [cls supportedInputContentMaxScaleForDevice:dev];
++         uint32_t clamped_w =
++            clamp_content_dim(content_w, key.input_width, key.output_width, min_s, max_s);
++         uint32_t clamped_h =
++            clamp_content_dim(content_h, key.input_height, key.output_height, min_s, max_s);
++         if (clamped_w != content_w || clamped_h != content_h) {
++            mesa_logw_once("clamped dynamic content %ux%u -> %ux%u (scale %.2f..%.2f)",
++                           content_w, content_h, clamped_w, clamped_h, min_s, max_s);
++            content_w = clamped_w;
++            content_h = clamped_h;
++         }
++      }
++
++      const bool reset = p->reset || fresh || (t != c->last_scaler);
++      if (verbose && (n <= 3 || n % 600 == 0)) {
++         mesa_logi("temporal #%u content %ux%u jitter (%g,%g) mvscale (%g,%g) reset %d depthReversed %d preExposure %g",
++                   n, content_w, content_h, p->jitter_x, p->jitter_y,
++                   p->motion_scale_x, p->motion_scale_y, reset, p->depth_reversed,
++                   p->pre_exposure);
++      }
++
++      t.colorTexture = color;
++      t.depthTexture = depth;
++      t.motionTexture = motion;
++      t.outputTexture = output;
++      t.inputContentWidth = content_w;
++      t.inputContentHeight = content_h;
++      t.jitterOffsetX = p->jitter_x;
++      t.jitterOffsetY = p->jitter_y;
++      t.motionVectorScaleX = p->motion_scale_x;
++      t.motionVectorScaleY = p->motion_scale_y;
++      t.preExposure = p->pre_exposure;
++      t.reset = reset;
++      t.depthReversed = p->depth_reversed;
++      t.fence = (id<MTLFence>)fence;
++      [t encodeToCommandBuffer:(id<MTL4CommandBuffer>)cmd_buf];
++      t.colorTexture = nil;
++      t.depthTexture = nil;
++      t.motionTexture = nil;
++      t.outputTexture = nil;
++      c->last_scaler = t;
++      return true;
++   }
++}
++
++void
++mtl_metalfx_cache_destroy(struct mtl_metalfx_cache **cache)
++{
++   if (!cache || !*cache)
++      return;
++   @autoreleasepool {
++      struct mtl_metalfx_cache *c = *cache;
++      for (size_t i = 0; i < c->count; i++) {
++         [c->entries[i].scaler release];
++      }
++      free(c->entries);
++      free(c);
++      *cache = NULL;
++   }
++}
+
+--- src/kosmickrisp/vulkan/kk_cmd_metalfx.c
++++ src/kosmickrisp/vulkan/kk_cmd_metalfx.c
+@@ -0,0 +1,217 @@
++/*
++ * Copyright 2026 Sercan Firat, Nivogli
++ * SPDX-License-Identifier: MIT
++ */
++
++/* MetalFX temporal upscaling for the game's DLSS option, through our NGX
++ * stand-in (tools/ngxcore). winevulkan has no way to pass a private command, so
++ * the stand-in calls vkCmdPushConstants with a magic layout and a struct of
++ * image handles and frame values. Only with MESA_KK_MFX=1. */
++
++#include "kk_cmd_buffer.h"
++#include "kk_device.h"
++#include "kk_image.h"
++
++#include "kosmickrisp/bridge/mtl_bridge.h"
++#include "kosmickrisp/bridge/mtl_metalfx.h"
++#include "kosmickrisp/bridge/mtl_sync.h"
++
++#undef MESA_LOG_TAG
++#define MESA_LOG_TAG "kk-metalfx"
++#include "util/log.h"
++#include "util/macros.h"
++#include "util/u_atomic.h"
++#include "util/u_debug.h"
++
++#define KK_MFX_LAYOUT 0x4D564B4D46583100ull /* "MVKMFX1" */
++#define KK_MFX_MAGIC  0x3158464Du           /* "MFX1" */
++#define KK_MFX_FLAG_DEPTH_INVERTED 8u
++
++/* Same layout as MVKMetalFXScaleInfo and mfx_info in tools/ngxcore/ngxcore.c.
++ * Note: sharpness is ignored (MetalFX temporal scaler has no sharpness
++ * control); flags currently only uses bit 3 (KK_MFX_FLAG_DEPTH_INVERTED);
++ * out_width/out_height are checked against the output texture extent. */
++struct kk_mfx_info {
++   uint32_t magic;
++   uint32_t size;
++   uint64_t color;
++   uint64_t output;
++   uint64_t depth;
++   uint64_t motion;
++   uint32_t in_width, in_height, out_width, out_height;
++   float jitter_x, jitter_y, mv_scale_x, mv_scale_y;
++   uint32_t reset, flags;
++   float sharpness, pre_exposure;
++};
++
++static_assert(sizeof(struct kk_mfx_info) == 88,
++              "kk_mfx_info must stay 88 bytes (matches tools/ngxcore/ngxcore.c)");
++
++static struct kk_image *
++kk_mfx_image(uint64_t handle)
++{
++   struct kk_image *image = kk_image_from_handle((VkImage)(uintptr_t)handle);
++   return image && image->plane_count == 1 && image->planes[0].mtl_handle
++             ? image
++             : NULL;
++}
++
++static uint32_t
++kk_mfx_content(uint32_t requested, uint32_t full)
++{
++   return requested && requested < full ? requested : full;
++}
++
++static bool
++kk_cmd_metalfx_intercept(struct kk_cmd_buffer *cmd,
++                         const VkPushConstantsInfoKHR *push)
++{
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   if (likely(!dev->mfx.enabled))
++      return false;
++
++   const struct kk_mfx_info *info = push->pValues;
++   if ((uint64_t)(uintptr_t)push->layout != KK_MFX_LAYOUT ||
++       push->size != sizeof(*info) || !info || info->magic != KK_MFX_MAGIC)
++      return false;
++
++   /* From here it's ours, whether or not it can run. */
++   if (cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
++      mesa_logw_once("secondary command buffer, no scaling");
++      return true;
++   }
++
++   if (!cmd->one_time_submit) {
++      mesa_logw_once("non-one-time-submit command buffer; resubmission will not re-scale");
++   }
++
++   struct kk_image *color = kk_mfx_image(info->color);
++   struct kk_image *depth = kk_mfx_image(info->depth);
++   struct kk_image *motion = kk_mfx_image(info->motion);
++   struct kk_image *output = kk_mfx_image(info->output);
++   if (!color || !depth || !motion || !output) {
++      mesa_logw_once("missing image, no scaling");
++      return true;
++   }
++
++   simple_mtx_lock(&dev->mfx.lock);
++   if (!dev->mfx.fence)
++      dev->mfx.fence = mtl_new_fence(dev->mtl_handle);
++   const unsigned n = ++dev->mfx.encodes;
++
++   /* MetalFX's encoders aren't in KK's order, so bracket them with non-empty
++    * compute encoders. Before: write 4-byte scratch, update the fence MetalFX
++    * waits on, and end the encoder (also ending any render pass in progress). */
++   struct kk_ptr pre_scratch = kk_pool_alloc(cmd, 4, 4);
++   if (pre_scratch.gpu)
++      kk_cmd_write(cmd, (struct libkk_imm_write){pre_scratch.gpu, 0});
++   mtl_update_fence(cs_get_compute(cmd), dev->mfx.fence, MTL_STAGE_ALL);
++   cs_end(cmd);
++
++   const struct mtl_metalfx_params params = {
++      .color = color->planes[0].mtl_handle,
++      .depth = depth->planes[0].mtl_handle,
++      .motion = motion->planes[0].mtl_handle,
++      .output = output->planes[0].mtl_handle,
++      .content_width = kk_mfx_content(info->in_width, color->vk.extent.width),
++      .content_height = kk_mfx_content(info->in_height, color->vk.extent.height),
++      .out_width = info->out_width,
++      .out_height = info->out_height,
++      .jitter_x = info->jitter_x,
++      .jitter_y = info->jitter_y,
++      .motion_scale_x = info->mv_scale_x,
++      .motion_scale_y = info->mv_scale_y,
++      .pre_exposure = info->pre_exposure > 0.0f ? info->pre_exposure : 1.0f,
++      .reset = info->reset != 0,
++      .depth_reversed = (info->flags & KK_MFX_FLAG_DEPTH_INVERTED) != 0,
++   };
++   const bool encoded = mtl_metalfx_temporal_encode(
++      &dev->mfx.cache, dev->mtl_handle, dev->mtl_compiler_handle,
++      cmd->metal.cmd_buf, dev->mfx.fence, &params, n, dev->mfx.log);
++   simple_mtx_unlock(&dev->mfx.lock);
++
++   /* After: wait for MetalFX, write 4-byte scratch so the encoder is non-empty,
++    * and end the encoder so its barrier holds back the game's next work. */
++   if (encoded) {
++      mtl_wait_for_fence(cs_get_compute(cmd), dev->mfx.fence, MTL_STAGE_ALL);
++      struct kk_ptr post_scratch = kk_pool_alloc(cmd, 4, 4);
++      if (post_scratch.gpu)
++         kk_cmd_write(cmd, (struct libkk_imm_write){post_scratch.gpu, 0});
++      cs_end(cmd);
++   }
++   return true;
++}
++
++/* The trampoline also enqueues the command for replay (not one-time-submit)
++ * and for secondaries, and the enqueue takes a reference on the layout, which
++ * here isn't an object. Intercept both v1 and v2 push-constant entry points in
++ * the exposed dispatch table so magic calls never enter the enqueue path. */
++static VKAPI_ATTR void VKAPI_CALL
++kk_mfx_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
++                        VkShaderStageFlags stageFlags, uint32_t offset,
++                        uint32_t size, const void *pValues)
++{
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   p_atomic_inc(&dev->mfx.push_v1_calls);
++   if ((uint64_t)(uintptr_t)layout == KK_MFX_LAYOUT) {
++      const VkPushConstantsInfoKHR info = {
++         .sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
++         .layout = layout,
++         .stageFlags = stageFlags,
++         .offset = offset,
++         .size = size,
++         .pValues = pValues,
++      };
++      if (kk_cmd_metalfx_intercept(cmd, &info))
++         return;
++   }
++   dev->mfx.next_push_constants(commandBuffer, layout, stageFlags, offset, size,
++                                pValues);
++}
++
++static VKAPI_ATTR void VKAPI_CALL
++kk_mfx_CmdPushConstants2KHR(VkCommandBuffer commandBuffer,
++                            const VkPushConstantsInfoKHR *pPushConstantsInfo)
++{
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   p_atomic_inc(&dev->mfx.push_v2_calls);
++   if (pPushConstantsInfo &&
++       (uint64_t)(uintptr_t)pPushConstantsInfo->layout == KK_MFX_LAYOUT &&
++       kk_cmd_metalfx_intercept(cmd, pPushConstantsInfo))
++      return;
++   dev->mfx.next_push_constants2(commandBuffer, pPushConstantsInfo);
++}
++
++void
++kk_device_metalfx_init(struct kk_device *dev)
++{
++   dev->mfx.enabled = debug_get_bool_option("MESA_KK_MFX", false);
++   dev->mfx.log = debug_get_bool_option("MESA_KK_MFX_LOG", false);
++   simple_mtx_init(&dev->mfx.lock, mtx_plain);
++   if (dev->mfx.enabled) {
++      dev->mfx.next_push_constants = dev->exposed_dispatch_table.CmdPushConstants;
++      dev->exposed_dispatch_table.CmdPushConstants = kk_mfx_CmdPushConstants;
++      dev->mfx.next_push_constants2 =
++         dev->exposed_dispatch_table.CmdPushConstants2KHR;
++      dev->exposed_dispatch_table.CmdPushConstants2KHR =
++         kk_mfx_CmdPushConstants2KHR;
++   }
++}
++
++void
++kk_device_metalfx_finish(struct kk_device *dev)
++{
++   if (dev->mfx.log) {
++      mesa_logi("device finish: encodes=%u push_v1_calls=%" PRIu64
++                " push_v2_calls=%" PRIu64,
++                dev->mfx.encodes,
++                (uint64_t)p_atomic_read(&dev->mfx.push_v1_calls),
++                (uint64_t)p_atomic_read(&dev->mfx.push_v2_calls));
++   }
++   mtl_metalfx_cache_destroy(&dev->mfx.cache);
++   if (dev->mfx.fence)
++      mtl_release(dev->mfx.fence);
++   simple_mtx_destroy(&dev->mfx.lock);
++}
+
+--- src/kosmickrisp/vulkan/kk_device.c
++++ src/kosmickrisp/vulkan/kk_device.c
+@@ -331,6 +331,8 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (result != VK_SUCCESS)
+       goto fail_sampler_heap;
+ 
++   kk_device_metalfx_init(dev);
++
+    if (pdev->settings.gpu_capture_immediately) {
+       mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
+       dev->gpu_capture_active = true;
+@@ -392,6 +394,8 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+       dev->has_queue = false;
+    }
+ 
++   kk_device_metalfx_finish(dev);
++
+    /* Release the residency set last once all BOs are released. */
+    mtl_release(dev->residency_set.handle);
+    simple_mtx_destroy(&dev->residency_set.mutex);
+
+--- src/kosmickrisp/vulkan/kk_device.h
++++ src/kosmickrisp/vulkan/kk_device.h
+@@ -26,6 +26,7 @@
+ 
+ struct kk_bo;
+ struct kk_physical_device;
++struct mtl_metalfx_cache;
+ struct vk_pipeline_cache;
+ 
+ struct kk_residency_set {
+@@ -106,6 +107,20 @@ struct kk_device {
+    util_once_flag heap_init_once;
+ 
+    bool gpu_capture_active;
++
++   struct {
++      bool enabled;
++      bool log;
++      simple_mtx_t lock;
++      struct mtl_metalfx_cache *cache;
++      mtl_fence *fence;
++      unsigned encodes;
++      uint32_t logged_flags;
++      uint64_t push_v1_calls;
++      uint64_t push_v2_calls;
++      PFN_vkCmdPushConstants next_push_constants;
++      PFN_vkCmdPushConstants2KHR next_push_constants2;
++   } mfx;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+@@ -120,6 +135,8 @@ VkResult kk_device_init_meta(struct kk_device *dev);
+ void kk_device_finish_meta(struct kk_device *dev);
+ VkResult kk_device_init_lib(struct kk_device *dev);
+ void kk_device_finish_lib(struct kk_device *dev);
++void kk_device_metalfx_init(struct kk_device *dev);
++void kk_device_metalfx_finish(struct kk_device *dev);
+ void kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap);
+ void kk_device_remove_heap_from_residency_set(struct kk_device *dev,
+                                               mtl_heap *heap);
+
+--- src/kosmickrisp/vulkan/meson.build
++++ src/kosmickrisp/vulkan/meson.build
+@@ -63,6 +63,7 @@ kk_files = files(
+   'kk_cmd_dispatch.c',
+   'kk_cmd_draw.c',
+   'kk_cmd_meta.c',
++  'kk_cmd_metalfx.c',
+   'kk_cmd_pool.h',
+   'kk_cmd_pool.c',
+   'kk_debug.h',
+

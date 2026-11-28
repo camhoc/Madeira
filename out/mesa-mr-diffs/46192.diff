@@ -1,0 +1,46 @@
+# kk: Use constant address space for load_global_constant_offset
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46192 state=merged
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+```
+kk: Use constant address space for load_global_constant_offset
+
+load_global_constant_offset should have used "constant" qualifier instead
+of "device" from the very beginning. Having workaround 6 applied to
+constant offsetted loads results in Metal hangs, mostly observed in
+multisampled samples like Sascha's.
+
+Fixes: 7c43bee7297 ("kk: workaround MSL compiler issue with volatile coherent qualifiers")
+Signed-off-by: Aitor Camacho <aitor@lunarg.com>
+```
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -1381,23 +1381,9 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+       break;
+    }
+    case nir_intrinsic_load_global_constant_offset: {
+-      enum gl_access_qualifier access = nir_intrinsic_access(instr);
+-      const char *type = msl_type_for_def(ctx->types, &instr->def);
+-      const char *qualifier = global_access_qualifier(ctx, access);
+-      if (access & ACCESS_ATOMIC) {
+-         assert(instr->num_components == 1u &&
+-                "We can only do single component with atomics");
+-         P(ctx, "atomic_load_explicit((%s atomic_%s*)(", qualifier, type);
+-         src_to_msl(ctx, &instr->src[0]);
+-         P(ctx, "+");
+-         src_to_msl(ctx, &instr->src[1]);
+-         P(ctx, ", memory_order_relaxed);\n");
+-      } else {
+-         src_to_packed_load_offset(ctx, &instr->src[0], &instr->src[1],
+-                                   qualifier,
+-                                   msl_type_for_def(ctx->types, &instr->def),
+-                                   instr->def.num_components);
+-      }
++      src_to_packed_load_offset(ctx, &instr->src[0], &instr->src[1], "constant",
++                                msl_type_for_def(ctx->types, &instr->def),
++                                instr->def.num_components);
+       P(ctx, ";\n");
+       break;
+    }
+

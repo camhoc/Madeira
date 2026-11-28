@@ -1,0 +1,219 @@
+# ntdll, server: Preparations for sending / receiving mach ports.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12717 state=closed
+# 
+--- dlls/ntdll/unix/server.c
++++ dlls/ntdll/unix/server.c
+@@ -1475,17 +1475,29 @@ static int server_connect(void)
+ #include <servers/bootstrap.h>
+ 
+ extern NTSTATUS apple_spawn_main_thread(void);
++static mach_port_t wineserver_port;
+ 
+-/* send our task port to the server */
+-static void send_server_task_port(void)
++static void send_mach_port( mach_port_t port )
+ {
+-    mach_port_t bootstrap_port, wineserver_port;
+-    mach_msg_return_t mret;
+-    kern_return_t kret;
+-
+-    struct {
++    struct
++    {
+         mach_msg_header_t           header;
+     } msg;
++    mach_msg_return_t ret;
++
++    msg.header.msgh_bits        = MACH_MSGH_BITS_SET_PORTS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_COPY_SEND, 0);
++    msg.header.msgh_size        = sizeof(msg);
++    msg.header.msgh_remote_port = wineserver_port;
++    msg.header.msgh_local_port  = port;
++
++    if ((ret = mach_msg_send( &msg.header ))) server_protocol_error( "mach_msg_send failed: 0x%08x\n", ret );
++}
++
++/* send our task port to the server */
++static void init_wineserver_port(void)
++{
++    mach_port_t bootstrap_port;
++    kern_return_t kret;
+ 
+     if (task_get_bootstrap_port(mach_task_self(), &bootstrap_port) != KERN_SUCCESS) return;
+ 
+@@ -1501,17 +1513,9 @@ static void send_server_task_port(void)
+ 
+     mach_port_deallocate(mach_task_self(), bootstrap_port);
+ 
+-    msg.header.msgh_bits        = MACH_MSGH_BITS_SET_PORTS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_COPY_SEND, 0);
+-    msg.header.msgh_size        = sizeof(msg);
+-    msg.header.msgh_remote_port = wineserver_port;
+-    msg.header.msgh_local_port  = mach_task_self();
+-
+-    mret = mach_msg_send(&msg.header);
+-    if (mret != MACH_MSG_SUCCESS)
+-        server_protocol_error( "mach_msg_send failed: 0x%08x\n", mret );
+-
+-    mach_port_deallocate(mach_task_self(), wineserver_port);
++    send_mach_port( mach_task_self() );
+ }
++
+ #endif  /* __APPLE__ */
+ 
+ 
+@@ -1740,7 +1744,7 @@ void server_init_process_done(void)
+     close( initial_cwd );
+ 
+ #ifdef __APPLE__
+-    send_server_task_port();
++    init_wineserver_port();
+     if ((status = apple_spawn_main_thread()))
+         ERR("Failed to spawn main thread, status %x\n", status);
+ #endif
+
+--- server/thread.c
++++ server/thread.c
+@@ -341,6 +341,11 @@ static void apply_thread_priority( struct thread *thread )
+ 
+ #endif
+ 
++static void clear_inflight_fd( struct inflight_fd *fd )
++{
++    fd->client = fd->server = -1;
++}
++
+ /* initialize the structure for a newly allocated thread */
+ static inline void init_thread_structure( struct thread *thread )
+ {
+@@ -388,8 +393,7 @@ static inline void init_thread_structure( struct thread *thread )
+     list_init( &thread->user_apc );
+     list_init( &thread->kernel_object );
+ 
+-    for (i = 0; i < MAX_INFLIGHT_FDS; i++)
+-        thread->inflight[i].server = thread->inflight[i].client = -1;
++    for (i = 0; i < MAX_INFLIGHT; i++) clear_inflight_fd( thread->inflight_fds + i );
+ }
+ 
+ static inline int is_thread_suspended( struct thread *thread )
+@@ -579,13 +583,10 @@ static void cleanup_thread( struct thread *thread )
+     destroy_thread_windows( thread );
+     free_msg_queue( thread );
+     release_thread_desktop( thread, 1 );
+-    for (i = 0; i < MAX_INFLIGHT_FDS; i++)
++    for (i = 0; i < MAX_INFLIGHT; i++)
+     {
+-        if (thread->inflight[i].client != -1)
+-        {
+-            close( thread->inflight[i].server );
+-            thread->inflight[i].client = thread->inflight[i].server = -1;
+-        }
++        close( thread->inflight_fds[i].server );
++        clear_inflight_fd( thread->inflight_fds + i );
+     }
+     free( thread->desc );
+     thread->req_data = NULL;
+@@ -1522,56 +1523,48 @@ static void clear_apc_queue( struct list *queue )
+ }
+ 
+ /* add an fd to the inflight list */
+-/* return list index, or -1 on error */
+-int thread_add_inflight_fd( struct thread *thread, int client, int server )
++void thread_add_inflight_fd( struct thread *thread, int client, int server )
+ {
+-    int i;
++    struct inflight_fd *fd, new = { .client = client, .server = server };
+ 
+-    if (server == -1) return -1;
++    if (server == -1) return;
+     if (client == -1)
+     {
+         close( server );
+-        return -1;
++        return;
+     }
+ 
+     /* first check if we already have an entry for this fd */
+-    for (i = 0; i < MAX_INFLIGHT_FDS; i++)
+-        if (thread->inflight[i].client == client)
+-        {
+-            close( thread->inflight[i].server );
+-            thread->inflight[i].server = server;
+-            return i;
+-        }
++    for (fd = thread->inflight_fds; fd < thread->inflight_fds + MAX_INFLIGHT; fd++)
++        if (fd->client == new.client) goto done;
+ 
+     /* now find a free spot to store it */
+-    for (i = 0; i < MAX_INFLIGHT_FDS; i++)
+-        if (thread->inflight[i].client == -1)
+-        {
+-            thread->inflight[i].client = client;
+-            thread->inflight[i].server = server;
+-            return i;
+-        }
++    for (fd = thread->inflight_fds; fd < thread->inflight_fds + MAX_INFLIGHT; fd++)
++        if (fd->client == -1) goto done;
+ 
+-    close( server );
+-    return -1;
++    fatal_error( "%04x: inflight fd array is full\n", thread->id );
++
++done:
++    close( fd->server );
++    *fd = new;
+ }
+ 
+ /* get an inflight fd and purge it from the list */
+ /* the fd must be closed when no longer used */
+ int thread_get_inflight_fd( struct thread *thread, int client )
+ {
+-    int i, ret;
++    struct inflight_fd *fd;
+ 
+     if (client == -1) return -1;
+ 
+     do
+     {
+-        for (i = 0; i < MAX_INFLIGHT_FDS; i++)
++        for (fd = thread->inflight_fds; fd < thread->inflight_fds + MAX_INFLIGHT; fd++)
+         {
+-            if (thread->inflight[i].client == client)
++            if (fd->client == client)
+             {
+-                ret = thread->inflight[i].server;
+-                thread->inflight[i].server = thread->inflight[i].client = -1;
++                int ret = fd->server;
++                clear_inflight_fd( fd );
+                 clear_error();
+                 return ret;
+             }
+
+--- server/thread.h
++++ server/thread.h
+@@ -45,7 +45,7 @@ struct inflight_fd
+     int client;  /* fd on the client side (or -1 if entry is free) */
+     int server;  /* fd on the server side */
+ };
+-#define MAX_INFLIGHT_FDS 16  /* max number of fds in flight per thread */
++#define MAX_INFLIGHT 16  /* max number of fds in flight per thread */
+ 
+ struct thread
+ {
+@@ -64,7 +64,7 @@ struct thread
+     struct thread_wait    *wait;          /* current wait condition if sleeping */
+     struct list            system_apc;    /* queue of system async procedure calls */
+     struct list            user_apc;      /* queue of user async procedure calls */
+-    struct inflight_fd     inflight[MAX_INFLIGHT_FDS];  /* fds currently in flight */
++    struct inflight_fd     inflight_fds[MAX_INFLIGHT];  /* fds currently in flight */
+     unsigned int           error;         /* current error code */
+     union generic_request  req;           /* current request */
+     void                  *req_data;      /* variable-size data for request */
+@@ -126,7 +126,7 @@ extern void kill_thread( struct thread *thread, int violent_death );
+ extern void wake_up( struct object *obj, int max );
+ extern int thread_queue_apc( struct process *process, struct thread *thread, struct object *owner, const union apc_call *call_data );
+ extern void thread_cancel_apc( struct thread *thread, struct object *owner, enum apc_type type );
+-extern int thread_add_inflight_fd( struct thread *thread, int client, int server );
++extern void thread_add_inflight_fd( struct thread *thread, int client, int server );
+ extern int thread_get_inflight_fd( struct thread *thread, int client );
+ extern struct token *thread_get_impersonation_token( struct thread *thread );
+ extern int get_effective_thread_priority( struct thread *thread );
+

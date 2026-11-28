@@ -1,0 +1,477 @@
+# winewayland: Implement color management protocol (Part 1)
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12204 state=closed
+# This MR implements conversion of VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT and VK_COLOR_SPACE_HDR10_ST2084_EXT to VK_COLOR_SPACE_PASS_THROUGH_EXT (for winewayland) using the color management protocol v3 windows_scrgb/windows_bt2100 image descriptions, respectively. The win32u interface allows for converting from any colorspace to any colorspace in case that is needed by other drivers. 
+
+This is needed for color accuracy on Wayland (and likely other drivers) since Windows does not adjust the resulting image based on an image description that the client targets; instead, Windows just passes through the image "without any adjustments to the signal to account for viewing conditions". More information about this can be seen in https://wayland.app/protocols/color-management-v1#wp_color_manager_v1:request:create_windows_bt2100 and https://wayland.app/protocols/color-management-v1#wp_color_manager_v1:request:create_windows_scrgb
+
+For example, KWin currently has a hack to check for Wine and automatically override the colorspace to the Windows one internally, so this MR would allow compositors to remove these hacks.
+
+Part 2 would probably be the EDID emulation that I posted an MR for in the past; I have an updated version that moves all that logic to win32u (to unify this with winemac.drv in the future).
+--- dlls/win32u/vulkan.c
++++ dlls/win32u/vulkan.c
+@@ -1829,6 +1829,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+     struct vulkan_instance *instance = physical_device->instance;
+     VkSwapchainCreateInfoKHR create_info_host = *create_info;
+     VkSurfaceCapabilitiesKHR capabilities;
++    VkSurfaceFormatKHR *formats;
+     VkSwapchainKHR host_swapchain;
+     struct ratio raw_dpi;
+     RECT client_rect;
+@@ -1847,9 +1848,49 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device, surface->obj.host.surface, &capabilities );
+     if (res) return res;
+ 
++    create_info_host.imageColorSpace = driver_funcs->p_map_surface_colorspace( NULL, create_info_host.imageColorSpace );
+     create_info_host.imageExtent.width = max( create_info_host.imageExtent.width, capabilities.minImageExtent.width );
+     create_info_host.imageExtent.height = max( create_info_host.imageExtent.height, capabilities.minImageExtent.height );
+ 
++    /* check if the new colorspace works with the provided format */
++    if (create_info_host.imageColorSpace == create_info->imageColorSpace)
++        driver_funcs->p_map_surface_colorspace( surface->client, create_info->imageColorSpace );
++    else
++    {
++        uint32_t format_count = 0, i = 0;
++
++        res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device, surface->obj.host.surface, &format_count, NULL );
++
++        if (!(formats = calloc( format_count, sizeof(*formats) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++        if ((res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device, surface->obj.host.surface,
++                                                                     &format_count, formats )))
++        {
++            free(formats);
++            return res;
++        }
++
++        for (; i < format_count; i++)
++        {
++            if (formats[i].format == create_info_host.imageFormat &&
++                formats[i].colorSpace == create_info_host.imageColorSpace)
++            {
++                driver_funcs->p_map_surface_colorspace( surface->client, create_info->imageColorSpace );
++                break;
++            }
++        }
++
++        free(formats);
++
++        if (i == format_count)
++        {
++            /* Don't update driver colorspace here since the driver assumes that a compatible surface format exists */
++            ERR("Colorspace %u is not compatible with format %u\n",
++                create_info_host.imageColorSpace, create_info_host.imageFormat);
++            create_info_host.imageColorSpace = create_info->imageColorSpace;
++        }
++    }
++
+     /* If the swapchain image size is not equal to the presentation size (e.g. because of DPI virtualization or
+      * display mode change emulation), MoltenVK's vkQueuePresentKHR returns VK_SUBOPTIMAL_KHR.
+      * Create the swapchain with VkSwapchainPresentScalingCreateInfoEXT to avoid this.
+@@ -2983,6 +3024,11 @@ static VkBool32 nulldrv_get_physical_device_presentation_support( struct vulkan_
+     return VK_TRUE;
+ }
+ 
++static VkColorSpaceKHR nulldrv_map_surface_colorspace( struct client_surface *client, VkColorSpaceKHR colorspace )
++{
++    return colorspace;
++}
++
+ static void nulldrv_map_instance_extensions( struct vulkan_instance_extensions *extensions )
+ {
+     if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_EXT_headless_surface = 1;
+@@ -3003,6 +3049,7 @@ static const struct vulkan_driver_funcs nulldrv_funcs =
+ {
+     .p_vulkan_surface_create = nulldrv_vulkan_surface_create,
+     .p_get_physical_device_presentation_support = nulldrv_get_physical_device_presentation_support,
++    .p_map_surface_colorspace = nulldrv_map_surface_colorspace,
+     .p_map_instance_extensions = nulldrv_map_instance_extensions,
+     .p_map_device_extensions = nulldrv_map_device_extensions,
+ };
+@@ -3039,6 +3086,12 @@ static VkBool32 lazydrv_get_physical_device_presentation_support( struct vulkan_
+     return driver_funcs->p_get_physical_device_presentation_support( physical_device, queue );
+ }
+ 
++static VkColorSpaceKHR lazydrv_map_surface_colorspace( struct client_surface *client, VkColorSpaceKHR colorspace )
++{
++    vulkan_driver_load();
++    return driver_funcs->p_map_surface_colorspace( client, colorspace );
++}
++
+ static void lazydrv_map_instance_extensions( struct vulkan_instance_extensions *extensions )
+ {
+     vulkan_driver_load();
+@@ -3055,6 +3108,7 @@ static const struct vulkan_driver_funcs lazydrv_funcs =
+ {
+     .p_vulkan_surface_create = lazydrv_vulkan_surface_create,
+     .p_get_physical_device_presentation_support = lazydrv_get_physical_device_presentation_support,
++    .p_map_surface_colorspace = lazydrv_map_surface_colorspace,
+     .p_map_instance_extensions = lazydrv_map_instance_extensions,
+     .p_map_device_extensions = lazydrv_map_device_extensions,
+ };
+
+--- dlls/winemac.drv/vulkan.c
++++ dlls/winemac.drv/vulkan.c
+@@ -76,6 +76,11 @@ static VkBool32 macdrv_get_physical_device_presentation_support(struct vulkan_ph
+     return VK_TRUE;
+ }
+ 
++static VkColorSpaceKHR macdrv_map_surface_colorspace(struct client_surface *client, VkColorSpaceKHR colorspace)
++{
++    return colorspace;
++}
++
+ static BOOL use_VK_EXT_metal_surface;
+ 
+ static void macdrv_map_instance_extensions(struct vulkan_instance_extensions *extensions)
+@@ -100,6 +105,7 @@ static const struct vulkan_driver_funcs macdrv_vulkan_driver_funcs =
+ {
+     .p_vulkan_surface_create = macdrv_vulkan_surface_create,
+     .p_get_physical_device_presentation_support = macdrv_get_physical_device_presentation_support,
++    .p_map_surface_colorspace = macdrv_map_surface_colorspace,
+     .p_map_instance_extensions = macdrv_map_instance_extensions,
+     .p_map_device_extensions = macdrv_map_device_extensions,
+ };
+
+--- dlls/winewayland.drv/Makefile.in
++++ dlls/winewayland.drv/Makefile.in
+@@ -8,6 +8,7 @@ VER_FILEDESCRIPTION_STR = "Wine Wayland driver"
+ 
+ SOURCES = \
+ 	alpha-modifier-v1.xml \
++        color-management-v1.xml \
+ 	cursor-shape-v1.xml \
+ 	display.c \
+ 	dllmain.c \
+
+--- dlls/winewayland.drv/color-management-v1.xml
++++ dlls/winewayland.drv/color-management-v1.xml
+
+--- dlls/winewayland.drv/vulkan.c
++++ dlls/winewayland.drv/vulkan.c
+@@ -70,6 +70,48 @@ static VkBool32 wayland_get_physical_device_presentation_support(struct vulkan_p
+                                                                         process_wayland.wl_display);
+ }
+ 
++static VkColorSpaceKHR wayland_map_surface_colorspace(struct client_surface *client, VkColorSpaceKHR colorspace)
++{
++    struct wayland_client_surface *surface = client ? impl_from_client_surface(client) : NULL;
++    struct wp_image_description_v1 *desc = NULL;
++    VkColorSpaceKHR new = colorspace;
++
++    if (process_wayland.supports_win_scrgb && colorspace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
++        new = VK_COLOR_SPACE_PASS_THROUGH_EXT;
++    else if (process_wayland.supports_win_pq && colorspace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
++        new = VK_COLOR_SPACE_PASS_THROUGH_EXT;
++
++    TRACE("mapping colorspace %u => %u\n", colorspace, new);
++
++    if (!surface) return new;
++    if (new == colorspace)
++    {
++        wayland_client_surface_attach_image_description(surface, NULL);
++        return colorspace;
++    }
++
++    switch (colorspace)
++    {
++    case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
++        desc = wp_color_manager_v1_create_windows_scrgb(process_wayland.wp_color_manager_v1);
++        break;
++    case VK_COLOR_SPACE_HDR10_ST2084_EXT:
++        desc = wp_color_manager_v1_create_windows_bt2100(process_wayland.wp_color_manager_v1);
++        break;
++    default: break;
++    }
++
++    if (!desc) goto err;
++
++    wayland_client_surface_attach_image_description(surface, desc);
++    wl_display_flush(process_wayland.wl_display);
++    return new;
++
++err:
++    ERR("Failed to configure image description for client surface!\n");
++    return colorspace;
++}
++
+ static void wayland_map_instance_extensions(struct vulkan_instance_extensions *extensions)
+ {
+     if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_wayland_surface = 1;
+@@ -90,6 +132,7 @@ static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs =
+ {
+     .p_vulkan_surface_create = wayland_vulkan_surface_create,
+     .p_get_physical_device_presentation_support = wayland_get_physical_device_presentation_support,
++    .p_map_surface_colorspace = wayland_map_surface_colorspace,
+     .p_map_instance_extensions = wayland_map_instance_extensions,
+     .p_map_device_extensions = wayland_map_device_extensions,
+ };
+
+--- dlls/winewayland.drv/wayland.c
++++ dlls/winewayland.drv/wayland.c
+@@ -86,6 +86,45 @@ static const struct wl_seat_listener seat_listener =
+     wl_seat_handle_name
+ };
+ 
++static void wayland_color_manager_handle_supported_intent(void *data,
++    struct wp_color_manager_v1 *wp_color_manager_v1, uint32_t intent)
++{
++}
++
++static void wayland_color_manager_handle_supported_feature(void *data,
++    struct wp_color_manager_v1 *wp_color_manager_v1, uint32_t feature)
++{
++    TRACE("feature %u\n", feature);
++
++    if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_SCRGB)
++        process_wayland.supports_win_scrgb = TRUE;
++    if (feature == WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_BT2100)
++        process_wayland.supports_win_pq = TRUE;
++}
++
++static void wayland_color_manager_handle_supported_named_tf(void *data,
++    struct wp_color_manager_v1 *wp_color_manager_v1, uint32_t tf)
++{
++}
++
++static void wayland_color_manager_handle_supported_primaries(void *data,
++    struct wp_color_manager_v1 *wp_color_manager_v1, uint32_t primaries)
++{
++}
++
++static void wayland_color_manager_handle_done(void *data,
++                        struct wp_color_manager_v1 *wp_color_manager_v1)
++{
++}
++
++static const struct wp_color_manager_v1_listener wp_color_manager_listener = {
++    wayland_color_manager_handle_supported_intent,
++    wayland_color_manager_handle_supported_feature,
++    wayland_color_manager_handle_supported_named_tf,
++    wayland_color_manager_handle_supported_primaries,
++    wayland_color_manager_handle_done
++};
++
+ /**********************************************************************
+  *          Registry handling
+  */
+@@ -215,6 +254,14 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+         process_wayland.wp_fractional_scale_manager_v1 =
+             wl_registry_bind(registry, id, &wp_fractional_scale_manager_v1_interface, 1);
+     }
++    else if (strcmp(interface, "wp_color_manager_v1") == 0)
++    {
++        process_wayland.wp_color_manager_v1 =
++            wl_registry_bind(registry, id, &wp_color_manager_v1_interface,
++                             version < 3 ? version : 3);
++        wp_color_manager_v1_add_listener(process_wayland.wp_color_manager_v1,
++                                         &wp_color_manager_listener, NULL);
++    }
+ #ifdef WL_FIXES_ACK_GLOBAL_REMOVE
+     else if (strcmp(interface, "wl_fixes") == 0)
+     {
+
+--- dlls/winewayland.drv/wayland_surface.c
++++ dlls/winewayland.drv/wayland_surface.c
+@@ -1156,6 +1156,8 @@ static void wayland_client_surface_destroy(struct client_surface *client)
+ 
+     TRACE("%s\n", debugstr_client_surface(client));
+ 
++    if (surface->wp_color_management_surface_v1)
++        wp_color_management_surface_v1_destroy(surface->wp_color_management_surface_v1);
+     if (surface->wp_viewport)
+         wp_viewport_destroy(surface->wp_viewport);
+     if (surface->wl_subsurface)
+@@ -1328,6 +1330,75 @@ done:
+     wayland_win_data_release(toplevel_data);
+ }
+ 
++static void wayland_image_description_v1_failed(void *user_data,
++                    struct wp_image_description_v1 *wp_image_description_v1,
++                    uint32_t cause, const char *msg)
++{
++    struct wayland_client_surface *surface = user_data;
++    ERR("cause=%u msg=%s\n", cause, debugstr_a(msg));
++
++    wp_image_description_v1_destroy(wp_image_description_v1);
++    client_surface_release(&surface->client);
++}
++
++static void wayland_image_description_v1_ready2(void *user_data,
++                    struct wp_image_description_v1 *wp_image_description_v1,
++                    uint32_t identity_hi, uint32_t identity_lo)
++{
++    struct wayland_client_surface *surface = user_data;
++    TRACE("id=%#x%x\n", identity_hi, identity_lo);
++
++    if (!surface->wp_color_management_surface_v1)
++    {
++        surface->wp_color_management_surface_v1 =
++            wp_color_manager_v1_get_surface(process_wayland.wp_color_manager_v1,
++                                            surface->wl_surface);
++        if (!surface->wp_color_management_surface_v1)
++        {
++            ERR("Failed to create color management surface for client surface!\n");
++            goto done;
++        }
++    }
++
++    wp_color_management_surface_v1_set_image_description(
++        surface->wp_color_management_surface_v1,
++        wp_image_description_v1,
++        WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
++    wp_image_description_v1_destroy(wp_image_description_v1);
++
++done:
++    client_surface_release(&surface->client);
++}
++
++static void wayland_image_description_v1_ready(void *user_data,
++                    struct wp_image_description_v1 *wp_image_description_v1,
++                    uint32_t identity)
++{
++    wayland_image_description_v1_ready2(user_data, wp_image_description_v1, 0, identity);
++}
++
++static const struct wp_image_description_v1_listener image_description_listener = {
++    wayland_image_description_v1_failed,
++    wayland_image_description_v1_ready,
++    wayland_image_description_v1_ready2
++};
++
++void wayland_client_surface_attach_image_description(struct wayland_client_surface *surface,
++                                                     struct wp_image_description_v1 *image_desc)
++{
++    if (!image_desc)
++    {
++        if (!surface->wp_color_management_surface_v1) return;
++
++        wp_color_management_surface_v1_destroy(surface->wp_color_management_surface_v1);
++        surface->wp_color_management_surface_v1 = NULL;
++        return;
++    }
++
++    client_surface_add_ref(&surface->client);
++    wp_image_description_v1_add_listener(image_desc, &image_description_listener, surface);
++}
++
+ static void dummy_buffer_release(void *data, struct wl_buffer *buffer)
+ {
+     struct wayland_shm_buffer *shm_buffer = data;
+
+--- dlls/winewayland.drv/waylanddrv.h
++++ dlls/winewayland.drv/waylanddrv.h
+@@ -41,6 +41,7 @@
+ #include "pointer-warp-v1-client-protocol.h"
+ #include "alpha-modifier-v1-client-protocol.h"
+ #include "fractional-scale-v1-client-protocol.h"
++#include "color-management-v1-client-protocol.h"
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -185,6 +186,7 @@ struct wayland
+     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
+     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
+     struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
++    struct wp_color_manager_v1 *wp_color_manager_v1;
+     struct wayland_seat seat;
+     struct wayland_keyboard keyboard;
+     struct wayland_pointer pointer;
+@@ -197,6 +199,8 @@ struct wayland
+     /* Protects the output_list and the wayland_output.current states. */
+     pthread_mutex_t output_mutex;
+     LONG input_serial;
++    BOOL supports_win_scrgb;
++    BOOL supports_win_pq;
+ };
+ 
+ struct wayland_output_mode
+@@ -256,6 +260,7 @@ struct wayland_client_surface
+     struct wl_surface *wl_surface;
+     struct wl_subsurface *wl_subsurface;
+     struct wp_viewport *wp_viewport;
++    struct wp_color_management_surface_v1 *wp_color_management_surface_v1;
+ };
+ 
+ extern struct wayland_client_surface *impl_from_client_surface(struct client_surface *client);
+@@ -342,6 +347,8 @@ POINT map_point_to_surface(struct wayland_surface *surface, POINT point);
+ RECT map_rect_from_surface(struct wayland_surface *surface, RECT rect);
+ POINT map_point_from_surface(struct wayland_surface *surface, POINT point);
+ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel, const RECT *rect);
++void wayland_client_surface_attach_image_description(struct wayland_client_surface *client,
++                                                     struct wp_image_description_v1 *desc);
+ void wayland_surface_ensure_contents(struct wayland_surface *surface);
+ void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
+ void wayland_surface_assign_icon(struct wayland_surface *surface);
+
+--- dlls/winex11.drv/vulkan.c
++++ dlls/winex11.drv/vulkan.c
+@@ -73,6 +73,11 @@ static VkBool32 X11DRV_get_physical_device_presentation_support( struct vulkan_p
+                                                                       default_visual.visual->visualid );
+ }
+ 
++static VkColorSpaceKHR X11DRV_map_surface_colorspace( struct client_surface *client, VkColorSpaceKHR colorspace )
++{
++    return colorspace;
++}
++
+ static void X11DRV_map_instance_extensions( struct vulkan_instance_extensions *extensions )
+ {
+     if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_xlib_surface = 1;
+@@ -93,6 +98,7 @@ static const struct vulkan_driver_funcs x11drv_vulkan_driver_funcs =
+ {
+     .p_vulkan_surface_create = X11DRV_vulkan_surface_create,
+     .p_get_physical_device_presentation_support = X11DRV_get_physical_device_presentation_support,
++    .p_map_surface_colorspace = X11DRV_map_surface_colorspace,
+     .p_map_instance_extensions = X11DRV_map_instance_extensions,
+     .p_map_device_extensions = X11DRV_map_device_extensions,
+ };
+
+--- include/wine/vulkan_driver.h
++++ include/wine/vulkan_driver.h
+@@ -360,6 +360,7 @@ struct vulkan_driver_funcs
+ {
+     VkResult (*p_vulkan_surface_create)(struct client_surface *, const struct vulkan_instance *, VkSurfaceKHR *);
+     VkBool32 (*p_get_physical_device_presentation_support)(struct vulkan_physical_device *, uint32_t);
++    VkColorSpaceKHR (*p_map_surface_colorspace)(struct client_surface *, VkColorSpaceKHR);
+     void (*p_map_instance_extensions)( struct vulkan_instance_extensions *extensions );
+     void (*p_map_device_extensions)( struct vulkan_device_extensions *extensions );
+ };
+
+--- NOTICES.md
++++ NOTICES.md
+@@ -1109,6 +1109,34 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ DEALINGS IN THE SOFTWARE.
+ ```
+ 
++### Wayland color management protocol
++```
++Copyright 2019 Sebastian Wick
++Copyright 2019 Erwin Burema
++Copyright 2020 AMD
++Copyright 2020-2024 Collabora, Ltd.
++Copyright 2024 Xaver Hugl
++Copyright 2022-2025 Red Hat, Inc.
++    
++Permission is hereby granted, free of charge, to any person obtaining a
++copy of this software and associated documentation files (the "Software"),
++to deal in the Software without restriction, including without limitation
++the rights to use, copy, modify, merge, publish, distribute, sublicense,
++and/or sell copies of the Software, and to permit persons to whom the
++Software is furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice (including the next
++paragraph) shall be included in all copies or substantial portions of the
++Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++DEALINGS IN THE SOFTWARE.
++```
+ 
+ ### Wayland cursor shape protocol
+ ```
+

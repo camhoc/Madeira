@@ -1,0 +1,69 @@
+# asahi/hk: use a lighter CDM barrier between compute dispatches
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44041 state=opened
+# Disclosure up front: I used an AI assistant for the investigation, the code and the test runs here. Flagging it given your comments and !43990 rather than have you work it out again. Everything below is reproducible on my machine and I will re-run anything.
+
+`agx_cdm_barrier()` sets every known bit. Its own comment says the extra bits went in for blit cache coherency, that their meaning was not known, and that it should be revisited. This adds `agx_cdm_barrier_light()`, which sets only the bits that were set before that, and uses it for CDM cache flushes.
+
+Per-dispatch cost, M1 (G13G, 8 core), `test-backend-ops perf -o ADD`, ne=[4096,1,1,1], 3 runs:
+
+| | us/dispatch |
+|---|---|
+| `agx_cdm_barrier()` | 7.1 - 7.4 |
+| `agx_cdm_barrier_light()` | 4.0 - 4.1 |
+
+dEQP-VK, one build with only this behaviour toggled, identical in every group including not-supported counts:
+
+| group | pass | fail |
+|---|---|---|
+| synchronization, memory_model, compute.pipeline | 13658 | 0 |
+| image, blit, copy, texture | 2588 | 0 |
+| draw, tessellation, geometry | 2611 | 1 |
+
+The single failure is `geometry.builtin_variable.primitive_id.matching`, which fails identically with the old barrier.
+
+The draw group matters because `hk_cmd_draw.c` launches the vertex, geometry and tessellation shaders through `hk_dispatch_with_usc()`, so this changes the barrier after every draw, not only every dispatch. I had missed that in the first version. The image group includes `blit_image.all_formats.generate_mipmaps` (1608 cases), which chains dependent blits, so it exercises what the extra bits were added for.
+
+This is not proof the dropped bits are unnecessary. `unk_0..unk_19` are undocumented, so all I can show is that nothing I can run notices the difference. If you know what they do, that would settle it.
+
+Changes since the first version:
+
+- Dropped the `hk_CmdPipelineBarrier2()` batch fast path entirely. Its predicate let a global memory barrier naming a transfer stage cover an image transfer with no i
+--- src/asahi/libagx/libagx_dgc.h
++++ src/asahi/libagx/libagx_dgc.h
+@@ -415,6 +415,23 @@ agx_cdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
+    return out;
+ }
+ 
++/* Only the bits agx_cdm_barrier() set before the blit fixes added the rest. */
++static inline GLOBAL uint32_t *
++agx_cdm_barrier_light(GLOBAL uint32_t *out, enum agx_chip chip)
++{
++   agx_push(out, CDM_BARRIER, cfg) {
++      cfg.unk_5 = true;
++      cfg.unk_6 = true;
++      cfg.unk_8 = true;
++
++      if (chip == AGX_CHIP_G13X) {
++         cfg.unk_4 = true;
++      }
++   }
++
++   return out;
++}
++
+ static inline GLOBAL uint32_t *
+ agx_vdm_return(GLOBAL uint32_t *out)
+ {
+
+--- src/asahi/vulkan/hk_cmd_dispatch.c
++++ src/asahi/vulkan/hk_cmd_dispatch.c
+@@ -48,7 +48,7 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
+    assert(cs->current + AGX_CDM_BARRIER_LENGTH < cs->end &&
+           "caller must ensure space");
+ 
+-   cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
++   cs->current = agx_cdm_barrier_light(cs->current, dev->dev.chip);
+    cs->stats.flushes++;
+ }
+ 
+

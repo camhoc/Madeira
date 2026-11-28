@@ -1,0 +1,408 @@
+# win32u/freetype: Fix tmExternalLeading for CFF fonts.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/10603 state=opened
+# This fixes font scaling issues with CFF fonts this was discovered from games utilizing DxLib.
+
+https://github.com/yumetodo/DxLib/tree/master
+
+https://dxlib.xsrv.jp/index.html
+
+I've ran tests on Windows and to confirm that this change is consistent with a number of fonts.
+
+Before:
+
+![image.png](/uploads/a398d5543df8561f1a6fbe9edded3b45/image.png){width="801" height="600"}
+
+After (this matches the windows visual from testing in a VM):
+
+![image.png](/uploads/cf4e4c8753b3482dd24211b519a5fe23/image.png){width="767" height="572"}
+
+Related Proton Issue:
+
+https://github.com/ValveSoftware/Proton/issues/7299
+
+Full Disclosure:
+
+An LLM was used to assist in finding this bug, the original fix written by the LLM wrote a loader binary that changed the pointers for `GetTextMetricsA` and `GetTextMetricsW` to point to a custom implementation that always set `tmExternalLeading`. The LLM determined that `GDI returns 0 when (winAscent + winDescent) > (Ascender - Descender)`, after testing on WIndows I found this to be incorrect, the actual difference is that CFF fonts always set `tmExternalLeading` to 0.
+--- dlls/gdi32/tests/Makefile.in
++++ dlls/gdi32/tests/Makefile.in
+@@ -4,6 +4,7 @@ IMPORTS   = setupapi user32 gdi32 advapi32
+ SOURCES = \
+ 	bitmap.c \
+ 	brush.c \
++	cff.sfd \
+ 	clipping.c \
+ 	dc.c \
+ 	dib.c \
+
+--- dlls/gdi32/tests/cff.otf
++++ dlls/gdi32/tests/cff.otf
+Binary files /dev/null and b/dlls/gdi32/tests/cff.otf differ
+
+--- dlls/gdi32/tests/cff.sfd
++++ dlls/gdi32/tests/cff.sfd
+@@ -0,0 +1,77 @@
++SplineFontDB: 3.0
++FontName: WineTestCFF
++FullName: WineTestCFF
++FamilyName: WineTestCFF
++Weight: Regular
++Copyright: Copyright(c) 2026 Wine Project
++UComments: "#pragma makedep otf"
++Version: 001.000
++ItalicAngle: 0
++UnderlinePosition: -100
++UnderlineWidth: 50
++Ascent: 800
++Descent: 200
++InvalidEm: 0
++LayerCount: 2
++Layer: 0 0 "Back" 1
++Layer: 1 0 "Fore" 0
++XUID: [1021 820 1266790224 8728248]
++FSType: 0
++OS2Version: 4
++OS2_WeightWidthSlopeOnly: 0
++OS2_UseTypoMetrics: 1
++CreationTime: 1776459418
++ModificationTime: 1776488787
++PfmFamily: 17
++TTFWeight: 400
++TTFWidth: 5
++LineGap: 500
++VLineGap: 0
++OS2TypoAscent: 880
++OS2TypoAOffset: 0
++OS2TypoDescent: -120
++OS2TypoDOffset: 0
++OS2TypoLinegap: 500
++OS2WinAscent: 1000
++OS2WinAOffset: 0
++OS2WinDescent: 240
++OS2WinDOffset: 0
++HheadAscent: 880
++HheadAOffset: 0
++HheadDescent: -120
++HheadDOffset: 0
++OS2Vendor: 'PfEd'
++MarkAttachClasses: 1
++DEI: 91125
++Encoding: ISO8859-1
++UnicodeInterp: none
++NameList: AGL For New Fonts
++DisplaySize: -48
++AntiAlias: 1
++FitToEm: 0
++WinInfo: 0 28 11
++BeginPrivate: 0
++EndPrivate
++BeginChars: 256 1
++
++StartChar: zero
++Encoding: 48 48 0
++Width: 1000
++Flags: H
++LayerCount: 2
++Fore
++SplineSet
++392 624 m 0
++ 389.000022888 624 386.000022888 624 383 624 c 0
++ 267.939740009 595.893556721 193.103101666 477.990871628 209 360 c 0
++ 188.189011503 240.233056337 277.262329295 144.585963957 398 159 c 0
++ 420.568423556 158.914300294 437.595888407 160.035977779 458 174 c 0
++ 576.77492213 199.252966911 654.742061929 330.670439307 644 450 c 0
++ 659.739813253 565.231194559 547.015903323 635.657432906 449 645 c 0
++ 425.568450805 647.870332424 406.287034473 640.721319603 386 636 c 0
++ 360.384076063 632.200638278 337.488412015 620.970317136 332 603 c 0
++ 320 597 l 1025
++EndSplineSet
++EndChar
++EndChars
++EndSplineFont
+
+--- dlls/gdi32/tests/font.c
++++ dlls/gdi32/tests/font.c
+@@ -154,7 +154,7 @@ static BOOL write_tmp_file( const void *data, DWORD *size, char *tmp_name )
+     return ret;
+ }
+ 
+-static BOOL write_ttf_file(const char *fontname, char *tmp_name)
++static BOOL write_font_file(const char *fontname, char *tmp_name)
+ {
+     void *rsrc_data;
+     DWORD rsrc_size;
+@@ -1671,7 +1671,7 @@ static void test_GetGlyphIndices(void)
+     ok(glyphs[4] == 0, "GetGlyphIndicesW should have returned 0 not %04x\n", glyphs[4]);
+     DeleteObject(SelectObject(hdc, hOldFont));
+ 
+-    ret = write_ttf_file("wine_nul.ttf", ttf_name);
++    ret = write_font_file("wine_nul.ttf", ttf_name);
+     ok(ret, "Failed to create test font file.\n");
+     font = load_font(ttf_name, &font_size);
+     ok(font != NULL, "Failed to map font file.\n");
+@@ -4132,6 +4132,49 @@ static void test_GetTextMetrics(void)
+     ReleaseDC(0, hdc);
+ }
+ 
++static void test_CFF_external_leading(void)
++{
++    char font_file[MAX_PATH];
++    DWORD num, ret;
++    HDC hdc;
++    LOGFONTW lf;
++    HFONT hfont, hfont_prev;
++    TEXTMETRICW tm;
++
++    if (!write_font_file("cff.otf", font_file))
++    {
++        skip("Failed to create otf file for testing\n");
++        return;
++    }
++
++    num = AddFontResourceExA(font_file, FR_PRIVATE, 0);
++    ok(num == 1, "AddFontResourceExA should add 1 font from cff.otf, got %ld\n", num);
++    if (num == 0) goto cleanup;
++
++    memset(&lf, 0, sizeof(lf));
++    lf.lfHeight = -18;
++    wcscpy(lf.lfFaceName, L"WineTestCFF");
++    hfont = CreateFontIndirectW(&lf);
++    ok(hfont != NULL, "CreateFontIndirectW failed\n");
++
++    hdc = GetDC(NULL);
++    hfont_prev = SelectObject(hdc, hfont);
++    ret = GetFontData(hdc, MS_MAKE_TAG('C','F','F',' '), 0, NULL, 0);
++    ok(ret != GDI_ERROR, "Expected CFF table, got GDI_ERROR\n");
++    ok(GetTextMetricsW(hdc, &tm), "GetTextMetricsW failed\n");
++    ok(tm.tmExternalLeading == 0, "Expected tmExternalLeading 0, got %ld\n", tm.tmExternalLeading);
++
++    SelectObject(hdc, hfont_prev);
++    DeleteObject(hfont);
++    ReleaseDC(NULL, hdc);
++    ret = RemoveFontResourceExA(font_file, FR_PRIVATE, 0);
++    ok(ret, "RemoveFontResourceExA error %ld\n", GetLastError());
++
++    cleanup:
++        ret = DeleteFileA(font_file);
++    ok(ret, "Failed to delete font file, %ld.\n", GetLastError());
++}
++
+ static void test_nonexistent_font(void)
+ {
+     static const struct
+@@ -5239,7 +5282,7 @@ static void test_AddFontMemResource(void)
+        GetLastError());
+ 
+     /* Now with scalable font */
+-    bRet = write_ttf_file("wine_test.ttf", ttf_name);
++    bRet = write_font_file("wine_test.ttf", ttf_name);
+     ok(bRet, "Failed to create test font file.\n");
+ 
+     font = load_font(ttf_name, &font_size);
+@@ -5967,7 +6010,7 @@ static void test_CreateScalableFontResource(void)
+     ULONG (WINAPI *pNtGdiMakeFontDir)( DWORD embed, BYTE *buffer, UINT size, const WCHAR *path, UINT len );
+     int i;
+ 
+-    if (!write_ttf_file("wine_test.ttf", ttf_name))
++    if (!write_font_file("wine_test.ttf", ttf_name))
+     {
+         skip("Failed to create ttf file for testing\n");
+         return;
+@@ -6290,7 +6333,7 @@ static void test_vertical_font(void)
+         "@MS UI Gothic",     /* has vmtx table, available on native */
+     };
+ 
+-    if (!write_ttf_file("vertical.ttf", ttf_name))
++    if (!write_font_file("vertical.ttf", ttf_name))
+     {
+         skip("Failed to create ttf file for testing\n");
+         return;
+@@ -6329,7 +6372,7 @@ static void test_vertical_font(void)
+ 
+     DeleteFileA(ttf_name);
+ 
+-    if (!write_ttf_file("vertical2.ttf", ttf_name))
++    if (!write_font_file("vertical2.ttf", ttf_name))
+     {
+         skip("Failed to create ttf file for testing\n");
+         return;
+@@ -7068,7 +7111,7 @@ static void test_long_names(void)
+     int ret;
+     HDC dc;
+ 
+-    if (!write_ttf_file("wine_longname.ttf", ttf_name))
++    if (!write_font_file("wine_longname.ttf", ttf_name))
+     {
+         skip("Failed to create ttf file for testing\n");
+         return;
+@@ -7114,13 +7157,13 @@ static void test_ttf_names(void)
+     int ret;
+     HDC dc;
+ 
+-    if (!write_ttf_file("wine_ttfnames.ttf", ttf_name))
++    if (!write_font_file("wine_ttfnames.ttf", ttf_name))
+     {
+         skip("Failed to create ttf file for testing\n");
+         return;
+     }
+ 
+-    if (!write_ttf_file("wine_ttfnames_bold.ttf", ttf_name_bold))
++    if (!write_font_file("wine_ttfnames_bold.ttf", ttf_name_bold))
+     {
+         skip("Failed to create ttf file for testing\n");
+         DeleteFileA(ttf_name);
+@@ -7194,20 +7237,20 @@ static void test_lang_names(void)
+         return;
+     }
+ 
+-    if (!write_ttf_file( "wine_langnames.ttf", ttf_name ))
++    if (!write_font_file( "wine_langnames.ttf", ttf_name ))
+     {
+         skip( "Failed to create ttf file for testing\n" );
+         return;
+     }
+ 
+-    if (!write_ttf_file( "wine_langnames2.ttf", ttf_name2 ))
++    if (!write_font_file( "wine_langnames2.ttf", ttf_name2 ))
+     {
+         skip( "Failed to create ttf file for testing\n" );
+         DeleteFileA( ttf_name );
+         return;
+     }
+ 
+-    if (!write_ttf_file( "wine_langnames3.ttf", ttf_name3 ))
++    if (!write_font_file( "wine_langnames3.ttf", ttf_name3 ))
+     {
+         skip( "Failed to create ttf file for testing\n" );
+         DeleteFileA( ttf_name2 );
+@@ -7848,7 +7891,7 @@ static void test_font_weight(void)
+     BOOL bret;
+     HDC hdc;
+ 
+-    bret = write_ttf_file("wine_heavy.ttf", ttf_name);
++    bret = write_font_file("wine_heavy.ttf", ttf_name);
+     ok(bret, "Failed to create test font file.\n");
+ 
+     count = AddFontResourceExA(ttf_name, 0, NULL);
+@@ -8067,6 +8110,7 @@ START_TEST(font)
+         skip("Arial Black or Symbol/Wingdings is not installed\n");
+     test_EnumFontFamiliesEx_default_charset();
+     test_GetTextMetrics();
++    test_CFF_external_leading();
+     test_RealizationInfo();
+     test_GetTextFace();
+     test_GetGlyphOutline();
+
+--- dlls/gdi32/tests/resource.rc
++++ dlls/gdi32/tests/resource.rc
+@@ -55,3 +55,6 @@ wine_nul.ttf RCDATA wine_nul.ttf
+ 
+ /* @makedep: wine_heavy.ttf */
+ wine_heavy.ttf RCDATA wine_heavy.ttf
++
++/* @makedep: cff.otf */
++cff.otf RCDATA cff.otf
+
+--- dlls/win32u/freetype.c
++++ dlls/win32u/freetype.c
+@@ -3392,12 +3392,16 @@ static BOOL freetype_set_outline_text_metrics( struct gdi_font *font )
+ 
+     TM.tmHeight = TM.tmAscent + TM.tmDescent;
+ 
+-    /* MSDN says:
+-     el = MAX(0, LineGap - ((WinAscent + WinDescent) - (Ascender - Descender)))
+-    */
+-    TM.tmExternalLeading = max(0, SCALE_Y(pHori->Line_Gap -
+-                                          ((ascent + descent) -
+-                                           (pHori->Ascender - pHori->Descender))));
++    /* MSDN documents the formula:
++     *     el = MAX(0, LineGap - ((WinAscent + WinDescent) - (Ascender - Descender)))
++     * but Windows GDI does not follow this for OpenType-CFF fonts: for any font 
++     * containing a 'CFF ' table it reports tmExternalLeading = 0.
++     */
++    if (font->ntmFlags & NTM_PS_OPENTYPE)
++        TM.tmExternalLeading = 0;
++    else
++        TM.tmExternalLeading = max(0, 
++            SCALE_Y(pHori->Line_Gap - ((ascent + descent) - (pHori->Ascender - pHori->Descender))));
+ 
+     TM.tmAveCharWidth = SCALE_X(pOS2->xAvgCharWidth);
+     if (TM.tmAveCharWidth == 0) {
+
+--- fonts/genttf.ff
++++ fonts/genfont.ff
+
+--- tools/makedep.c
++++ tools/makedep.c
+@@ -95,6 +95,7 @@ struct incl_file
+ #define FLAG_RC_PO          0x00100000  /* rc file contains translations */
+ #define FLAG_RC_HEADER      0x00200000  /* rc file is a header */
+ #define FLAG_SFD_FONTS      0x00400000  /* sfd file generated bitmap fonts */
++#define FLAG_SFD_OTF        0x00800000  /* sfd file generated otf font */
+ #define FLAG_C_IMPLIB       0x01000000  /* file is part of an import library */
+ #define FLAG_C_UNIX         0x02000000  /* file is part of a Unix library */
+ #define FLAG_C_CXX          0x04000000  /* file uses C++ */
+@@ -1022,6 +1023,7 @@ static void parse_pragma_directive( struct file *source, char *str )
+                 strarray_add( array, xstrdup( strtok( NULL, "" )));
+                 return;
+             }
++            else if (!strcmp( flag, "otf" )) source->flags |= FLAG_SFD_OTF;
+         }
+         else
+         {
+@@ -1548,7 +1550,11 @@ static struct file *open_include_file( const struct makefile *make, struct incl_
+     /* check for generated files */
+     if ((file = open_local_generated_file( make, source, ".tab.h", ".y" ))) return file;
+     if ((file = open_local_generated_file( make, source, ".h", ".idl" ))) return file;
+-    if (fontforge && (file = open_local_generated_file( make, source, ".ttf", ".sfd" ))) return file;
++    if (fontforge)
++    {
++        if ((file = open_local_generated_file( make, source, ".ttf", ".sfd" ))) return file;
++        if ((file = open_local_generated_file( make, source, ".otf", ".sfd" ))) return file;
++    }
+     if (convert && rsvg && icotool)
+     {
+         if ((file = open_local_maintainer_file( make, source, ".bmp", ".svg" ))) return file;
+@@ -3282,21 +3288,23 @@ static void output_source_x( struct makefile *make, struct incl_file *source, co
+  */
+ static void output_source_sfd( struct makefile *make, struct incl_file *source, const char *obj )
+ {
+-    char *ttf_obj = strmake( "%s.ttf", obj );
+-    char *ttf_file = src_dir_path( make, ttf_obj );
++    int is_otf = source->file->flags & FLAG_SFD_OTF;
++    const char *ext = is_otf ? "otf" : "ttf";
++    char *font_obj = strmake( "%s.%s", obj, ext );
++    char *font_file = src_dir_path( make, font_obj );
+ 
+     if (fontforge && !make->src_dir)
+     {
+-        output( "%s: %s\n", ttf_file, source->filename );
++        output( "%s: %s\n", font_file, source->filename );
+         output( "\t%s%s -script %s %s $@\n", cmd_prefix( "GEN" ),
+-                fontforge, root_src_dir_path( "fonts/genttf.ff" ), source->filename );
+-        if (!(source->file->flags & FLAG_SFD_FONTS)) strarray_add( &make->font_files, ttf_obj );
+-        strarray_add( &make->maintainerclean_files, ttf_obj );
++                fontforge, root_src_dir_path( "fonts/genfont.ff" ), source->filename );
++        if (!(source->file->flags & FLAG_SFD_FONTS)) strarray_add( &make->font_files, font_obj );
++        strarray_add( &make->maintainerclean_files, font_obj );
+     }
+     if (source->file->flags & FLAG_INSTALL)
+     {
+-        install_data_file_src( make, source->name, ttf_obj, "$(datadir)/wine/fonts" );
+-        output_srcdir_symlink( make, ttf_obj );
++        install_data_file_src( make, source->name, font_obj, "$(datadir)/wine/fonts" );
++        output_srcdir_symlink( make, font_obj );
+     }
+ 
+     if (source->file->flags & FLAG_SFD_FONTS)
+@@ -3308,8 +3316,8 @@ static void output_source_sfd( struct makefile *make, struct incl_file *source,
+             char *args = strtok( NULL, "" );
+ 
+             strarray_add( &make->all_targets[0], xstrdup( font ));
+-            output( "%s: %s %s\n", obj_dir_path( make, font ), sfnt2fon, ttf_file );
+-            output( "\t%s%s -q -o $@ %s %s\n", cmd_prefix( "GEN" ), sfnt2fon, ttf_file, args );
++            output( "%s: %s %s\n", obj_dir_path( make, font ), sfnt2fon, font_file );
++            output( "\t%s%s -q -o $@ %s %s\n", cmd_prefix( "GEN" ), sfnt2fon, font_file, args );
+             install_data_file( make, source->name, font, "$(datadir)/wine/fonts", NULL );
+         }
+     }
+

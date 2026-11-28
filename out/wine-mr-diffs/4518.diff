@@ -1,0 +1,284 @@
+# ntdll: Integrate with GDB using r_debug.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/4518 state=closed
+# Effectively implementing the debugger interface as described in https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/rtld-debugger-interface.txt
+
+This is an actual attempt at having this upstream, split from https://gitlab.winehq.org/wine/wine/-/merge_requests/1074 which people have been finding useful for debugging Wine directly in GDB. This supports everything you would expect, from automatic symbol loading as well as cross-syscall backtraces with the new Python unwinder.
+--- dlls/ntdll/unix/virtual.c
++++ dlls/ntdll/unix/virtual.c
+@@ -54,6 +54,12 @@
+ #ifdef HAVE_SYS_USER_H
+ # include <sys/user.h>
+ #endif
++#ifdef HAVE_LINK_H
++# include <link.h>
++#endif
++#ifdef HAVE_SYS_LINK_H
++# include <sys/link.h>
++#endif
+ #ifdef HAVE_LIBPROCSTAT_H
+ # include <libprocstat.h>
+ #endif
+@@ -85,6 +91,120 @@ WINE_DEFAULT_DEBUG_CHANNEL(virtual);
+ WINE_DECLARE_DEBUG_CHANNEL(module);
+ WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
+ 
++/* Gdb integration, in loader/main.c */
++static struct r_debug *wine_r_debug;
++
++#if defined(HAVE_LINK_H) || defined(HAVE_SYS_LINK_H)
++
++struct link_map_entry
++{
++    struct link_map map;
++    const void *module;
++};
++static struct link_map link_map = {.l_name = (char *)""};
++
++static void r_debug_set_state( int state )
++{
++    wine_r_debug->r_map = &link_map;
++    wine_r_debug->r_state = state;
++    ((void (*)(void))wine_r_debug->r_brk)();
++}
++
++static char *get_path_from_fd( int fd, int sz )
++{
++#ifdef linux
++    char *ret = malloc( 32 + sz );
++
++    if (ret) sprintf( ret, "/proc/self/fd/%u", fd );
++    return ret;
++#elif defined(F_GETPATH)
++    char *ret = malloc( PATH_MAX + sz );
++
++    if (!ret) return NULL;
++    if (!fcntl( fd, F_GETPATH, ret )) return ret;
++    free( ret );
++    return NULL;
++#else
++    return NULL;
++#endif
++}
++
++static char *r_debug_path_from_fd( int fd )
++{
++    char *real, *path;
++    if (!(path = get_path_from_fd( fd, 0 ))) return NULL;
++    if (!(real = realpath( path, NULL ))) return path;
++    free( path );
++    return real;
++}
++
++static void r_debug_add_module( void *module, int fd, INT_PTR offset )
++{
++    struct link_map *ptr = link_map.l_next, *next;
++    struct link_map_entry *entry;
++
++    if (!wine_r_debug) return;
++
++    while (ptr)
++    {
++        entry = LIST_ENTRY(ptr, struct link_map_entry, map);
++        if (entry->module == module) break;
++        ptr = ptr->l_next;
++    }
++
++    r_debug_set_state( RT_ADD );
++
++    if (ptr) entry->map.l_addr = offset;
++    else if ((entry = calloc( 1, sizeof(*entry) )))
++    {
++        entry->module = module;
++        entry->map.l_addr = offset;
++        entry->map.l_name = r_debug_path_from_fd( fd );
++
++        entry->map.l_next = link_map.l_next;
++        if ((next = entry->map.l_next)) next->l_prev = &entry->map;
++        entry->map.l_prev = &link_map;
++        link_map.l_next = &entry->map;
++    }
++
++    r_debug_set_state( RT_CONSISTENT );
++}
++
++static void r_debug_remove_module( void *module )
++{
++    struct link_map *ptr = link_map.l_next, *next;
++    struct link_map_entry *entry;
++
++    if (!wine_r_debug) return;
++
++    while (ptr)
++    {
++        entry = LIST_ENTRY(ptr, struct link_map_entry, map);
++        if (entry->module == module) break;
++        ptr = ptr->l_next;
++    }
++    if (!ptr) return;
++
++    r_debug_set_state( RT_DELETE );
++
++    entry->map.l_prev->l_next = entry->map.l_next;
++    if ((next = entry->map.l_next)) next->l_prev = entry->map.l_prev;
++
++    r_debug_set_state( RT_CONSISTENT );
++
++    free( entry->map.l_name );
++    free( entry );
++}
++
++#else /* defined(HAVE_LINK_H) || defined(HAVE_SYS_LINK_H) */
++
++#define RT_CONSISTENT 0
++static void r_debug_set_state( int state ) {}
++static void r_debug_add_module( void *module, int fd, INT_PTR offset ) {}
++static void r_debug_remove_module( void *module ) {}
++
++#endif /* defined(HAVE_LINK_H) || defined(HAVE_SYS_LINK_H) */
++
+ struct preload_info
+ {
+     void  *addr;
+@@ -2962,6 +3082,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const WCHAR *filena
+ #ifdef VALGRIND_LOAD_PDB_DEBUGINFO
+     VALGRIND_LOAD_PDB_DEBUGINFO(fd, ptr, total_size, ptr - (char *)wine_server_get_ptr( image_info->base ));
+ #endif
++    r_debug_add_module( ptr, fd, ptr - (char *)wine_server_get_ptr( image_info->base ) );
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -3324,11 +3445,14 @@ static void *alloc_virtual_heap( SIZE_T size )
+ void virtual_init(void)
+ {
+     const struct preload_info **preload_info = dlsym( RTLD_DEFAULT, "wine_main_preload_info" );
++    struct r_debug **r_debug = dlsym( RTLD_DEFAULT, "wine_r_debug" );
+     const char *preload;
+     size_t size;
+     int i;
+     pthread_mutexattr_t attr;
+ 
++    if (r_debug && (wine_r_debug = *r_debug)) r_debug_set_state( RT_CONSISTENT );
++
+     pthread_mutexattr_init( &attr );
+     pthread_mutexattr_settype( &attr, PTHREAD_MUTEX_RECURSIVE );
+     pthread_mutex_init( &virtual_mutex, &attr );
+@@ -5840,7 +5964,11 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
+     SERVER_END_REQ;
+     if (!status)
+     {
+-        if (view->protect & SEC_IMAGE) release_builtin_module( view->base );
++        if (view->protect & SEC_IMAGE)
++        {
++            r_debug_remove_module( view->base );
++            release_builtin_module( view->base );
++        }
+         if (flags & MEM_PRESERVE_PLACEHOLDER) free_pages_preserve_placeholder( view, view->base, view->size );
+         else delete_view( view );
+     }
+
+--- loader/main.c
++++ loader/main.c
+@@ -73,7 +73,8 @@ static void init_reserved_areas(void)
+ 
+ #else
+ 
+-/* the preloader will set this variable */
++/* the preloader will set these variables */
++__attribute((visibility("default"))) struct r_debug *wine_r_debug = NULL;
+ const __attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = NULL;
+ 
+ static void init_reserved_areas(void)
+
+--- loader/preloader.c
++++ loader/preloader.c
+@@ -79,12 +79,16 @@
+ #ifdef HAVE_ELF_H
+ # include <elf.h>
+ #endif
++
++/* define _r_debug so we can re-define it as r_debug_extended */
++#define _r_debug no_r_debug;
+ #ifdef HAVE_LINK_H
+ # include <link.h>
+ #endif
+ #ifdef HAVE_SYS_LINK_H
+ # include <sys/link.h>
+ #endif
++#undef _r_debug
+ 
+ #include "wine/asm.h"
+ #include "main.h"
+@@ -1387,6 +1391,39 @@ static void set_process_name( int argc, char *argv[] )
+     for (i = 1; i < argc; i++) argv[i] -= off;
+ }
+ 
++struct wld_r_debug_extended
++{
++    struct r_debug base;
++    struct wld_r_debug_extended *r_next;
++};
++
++/* GDB integration, _r_debug_state is *required* for GDB to hook the preloader */
++__attribute((visibility("default"))) void _r_debug_state(void) {}
++__attribute((visibility("default"))) struct wld_r_debug_extended _r_debug = {{0}};
++
++/* sets the preloader r_debug address into DT_DEBUG */
++static void init_r_debug( struct wld_auxv *av )
++{
++    ElfW(Phdr) *phdr, *ph;
++    ElfW(Dyn) *dyn = NULL;
++    char *l_addr;
++    int phnum;
++
++    _r_debug.base.r_version = 2;
++    _r_debug.base.r_brk = (ElfW(Addr))_r_debug_state;
++
++    if (!(phnum = get_auxiliary( av, AT_PHNUM, 0 ))) return;
++    if (!(phdr = (void *)get_auxiliary( av, AT_PHDR, 0 ))) return;
++    l_addr = (char *)phdr - sizeof(ElfW(Ehdr));
++    _r_debug.base.r_ldbase = (ElfW(Addr))l_addr;
++
++    for (ph = phdr; ph < &phdr[phnum]; ++ph) if (ph->p_type == PT_DYNAMIC) break;
++    if (ph >= &phdr[phnum]) return;
++
++    dyn = (void *)(ph->p_vaddr + l_addr);
++    while (dyn->d_tag != DT_DEBUG && dyn->d_tag != DT_NULL) dyn++;
++    if (dyn->d_tag == DT_DEBUG) dyn->d_un.d_ptr = (uintptr_t)&_r_debug;
++}
+ 
+ /*
+  *  wld_start
+@@ -1403,6 +1440,7 @@ void* wld_start( void **stack )
+     struct wld_auxv new_av[8], delete_av[3], *av;
+     struct wld_link_map main_binary_map, ld_so_map;
+     struct wine_preload_info **wine_main_preload_info;
++    struct r_debug *ld_so_r_debug, **wine_r_debug;
+ 
+     pargc = *stack;
+     argv = (char **)pargc + 1;
+@@ -1432,6 +1470,8 @@ void* wld_start( void **stack )
+     dump_auxiliary( av );
+ #endif
+ 
++    init_r_debug( av );
++
+     /* reserve memory that Wine needs */
+     if (reserve) preload_reserve( reserve );
+     for (i = 0; preload_info[i].size; i++)
+@@ -1470,6 +1510,15 @@ void* wld_start( void **stack )
+     interp = (char *)main_binary_map.l_addr + main_binary_map.l_interp;
+     map_so_lib( interp, &ld_so_map );
+ 
++    /* expose ld.so _r_debug as a separate namespace in r_next */
++    ld_so_r_debug = find_symbol( &ld_so_map, "_r_debug", STT_OBJECT );
++    if (ld_so_r_debug) _r_debug.r_next = (struct wld_r_debug_extended *)ld_so_r_debug;
++    else wld_printf( "_r_debug not found in ld.so\n" );
++
++    wine_r_debug = find_symbol( &main_binary_map, "wine_r_debug", STT_OBJECT );
++    if (wine_r_debug) *wine_r_debug = &_r_debug.base;
++    else wld_printf( "wine_r_debug not found\n" );
++
+     /* store pointer to the preload info into the appropriate main binary variable */
+     wine_main_preload_info = find_symbol( &main_binary_map, "wine_main_preload_info", STT_OBJECT );
+     if (wine_main_preload_info) *wine_main_preload_info = preload_info;
+

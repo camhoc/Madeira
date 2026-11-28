@@ -1,0 +1,286 @@
+# kk: A few convenience changes for debugging
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44565 state=merged
+# ### What does this MR do and why?
+
+The MR has a couple of changes to help with debugging:
+- It doesn't create counter pools and instead just writes zeroes for Vulkan timestamp. Not great but it only does that if capturing is enabled and the Metal capture layer refuses to work completely otherwise. At least I put in a warning when a query pool is created.
+- Don't immediately start capturing at launch unless `MESA_KK_GPU_CAPTURE_IMMEDIATELY=1` is also set.
+- Support controling capturing via Vulkan debug utils messages: `capture-marker,begin_capture` and `capture-marker,end-capture`. Renderdoc uses those markers and DXVK uses them.
+- Push debug groups to the command buffer if there's no active encoder. The debug groups of DXVK got lost without this.
+
+Some other things we could do in the future:
+- Add in the ability to capture specific frames into Kosmickrisp. That would ofc be tricky because there could be multiple swapchains but 'best effort' would probably be good enough for the vast majority of cases.
+- Move existing Metal capture files out of the way because the capture layer refuses to use any other filename than `processname.mtlcapture`.
+--- docs/drivers/kosmickrisp.rst
++++ docs/drivers/kosmickrisp.rst
+@@ -76,7 +76,8 @@ Environment variables
+ KosmicKrisp specific environment variables:
+ 
+ - ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders.
+-- ``MESA_KK_GPU_CAPTURE``: Starts Metal capture at device create and ends it at device destroy. Set to ``1`` to activate.
++- ``MESA_KK_GPU_CAPTURE``: Enables Metal capture, can be controlled using debug utils labels or using ``MESA_KK_GPU_CAPTURE_IMMEDIATELY``. Set to ``1`` to activate.
++- ``MESA_KK_GPU_CAPTURE_IMMEDIATELY``: Starts Metal capture at device creation and ends it at device destruction. Set to ``1`` to activate.
+ - ``MESA_KK_GPU_CAPTURE_DIRECTORY``: Metal capture will be saved to the specified directory. Defaults to Xcode if no path is provided.
+ - ``MESA_KK_DISABLE_WORKAROUNDS``: Provide ``all`` to disable all workarounds. Otherwise, provide a comma separated list to disable wanted workarounds e.g. ``1,3,4`` to disable workaround 1, 3 and 4.
+ - ``MESA_KK_EXPERIMENTAL``: Enables advertising experimental features which may not provide full correctness or may negatively impact performance when enabled. Provide ``all`` to advertise all listed features.
+
+--- src/kosmickrisp/bridge/stubs/mtl_command_buffer.c
++++ src/kosmickrisp/bridge/stubs/mtl_command_buffer.c
+@@ -34,3 +34,13 @@ mtl_command_buffer_set_label(mtl_command_buffer *command_buffer,
+                              const char *label)
+ {
+ }
++
++void
++mtl_command_buffer_push_debug_group(void *encoder, const char *label)
++{
++}
++
++void
++mtl_command_buffer_pop_debug_group(void *encoder)
++{
++}
+
+--- src/kosmickrisp/bridge/mtl_command_buffer.h
++++ src/kosmickrisp/bridge/mtl_command_buffer.h
+@@ -24,4 +24,9 @@ void mtl_command_resolve_counter_heap(mtl_command_buffer *command_buffer,
+ 
+ void mtl_command_buffer_set_label(mtl_command_buffer *cb, const char *label);
+ 
++void mtl_command_buffer_push_debug_group(mtl_command_buffer *command_buffer,
++                                         const char *label);
++
++void mtl_command_buffer_pop_debug_group(mtl_command_buffer *command_buffer);
++
+ #endif /* MTL_COMMAND_BUFFER_H */
+
+--- src/kosmickrisp/bridge/mtl_command_buffer.m
++++ src/kosmickrisp/bridge/mtl_command_buffer.m
+@@ -69,3 +69,21 @@ mtl_command_buffer_set_label(mtl_command_buffer *command_buffer,
+       cb.label = @(label);
+    }
+ }
++
++void
++mtl_command_buffer_push_debug_group(mtl_command_buffer *command_buffer,
++                                    const char *label)
++{
++    @autoreleasepool {
++      id<MTL4CommandBuffer> cb = (id<MTL4CommandBuffer>)command_buffer;
++      [cb pushDebugGroup:@(label)];
++    }
++}
++
++void mtl_command_buffer_pop_debug_group(mtl_command_buffer *command_buffer)
++{
++   @autoreleasepool {
++      id<MTL4CommandBuffer> cb = (id<MTL4CommandBuffer>)command_buffer;
++      [cb popDebugGroup];
++   }
++}
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -13,6 +13,7 @@
+ #include "kk_entrypoints.h"
+ #include "kk_format.h"
+ #include "kk_image_view.h"
++#include "kk_physical_device.h"
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ #include "kosmickrisp/bridge/mtl_command_buffer.h"
+@@ -22,6 +23,7 @@
+ 
+ #include "vk_alloc.h"
+ #include "vk_common_entrypoints.h"
++#include "vk_device.h"
+ #include "vk_format.h"
+ #include "vk_pipeline_layout.h"
+ 
+@@ -1089,9 +1091,11 @@ kk_CmdBeginDebugUtilsLabelEXT(VkCommandBuffer _commandBuffer,
+ 
+    if (cmd->metal.render)
+       mtl_encoder_push_debug_group(cmd->metal.render, pLabelInfo->pLabelName);
+-
+-   if (cmd->metal.compute)
++   else if (cmd->metal.compute)
+       mtl_encoder_push_debug_group(cmd->metal.compute, pLabelInfo->pLabelName);
++   else
++      mtl_command_buffer_push_debug_group(cmd->metal.cmd_buf,
++                                          pLabelInfo->pLabelName);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -1102,9 +1106,10 @@ kk_CmdEndDebugUtilsLabelEXT(VkCommandBuffer _commandBuffer)
+ 
+    if (cmd->metal.render)
+       mtl_encoder_pop_debug_group(cmd->metal.render);
+-
+-   if (cmd->metal.compute)
++   else if (cmd->metal.compute)
+       mtl_encoder_pop_debug_group(cmd->metal.compute);
++   else
++      mtl_command_buffer_pop_debug_group(cmd->metal.cmd_buf);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -1112,6 +1117,25 @@ kk_CmdInsertDebugUtilsLabelEXT(VkCommandBuffer _commandBuffer,
+                                const VkDebugUtilsLabelEXT *pLabelInfo)
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, _commandBuffer);
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   struct kk_physical_device *pdev = kk_device_physical(dev);
++
++   if (pdev->settings.gpu_capture_enabled &&
++       !pdev->settings.gpu_capture_immediately) {
++      if (!dev->gpu_capture_active &&
++          strcmp(pLabelInfo->pLabelName, "capture-marker,begin_capture") == 0) {
++         dev->gpu_capture_active = true;
++         mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
++         return;
++      }
++
++      if (dev->gpu_capture_active &&
++          strcmp(pLabelInfo->pLabelName, "capture-marker,end_capture") == 0) {
++         mtl_stop_gpu_capture();
++         dev->gpu_capture_active = false;
++         return;
++      }
++   }
+ 
+    /* We purposely don't call the common implementation here. It makes
+     * debug regions that last until the next vkCmdInsertDebugUtilsLabelEXT()
+
+--- src/kosmickrisp/vulkan/kk_device.c
++++ src/kosmickrisp/vulkan/kk_device.c
+@@ -331,10 +331,9 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (result != VK_SUCCESS)
+       goto fail_sampler_heap;
+ 
+-   if (pdev->settings.gpu_capture_enabled) {
+-      const char *capture_directory =
+-         debug_get_option("MESA_KK_GPU_CAPTURE_DIRECTORY", NULL);
+-      mtl_start_gpu_capture(dev->mtl_handle, capture_directory);
++   if (pdev->settings.gpu_capture_immediately) {
++      mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
++      dev->gpu_capture_active = true;
+    }
+ 
+    *pDevice = kk_device_to_handle(dev);
+@@ -368,14 +367,13 @@ VKAPI_ATTR void VKAPI_CALL
+ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+ {
+    VK_FROM_HANDLE(kk_device, dev, _device);
+-   struct kk_physical_device *pdev = kk_device_physical(dev);
+ 
+    if (!dev)
+       return;
+ 
+    /* End capture before we start releasing resources. Otherwise, Metal capture
+     * may run into issues. */
+-   if (pdev->settings.gpu_capture_enabled) {
++   if (dev->gpu_capture_active) {
+       mtl_stop_gpu_capture();
+    }
+ 
+
+--- src/kosmickrisp/vulkan/kk_device.h
++++ src/kosmickrisp/vulkan/kk_device.h
+@@ -104,6 +104,8 @@ struct kk_device {
+    /* Geomtry heap */
+    struct kk_bo *heap;
+    util_once_flag heap_init_once;
++
++   bool gpu_capture_active;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1090,6 +1090,14 @@ kk_parse_environment_options(struct kk_physical_device *pdev)
+    settings->gpu_capture_enabled =
+       debug_get_bool_option("MESA_KK_GPU_CAPTURE", false);
+ 
++   if (settings->gpu_capture_enabled) {
++      settings->gpu_capture_dir =
++         debug_get_option("MESA_KK_GPU_CAPTURE_DIRECTORY", NULL);
++
++      settings->gpu_capture_immediately =
++         debug_get_bool_option("MESA_KK_GPU_CAPTURE_IMMEDIATELY", false);
++   }
++
+    const char *list = debug_get_option("MESA_KK_DISABLE_WORKAROUNDS", "");
+    const char *all_workarounds = "all";
+    const size_t all_len = strlen(all_workarounds);
+
+--- src/kosmickrisp/vulkan/kk_physical_device.h
++++ src/kosmickrisp/vulkan/kk_physical_device.h
+@@ -51,6 +51,7 @@ struct kk_device_info {
+ struct kk_env_settings {
+    bool experimental_enabled;
+    bool gpu_capture_enabled;
++   bool gpu_capture_immediately;
+    const char *gpu_capture_dir;
+    uint64_t disabled_workarounds;
+ };
+
+--- src/kosmickrisp/vulkan/kk_query_pool.c
++++ src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -133,6 +133,7 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
+                    VkQueryPool *pQueryPool)
+ {
+    VK_FROM_HANDLE(kk_device, dev, device);
++   struct kk_physical_device *pdev = kk_device_physical(dev);
+    struct kk_query_pool *pool;
+    VkResult result = VK_SUCCESS;
+ 
+@@ -196,13 +197,19 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
+          remap_index[pool->oq.queries++] = index;
+       }
+    } else if (kk_pool_is_ts(pool)) {
+-      /* Timestamps are sampled into a Metal counter heap (one entry per query)
+-       * and resolved into `bo` after the GPU writes them. */
+-      pool->ts.heap =
+-         mtl_new_timestamp_counter_heap(dev->mtl_handle, pool->vk.query_count);
+-      if (pool->ts.heap == NULL) {
+-         kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool), pAllocator);
+-         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      if (!pdev->settings.gpu_capture_enabled) {
++         /* Timestamps are sampled into a Metal counter heap (one entry per query)
++          * and resolved into `bo` after the GPU writes them. */
++         pool->ts.heap = mtl_new_timestamp_counter_heap(dev->mtl_handle,
++                                                        pool->vk.query_count);
++         if (pool->ts.heap == NULL) {
++            kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool),
++                                pAllocator);
++            return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++         }
++      } else {
++         mesa_logw(
++            "Using stub query pool because Metal GPU captures don't support counter pools\n");
+       }
+    }
+ 
+@@ -358,8 +365,19 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+-   assert(kk_pool_is_ts(pool) && pool->ts.heap);
++   struct kk_physical_device *pdev = kk_device_physical(dev);
++   assert(kk_pool_is_ts(pool));
++
++   if (pdev->settings.gpu_capture_enabled) {
++      /* There is no counter heap because we are capturing. */
++      libkk_write_u32(cmd, kk_grid_1d(1), true,
++                      kk_query_report_addr(dev, pool, query),
++                      0u);
++
++      return;
++   }
+ 
++   assert(pool->ts.heap);
+    uint32_t count = kk_mv_query_count(cmd);
+    enum mtl_render_stages mtl_stage =
+       kk_pipeline_stages_to_mtl_render_stage(stage);
+

@@ -1,0 +1,174 @@
+# ntoskrnl: Implement KeTryToAcquireGuardedMutex and ExTryToAcquireFastMutex
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12651 state=closed
+# ### Summary
+
+This series implements `KeTryToAcquireGuardedMutex` and `ExTryToAcquireFastMutex` in `ntoskrnl.exe`, adds their missing declarations in `ddk/wdm.h`, and adds unit test coverage in `driver.c`.
+
+### Application / Game Context
+
+Required by kernel drivers such as AntiCheatExpert (ACE) used by games like _Duet Night Abyss_ and _Arknights: Endfield_. When launching these games under Wine/Proton, the driver calls `KeTryToAcquireGuardedMutex` during initialization and immediately crashes with: `wine: Call from ... to unimplemented function ntoskrnl.exe.KeAcquireGuardedMutex / KeTryToAcquireGuardedMutex, aborting`
+
+Reference: https://github.com/ValveSoftware/Proton/issues/9331 (also #8988, #9258)
+--- dlls/ntoskrnl.exe/tests/driver.c
++++ dlls/ntoskrnl.exe/tests/driver.c
+@@ -1012,6 +1012,53 @@ static void test_sync(void)
+ 
+     run_thread(mutex_thread, (void *)0);
+ 
++    /* test guarded mutex */
++    {
++        KGUARDED_MUTEX guarded_mutex;
++        BOOLEAN success;
++
++        KeInitializeGuardedMutex(&guarded_mutex);
++        ok(guarded_mutex.Count == FM_LOCK_BIT, "got %ld\n", guarded_mutex.Count);
++
++        success = KeTryToAcquireGuardedMutex(&guarded_mutex);
++        ok(success, "KeTryToAcquireGuardedMutex failed\n");
++        ok(guarded_mutex.Count == 0, "got %ld\n", guarded_mutex.Count);
++
++        success = KeTryToAcquireGuardedMutex(&guarded_mutex);
++        ok(!success, "KeTryToAcquireGuardedMutex succeeded unexpectedly\n");
++
++        KeReleaseGuardedMutex(&guarded_mutex);
++        ok(guarded_mutex.Count == FM_LOCK_BIT, "got %ld\n", guarded_mutex.Count);
++
++        KeAcquireGuardedMutex(&guarded_mutex);
++        ok(guarded_mutex.Count == 0, "got %ld\n", guarded_mutex.Count);
++
++        success = KeTryToAcquireGuardedMutex(&guarded_mutex);
++        ok(!success, "KeTryToAcquireGuardedMutex succeeded unexpectedly\n");
++
++        KeReleaseGuardedMutex(&guarded_mutex);
++        ok(guarded_mutex.Count == FM_LOCK_BIT, "got %ld\n", guarded_mutex.Count);
++    }
++
++    /* test fast mutex */
++    {
++        FAST_MUTEX fast_mutex;
++        BOOLEAN success;
++
++        ExInitializeFastMutex(&fast_mutex);
++        ok(fast_mutex.Count == FM_LOCK_BIT, "got %ld\n", fast_mutex.Count);
++
++        success = ExTryToAcquireFastMutex(&fast_mutex);
++        ok(success, "ExTryToAcquireFastMutex failed\n");
++        ok(fast_mutex.Count == 0, "got %ld\n", fast_mutex.Count);
++
++        success = ExTryToAcquireFastMutex(&fast_mutex);
++        ok(!success, "ExTryToAcquireFastMutex succeeded unexpectedly\n");
++
++        ExReleaseFastMutex(&fast_mutex);
++        ok(fast_mutex.Count == FM_LOCK_BIT, "got %ld\n", fast_mutex.Count);
++    }
++
+     /* test timers */
+     KeInitializeTimerEx(&timer, NotificationTimer);
+ 
+
+--- dlls/ntoskrnl.exe/ntoskrnl.exe.spec
++++ dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+@@ -13,6 +13,7 @@
+ @ stub ExReInitializeRundownProtection
+ @ stdcall -arch=!i386 ExReleaseFastMutex(ptr)
+ @ stdcall -fastcall ExReleaseFastMutexUnsafe(ptr)
++@ stdcall -arch=!i386 ExTryToAcquireFastMutex(ptr)
+ @ stdcall -fastcall ExReleaseResourceLite(ptr)
+ @ stub ExReleaseRundownProtection
+ @ stub ExReleaseRundownProtectionEx
+@@ -62,6 +63,7 @@
+ @ stdcall -fastcall KeReleaseInStackQueuedSpinLockFromDpcLevel(ptr)
+ @ stdcall -fastcall KeReleaseGuardedMutexUnsafe(ptr)
+ @ stdcall -fastcall KeReleaseGuardedMutex(ptr)
++@ stdcall -fastcall KeTryToAcquireGuardedMutex(ptr)
+ @ stub KeSetTimeUpdateNotifyRoutine
+ @ stub KefAcquireSpinLockAtDpcLevel
+ @ stub KefReleaseSpinLockFromDpcLevel
+
+--- dlls/ntoskrnl.exe/sync.c
++++ dlls/ntoskrnl.exe/sync.c
+@@ -477,6 +477,16 @@ void FASTCALL KeReleaseGuardedMutex(PKGUARDED_MUTEX mutex)
+     /* FIXME: Leave Guarded Region */
+ }
+ 
++/***********************************************************************
++ *           KeTryToAcquireGuardedMutex   (NTOSKRNL.EXE.@)
++ */
++DEFINE_FASTCALL1_WRAPPER(KeTryToAcquireGuardedMutex)
++BOOLEAN FASTCALL KeTryToAcquireGuardedMutex(PKGUARDED_MUTEX mutex)
++{
++    /* FIXME: Enter Guarded Region */
++    return ExTryToAcquireFastMutex((PFAST_MUTEX)mutex);
++}
++
+ static void CALLBACK ke_timer_complete_proc(PTP_CALLBACK_INSTANCE instance, void *timer_, PTP_TIMER tp_timer)
+ {
+     KTIMER *timer = timer_;
+@@ -917,6 +927,21 @@ void WINAPI ExReleaseFastMutex( FAST_MUTEX *mutex )
+     /* FIXME: restore IRQL */
+ }
+ 
++/***********************************************************************
++ *           ExTryToAcquireFastMutex    (NTOSKRNL.@)
++ */
++BOOLEAN WINAPI ExTryToAcquireFastMutex( FAST_MUTEX *mutex )
++{
++    TRACE("mutex %p.\n", mutex);
++
++    if (InterlockedCompareExchange( &mutex->Count, 0, FM_LOCK_BIT ) == FM_LOCK_BIT)
++    {
++        /* FIXME: lower IRQL */
++        return TRUE;
++    }
++    return FALSE;
++}
++
+ #endif /* __i386__ */
+ 
+ /* Use of the fields of an ERESOURCE structure seems to vary wildly between
+
+--- include/ddk/wdm.h
++++ include/ddk/wdm.h
+@@ -1851,6 +1851,7 @@ NTSTATUS  WINAPI DbgQueryDebugFilterState(ULONG, ULONG);
+ 
+ void    FASTCALL ExAcquireFastMutex(FAST_MUTEX*);
+ void    FASTCALL ExAcquireFastMutexUnsafe(PFAST_MUTEX);
++BOOLEAN FASTCALL ExTryToAcquireFastMutex(PFAST_MUTEX);
+ BOOLEAN   WINAPI ExAcquireResourceExclusiveLite(ERESOURCE*,BOOLEAN);
+ BOOLEAN   WINAPI ExAcquireResourceSharedLite(ERESOURCE*,BOOLEAN);
+ BOOLEAN   WINAPI ExAcquireSharedStarveExclusive(ERESOURCE*,BOOLEAN);
+@@ -1947,6 +1948,8 @@ NTSTATUS  WINAPI IoSetDeviceInterfaceState(UNICODE_STRING*,BOOLEAN);
+ NTSTATUS  WINAPI IoSetDevicePropertyData(DEVICE_OBJECT*,const DEVPROPKEY*,LCID,ULONG,DEVPROPTYPE,ULONG,void*);
+ NTSTATUS  WINAPI IoWMIRegistrationControl(PDEVICE_OBJECT,ULONG);
+ 
++void    FASTCALL KeAcquireGuardedMutex(PKGUARDED_MUTEX);
++void    FASTCALL KeAcquireGuardedMutexUnsafe(PKGUARDED_MUTEX);
+ void    FASTCALL KeAcquireInStackQueuedSpinLockAtDpcLevel(KSPIN_LOCK*,KLOCK_QUEUE_HANDLE*);
+ #ifdef __i386__
+ void      WINAPI KeAcquireSpinLock(KSPIN_LOCK*,KIRQL*);
+@@ -1966,6 +1969,7 @@ PKTHREAD  WINAPI KeGetCurrentThread(void);
+ void      WINAPI KeInitializeDeviceQueue(KDEVICE_QUEUE*);
+ void      WINAPI KeInitializeDpc(KDPC*,PKDEFERRED_ROUTINE,void*);
+ void      WINAPI KeInitializeEvent(PRKEVENT,EVENT_TYPE,BOOLEAN);
++void    FASTCALL KeInitializeGuardedMutex(PKGUARDED_MUTEX);
+ void      WINAPI KeInitializeMutex(PRKMUTEX,ULONG);
+ void      WINAPI KeInitializeSemaphore(PRKSEMAPHORE,LONG,LONG);
+ void      WINAPI KeInitializeTimerEx(PKTIMER,TIMER_TYPE);
+@@ -1980,6 +1984,8 @@ ULONG     WINAPI KeQueryTimeIncrement(void);
+ LONG      WINAPI KeReadStateEvent(PRKEVENT);
+ void    FASTCALL KeReleaseInStackQueuedSpinLockFromDpcLevel(KLOCK_QUEUE_HANDLE*);
+ LONG      WINAPI KeReleaseMutex(PRKMUTEX,BOOLEAN);
++void    FASTCALL KeReleaseGuardedMutex(PKGUARDED_MUTEX);
++void    FASTCALL KeReleaseGuardedMutexUnsafe(PKGUARDED_MUTEX);
+ LONG      WINAPI KeReleaseSemaphore(PRKSEMAPHORE,KPRIORITY,LONG,BOOLEAN);
+ void      WINAPI KeReleaseSpinLock(KSPIN_LOCK*,KIRQL);
+ void      WINAPI KeReleaseSpinLockFromDpcLevel(KSPIN_LOCK*);
+@@ -1993,6 +1999,7 @@ void      WINAPI KeSetSystemAffinityThread(KAFFINITY);
+ KAFFINITY WINAPI KeSetSystemAffinityThreadEx(KAFFINITY affinity);
+ BOOLEAN   WINAPI KeSetTimer(KTIMER*,LARGE_INTEGER,KDPC*);
+ BOOLEAN   WINAPI KeSetTimerEx(KTIMER*,LARGE_INTEGER,LONG,KDPC*);
++BOOLEAN FASTCALL KeTryToAcquireGuardedMutex(PKGUARDED_MUTEX);
+ void      WINAPI KeSignalCallDpcDone(void*);
+ BOOLEAN   WINAPI KeSignalCallDpcSynchronize(void*);
+ NTSTATUS  WINAPI KeWaitForMultipleObjects(ULONG,void*[],WAIT_TYPE,KWAIT_REASON,KPROCESSOR_MODE,BOOLEAN,LARGE_INTEGER*,KWAIT_BLOCK*);
+

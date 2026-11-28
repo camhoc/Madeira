@@ -1,0 +1,70 @@
+# winscard: Pack reader_state_macos struct.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12804 state=merged
+# 
+--- dlls/winscard/tests/winscard.c
++++ dlls/winscard/tests/winscard.c
+@@ -165,6 +165,10 @@ static void test_SCardEstablishContext(void)
+     }
+     ret = SCardStatusW( connect, names, &len, &state, &protocol, NULL, NULL );
+     ok( ret == SCARD_S_SUCCESS, "got %lx\n", ret );
++    ret = SCardStatusW( connect, NULL, &len, &state, &protocol, NULL, NULL );
++    ok( ret == SCARD_S_SUCCESS, "got %lx\n", ret );
++    ret = SCardStatusW( connect, names, NULL, &state, &protocol, NULL, NULL );
++    ok( ret == SCARD_S_SUCCESS, "got %lx\n", ret );
+     ret = SCardStatusW( connect, NULL, NULL, &state, &protocol, NULL, NULL );
+     ok( ret == SCARD_S_SUCCESS, "got %lx\n", ret );
+     ret = SCardStatusW( connect, NULL, NULL, NULL, NULL, NULL, NULL );
+
+--- dlls/winscard/unixlib.c
++++ dlls/winscard/unixlib.c
+@@ -94,6 +94,8 @@ static NTSTATUS scard_is_valid_context( void *args )
+ }
+ 
+ #ifdef __APPLE__
++
++#pragma pack(push, 1)
+ struct reader_state_macos
+ {
+     UINT64 reader;
+@@ -103,6 +105,7 @@ struct reader_state_macos
+     UINT32 atr_size;
+     unsigned char atr[MAX_ATR_SIZE];
+ };
++#pragma pack(pop)
+ 
+ static struct reader_state_macos *map_states_in( const struct reader_state *state, unsigned int count )
+ {
+
+--- dlls/winscard/winscard.c
++++ dlls/winscard/winscard.c
+@@ -282,7 +282,6 @@ LONG WINAPI SCardStatusA( SCARDHANDLE connect, char *names, DWORD *names_len, DW
+     TRACE( "%Ix, %p, %p, %p, %p, %p, %p\n", connect, names, names_len, state, protocol, atr, atr_len );
+ 
+     if (!handle || handle->magic != CONNECT_MAGIC) return ERROR_INVALID_HANDLE;
+-    if (!names_len) return SCARD_E_INVALID_PARAMETER;
+ 
+     if (atr_len && *atr_len == SCARD_AUTOALLOCATE)
+     {
+@@ -386,7 +385,6 @@ LONG WINAPI SCardStatusW( SCARDHANDLE connect, WCHAR *names, DWORD *names_len, D
+     TRACE( "%Ix, %p, %p, %p, %p, %p, %p\n", connect, names, names_len, state, protocol, atr, atr_len );
+ 
+     if (!handle || handle->magic != CONNECT_MAGIC) return ERROR_INVALID_HANDLE;
+-    if (!names_len) return SCARD_E_INVALID_PARAMETER;
+ 
+     if (atr_len && *atr_len == SCARD_AUTOALLOCATE)
+     {
+
+--- include/winscard.h
++++ include/winscard.h
+@@ -72,10 +72,6 @@ DECL_WINELIB_TYPE_AW(LPSCARD_READERSTATE)
+ 
+ #define SCARD_AUTOALLOCATE (DWORD)(-1)
+ 
+-#define SCARD_SCOPE_USER     0
+-#define SCARD_SCOPE_TERMINAL 1
+-#define SCARD_SCOPE_SYSTEM   2
+-
+ #define SCARD_STATE_UNAWARE     0x00000000
+ #define SCARD_STATE_IGNORE      0x00000001
+ #define SCARD_STATE_CHANGED     0x00000002
+

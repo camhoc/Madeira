@@ -1,0 +1,1331 @@
+# win32u: Introduce a keyboard layout cache.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11909 state=opened
+# As an alternative implementation for !11474. Managing the keyboard layouts directly in win32u removes a lot of the duplication across drivers, and it will make the win32u keyboard code simpler as it can then own, and more easily access the loaded layouts and KBDTABLES.
+
+The tables could be filled through extra UpdateKeyboardLayouts callbacks from the drivers, and later we could also consider loading libxkbcommon directly in win32u, to remove most of the unfortunate winex11 / winewayland code duplication. For winemac, we can probably keep the callbacks, or we can consider moving some of the macOS code to win32u if that's feasible (IMO would be ideal if we can).
+--- dlls/user32/tests/input.c
++++ dlls/user32/tests/input.c
+@@ -6634,6 +6634,139 @@ static void test_LoadKeyboardLayoutEx( HKL orig_hkl )
+     ok_eq( old_hkl, GetKeyboardLayout( 0 ), HKL, "%p" );
+ }
+ 
++static void test_loadkeyboardlayout_process(void)
++{
++    static const WCHAR test_layout_name[] = L"00000429";
++    static const HKL test_hkl = (HKL)0x04290429;
++    HANDLE start, end;
++    HKL *layouts, *layouts2, hkl;
++    DWORD result;
++    UINT count, count2;
++
++    start = CreateEventA(NULL, FALSE, FALSE, "loadkeyboardlayout_test_start");
++    ok(start != NULL, "CreateEvent failed\n");
++    end = CreateEventA(NULL, FALSE, FALSE, "loadkeyboardlayout_test_end");
++    ok(end != NULL, "CreateEvent failed\n");
++
++    SetEvent( start );
++
++    result = WaitForSingleObject(end, 1000);
++    ok( result == WAIT_OBJECT_0, "Unexpected result %#lx\n", result );
++
++    layouts = get_keyboard_layouts( &count );
++
++    /* There is no refcounting of sorts */
++    hkl = LoadKeyboardLayoutW( test_layout_name, 0 );
++    todo_wine
++    ok_eq( test_hkl, hkl, HKL, "%p" );
++
++    layouts2 = get_keyboard_layouts( &count2 );
++    ok_eq( count, count2, UINT, "%u" );
++    todo_wine
++    ok_eq( test_hkl, layouts2[count2 - 1], HKL, "%p" );
++    ok( !memcmp( layouts, layouts2, count * sizeof(*layouts) ), "keyboard layouts changed\n" );
++    free( layouts2 );
++
++    result = UnloadKeyboardLayout( test_hkl );
++    todo_wine
++    ok( result, "UnloadKeyboardLayout failed, error %lu\n", GetLastError() );
++
++    layouts2 = get_keyboard_layouts( &count2 );
++    todo_wine
++    ok_eq( count, count2 + 1, UINT, "%u" );
++    ok( !memcmp( layouts, layouts2, count2 * sizeof(*layouts) ), "keyboard layouts changed\n" );
++
++    free(layouts2);
++    free(layouts);
++}
++
++static void test_LoadKeyboardLayout( const char * argv0, HKL orig_hkl )
++{
++    static const WCHAR test_layout_name[] = L"00000429";
++    static const HKL test_hkl = (HKL)0x04290429;
++
++    WCHAR klid[KL_NAMELENGTH], value[KL_NAMELENGTH];
++    DWORD ret, type, klid_size, value_size;
++    HKL *layouts2, *layouts, old_hkl, hkl;
++    PROCESS_INFORMATION process_info;
++    STARTUPINFOA startup_info;
++    UINT i, count, count2;
++    char path[MAX_PATH];
++    HANDLE start, end;
++    HKEY hkey;
++
++    old_hkl = GetKeyboardLayout( 0 );
++    ok_ne( 0, old_hkl, HKL, "%p" );
++
++    /* If we are dealing with a testbot setup that is prone to spurious
++     * layout changes, layout activations in this test are likely to
++     * not have the expected effect, invalidating the test assumptions. */
++    if (orig_hkl != old_hkl)
++    {
++        win_skip( "Spurious keyboard layout changed detected (expected: %p got: %p)\n",
++                  orig_hkl, old_hkl );
++        return;
++    }
++
++    layouts = get_keyboard_layouts( &count );
++    for (i = 0; i < count; i++) if (layouts[i] == test_hkl) break;
++    if (i != count)
++    {
++        skip( "Test HKL is already loaded (position %u), skipping tests\n", i );
++        free( layouts );
++        return;
++    }
++
++    start = CreateEventA(NULL, FALSE, FALSE, "loadkeyboardlayout_test_start");
++    ok(start != NULL, "CreateEvent failed\n");
++    end = CreateEventA(NULL, FALSE, FALSE, "loadkeyboardlayout_test_end");
++    ok(end != NULL, "CreateEvent failed\n");
++
++    memset(&startup_info, 0, sizeof(startup_info));
++    startup_info.cb = sizeof(startup_info);
++    startup_info.dwFlags = STARTF_USESHOWWINDOW;
++    startup_info.wShowWindow = SW_SHOWNORMAL;
++
++    sprintf(path, "%s input test_loadkeyboardlayout", argv0);
++    ret = CreateProcessA(NULL, path, NULL, NULL, TRUE, 0, NULL, NULL, &startup_info, &process_info );
++    ok(ret, "CreateProcess \"%s\" failed err %lu.\n", path, GetLastError());
++
++    ret = WaitForSingleObject(start, 1000);
++    ok( ret == WAIT_OBJECT_0, "Unexpected ret %#lx\n", ret );
++
++    hkl = LoadKeyboardLayoutW( test_layout_name, 0 );
++    todo_wine
++    ok_eq( test_hkl, hkl, HKL, "%p" );
++    layouts2 = get_keyboard_layouts( &count2 );
++    todo_wine
++    ok_eq( count + 1, count2, UINT, "%u" );
++    todo_wine
++    ok_eq( test_hkl, layouts2[count2 - 1], HKL, "%p" );
++    ok( !memcmp( layouts2, layouts, count * sizeof(*layouts) ), "keyboard layouts changed\n" );
++    free( layouts2 );
++    free( layouts );
++
++    if (!RegOpenKeyW( HKEY_CURRENT_USER, L"Keyboard Layout\\Substitutes", &hkey ))
++    {
++        i = 0;
++        type = REG_SZ;
++        klid_size = sizeof(klid);
++        value_size = ARRAY_SIZE(value);
++        while (!RegEnumValueW( hkey, i++, value, &value_size, NULL, &type, (void *)&klid, &klid_size ))
++        {
++            klid_size = sizeof(klid);
++            value_size = ARRAY_SIZE(value);
++            ok( wcsicmp( klid, test_layout_name ), "test layout found in the registry\n" );
++        }
++
++        RegCloseKey( hkey );
++    }
++
++    SetEvent( end );
++
++    ok_eq( old_hkl, GetKeyboardLayout( 0 ), HKL, "%p" );
++}
++
+ /* run the tests in a separate desktop to avoid interaction with other
+  * tests, current desktop state, or user actions. */
+ static void test_input_desktop( char **argv )
+@@ -6660,6 +6793,7 @@ static void test_input_desktop( char **argv )
+     test_SendInput_raw_key_messages( 'F', wch, hkl );
+ 
+     test_LoadKeyboardLayoutEx( hkl );
++    test_LoadKeyboardLayout( argv[0], hkl );
+ 
+     ok_ret( 1, SetCursorPos( pos.x, pos.y ) );
+ 
+@@ -6916,6 +7050,8 @@ START_TEST(input)
+         return test_system_messages_with_rawinput_nolegacy();
+     if (argc >= 3 && !strcmp( argv[2], "test_SetFocus" ))
+         return test_SetFocus_process();
++    if (argc >= 3 && !strcmp( argv[2], "test_loadkeyboardlayout" ))
++        return test_loadkeyboardlayout_process();
+ 
+     run_in_desktop( argv, "test_input_desktop", 1 );
+     test_keynames();
+
+--- dlls/win32u/driver.c
++++ dlls/win32u/driver.c
+@@ -625,7 +625,7 @@ static void nulldrv_Beep(void)
+ {
+ }
+ 
+-static UINT nulldrv_GetKeyboardLayoutList( INT size, HKL *layouts )
++static UINT nulldrv_UpdateKeyboardLayouts( const struct keyboard_funcs *funcs )
+ {
+     return ~0; /* use default implementation */
+ }
+@@ -1084,9 +1084,9 @@ static INT loaderdrv_GetKeyNameText( LONG lparam, LPWSTR buffer, INT size )
+     return load_driver()->pGetKeyNameText( lparam, buffer, size );
+ }
+ 
+-static UINT loaderdrv_GetKeyboardLayoutList( INT size, HKL *layouts )
++static UINT loaderdrv_UpdateKeyboardLayouts( const struct keyboard_funcs *funcs )
+ {
+-    return load_driver()->pGetKeyboardLayoutList( size, layouts );
++    return load_driver()->pUpdateKeyboardLayouts( funcs );
+ }
+ 
+ static UINT loaderdrv_MapVirtualKeyEx( UINT code, UINT type, HKL layout )
+@@ -1274,7 +1274,7 @@ static const struct user_driver_funcs lazy_load_driver =
+     loaderdrv_ActivateKeyboardLayout,
+     loaderdrv_Beep,
+     loaderdrv_GetKeyNameText,
+-    loaderdrv_GetKeyboardLayoutList,
++    loaderdrv_UpdateKeyboardLayouts,
+     loaderdrv_MapVirtualKeyEx,
+     loaderdrv_RegisterHotKey,
+     loaderdrv_ToUnicodeEx,
+@@ -1379,7 +1379,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
+     SET_USER_FUNC(ActivateKeyboardLayout);
+     SET_USER_FUNC(Beep);
+     SET_USER_FUNC(GetKeyNameText);
+-    SET_USER_FUNC(GetKeyboardLayoutList);
++    SET_USER_FUNC(UpdateKeyboardLayouts);
+     SET_USER_FUNC(MapVirtualKeyEx);
+     SET_USER_FUNC(RegisterHotKey);
+     SET_USER_FUNC(ToUnicodeEx);
+
+--- dlls/win32u/font.c
++++ dlls/win32u/font.c
+@@ -3542,12 +3542,9 @@ CPTABLEINFO *get_cptable( WORD cp )
+     return &tables[i];
+ }
+ 
+-/* Based on NlsValidateLocale */
+-const NLS_LOCALE_DATA *get_locale_data( LCID lcid )
++const NLS_LOCALE_HEADER *get_locale_table(void)
+ {
+     static const NLS_LOCALE_HEADER *locale_table;
+-    static const NLS_LOCALE_LCID_INDEX *lcids_index;
+-    int min = 0, max;
+ 
+     if (!locale_table)
+     {
+@@ -3578,9 +3575,21 @@ const NLS_LOCALE_DATA *get_locale_data( LCID lcid )
+             NtUnmapViewOfSection( GetCurrentProcess(), addr );
+ 
+         locale_table = (const NLS_LOCALE_HEADER *)((char *)header + header->locales);
+-        lcids_index = (const NLS_LOCALE_LCID_INDEX *)((char *)locale_table + locale_table->lcids_offset);
+     }
+ 
++    return locale_table;
++}
++
++/* Based on NlsValidateLocale */
++const NLS_LOCALE_DATA *get_locale_data( LCID lcid )
++{
++    const NLS_LOCALE_LCID_INDEX *lcids_index;
++    const NLS_LOCALE_HEADER *locale_table;
++    int min = 0, max;
++
++    if (!(locale_table = get_locale_table())) return NULL;
++    lcids_index = (const NLS_LOCALE_LCID_INDEX *)((char *)locale_table + locale_table->lcids_offset);
++
+     max = locale_table->nb_lcids - 1;
+     while (min <= max)
+     {
+
+--- dlls/win32u/input.c
++++ dlls/win32u/input.c
+
+--- dlls/win32u/ntuser_private.h
++++ dlls/win32u/ntuser_private.h
+@@ -120,7 +120,6 @@ struct user_thread_info
+     struct imm_thread_data       *imm_thread_data;        /* IMM thread data */
+     HIMC                          default_imc;            /* default input context */
+     HKL                           kbd_layout;             /* Current keyboard layout */
+-    UINT                          kbd_layout_id;          /* Current keyboard layout ID */
+     struct raw_mouse              raw_mouse;              /* accumulated hardware raw mouse frames */
+     INPUT                         mouse_motion;           /* accumulated hardware mouse motion */
+     HWND                          mouse_hwnd;             /* hardware mouse motion target window */
+
+--- dlls/win32u/sysparams.c
++++ dlls/win32u/sysparams.c
+@@ -815,7 +815,7 @@ static BOOL read_source_monitor_path( HKEY hkey, UINT index, char *path )
+     return TRUE;
+ }
+ 
+-static void reg_empty_key( HKEY root, const char *key_name, BOOL subkeys_only )
++void reg_empty_key( HKEY root, const char *key_name, BOOL subkeys_only )
+ {
+     char buffer[4096];
+     KEY_NODE_INFORMATION *key = (KEY_NODE_INFORMATION *)buffer;
+@@ -5978,12 +5978,10 @@ void sysparams_init(void)
+     WCHAR buffer[MAX_PATH+16], *p, *appname;
+     char *app_compat_flags = NULL;
+     DWORD i, dispos, dpi_scaling;
+-    WCHAR layout[KL_NAMELENGTH];
+     pthread_mutexattr_t attr;
+     HKEY hkey, appkey = 0;
+     DWORD len;
+ 
+-    static const WCHAR oneW[] = {'1',0};
+     static const WCHAR x11driverW[] = {'\\','X','1','1',' ','D','r','i','v','e','r',0};
+ 
+     pthread_mutexattr_init( &attr );
+@@ -5995,9 +5993,12 @@ void sysparams_init(void)
+ 
+     if ((hkey = reg_create_ascii_key( hkcu_key, "Keyboard Layout\\Preload", 0, NULL )))
+     {
+-        if (NtUserGetKeyboardLayoutName( layout ))
+-            set_reg_value( hkey, oneW, REG_SZ, (const BYTE *)layout,
+-                           (lstrlenW(layout) + 1) * sizeof(WCHAR) );
++        char layout[KL_NAMELENGTH];
++        LCID locale;
++
++        NtQueryDefaultLocale( TRUE, &locale );
++        sprintf( layout, "%08X", MAKELONG( locale, locale ) );
++        set_reg_ascii_value( hkey, "1", layout );
+         NtClose( hkey );
+     }
+ 
+@@ -7618,6 +7619,10 @@ ULONG_PTR WINAPI NtUserCallNoParam( ULONG code )
+         display_mode_changed( FALSE );
+         return TRUE;
+ 
++    case NtUserCallNoParam_KeyboardLayoutsChanged:
++        keyboard_layouts_init( TRUE );
++        return TRUE;
++
+     /* temporary exports */
+     case NtUserExitingThread:
+         exiting_thread_id = GetCurrentThreadId();
+
+--- dlls/win32u/win32u_private.h
++++ dlls/win32u/win32u_private.h
+@@ -94,6 +94,7 @@ extern void unregister_imm_window( HWND hwnd );
+ /* input.c */
+ extern BOOL grab_pointer;
+ extern BOOL grab_fullscreen;
++extern void keyboard_layouts_init( BOOL changed );
+ extern BOOL is_mouse_in_pointer_enabled( HWND hwnd );
+ extern HWND get_active_window(void);
+ extern HWND get_capture(void);
+@@ -349,6 +350,7 @@ extern void winstation_init(void);
+ extern void sysparams_init(void);
+ extern int muldiv( int a, int b, int c );
+ 
++extern void reg_empty_key( HKEY root, const char *key_name, BOOL subkeys_only );
+ extern HKEY reg_create_key( HKEY root, const WCHAR *name, ULONG name_len,
+                             DWORD options, DWORD *disposition );
+ extern HKEY reg_create_ascii_key( HKEY root, const char *name, DWORD options,
+@@ -387,6 +389,7 @@ static inline WCHAR win32u_towupper( WCHAR ch )
+ extern CPTABLEINFO ansi_cp;
+ 
+ CPTABLEINFO *get_cptable( WORD cp );
++const NLS_LOCALE_HEADER *get_locale_table(void);
+ const NLS_LOCALE_DATA *get_locale_data( LCID lcid );
+ extern BOOL translate_charset_info( DWORD *src, CHARSETINFO *cs, DWORD flags );
+ DWORD win32u_mbtowc( CPTABLEINFO *info, WCHAR *dst, DWORD dstlen, const char *src,
+
+--- dlls/winemac.drv/gdi.c
++++ dlls/winemac.drv/gdi.c
+@@ -253,7 +253,7 @@ static const struct user_driver_funcs macdrv_funcs =
+     .pDestroyWindow = macdrv_DestroyWindow,
+     .pUpdateDisplayDevices = macdrv_UpdateDisplayDevices,
+     .pGetCursorPos = macdrv_GetCursorPos,
+-    .pGetKeyboardLayoutList = macdrv_GetKeyboardLayoutList,
++    .pUpdateKeyboardLayouts = macdrv_UpdateKeyboardLayouts,
+     .pGetKeyNameText = macdrv_GetKeyNameText,
+     .pMapVirtualKeyEx = macdrv_MapVirtualKeyEx,
+     .pProcessEvents = macdrv_ProcessEvents,
+
+--- dlls/winemac.drv/keyboard.c
++++ dlls/winemac.drv/keyboard.c
+@@ -341,113 +341,14 @@ static struct list layout_list = LIST_INIT( layout_list );
+ struct layout
+ {
+     struct list entry;
+-    LANGID lang;
+-    /* "Layout Id", used by NtUserGetKeyboardLayoutName / LoadKeyboardLayoutW */
+-    WORD layout_id;
+     TISInputSourceRef input_source;
+-    BOOL enabled; /* is the input source enabled - ie displayed in the input source selector UI */
++    HKL hkl;
+ };
+ 
+ static pthread_mutex_t layout_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+ 
+ int macdrv_layout_list_needs_update = TRUE;
+ 
+-static const NLS_LOCALE_HEADER *locale_table;
+-
+-static int compare_locale_names(const WCHAR *n1, const WCHAR *n2)
+-{
+-    for (;;)
+-    {
+-        WCHAR ch1 = *n1++;
+-        WCHAR ch2 = *n2++;
+-        if (ch1 >= 'a' && ch1 <= 'z') ch1 -= 'a' - 'A';
+-        else if (ch1 == '_') ch1 = '-';
+-        if (ch2 >= 'a' && ch2 <= 'z') ch2 -= 'a' - 'A';
+-        else if (ch2 == '_') ch2 = '-';
+-        if (!ch1 || ch1 != ch2) return ch1 - ch2;
+-    }
+-}
+-
+-
+-static const NLS_LOCALE_LCNAME_INDEX *find_lcname_entry(const WCHAR *name)
+-{
+-    const NLS_LOCALE_LCNAME_INDEX *lcnames_index;
+-    const WCHAR *locale_strings;
+-    int min = 0, max = locale_table->nb_lcnames - 1;
+-
+-    locale_strings = (const WCHAR *)((char *)locale_table + locale_table->strings_offset);
+-    lcnames_index = (const NLS_LOCALE_LCNAME_INDEX *)((char *)locale_table + locale_table->lcnames_offset);
+-
+-    while (min <= max)
+-    {
+-        int res, pos = (min + max) / 2;
+-        const WCHAR *str = locale_strings + lcnames_index[pos].name;
+-        res = compare_locale_names(name, str + 1);
+-        if (res < 0) max = pos - 1;
+-        else if (res > 0) min = pos + 1;
+-        else return &lcnames_index[pos];
+-    }
+-    return NULL;
+-}
+-
+-
+-static DWORD get_lcid(CFStringRef lang)
+-{
+-    const NLS_LOCALE_LCNAME_INDEX *entry;
+-    const NLS_LOCALE_DATA *locale;
+-    CFRange range;
+-    WCHAR str[10];
+-    ULONG offset;
+-
+-    if (!locale_table)
+-    {
+-        struct
+-        {
+-            UINT ctypes;
+-            UINT unknown1;
+-            UINT unknown2;
+-            UINT unknown3;
+-            UINT locales;
+-            UINT charmaps;
+-            UINT geoids;
+-            UINT scripts;
+-        } *header;
+-        LCID system_lcid;
+-        LARGE_INTEGER size;
+-
+-        if (NtInitializeNlsFiles((void **)&header, &system_lcid, &size))
+-        {
+-            ERR("NtInitializeNlsFiles failed\n");
+-            return 0;
+-        }
+-
+-        if (InterlockedCompareExchangePointer((void **)&locale_table,
+-                                              (char *)header + header->locales, NULL))
+-            NtUnmapViewOfSection(GetCurrentProcess(), header);
+-    }
+-
+-    range.location = 0;
+-    range.length = min(CFStringGetLength(lang), ARRAY_SIZE(str) - 1);
+-    CFStringGetCharacters(lang, range, str);
+-    str[range.length] = 0;
+-
+-    if (!(entry = find_lcname_entry(str)))
+-    {
+-        ERR("%s not found\n", debugstr_w(str));
+-        return 0;
+-    }
+-
+-    offset = locale_table->locales_offset + entry->idx * locale_table->locale_size;
+-    locale = (const NLS_LOCALE_DATA *)((const char *)locale_table + offset);
+-    return locale->inotneutral ? entry->id : locale->idefaultlanguage;
+-}
+-
+-static HKL get_layout_hkl(struct layout *layout, LCID locale)
+-{
+-    if (!layout->layout_id) return UlongToHandle(MAKELONG(locale, layout->lang));
+-    return UlongToHandle(MAKELONG(locale, layout->layout_id));
+-}
+-
+ /******************************************************************
+  *                get_layout_from_source
+  *
+@@ -481,52 +382,8 @@ static struct layout *get_layout_from_source(TISInputSourceRef input)
+  */
+ static void update_layout_list(void)
+ {
+-    LCID locale = LOWORD(NtUserGetKeyboardLayout(0));
+-    CFArrayRef sources;
+-    struct layout *layout;
+-    int i;
+-
+     if (!InterlockedExchange((LONG *)&macdrv_layout_list_needs_update, FALSE)) return;
+-
+-    sources = macdrv_create_input_source_list();
+-
+-    LIST_FOR_EACH_ENTRY(layout, &layout_list, struct layout, entry)
+-        layout->enabled = FALSE;
+-
+-    for (i = 0; i < CFArrayGetCount(sources); i++)
+-    {
+-        CFDictionaryRef dict = CFArrayGetValueAtIndex(sources, i);
+-        TISInputSourceRef input = (TISInputSourceRef)CFDictionaryGetValue(dict, macdrv_input_source_input_key);
+-        layout = get_layout_from_source(input);
+-        if (!layout)
+-        {
+-            static WORD next_layout_id = 1;
+-
+-            CFStringRef type = CFDictionaryGetValue(dict, macdrv_input_source_type_key);
+-            LANGID lang = get_lcid(CFDictionaryGetValue(dict, macdrv_input_source_lang_key));
+-            HKL lang_hkl = UlongToPtr(MAKELONG(lang, lang));
+-            UINT index = 0;
+-
+-            LIST_FOR_EACH_ENTRY_REV(layout, &layout_list, struct layout, entry)
+-                if (layout->lang == lang) index++;
+-
+-            layout = calloc(1, sizeof(*layout));
+-            layout->input_source = (TISInputSourceRef)CFRetain(input);
+-            layout->lang = lang;
+-            if (is_ime_hkl(lang_hkl) && !index) layout->layout_id = 0; /* HKL has a builtin IME */
+-            else if (!CFEqual(type, kTISTypeKeyboardLayout)) layout->layout_id = 0xe000 | next_layout_id++;
+-            else if (index) layout->layout_id = 0xf000 | next_layout_id++;
+-
+-            list_add_tail(&layout_list, &layout->entry);
+-            TRACE("adding new layout %p\n", get_layout_hkl(layout, locale));
+-        }
+-        else
+-            TRACE("enabling already existing layout %p\n", get_layout_hkl(layout, locale));
+-
+-        layout->enabled = TRUE;
+-    }
+-
+-    CFRelease(sources);
++    NtUserCallNoParam( NtUserCallNoParam_KeyboardLayoutsChanged );
+ }
+ 
+ /***********************************************************************
+@@ -540,11 +397,12 @@ HKL macdrv_get_hkl_from_source(TISInputSourceRef input)
+     struct layout *layout;
+     HKL ret = 0;
+ 
++    update_layout_list();
++
+     pthread_mutex_lock(&layout_list_mutex);
+ 
+-    update_layout_list();
+     layout = get_layout_from_source(input);
+-    if (layout) ret = get_layout_hkl(layout, locale);
++    if (layout) ret = UlongToPtr(MAKELONG(locale, HIWORD(layout->hkl)));
+ 
+     pthread_mutex_unlock(&layout_list_mutex);
+ 
+@@ -1184,12 +1042,13 @@ BOOL macdrv_ActivateKeyboardLayout(HKL hkl, UINT flags)
+     if (hkl == thread_data->active_keyboard_layout)
+         return TRUE;
+ 
+-    pthread_mutex_lock(&layout_list_mutex);
+     update_layout_list();
+ 
++    pthread_mutex_lock(&layout_list_mutex);
++
+     LIST_FOR_EACH_ENTRY(layout, &layout_list, struct layout, entry)
+     {
+-        if (HIWORD(hkl) == layout->layout_id ? layout->layout_id : layout->lang)
++        if (HIWORD(hkl) == HIWORD(layout->hkl))
+         {
+             if (macdrv_select_input_source(layout->input_source))
+             {
+@@ -1324,33 +1183,52 @@ INT macdrv_GetKeyNameText(LONG lparam, LPWSTR buffer, INT size)
+ /***********************************************************************
+  *     GetKeyboardLayoutList (MACDRV.@)
+  */
+-UINT macdrv_GetKeyboardLayoutList(INT size, HKL *list)
++UINT macdrv_UpdateKeyboardLayouts(const struct keyboard_funcs *funcs)
+ {
+-    LCID locale = LOWORD(NtUserGetKeyboardLayout(0));
+-    int count = 0;
+     struct layout *layout;
++    CFArrayRef sources;
++    struct list *ptr;
+ 
+-    TRACE("%d, %p\n", size, list);
++    TRACE("\n");
+ 
+     pthread_mutex_lock(&layout_list_mutex);
+ 
+-    update_layout_list();
++    while ((ptr = list_head(&layout_list)))
++    {
++        layout = LIST_ENTRY(ptr, struct layout, entry);
++        CFRelease(layout->input_source);
++        list_remove(&layout->entry);
++        free(layout);
++    }
+ 
+-    LIST_FOR_EACH_ENTRY(layout, &layout_list, struct layout, entry)
++    sources = macdrv_create_input_source_list();
++
++    for (int i = 0; i < CFArrayGetCount(sources); i++)
+     {
+-        if (!layout->enabled) continue;
+-        if (list)
+-        {
+-            if (count >= size) break;
+-            list[count] = get_layout_hkl(layout, locale);
+-            TRACE("\t%d: %p\n", count, list[count]);
+-        }
+-        count++;
++        CFDictionaryRef dict = CFArrayGetValueAtIndex(sources, i);
++        TISInputSourceRef input = (TISInputSourceRef)CFDictionaryGetValue(dict, macdrv_input_source_input_key);
++        CFStringRef lang = CFDictionaryGetValue(dict, macdrv_input_source_lang_key);
++        CFStringRef type = CFDictionaryGetValue(dict, macdrv_input_source_type_key);
++        char name[16];
++        UINT klid;
++        HKL hkl;
++
++        CFStringGetCString(lang, name, sizeof(name), kCFStringEncodingUTF8);
++        hkl = funcs->add_layout(0, name, NULL, !CFEqual(type, kTISTypeKeyboardLayout), (UINT_PTR)input);
++
++        if (!(layout = calloc(1, sizeof(*layout)))) break;
++        layout->input_source = (TISInputSourceRef)CFRetain(input);
++        layout->hkl = hkl;
++        list_add_tail(&layout_list, &layout->entry);
++
++        TRACE("added new layout %p for source %p\n", hkl, input);
+     }
++
++    CFRelease(sources);
++
+     pthread_mutex_unlock(&layout_list_mutex);
+ 
+-    TRACE("returning %d\n", count);
+-    return count;
++    return 0;
+ }
+ 
+ 
+
+--- dlls/winemac.drv/macdrv.h
++++ dlls/winemac.drv/macdrv.h
+@@ -164,7 +164,7 @@ extern void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hin
+ extern UINT macdrv_MapVirtualKeyEx(UINT wCode, UINT wMapType, HKL hkl);
+ extern INT macdrv_ToUnicodeEx(UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
+                               LPWSTR bufW, int bufW_size, UINT flags, HKL hkl);
+-extern UINT macdrv_GetKeyboardLayoutList(INT size, HKL *list);
++extern UINT macdrv_UpdateKeyboardLayouts(const struct keyboard_funcs *funcs);
+ extern INT macdrv_GetKeyNameText(LONG lparam, LPWSTR buffer, INT size);
+ extern void macdrv_NotifyIMEStatus(HWND hwnd, UINT status);
+ extern BOOL macdrv_SetIMECompositionRect(HWND hwnd, RECT rect);
+
+--- dlls/winex11.drv/init.c
++++ dlls/winex11.drv/init.c
+@@ -614,6 +614,7 @@ static const struct user_driver_funcs x11drv_funcs =
+ 
+     .pActivateKeyboardLayout = X11DRV_ActivateKeyboardLayout,
+     .pBeep = X11DRV_Beep,
++    .pUpdateKeyboardLayouts = X11DRV_UpdateKeyboardLayouts,
+     .pGetKeyNameText = X11DRV_GetKeyNameText,
+     .pMapVirtualKeyEx = X11DRV_MapVirtualKeyEx,
+     .pToUnicodeEx = X11DRV_ToUnicodeEx,
+
+--- dlls/winex11.drv/keyboard.c
++++ dlls/winex11.drv/keyboard.c
+@@ -238,97 +238,9 @@ static WORD keyc2scan( unsigned int keycode, unsigned int state )
+ static int NumLockMask, ScrollLockMask, AltGrMask; /* mask in the XKeyEvent state */
+ 
+ static pthread_mutex_t kbd_mutex = PTHREAD_MUTEX_INITIALIZER;
+-static struct list xkb_layouts = LIST_INIT( xkb_layouts );
+ 
+ static char KEYBOARD_MapDeadKeysym(KeySym keysym);
+ 
+-static const WCHAR keyboard_layouts_keyW[] =
+-{
+-    '\\','R','e','g','i','s','t','r','y',
+-    '\\','M','a','c','h','i','n','e',
+-    '\\','S','y','s','t','e','m',
+-    '\\','C','u','r','r','e','n','t','C','o','n','t','r','o','l','S','e','t',
+-    '\\','C','o','n','t','r','o','l',
+-    '\\','K','e','y','b','o','a','r','d',' ','L','a','y','o','u','t','s'
+-};
+-
+-static ULONG query_reg_ascii_value( HKEY hkey, const char *name, KEY_VALUE_PARTIAL_INFORMATION *info, ULONG size )
+-{
+-    WCHAR nameW[64];
+-
+-    asciiz_to_unicode( nameW, name );
+-    return query_reg_value( hkey, nameW, info, size );
+-}
+-
+-static WORD get_layout_id_from_klid( DWORD klid )
+-{
+-    static WORD next_layout_id = 0x100;
+-
+-    char buffer[2048];
+-    KEY_VALUE_PARTIAL_INFORMATION *value = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
+-    WORD layout_id = 0;
+-    HKEY hkey = NULL, subkey;
+-    WCHAR name[16];
+-
+-    TRACE( "klid %08x\n", klid );
+-
+-    if (!HIWORD(klid)) return 0;
+-    if (klid == -1) goto done;
+-
+-    snprintf( buffer, sizeof(buffer), "%08x", klid );
+-    asciiz_to_unicode( name, buffer );
+-
+-    if (!(hkey = reg_open_key( NULL, keyboard_layouts_keyW, sizeof(keyboard_layouts_keyW) ))) goto done;
+-
+-    if (!(subkey = reg_open_key( hkey, name, 8 * sizeof(WCHAR) ))) goto done;
+-
+-    if (query_reg_ascii_value( subkey, "Layout Id", value, sizeof(buffer) ) && value->Type == REG_SZ)
+-        layout_id = wcstoul( (const WCHAR *)value->Data, NULL, 16 );
+-    NtClose( subkey );
+-
+-done:
+-    if (hkey) NtClose( hkey );
+-    if (!layout_id) layout_id = next_layout_id++;
+-    TRACE( "layout_id %04x\n", layout_id );
+-    return layout_id;
+-}
+-
+-static void create_layout_from_xkb( int xkb_group, const char *xkb_layout, LANGID lang, DWORD klid )
+-{
+-    struct layout *layout;
+-    WORD index = 0;
+-
+-    TRACE( "xkb_group %u, xkb_layout %s, lang %04x, klid %08x\n", xkb_group, xkb_layout, lang, klid );
+-
+-    LIST_FOR_EACH_ENTRY( layout, &xkb_layouts, struct layout, entry )
+-    {
+-        if (!strcmp( layout->xkb_layout, xkb_layout ))
+-        {
+-            TRACE( "Found existing layout entry %p, lang %04x, klid %08x, layout_id %04x\n",
+-                   layout, layout->lang, layout->klid, layout->layout_id );
+-            if (layout->xkb_group == -1) layout->xkb_group = xkb_group;
+-            return;
+-        }
+-        if (lang == layout->lang && HIWORD(layout->klid) >= 0x20) index++;
+-    }
+-
+-    if (!(layout = calloc( 1, sizeof(*layout) + strlen( xkb_layout ) + 1 )))
+-    {
+-        WARN( "Failed to allocate memory for Xkb layout entry\n" );
+-        return;
+-    }
+-    list_add_tail( &xkb_layouts, &layout->entry );
+-
+-    layout->xkb_group = xkb_group;
+-    layout->xkb_layout = strcpy( (char *)(layout + 1), xkb_layout );
+-
+-    layout->lang = lang;
+-    layout->klid = !klid ? MAKELONG(lang, 0) : (klid == -1) ? MAKELONG(lang, index + 0x20) : klid;
+-    layout->layout_id = get_layout_id_from_klid( klid );
+-
+-    TRACE( "Created layout entry %p, lang %04x, klid %08x, layout_id %04x\n", layout, layout->lang, layout->klid, layout->layout_id );
+-}
+-
+ /* Keyboard translation tables */
+ #define MAIN_LEN 49
+ static const WORD main_key_vkey_qwerty[MAIN_LEN] =
+@@ -1608,173 +1520,6 @@ BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *xev )
+     return TRUE;
+ }
+ 
+-static const struct layout_id_map_entry
+-{
+-    const char *name;
+-    LANGID langid;
+-} layout_ids[] =
+-{
+-    { "af", MAKELANGID(LANG_DARI, SUBLANG_DEFAULT) },
+-    { "al", MAKELANGID(LANG_ALBANIAN, SUBLANG_DEFAULT) },
+-    { "am", MAKELANGID(LANG_ARMENIAN, SUBLANG_DEFAULT) },
+-    { "ara", MAKELANGID(LANG_ARABIC, SUBLANG_DEFAULT) },
+-    { "at", MAKELANGID(LANG_GERMAN, SUBLANG_GERMAN_AUSTRIAN) },
+-    { "az", MAKELANGID(LANG_AZERBAIJANI, SUBLANG_DEFAULT) },
+-    { "au", MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_AUS) },
+-    { "ba", MAKELANGID(LANG_BOSNIAN, SUBLANG_BOSNIAN_BOSNIA_HERZEGOVINA_CYRILLIC) },
+-    { "bd", MAKELANGID(LANG_BANGLA, SUBLANG_DEFAULT) },
+-    { "be", MAKELANGID(LANG_FRENCH, SUBLANG_FRENCH_BELGIAN) },
+-    { "bg", MAKELANGID(LANG_BULGARIAN, SUBLANG_DEFAULT) },
+-    { "br", MAKELANGID(LANG_PORTUGUESE, 2) },
+-    { "brai", MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_DEFAULT) },
+-    { "bt", MAKELANGID(LANG_TIBETAN, 3) },
+-    { "bw", MAKELANGID(LANG_TSWANA, SUBLANG_TSWANA_BOTSWANA) },
+-    { "by", MAKELANGID(LANG_BELARUSIAN, SUBLANG_DEFAULT) },
+-    { "ca", MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_CAN) },
+-    { "cd", MAKELANGID(LANG_FRENCH, SUBLANG_CUSTOM_UNSPECIFIED) },
+-    { "ch", MAKELANGID(LANG_GERMAN, SUBLANG_GERMAN_SWISS) },
+-    { "cm", MAKELANGID(LANG_FRENCH, 11) },
+-    { "cn", MAKELANGID(LANG_CHINESE, SUBLANG_DEFAULT) },
+-    { "cz", MAKELANGID(LANG_CZECH, SUBLANG_DEFAULT) },
+-    { "de", MAKELANGID(LANG_GERMAN, SUBLANG_DEFAULT) },
+-    { "dk", MAKELANGID(LANG_DANISH, SUBLANG_DEFAULT) },
+-    { "dz", MAKELANGID(LANG_TAMAZIGHT, SUBLANG_TAMAZIGHT_ALGERIA_LATIN) },
+-    { "ee", MAKELANGID(LANG_ESTONIAN, SUBLANG_DEFAULT) },
+-    { "epo", MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_DEFAULT) },
+-    { "es", MAKELANGID(LANG_SPANISH, SUBLANG_DEFAULT) },
+-    { "et", MAKELANGID(LANG_AMHARIC, SUBLANG_DEFAULT) },
+-    { "fi", MAKELANGID(LANG_FINNISH, SUBLANG_DEFAULT) },
+-    { "fo", MAKELANGID(LANG_FAEROESE, SUBLANG_DEFAULT) },
+-    { "fr", MAKELANGID(LANG_FRENCH, SUBLANG_DEFAULT) },
+-    { "gb", MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_UK) },
+-    { "ge", MAKELANGID(LANG_GEORGIAN, SUBLANG_DEFAULT) },
+-    { "gh", MAKELANGID(LANG_ENGLISH, SUBLANG_CUSTOM_UNSPECIFIED) },
+-    { "gn", MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_DEFAULT) },
+-    { "gr", MAKELANGID(LANG_GREEK, SUBLANG_DEFAULT) },
+-    { "hr", MAKELANGID(LANG_CROATIAN, SUBLANG_DEFAULT) },
+-    { "hu", MAKELANGID(LANG_HUNGARIAN, SUBLANG_DEFAULT) },
+-    { "id", MAKELANGID(LANG_INDONESIAN, SUBLANG_DEFAULT) },
+-    { "ie", MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_EIRE) },
+-    { "il", MAKELANGID(LANG_HEBREW, SUBLANG_DEFAULT) },
+-    { "in", MAKELANGID(LANG_HINDI, SUBLANG_DEFAULT) },
+-    { "iq", MAKELANGID(LANG_ARABIC, SUBLANG_ARABIC_IRAQ) },
+-    { "ir", MAKELANGID(LANG_PERSIAN, SUBLANG_DEFAULT) },
+-    { "is", MAKELANGID(LANG_ICELANDIC, SUBLANG_DEFAULT) },
+-    { "it", MAKELANGID(LANG_ITALIAN, SUBLANG_DEFAULT) },
+-    { "jp", MAKELANGID(LANG_JAPANESE, SUBLANG_DEFAULT) },
+-    { "ke", MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_DEFAULT) },
+-    { "kg", MAKELANGID(LANG_KYRGYZ, SUBLANG_DEFAULT) },
+-    { "kh", MAKELANGID(LANG_KHMER, SUBLANG_DEFAULT) },
+-    { "kr", MAKELANGID(LANG_KOREAN, SUBLANG_DEFAULT) },
+-    { "kz", MAKELANGID(LANG_KAZAK, SUBLANG_DEFAULT) },
+-    { "la", MAKELANGID(LANG_LAO, SUBLANG_DEFAULT) },
+-    { "latam", MAKELANGID(LANG_SPANISH, SUBLANG_CUSTOM_UNSPECIFIED) },
+-    { "lk", MAKELANGID(LANG_SINHALESE, SUBLANG_DEFAULT) },
+-    { "lt", MAKELANGID(LANG_LITHUANIAN, SUBLANG_DEFAULT) },
+-    { "lv", MAKELANGID(LANG_LATVIAN, SUBLANG_DEFAULT) },
+-    { "ma", MAKELANGID(LANG_ARABIC, SUBLANG_ARABIC_MOROCCO) },
+-    { "mao", MAKELANGID(LANG_MAORI, SUBLANG_DEFAULT) },
+-    { "md", MAKELANGID(LANG_ROMANIAN, SUBLANG_CUSTOM_UNSPECIFIED) },
+-    { "me", MAKELANGID(LANG_SERBIAN, SUBLANG_SERBIAN_MONTENEGRO_LATIN) },
+-    { "mk", MAKELANGID(LANG_MACEDONIAN, SUBLANG_DEFAULT) },
+-    { "ml", MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_DEFAULT) },
+-    { "mm", MAKELANGID(0x55 /*LANG_BURMESE*/, SUBLANG_DEFAULT) },
+-    { "mn", MAKELANGID(LANG_MONGOLIAN, SUBLANG_DEFAULT) },
+-    { "mt", MAKELANGID(LANG_MALTESE, SUBLANG_DEFAULT) },
+-    { "mv", MAKELANGID(LANG_DIVEHI, SUBLANG_DEFAULT) },
+-    { "my", MAKELANGID(LANG_MALAY, SUBLANG_DEFAULT) },
+-    { "ng", MAKELANGID(LANG_ENGLISH, SUBLANG_CUSTOM_UNSPECIFIED) },
+-    { "nl", MAKELANGID(LANG_DUTCH, SUBLANG_DEFAULT) },
+-    { "no", MAKELANGID(LANG_NORWEGIAN, SUBLANG_DEFAULT) },
+-    { "np", MAKELANGID(LANG_NEPALI, SUBLANG_DEFAULT) },
+-    { "ph", MAKELANGID(LANG_FILIPINO, SUBLANG_DEFAULT) },
+-    { "pk", MAKELANGID(LANG_URDU, SUBLANG_DEFAULT) },
+-    { "pl", MAKELANGID(LANG_POLISH, SUBLANG_DEFAULT) },
+-    { "pt", MAKELANGID(LANG_PORTUGUESE, SUBLANG_DEFAULT) },
+-    { "ro", MAKELANGID(LANG_ROMANIAN, SUBLANG_DEFAULT) },
+-    { "rs", MAKELANGID(LANG_SERBIAN, SUBLANG_SERBIAN_LATIN) },
+-    { "ru", MAKELANGID(LANG_RUSSIAN, SUBLANG_DEFAULT) },
+-    { "se", MAKELANGID(LANG_SWEDISH, SUBLANG_DEFAULT) },
+-    { "si", MAKELANGID(LANG_SLOVENIAN, SUBLANG_DEFAULT) },
+-    { "sk", MAKELANGID(LANG_SLOVAK, SUBLANG_DEFAULT) },
+-    { "sn", MAKELANGID(LANG_WOLOF, SUBLANG_DEFAULT) },
+-    { "sy", MAKELANGID(LANG_SYRIAC, SUBLANG_DEFAULT) },
+-    { "tg", MAKELANGID(LANG_FRENCH, SUBLANG_CUSTOM_UNSPECIFIED) },
+-    { "th", MAKELANGID(LANG_THAI, SUBLANG_DEFAULT) },
+-    { "tj", MAKELANGID(LANG_TAJIK, SUBLANG_DEFAULT) },
+-    { "tm", MAKELANGID(LANG_TURKMEN, SUBLANG_DEFAULT) },
+-    { "tr", MAKELANGID(LANG_TURKISH, SUBLANG_DEFAULT) },
+-    { "tw", MAKELANGID(LANG_CHINESE, SUBLANG_CUSTOM_UNSPECIFIED) },
+-    { "tz", MAKELANGID(LANG_SWAHILI, SUBLANG_CUSTOM_UNSPECIFIED) },
+-    { "ua", MAKELANGID(LANG_UKRAINIAN, SUBLANG_DEFAULT) },
+-    { "us", MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT) },
+-    { "uz", MAKELANGID(LANG_UZBEK, 2) },
+-    { "vn", MAKELANGID(LANG_VIETNAMESE, SUBLANG_DEFAULT) },
+-    { "za", MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_SOUTH_AFRICA) },
+-};
+-
+-static int layout_id_map_cmp( const void *key, const void *element )
+-{
+-    const struct layout_id_map_entry *entry = element;
+-    return strcmp( key, entry->name );
+-}
+-
+-static LANGID langid_from_xkb_layout( const char *layout )
+-{
+-    const struct layout_id_map_entry *entry;
+-
+-    entry = bsearch( layout, layout_ids, ARRAY_SIZE(layout_ids), sizeof(*layout_ids), layout_id_map_cmp );
+-    if (entry) return entry->langid;
+-
+-    FIXME( "Unknown layout %s\n", debugstr_a(layout) );
+-    return MAKELANGID(LANG_NEUTRAL, SUBLANG_CUSTOM_UNSPECIFIED);
+-};
+-
+-static const char *xkb_layout_from_langid( LANGID langid )
+-{
+-    for (int i = 0; i < ARRAY_SIZE(layout_ids); i++)
+-        if (langid == layout_ids[i].langid)
+-            return layout_ids[i].name;
+-    return NULL;
+-}
+-
+-static const struct klid_map_entry
+-{
+-    const char *layout;
+-    const char *variant;
+-    DWORD klid;
+-} klid_map[] =
+-{
+-    { "us", "dvorak", 0x00010409 },
+-    { "us", "dvorak-l", 0x00030409 },
+-    { "us", "dvorak-r", 0x00040409 },
+-};
+-
+-static int klid_map_cmp( const void *key, const void *element )
+-{
+-    const struct klid_map_entry *map_key = key;
+-    const struct klid_map_entry *entry = element;
+-    int c;
+-
+-    if ((c = strcmp( map_key->layout, entry->layout ))) return c;
+-    return strcmp( map_key->variant, entry->variant );
+-}
+-
+-static DWORD klid_from_xkb_layout( const char *layout, const char *variant )
+-{
+-    struct klid_map_entry key = { layout, variant };
+-    const struct klid_map_entry *entry;
+-
+-    if (!variant)
+-        return 0;
+-
+-    entry = bsearch( &key, klid_map, ARRAY_SIZE(klid_map), sizeof(*klid_map), klid_map_cmp );
+-    if (entry) return entry->klid;
+-
+-    FIXME( "Unknown variant %s\n", debugstr_a(variant) );
+-    return -1;
+-}
+-
+ /* fuzzy layout detection through keysym / keycode matching, kbd_section must be held */
+ static unsigned int detect_keyboard_layout( Display *display, XModifierKeymap *modmap, unsigned int xkb_group )
+ {
+@@ -2110,7 +1855,7 @@ static void init_keycode_mappings( Display *display )
+ }
+ 
+ static void find_xkb_layout_variant( Display *display, XModifierKeymap *mmp, int group, const char *name,
+-                                     const char **layout, const char **variant )
++                                     const char **layout, const char **variant, LANGID *lang )
+ {
+     unsigned int index;
+ #ifdef SONAME_LIBXKBREGISTRY
+@@ -2139,19 +1884,19 @@ static void find_xkb_layout_variant( Display *display, XModifierKeymap *mmp, int
+ #endif
+ 
+     index = detect_keyboard_layout( display, mmp, group );
+-    *layout = xkb_layout_from_langid( main_key_tab[index].lcid );
++    *lang = main_key_tab[index].lcid;
+     if (strstr( main_key_tab[index].comment, "dvorak" )) *variant = "dvorak";
+ }
+ 
+ /* initialize or update keyboard layouts */
+-void init_keyboard_layouts( Display *display )
++UINT X11DRV_UpdateKeyboardLayouts( const struct keyboard_funcs *funcs )
+ {
++    Display *display = x11drv_init_thread_data()->display;
+     char *names[4] = { NULL };
+     unsigned int xkb_group;
+     XkbStateRec xkb_state;
+     XModifierKeymap *mmp;
+     XkbDescRec *xkb_desc;
+-    struct layout *entry;
+     LANGID xkb_lang = 0;
+     Status status;
+     KeyCode *kcp;
+@@ -2183,10 +1928,6 @@ void init_keyboard_layouts( Display *display )
+         }
+     }
+ 
+-    /* Flag any previously created Xkb layout as invalid */
+-    LIST_FOR_EACH_ENTRY( entry, &xkb_layouts, struct layout, entry )
+-        entry->xkb_group = -1;
+-
+     if (!use_xkb) init_default_keyc2scan( display );
+ 
+     status = XkbGetState( display, XkbUseCoreKbd, &xkb_state );
+@@ -2207,22 +1948,19 @@ void init_keyboard_layouts( Display *display )
+ 
+     for (int i = 0; i < count; i++)
+     {
+-        const char *layout, *variant = NULL;
+-        char buffer[1024];
+-        DWORD klid;
+-        LANGID lang;
++        const char *layout = NULL, *variant = NULL;
++        LANGID lang = 0;
++        HKL hkl;
+ 
+-        find_xkb_layout_variant( display, mmp, i, names[i], &layout, &variant );
+-        lang = langid_from_xkb_layout( layout );
+-        klid = klid_from_xkb_layout( layout, variant );
+-        if (i == xkb_group) xkb_lang = lang;
++        find_xkb_layout_variant( display, mmp, i, names[i], &layout, &variant, &lang );
++        if (!variant) variant = "";
+ 
+-        TRACE( "Found group %u with name %s -> layout %s:%s, lang %04x, klid %08x\n", i, debugstr_a(names[i]),
+-               debugstr_a(layout), debugstr_a(variant), lang, klid );
++        hkl = funcs->add_layout( lang, layout, variant, FALSE, i );
+ 
+-        snprintf( buffer, ARRAY_SIZE(buffer), "%s:%s", layout, variant );
+-        create_layout_from_xkb( i, buffer, lang, klid );
++        TRACE( "Found group %u with name %s -> layout %s:%s, hkl %p\n", i, debugstr_a(names[i]),
++               debugstr_a(layout), debugstr_a(variant), hkl );
+ 
++        if (i == xkb_group) xkb_lang = LOWORD(hkl);
+         if (names[i]) XFree( names[i] );
+     }
+ 
+@@ -2236,9 +1974,9 @@ void init_keyboard_layouts( Display *display )
+     init_keycode_mappings( display );
+ 
+     pthread_mutex_unlock( &kbd_mutex );
++    return 0;
+ }
+ 
+-
+ /***********************************************************************
+  *		ActivateKeyboardLayout (X11DRV.@)
+  */
+@@ -2261,7 +1999,7 @@ static BOOL X11DRV_KeyboardMappingNotify( HWND dummy, XEvent *event )
+     HWND hwnd;
+ 
+     XRefreshKeyboardMapping(&event->xmapping);
+-    init_keyboard_layouts( event->xmapping.display );
++    NtUserCallNoParam( NtUserCallNoParam_KeyboardLayoutsChanged );
+ 
+     hwnd = get_focus();
+     if (!hwnd) hwnd = get_active_window();
+@@ -2297,14 +2035,14 @@ void x11drv_init_keyboard( Display *display )
+     if (!(xkbregistry_handle = dlopen( SONAME_LIBXKBREGISTRY, RTLD_NOW )))
+     {
+         WARN( "Failed to load %s\n", SONAME_LIBXKBREGISTRY );
+-        goto xkbregistry_init_done;
++        return;
+     }
+ #define LOAD_FUNCPTR( f )                                                                          \
+     if (!(p_##f = dlsym( xkbregistry_handle, #f )))                                                \
+     {                                                                                              \
+         ERR( "Failed to find " #f "\n" );                                                          \
+         dlclose( xkbregistry_handle );                                                             \
+-        goto xkbregistry_init_done;                                                                \
++        return;                                                                                    \
+     }
+ 
+     LOAD_FUNCPTR(rxkb_context_new)
+@@ -2319,11 +2057,7 @@ void x11drv_init_keyboard( Display *display )
+     if (!(rxkb_context = p_rxkb_context_new( RXKB_CONTEXT_NO_FLAGS )) ||
+         !p_rxkb_context_parse_default_ruleset( rxkb_context ))
+         ERR( "Failed to parse default Xkb ruleset\n" );
+-
+-xkbregistry_init_done:
+ #endif
+-
+-    init_keyboard_layouts( display );
+ }
+ 
+ 
+
+--- dlls/winex11.drv/x11drv.h
++++ dlls/winex11.drv/x11drv.h
+@@ -206,6 +206,7 @@ extern BOOL X11DRV_UnrealizePalette( HPALETTE hpal );
+ 
+ extern BOOL X11DRV_ActivateKeyboardLayout( HKL hkl, UINT flags );
+ extern void X11DRV_Beep(void);
++extern UINT X11DRV_UpdateKeyboardLayouts( const struct keyboard_funcs *funcs );
+ extern INT X11DRV_GetKeyNameText( LONG lparam, LPWSTR buffer, INT size );
+ extern UINT X11DRV_MapVirtualKeyEx( UINT code, UINT map_type, HKL hkl );
+ extern INT X11DRV_ToUnicodeEx( UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
+
+--- include/wine/gdi_driver.h
++++ include/wine/gdi_driver.h
+@@ -353,6 +353,11 @@ struct gdi_device_manager
+     void (*add_modes)( const DEVMODEW *current, UINT modes_count, const DEVMODEW *modes, void *param );
+ };
+ 
++struct keyboard_funcs
++{
++    HKL  (*add_layout)( LANGID lang, const char *name, const char *variant, BOOL ime, UINT_PTR host_id );
++};
++
+ #define WINE_DM_UNSUPPORTED 0x80000000
+ #define WINE_SWP_FULLSCREEN 0x80000000
+ #define WINE_SWP_RESIZABLE  0x40000000
+@@ -368,7 +373,7 @@ struct user_driver_funcs
+     BOOL    (*pActivateKeyboardLayout)(HKL, UINT);
+     void    (*pBeep)(void);
+     INT     (*pGetKeyNameText)(LONG,LPWSTR,INT);
+-    UINT    (*pGetKeyboardLayoutList)(INT, HKL *);
++    UINT    (*pUpdateKeyboardLayouts)(const struct keyboard_funcs *funcs);
+     UINT    (*pMapVirtualKeyEx)(UINT,UINT,HKL);
+     BOOL    (*pRegisterHotKey)(HWND,UINT,UINT);
+     INT     (*pToUnicodeEx)(UINT,UINT,const BYTE *,LPWSTR,int,UINT,HKL);
+
+--- include/ntuser.h
++++ include/ntuser.h
+@@ -1070,6 +1070,7 @@ enum
+     NtUserCallNoParam_GetShellWindow,
+     NtUserCallNoParam_GetTaskmanWindow,
+     NtUserCallNoParam_DisplayModeChanged,
++    NtUserCallNoParam_KeyboardLayoutsChanged,
+     /* temporary exports */
+     NtUserExitingThread,
+     NtUserThreadDetach,
+
+--- loader/wine.inf.in
++++ loader/wine.inf.in
+@@ -63,6 +63,7 @@ AddReg=\
+     Debugger,\
+     DirectX,\
+     Fonts,\
++    KeyboardLayouts,\
+     LicenseInformation,\
+     MCI,\
+     Misc,\
+@@ -646,6 +647,227 @@ HKCU,Software\Microsoft\Windows\Shell\Associations\UrlAssociations\ftp\UserChoic
+ HKCU,Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice,"ProgId",,"http"
+ HKCU,Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice,"ProgId",,"https"
+ 
++[KeyboardLayouts]
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000401,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000402,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000404,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000405,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000406,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000407,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000408,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000409,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000040a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000040b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000040c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000040d,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000040e,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000040f,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000410,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000411,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000412,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000413,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000414,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000415,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000416,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000418,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000419,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000041a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000041b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000041c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000041d,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000041e,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000041f,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000420,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000422,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000423,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000424,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000425,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000426,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000427,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000428,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000429,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000042a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000042b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000042c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000042e,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000042f,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000432,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000437,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000438,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000439,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000043a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000043b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000043f,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000440,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000442,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000444,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000445,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000446,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000447,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000448,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000449,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000044a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000044b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000044c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000044d,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000044e,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000450,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000451,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000452,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000453,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000454,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000045a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000045b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000045c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000461,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000463,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000465,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000468,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000046a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000046c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000046d,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000046e,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000046f,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000470,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000474,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000475,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000480,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000481,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000485,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000488,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000492,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000804,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000807,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000809,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000080a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000080c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000813,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000816,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000081a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000082c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000083b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000843,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000850,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000085d,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000085f,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000c04,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000c0c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000c1a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00000c51,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00001004,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00001009,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000100c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000105f,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00001404,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00001409,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00001809,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0000201a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00004009,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010401,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010402,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010405,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010407,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010408,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010409,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001040a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001040c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001040e,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010410,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010415,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010416,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010418,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010419,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001041b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001041e,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001041f,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010426,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010427,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001042b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001042c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001042e,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001042f,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010437,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010439,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001043a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001043b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010444,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010445,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010451,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010453,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001045a,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001045b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001045c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001045d,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010465,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010480,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001080c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001083b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010850,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00010c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00011009,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0001105f,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00011809,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020401,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020402,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020405,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020407,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020408,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020409,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0002040c,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0002040d,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020418,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020419,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0002041e,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020422,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020426,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020427,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0002042b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0002042e,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020437,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020445,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020449,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0002045d,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0002083b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020850,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00020c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00030401,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00030402,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00030407,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00030408,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00030409,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0003040d,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0003041e,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\0003042b,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00030437,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00030449,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00030c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00040402,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00040408,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00040409,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00040437,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00040c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00050408,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00050409,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00050429,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00060408,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00060409,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00070c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00080c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00090c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\000a0c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\000b0c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\000c0c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\000d0c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\000e0c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\000f0c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00100c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00110c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00120c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00130c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00140c00,,16
++HKLM,SYSTEM\CurrentControlSet\Control\Keyboard Layouts\00150c00,,16
++
+ [OLE]
+ HKLM,"Software\Microsoft\OLE","EnableDCOM",,"Y"
+ HKLM,"Software\Microsoft\OLE","EnableRemoteConnect",,"N"
+

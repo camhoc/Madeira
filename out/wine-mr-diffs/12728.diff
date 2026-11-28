@@ -1,0 +1,65 @@
+# wineoss.drv: Prefer 32-bit float as the shared mode mix format.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12728 state=merged
+# Windows always reports 32-bit float as the shared mode mix format, and
+test_audioclient() in mmdevapi/tests/render.c checks for it. Some
+applications rely on it: Wwise, used by many games, writes float samples
+into the buffer whatever format it initialized the stream with, so a
+16-bit mix format makes it write twice the buffer size and crash.
+
+SNDCTL_ENGINEINFO only reports the formats of the engine itself, which
+on FreeBSD is the virtual channel format (16-bit by default), so also
+query SNDCTL_DSP_GETFMTS for the formats the driver converts from. This
+also gives capture devices a mix format; GetMixFormat() failed on them
+because ENGINEINFO reported no input formats.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=58498
+--- dlls/wineoss.drv/oss.c
++++ dlls/wineoss.drv/oss.c
+@@ -1126,7 +1126,7 @@ static NTSTATUS oss_get_mix_format(void *args)
+     struct get_mix_format_params *params = args;
+     WAVEFORMATEXTENSIBLE *fmt = params->fmt;
+     oss_audioinfo ai;
+-    int formats, fd;
++    int formats, getfmts, fd;
+ 
+     if(params->flow != eRender && params->flow != eCapture){
+         params->result = E_UNEXPECTED;
+@@ -1147,22 +1147,31 @@ static NTSTATUS oss_get_mix_format(void *args)
+         params->result = E_FAIL;
+         return STATUS_SUCCESS;
+     }
++    /* ENGINEINFO only lists the formats of the engine itself (on FreeBSD,
++     * the virtual channel format); GETFMTS also lists those the driver
++     * converts from. */
++    if(ioctl(fd, SNDCTL_DSP_GETFMTS, &getfmts) < 0)
++        getfmts = 0;
+     close(fd);
+ 
+     if(params->flow == eRender)
+-        formats = ai.oformats;
++        formats = ai.oformats | getfmts;
+     else
+-        formats = ai.iformats;
++        formats = ai.iformats | getfmts;
+ 
++    /* Windows always reports 32-bit float as the shared mode mix format, and
++     * some applications (e.g. Wwise) write float samples whatever format
++     * they initialized the stream with. */
+     fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+-    if(formats & AFMT_S16_LE){
+-        fmt->Format.wBitsPerSample = 16;
+-        fmt->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+ #ifdef AFMT_FLOAT
+-    }else if(formats & AFMT_FLOAT){
++    if(formats & AFMT_FLOAT){
+         fmt->Format.wBitsPerSample = 32;
+         fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
++    }else
+ #endif
++    if(formats & AFMT_S16_LE){
++        fmt->Format.wBitsPerSample = 16;
++        fmt->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+     }else if(formats & AFMT_U8){
+         fmt->Format.wBitsPerSample = 8;
+         fmt->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+

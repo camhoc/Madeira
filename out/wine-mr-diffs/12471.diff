@@ -1,0 +1,109 @@
+# Add tests and don't allow x86_64 processes to set context of an ARM64 process.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12471 state=opened
+# On ARM64 Windows using `SetThreadContext()`:
+- an ARM64 process can set context in any other architecture process (i386, x86_64, ARM64).
+- an x86_64 process can set context in i386 or x86_64, but not ARM64.
+- an i386 process can only set context in another i386 process.
+
+Add tests for these scenarios, and don't allow an x86_64 process to set the context of an ARM64 process.
+
+This resolves an issue seen on ARM64 when running beamNG under Steam. beamNG has an x86 launcher, which launches the ARM64 game binary.
+The Steam Overlay is loaded in the launcher, it hooks CreateProcess so it can inject itself into child processes but it has no checks to avoid injecting x86 code into an ARM64 process. On Windows the launcher/overlay's `SetThreadContext()` call fails and the ARM64 process runs normally, but on Wine it was succeeding and crashing the ARM64 process.
+--- dlls/ntdll/tests/wow64.c
++++ dlls/ntdll/tests/wow64.c
+@@ -3420,6 +3420,74 @@ static void test_suspend_doorbell(void)
+ 
+ #endif /* __arm64ec__ */
+ 
++static void test_arm64_get_set_context(void)
++{
++    static char cmd_sysnative[] = "C:\\windows\\sysnative\\cmd.exe /c exit";
++    static char cmd_system32[] = "C:\\windows\\system32\\cmd.exe /c exit";
++    static char cmd_syswow64[] = "C:\\windows\\syswow64\\cmd.exe /c exit";
++    PROCESS_INFORMATION pi;
++    CONTEXT ctx;
++    BOOL ret;
++
++    if (native_machine != IMAGE_FILE_MACHINE_ARM64)
++        return;
++
++    if (create_process_machine( cmd_syswow64, CREATE_SUSPENDED, IMAGE_FILE_MACHINE_I386, &pi ))
++    {
++        memset( &ctx, 0xcc, sizeof(ctx) );
++        ctx.ContextFlags = CONTEXT_FULL;
++        ret = GetThreadContext( pi.hThread, &ctx );
++        ok( ret, "GetThreadContext failed %lu\n", GetLastError() );
++
++        ret = SetThreadContext( pi.hThread, &ctx );
++        ok( ret, "SetThreadContext failed %lu\n", GetLastError() );
++
++        TerminateProcess( pi.hProcess, 0 );
++        CloseHandle( pi.hProcess );
++        CloseHandle( pi.hThread );
++    }
++
++    for (int i = 0; i < 2; i++)
++    {
++        USHORT machine = i ? IMAGE_FILE_MACHINE_ARM64 : IMAGE_FILE_MACHINE_AMD64;
++
++        if (create_process_machine( is_win64 ? cmd_system32 : cmd_sysnative, CREATE_SUSPENDED, machine, &pi ))
++        {
++            winetest_push_context( "%04x", machine );
++
++            memset( &ctx, 0xcc, sizeof(ctx) );
++            ctx.ContextFlags = CONTEXT_FULL;
++            ret = GetThreadContext( pi.hThread, &ctx );
++            if (current_machine == IMAGE_FILE_MACHINE_I386)
++            {
++                ok( !ret, "GetThreadContext unexpectedly succeeded\n" );
++                ok( GetLastError() == ERROR_INVALID_PARAMETER, "Unexpected error %lu\n", GetLastError() );
++            }
++            else
++                ok( ret, "GetThreadContext failed %lu\n", GetLastError() );
++
++            ret = SetThreadContext( pi.hThread, &ctx );
++            if (machine == current_machine ||
++                (current_machine == IMAGE_FILE_MACHINE_ARM64 &&
++                 machine == IMAGE_FILE_MACHINE_AMD64))
++                ok( ret, "SetThreadContext failed %lu\n", GetLastError() );
++            else
++            {
++                ok( !ret, "SetThreadContext unexpectedly succeeded\n" );
++                if (current_machine == IMAGE_FILE_MACHINE_I386)
++                    ok( GetLastError() == ERROR_INVALID_PARAMETER, "Unexpected error %lu\n", GetLastError() );
++                else
++                    ok( GetLastError() == ERROR_SET_CONTEXT_DENIED, "Unexpected error %lu\n", GetLastError() );
++            }
++
++            TerminateProcess( pi.hProcess, 0 );
++            CloseHandle( pi.hProcess );
++            CloseHandle( pi.hThread );
++            winetest_pop_context();
++        }
++    }
++}
++
+ static void test_arm64ec(void)
+ {
+ #ifdef __aarch64__
+@@ -3468,5 +3536,6 @@ START_TEST(wow64)
+     test_memory_notifications();
+     test_cpu_area();
+     test_exception_dispatcher();
++    test_arm64_get_set_context();
+     test_arm64ec();
+ }
+
+--- server/thread.c
++++ server/thread.c
+@@ -2296,6 +2296,9 @@ DECL_HANDLER(set_thread_context)
+     if (contexts[CTX_NATIVE].machine != native_machine ||
+         (ctx_count == 2 && contexts[CTX_WOW].machine != thread->process->machine))
+         set_error( STATUS_INVALID_PARAMETER );
++    else if (current->process->machine == IMAGE_FILE_MACHINE_AMD64 &&
++             thread->process->machine == IMAGE_FILE_MACHINE_ARM64)
++        set_error( STATUS_SET_CONTEXT_DENIED );
+     else if (thread->is_system)
+         set_error( STATUS_ACCESS_DENIED );
+     else if (thread->state == TERMINATED)
+

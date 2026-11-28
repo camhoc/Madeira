@@ -1,0 +1,15 @@
+# ntdll: Reserve space for the thread name terminator on BSD
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12710 state=merged
+# Leave one byte available when converting the native thread name so appending the NUL terminator cannot write past the end of the buffer.
+--- dlls/ntdll/unix/thread.c
++++ dlls/ntdll/unix/thread.c
+@@ -2166,7 +2166,7 @@ static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
+         return;
+     }
+ 
+-    len = ntdll_wcstoumbs( name->Buffer, name->Length / sizeof(WCHAR), nameA, sizeof(nameA), FALSE );
++    len = ntdll_wcstoumbs( name->Buffer, name->Length / sizeof(WCHAR), nameA, sizeof(nameA) - 1, FALSE );
+     nameA[len] = '\0';
+     thr_set_name( unix_tid, nameA );
+ #else
+

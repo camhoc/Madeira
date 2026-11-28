@@ -1,0 +1,243 @@
+# dinput: Check for pending device reads in Poll()
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12418 state=opened
+# When a HID joystick is unplugged while acquired, its pending overlapped ReadFile completes and signals read_event, but the device status is only updated to STATUS_UNPLUGGED asynchronously on the worker thread. If GetDeviceState(), GetDeviceData(), or Poll() is called before the worker thread wakes up and processes read_event, the device still appears acquired.
+
+Check read_event in hid_joystick_poll() and re-check the device status
+after polling in dinput_device_GetDeviceData().
+
+This also fixes the occasionally flaky test_input_lost() test.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60579
+--- dlls/dinput/tests/hotplug.c
++++ dlls/dinput/tests/hotplug.c
+@@ -110,6 +110,37 @@ static void check_interface_( unsigned int line, void *iface_ptr, REFIID iid, BO
+     if (SUCCEEDED(hr)) IUnknown_Release( unk );
+ }
+ 
++static HANDLE hook_start_event, hook_ready_event, hook_done_event;
++
++static LRESULT CALLBACK mouse_ll_hook_proc( int code, WPARAM wparam, LPARAM lparam )
++{
++    if (code == HC_ACTION && wparam == WM_MOUSEWHEEL)
++    {
++        SetEvent( hook_ready_event );
++        WaitForSingleObject( hook_done_event, 5000 );
++        return 1;
++    }
++    return CallNextHookEx( NULL, code, wparam, lparam );
++}
++
++static DWORD WINAPI mouse_ll_hook_thread( void *arg )
++{
++    HHOOK hook;
++    DWORD ret;
++
++    hook = SetWindowsHookExW( WH_MOUSE_LL, mouse_ll_hook_proc, GetModuleHandleW( NULL ), 0 );
++    ok( !!hook, "SetWindowsHookExW failed, error %lu\n", GetLastError() );
++    SetEvent( hook_ready_event );
++
++    ret = WaitForSingleObject( hook_start_event, 5000 );
++    ok( !ret, "WaitForSingleObject returned %#lx\n", ret );
++
++    mouse_event( MOUSEEVENTF_WHEEL, 0, 0, 0, 0 );
++
++    UnhookWindowsHookEx( hook );
++    return 0;
++}
++
+ static BOOL test_input_lost( DWORD version )
+ {
+ #include "psh_hid_macros.h"
+@@ -156,10 +187,14 @@ static BOOL test_input_lost( DWORD version )
+ 
+     DIDEVICEINSTANCEW devinst = {.dwSize = sizeof(DIDEVICEINSTANCEW)}, devinst2 = devinst;
+     IDirectInputDevice8W *device = NULL, *device2;
++    IDirectInputDeviceW *mouse = NULL;
+     DIDEVICEOBJECTDATA objdata[32] = {{0}};
+     ULONG ref, count, size;
++    IDirectInputW *di;
+     DIJOYSTATE2 state;
++    HANDLE thread;
+     HRESULT hr;
++    DWORD ret;
+ 
+     winetest_push_context( "%#lx", version );
+ 
+@@ -215,9 +250,6 @@ static BOOL test_input_lost( DWORD version )
+     hr = IDirectInputDevice8_GetDeviceState( device, sizeof(state), &state );
+     ok( hr == S_OK, "GetDeviceState returned %#lx\n", hr );
+ 
+-    ref = IDirectInputDevice8_Release( device );
+-    ok( ref == 0, "Release returned %ld\n", ref );
+-
+     /* Test guidInstance across hotplugs. It should remain the same. */
+     hr = dinput_test_create_device( version, &devinst2, &device2 );
+     ok( hr == DI_OK, "Unexpected hr %#lx.\n", hr );
+@@ -227,8 +259,66 @@ static BOOL test_input_lost( DWORD version )
+     ref = IDirectInputDevice8_Release( device2 );
+     ok( ref == 0, "Release returned %ld\n", ref );
+ 
+-done:
++    hook_start_event = CreateEventW( NULL, FALSE, FALSE, NULL );
++    hook_ready_event = CreateEventW( NULL, FALSE, FALSE, NULL );
++    hook_done_event = CreateEventW( NULL, FALSE, FALSE, NULL );
++    thread = CreateThread( NULL, 0, mouse_ll_hook_thread, NULL, 0, NULL );
++    ok( !!thread, "CreateThread failed, error %lu\n", GetLastError() );
++    ret = WaitForSingleObject( hook_ready_event, 5000 );
++    ok( !ret, "WaitForSingleObject returned %#lx\n", ret );
++
++    hr = DirectInputCreateEx( instance, 0x0700, &IID_IDirectInput7W, (void **)&di, NULL );
++    ok( hr == DI_OK, "DirectInputCreateEx returned %#lx\n", hr );
++    hr = IDirectInput_CreateDevice( di, &GUID_SysMouse, &mouse, NULL );
++    ok( hr == DI_OK, "CreateDevice returned %#lx\n", hr );
++    IDirectInput_Release( di );
++    hr = IDirectInputDevice_SetDataFormat( mouse, &c_dfDIMouse );
++    ok( hr == DI_OK, "SetDataFormat returned %#lx\n", hr );
++    hr = IDirectInputDevice_SetCooperativeLevel( mouse, 0, DISCL_NONEXCLUSIVE | DISCL_BACKGROUND );
++    ok( hr == DI_OK, "SetCooperativeLevel returned %#lx\n", hr );
++    hr = IDirectInputDevice_Acquire( mouse );
++    ok( hr == DI_OK, "Acquire returned %#lx\n", hr );
++
++    SetEvent( hook_start_event );
++    ret = WaitForSingleObject( hook_ready_event, 5000 );
++    ok( !ret, "WaitForSingleObject returned %#lx\n", ret );
++
+     hid_device_stop( &desc, 1 );
++
++    hr = IDirectInputDevice8_GetDeviceState( device, sizeof(state), &state );
++    ok( hr == DIERR_INPUTLOST, "GetDeviceState returned %#lx\n", hr );
++    hr = IDirectInputDevice8_GetDeviceState( device, sizeof(state), &state );
++    ok( hr == DIERR_INPUTLOST, "GetDeviceState returned %#lx\n", hr );
++    hr = IDirectInputDevice8_GetDeviceData( device, size, objdata, &count, DIGDD_PEEK );
++    ok( hr == DIERR_INPUTLOST, "GetDeviceData returned %#lx\n", hr );
++    hr = IDirectInputDevice8_Poll( device );
++    ok( hr == DIERR_INPUTLOST, "Poll returned: %#lx\n", hr );
++
++    hr = IDirectInputDevice8_Acquire( device );
++    ok( hr == DIERR_UNPLUGGED, "Acquire returned %#lx\n", hr );
++    hr = IDirectInputDevice8_GetDeviceState( device, sizeof(state), &state );
++    ok( hr == DIERR_NOTACQUIRED, "GetDeviceState returned %#lx\n", hr );
++    hr = IDirectInputDevice8_GetDeviceData( device, size, objdata, &count, DIGDD_PEEK );
++    ok( hr == DIERR_NOTACQUIRED, "GetDeviceData returned %#lx\n", hr );
++    hr = IDirectInputDevice8_Unacquire( device );
++    ok( hr == DI_NOEFFECT, "Unacquire returned: %#lx\n", hr );
++
++    SetEvent( hook_done_event );
++    ret = WaitForSingleObject( thread, 5000 );
++    ok( !ret, "WaitForSingleObject returned %#lx\n", ret );
++    CloseHandle( thread );
++    CloseHandle( hook_start_event );
++    CloseHandle( hook_ready_event );
++    CloseHandle( hook_done_event );
++    IDirectInputDevice_Unacquire( mouse );
++    ref = IDirectInputDevice_Release( mouse );
++    ok( ref == 0, "Release returned %ld\n", ref );
++
++    ref = IDirectInputDevice8_Release( device );
++    ok( ref == 0, "Release returned %ld\n", ref );
++
++done:
++    if (!device) hid_device_stop( &desc, 1 );
+     cleanup_registry_keys();
+ 
+     winetest_pop_context();
+
+--- dlls/dinput/device.c
++++ dlls/dinput/device.c
+@@ -1523,6 +1523,21 @@ static HRESULT WINAPI dinput_device_GetDeviceData( IDirectInputDevice8W *iface,
+     IDirectInputDevice2_Poll(iface);
+     EnterCriticalSection(&This->crit);
+ 
++    if (This->dinput->dwVersion == 0x0800 || size == sizeof(DIDEVICEOBJECTDATA_DX3))
++    {
++        if (This->status == STATUS_UNPLUGGED)
++        {
++            LeaveCriticalSection(&This->crit);
++            return DIERR_INPUTLOST;
++        }
++
++        if (This->status != STATUS_ACQUIRED)
++        {
++            LeaveCriticalSection(&This->crit);
++            return DIERR_NOTACQUIRED;
++        }
++    }
++
+     len = This->queue_head - This->queue_tail;
+     if (len < 0) len += This->queue_len;
+ 
+
+--- dlls/dinput/joystick_hid.c
++++ dlls/dinput/joystick_hid.c
+@@ -1498,9 +1498,14 @@ static HRESULT hid_joystick_read( IDirectInputDevice8W *iface )
+     HRESULT hr;
+     BOOL ret;
+ 
+-    ret = GetOverlappedResult( impl->device, &impl->read_ovl, &count, FALSE );
+-
+     EnterCriticalSection( &impl->base.crit );
++    if (impl->device == INVALID_HANDLE_VALUE)
++    {
++        LeaveCriticalSection( &impl->base.crit );
++        return DIERR_INPUTLOST;
++    }
++
++    ret = GetOverlappedResult( impl->device, &impl->read_ovl, &count, FALSE );
+     while (ret)
+     {
+         if (TRACE_ON(dinput))
+@@ -1590,7 +1595,10 @@ static HRESULT hid_joystick_read( IDirectInputDevice8W *iface )
+         ret = ReadFile( impl->device, report_buf, report_len, &count, &impl->read_ovl );
+     }
+ 
+-    if (GetLastError() == ERROR_IO_PENDING || GetLastError() == ERROR_OPERATION_ABORTED) hr = DI_OK;
++    if (GetLastError() == ERROR_IO_PENDING ||
++        GetLastError() == ERROR_IO_INCOMPLETE ||
++        GetLastError() == ERROR_OPERATION_ABORTED)
++        hr = DI_OK;
+     else
+     {
+         WARN( "GetOverlappedResult/ReadFile failed, error %lu\n", GetLastError() );
+@@ -1603,6 +1611,32 @@ static HRESULT hid_joystick_read( IDirectInputDevice8W *iface )
+     return hr;
+ }
+ 
++static HRESULT hid_joystick_poll( IDirectInputDevice8W *iface )
++{
++    struct hid_joystick *impl = impl_from_IDirectInputDevice8W( iface );
++
++    if (WaitForSingleObject( impl->base.read_event, 0 ) != WAIT_OBJECT_0)
++        return DI_NOEFFECT;
++
++    EnterCriticalSection( &impl->base.crit );
++    if (impl->base.status == STATUS_ACQUIRED && FAILED(hid_joystick_read( iface )))
++    {
++        hid_joystick_unacquire( iface );
++        impl->base.status = STATUS_UNPLUGGED;
++        LeaveCriticalSection( &impl->base.crit );
++        dinput_hooks_unacquire_device( iface );
++        return DIERR_INPUTLOST;
++    }
++    if (impl->base.status == STATUS_UNPLUGGED)
++    {
++        LeaveCriticalSection( &impl->base.crit );
++        return DIERR_INPUTLOST;
++    }
++    LeaveCriticalSection( &impl->base.crit );
++
++    return DI_NOEFFECT;
++}
++
+ static HRESULT hid_joystick_enum_objects( IDirectInputDevice8W *iface, const DIPROPHEADER *filter,
+                                           DWORD flags, enum_object_callback callback, void *context )
+ {
+@@ -1613,7 +1647,7 @@ static HRESULT hid_joystick_enum_objects( IDirectInputDevice8W *iface, const DIP
+ static const struct dinput_device_vtbl hid_joystick_vtbl =
+ {
+     hid_joystick_destroy,
+-    NULL,
++    hid_joystick_poll,
+     hid_joystick_read,
+     hid_joystick_acquire,
+     hid_joystick_unacquire,
+

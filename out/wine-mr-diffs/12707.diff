@@ -1,0 +1,573 @@
+# winemac: Move window focus handling to the Cocoa main thread.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12707 state=merged
+# This is the 2nd part of fixing D2R reentrant message hangs on alt-tab usage.
+
+All three events that are removed here are very intertwined logic-wise (even so much so that WINDOW_LOST_FOCUS and APP_DEACTIVATED have to be in one commit together to not cause any regressions).
+
+There are some touch ups here and there (like the extra `WS_VISIBLE` check and fixes to `causing_becomeKeyWindow`) that fix 14 of the user32 msg related test failures.
+
+The win32u change is needed, because the Cocoa main thread owns neither window, but calls `NtUserSetForegroundWindowInternal`, which caused an extra `WM_WINE_SETACTIVEWINDOW` that should not be there.
+--- dlls/user32/tests/win.c
++++ dlls/user32/tests/win.c
+@@ -69,6 +69,7 @@ static BOOL (WINAPI *pNtUserModifyUserStartupInfoFlags)(DWORD,DWORD);
+ static BOOL test_lbuttondown_flag;
+ static DWORD num_gettext_msgs;
+ static DWORD num_settext_msgs;
++static DWORD num_inactive_msgs;
+ static HWND hwndMessage;
+ static HWND hwndMain, hwndMain2;
+ static HHOOK hhook;
+@@ -1112,6 +1113,9 @@ static LRESULT WINAPI main_window_procA(HWND hwnd, UINT msg, WPARAM wparam, LPAR
+         case WM_SETTEXT:
+             num_settext_msgs++;
+             break;
++        case WM_ACTIVATE:
++            if (hwnd == hwndMain && LOWORD(wparam) == WA_INACTIVE) num_inactive_msgs++;
++            break;
+         case WM_ACTIVATEAPP:
+             if (wparam) app_activated = TRUE;
+             else app_deactivated = TRUE;
+@@ -11481,7 +11485,9 @@ static void test_activateapp(HWND window1)
+     ok(!app_activated, "Received WM_ACTIVATEAPP(1), did not expect it.\n");
+     ok(app_deactivated, "Expected WM_ACTIVATEAPP(0), did not receive it.\n");
+ 
++    num_inactive_msgs = 0;
+     SetForegroundWindow(thread_params.thread_window);
++    ok(num_inactive_msgs == 1, "Expected one WM_ACTIVATE(WA_INACTIVE), got %lu.\n", num_inactive_msgs);
+     check_wnd_state(0, thread_params.thread_window, 0, 0);
+     flush_events(TRUE);
+ 
+@@ -11528,6 +11534,22 @@ static void test_activateapp(HWND window1)
+     ok(!app_activated, "Received WM_ACTIVATEAPP(1), did not expect it.\n");
+     ok(!app_deactivated, "Received WM_ACTIVATEAPP(0), did not expect it.\n");
+ 
++    /* Reclaim foreground with window1 before processing the loss for window2. */
++    PostThreadMessageA(tid, thread_params.msg_command, SET_FOREGROUND_STEAL_1, 0);
++    WaitForSingleObject(thread_params.command_executed, INFINITE);
++    test_window = GetForegroundWindow();
++    ok(test_window == thread_params.thread_window, "Expected foreground window %p, got %p.\n",
++            thread_params.thread_window, test_window);
++
++    num_inactive_msgs = 0;
++    ok(SetForegroundWindow(window1), "SetForegroundWindow failed.\n");
++    check_wnd_state(window1, window1, window1, 0);
++
++    while (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
++    ok(!num_inactive_msgs, "Received %lu unexpected WM_ACTIVATE(WA_INACTIVE) messages.\n", num_inactive_msgs);
++    test_window = GetForegroundWindow();
++    ok(test_window == window1, "Expected foreground window %p, got %p.\n", window1, test_window);
++
+     PostThreadMessageA(tid, thread_params.msg_quit, 0, 0);
+     WaitForSingleObject(thread, INFINITE);
+ 
+
+--- dlls/win32u/message.c
++++ dlls/win32u/message.c
+@@ -2202,7 +2202,7 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
+     {
+         HWND prev;
+ 
+-        if (!wparam && NtUserGetForegroundWindow() == hwnd) return 0;
++        if (!wparam && get_window_thread( NtUserGetForegroundWindow(), NULL ) == GetCurrentThreadId()) return 0;
+         if (!set_active_window( (HWND)wparam, &prev, FALSE, TRUE, lparam )) return 0;
+         return (LRESULT)prev;
+     }
+
+--- dlls/winemac.drv/cocoa_app.h
++++ dlls/winemac.drv/cocoa_app.h
+@@ -52,7 +52,6 @@ @interface WineApplicationController : NSObject <NSApplicationDelegate>
+ 
+     NSMutableArray* keyWindows;
+     NSMutableSet* triedWindows;
+-    unsigned long windowFocusSerial;
+ 
+     TISInputSourceRef lastKeyboardInputSource;
+     TISInputSourceRef lastKeyboardLayoutInputSource;
+
+--- dlls/winemac.drv/cocoa_app.m
++++ dlls/winemac.drv/cocoa_app.m
+@@ -28,6 +28,7 @@
+ 
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
++WINE_DEFAULT_DEBUG_CHANNEL(macdrv);
+ 
+ static NSString* const WineAppWaitQueryResponseMode = @"WineAppWaitQueryResponseMode";
+ 
+@@ -356,67 +357,42 @@ - (double) ticksForEventTime:(NSTimeInterval)eventTime
+         return (eventTime + eventTimeAdjustment) * 1000;
+     }
+ 
+-    /* Invalidate old focus offers across all queues. */
+-    - (void) invalidateGotFocusEvents
+-    {
+-        WineEventQueue* queue;
+-
+-        windowFocusSerial++;
+-
+-        [eventQueuesLock lock];
+-        for (queue in eventQueues)
+-        {
+-            [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_GOT_FOCUS)
+-                                   forWindow:nil];
+-        }
+-        [eventQueuesLock unlock];
+-    }
+-
+     - (void) windowGotFocus:(WineWindow*)window
+     {
+-        macdrv_event* event;
+-
+-        [self invalidateGotFocusEvents];
++        HWND hwnd = macdrv_get_window_hwnd(window);
+ 
+-        event = macdrv_create_event(WINDOW_GOT_FOCUS, window);
+-        event->window_got_focus.serial = windowFocusSerial;
+-        if (triedWindows)
+-            event->window_got_focus.tried_windows = [triedWindows retain];
+-        else
+-            event->window_got_focus.tried_windows = [[NSMutableSet alloc] init];
+-        [window.queue postEvent:event];
+-        macdrv_release_event(event);
++        if (hwnd && !macdrv_window_got_focus(hwnd))
++            [self windowRejectedFocus:window];
+     }
+ 
+-    - (void) windowRejectedFocusEvent:(const macdrv_event*)event
++    - (void) windowRejectedFocus:(WineWindow*)window
+     {
+-        if (event->window_got_focus.serial == windowFocusSerial)
+-        {
+-            NSMutableArray* windows = [keyWindows mutableCopy];
+-            NSNumber* windowNumber;
+-            WineWindow* window;
++        NSMutableArray* windows = [keyWindows mutableCopy];
++        /* makeKeyWindow can recursively reject focus, so each level needs its own reference. */
++        NSMutableSet* tried = triedWindows ? [triedWindows retain] : [[NSMutableSet alloc] init];
++        NSNumber* windowNumber;
+ 
+-            for (windowNumber in [NSWindow windowNumbersWithOptions:NSWindowNumberListAllSpaces])
+-            {
+-                window = (WineWindow*)[NSApp windowWithWindowNumber:[windowNumber integerValue]];
+-                if ([window isKindOfClass:[WineWindow class]] && [window screen] &&
+-                    ![windows containsObject:window])
+-                    [windows addObject:window];
+-            }
++        for (windowNumber in [NSWindow windowNumbersWithOptions:NSWindowNumberListAllSpaces])
++        {
++            WineWindow* candidate = (WineWindow*)[NSApp windowWithWindowNumber:[windowNumber integerValue]];
++            if ([candidate isKindOfClass:[WineWindow class]] && [candidate screen] &&
++                ![windows containsObject:candidate])
++                [windows addObject:candidate];
++        }
+ 
+-            triedWindows = (NSMutableSet*)event->window_got_focus.tried_windows;
+-            [triedWindows addObject:event->window];
+-            for (window in windows)
++        triedWindows = tried;
++        [tried addObject:window];
++        for (window in windows)
++        {
++            if (![tried containsObject:window] && [window canBecomeKeyWindow])
+             {
+-                if (![triedWindows containsObject:window] && [window canBecomeKeyWindow])
+-                {
+-                    [window makeKeyWindow];
+-                    break;
+-                }
++                [window makeKeyWindow];
++                break;
+             }
+-            triedWindows = nil;
+-            [windows release];
+         }
++        triedWindows = nil;
++        [tried release];
++        [windows release];
+     }
+ 
+     static BOOL EqualInputSource(TISInputSourceRef source1, TISInputSourceRef source2)
+@@ -2236,19 +2212,21 @@ - (void)applicationDidBecomeActive:(NSNotification *)notification
+ 
+     - (void)applicationDidResignActive:(NSNotification *)notification
+     {
+-        macdrv_event* event;
+-        WineEventQueue* queue;
+-
+-        [self invalidateGotFocusEvents];
++        HWND foreground = NtUserGetForegroundWindow();
++        WineWindow* window;
+ 
+-        event = macdrv_create_event(APP_DEACTIVATED, nil);
++        NtUserClipCursor(NULL);
+ 
+-        [eventQueuesLock lock];
+-        for (queue in eventQueues)
+-            [queue postEvent:event];
+-        [eventQueuesLock unlock];
+-
+-        macdrv_release_event(event);
++        for (window in [NSApp windows])
++        {
++            if ([window isKindOfClass:[WineWindow class]] &&
++                macdrv_get_window_hwnd(window) == foreground)
++            {
++                TRACE("setting fg to desktop\n");
++                NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
++                break;
++            }
++        }
+ 
+         [self releaseMouseCapture];
+     }
+@@ -2377,19 +2355,6 @@ void OnMainThreadAsync(dispatch_block_t block)
+ 
+ @end
+ 
+-/***********************************************************************
+- *              macdrv_window_rejected_focus
+- *
+- * Pass focus to the next window that hasn't already rejected this same
+- * WINDOW_GOT_FOCUS event.
+- */
+-void macdrv_window_rejected_focus(const macdrv_event *event)
+-{
+-    OnMainThread(^{
+-        [[WineApplicationController sharedController] windowRejectedFocusEvent:event];
+-    });
+-}
+-
+ /***********************************************************************
+  *              macdrv_get_input_source_info
+  *
+
+--- dlls/winemac.drv/cocoa_event.m
++++ dlls/winemac.drv/cocoa_event.m
+@@ -673,9 +673,6 @@ void macdrv_release_event(macdrv_event *event)
+             case QUERY_EVENT_NO_PREEMPT_WAIT:
+                 macdrv_release_query(event->query_event.query);
+                 break;
+-            case WINDOW_GOT_FOCUS:
+-                [(NSMutableSet*)event->window_got_focus.tried_windows release];
+-                break;
+         }
+ 
+         [event->window release];
+
+--- dlls/winemac.drv/cocoa_window.m
++++ dlls/winemac.drv/cocoa_window.m
+@@ -1216,9 +1216,7 @@ - (void) setMacDrvState:(const struct macdrv_window_state*)state
+                     {
+                         [self setStyleMask:([self styleMask] | NSWindowStyleMaskMiniaturizable)];
+                         [super miniaturize:nil];
+-                        discard |= event_mask_for_type(WINDOW_BROUGHT_FORWARD) |
+-                                   event_mask_for_type(WINDOW_GOT_FOCUS) |
+-                                   event_mask_for_type(WINDOW_LOST_FOCUS);
++                        discard |= event_mask_for_type(WINDOW_BROUGHT_FORWARD);
+                     }
+                 }
+                 else
+@@ -1228,7 +1226,6 @@ - (void) setMacDrvState:(const struct macdrv_window_state*)state
+             {
+                 ignore_windowDeminiaturize = TRUE;
+                 [self deminiaturize:nil];
+-                discard |= event_mask_for_type(WINDOW_LOST_FOCUS);
+             }
+ 
+             if (discard)
+@@ -1712,8 +1709,6 @@ - (void) doOrderOut
+         {
+             pendingOrderOut = TRUE;
+             [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_BROUGHT_FORWARD) |
+-                                             event_mask_for_type(WINDOW_GOT_FOCUS) |
+-                                             event_mask_for_type(WINDOW_LOST_FOCUS) |
+                                              event_mask_for_type(WINDOW_RESTORE_REQUESTED)
+                                    forWindow:self];
+             return;
+@@ -1729,6 +1724,7 @@ - (void) doOrderOut
+             [parent grabDockIconSnapshotFromWindow:self force:NO];
+ 
+         [self becameIneligibleParentOrChild];
++        causing_becomeKeyWindow = self;
+         if ([self isMiniaturized] || [self styleMask] & NSWindowStyleMaskFullScreen)
+         {
+             fakingClose = TRUE;
+@@ -1737,6 +1733,7 @@ - (void) doOrderOut
+         }
+         else
+             [self orderOut:nil];
++        causing_becomeKeyWindow = nil;
+         [self setBackgroundColor:[NSColor clearColor]];
+         [self setOpaque:NO];
+         drawnSinceShown = NO;
+@@ -1747,8 +1744,6 @@ - (void) doOrderOut
+         [NSApp removeWindowsItem:self];
+ 
+         [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_BROUGHT_FORWARD) |
+-                                         event_mask_for_type(WINDOW_GOT_FOCUS) |
+-                                         event_mask_for_type(WINDOW_LOST_FOCUS) |
+                                          event_mask_for_type(WINDOW_RESTORE_REQUESTED)
+                                forWindow:self];
+     }
+@@ -1962,10 +1957,6 @@ - (void) makeFocused:(BOOL)activate
+         causing_becomeKeyWindow = self;
+         [self makeKeyWindow];
+         causing_becomeKeyWindow = nil;
+-
+-        [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_GOT_FOCUS) |
+-                                         event_mask_for_type(WINDOW_LOST_FOCUS)
+-                               forWindow:self];
+     }
+ 
+     - (void) postKey:(uint16_t)keyCode
+@@ -2660,7 +2651,7 @@ - (void)windowDidBecomeKey:(NSNotification *)notification
+         if (event)
+             [self flagsChanged:event];
+ 
+-        if (causing_becomeKeyWindow == self) return;
++        if (causing_becomeKeyWindow) return;
+ 
+         [controller windowGotFocus:self];
+     }
+@@ -2755,13 +2746,9 @@ - (void)windowDidMove:(NSNotification *)notification
+ 
+     - (void)windowDidResignKey:(NSNotification *)notification
+     {
+-        macdrv_event* event;
+-
+         if (causing_becomeKeyWindow) return;
+ 
+-        event = macdrv_create_event(WINDOW_LOST_FOCUS, self);
+-        [queue postEvent:event];
+-        macdrv_release_event(event);
++        macdrv_window_lost_focus(hwnd);
+     }
+ 
+     - (void)windowDidResize:(NSNotification *)notification skipSizeMove:(BOOL)skipSizeMove
+
+--- dlls/winemac.drv/event.c
++++ dlls/winemac.drv/event.c
+@@ -35,7 +35,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(event);
+ static const char *dbgstr_event(int type)
+ {
+     static const char * const event_names[] = {
+-        "APP_DEACTIVATED",
+         "APP_QUIT_REQUESTED",
+         "DISPLAYS_CHANGED",
+         "HOTKEY_PRESS",
+@@ -59,8 +58,6 @@ static const char *dbgstr_event(int type)
+         "WINDOW_DRAG_BEGIN",
+         "WINDOW_DRAG_END",
+         "WINDOW_FRAME_CHANGED",
+-        "WINDOW_GOT_FOCUS",
+-        "WINDOW_LOST_FOCUS",
+         "WINDOW_RESIZE_ENDED",
+         "WINDOW_RESTORE_REQUESTED",
+     };
+@@ -104,7 +101,6 @@ static macdrv_event_mask get_event_mask(DWORD mask)
+ 
+     if (mask & QS_POSTMESSAGE)
+     {
+-        event_mask |= event_mask_for_type(APP_DEACTIVATED);
+         event_mask |= event_mask_for_type(APP_QUIT_REQUESTED);
+         event_mask |= event_mask_for_type(DISPLAYS_CHANGED);
+         event_mask |= event_mask_for_type(LOST_PASTEBOARD_OWNERSHIP);
+@@ -112,8 +108,6 @@ static macdrv_event_mask get_event_mask(DWORD mask)
+         event_mask |= event_mask_for_type(STATUS_ITEM_MOUSE_MOVE);
+         event_mask |= event_mask_for_type(WINDOW_DID_UNMINIMIZE);
+         event_mask |= event_mask_for_type(WINDOW_FRAME_CHANGED);
+-        event_mask |= event_mask_for_type(WINDOW_GOT_FOCUS);
+-        event_mask |= event_mask_for_type(WINDOW_LOST_FOCUS);
+     }
+ 
+     if (mask & QS_SENDMESSAGE)
+@@ -312,9 +306,6 @@ void macdrv_handle_event(const macdrv_event *event)
+ 
+     switch (event->type)
+     {
+-    case APP_DEACTIVATED:
+-        macdrv_app_deactivated();
+-        break;
+     case APP_QUIT_REQUESTED:
+         macdrv_app_quit_requested(event);
+         break;
+@@ -378,12 +369,6 @@ void macdrv_handle_event(const macdrv_event *event)
+     case WINDOW_FRAME_CHANGED:
+         macdrv_window_frame_changed(hwnd, event);
+         break;
+-    case WINDOW_GOT_FOCUS:
+-        macdrv_window_got_focus(hwnd, event);
+-        break;
+-    case WINDOW_LOST_FOCUS:
+-        macdrv_window_lost_focus(hwnd, event);
+-        break;
+     case WINDOW_RESIZE_ENDED:
+         macdrv_window_resize_ended(hwnd);
+         break;
+
+--- dlls/winemac.drv/macdrv.h
++++ dlls/winemac.drv/macdrv.h
+@@ -266,9 +266,8 @@ extern void macdrv_ime_set_text(HWND hwnd, CFStringRef text, bool complete,
+ 
+ extern void macdrv_window_close_requested(HWND hwnd);
+ extern void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event);
+-extern void macdrv_window_got_focus(HWND hwnd, const macdrv_event *event);
+-extern void macdrv_window_lost_focus(HWND hwnd, const macdrv_event *event);
+-extern void macdrv_app_deactivated(void);
++extern bool macdrv_window_got_focus(HWND hwnd);
++extern void macdrv_window_lost_focus(HWND hwnd);
+ extern void macdrv_app_quit_requested(const macdrv_event *event);
+ extern void macdrv_window_maximize_requested(HWND hwnd);
+ extern void macdrv_window_minimize_requested(HWND hwnd);
+@@ -326,6 +325,11 @@ static inline LRESULT send_message(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
+     return NtUserMessageCall(hwnd, msg, wparam, lparam, NULL, NtUserSendMessage, FALSE);
+ }
+ 
++static inline LRESULT send_notify_message(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
++{
++    return NtUserMessageCall(hwnd, msg, wparam, lparam, NULL, NtUserSendNotifyMessage, FALSE);
++}
++
+ static inline LRESULT send_message_timeout(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
+                                            UINT flags, UINT timeout, PDWORD_PTR res_ptr)
+ {
+
+--- dlls/winemac.drv/macdrv_cocoa.h
++++ dlls/winemac.drv/macdrv_cocoa.h
+@@ -190,7 +190,6 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+ }
+ 
+ extern int macdrv_start_cocoa_app(unsigned long long tickcount);
+-extern void macdrv_window_rejected_focus(const struct macdrv_event *event);
+ extern void macdrv_beep(void);
+ extern void macdrv_set_application_icon(CFArrayRef images);
+ extern void macdrv_quit_reply(int reply);
+@@ -255,7 +254,6 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+ 
+ /* event */
+ enum {
+-    APP_DEACTIVATED,
+     APP_QUIT_REQUESTED,
+     DISPLAYS_CHANGED,
+     HOTKEY_PRESS,
+@@ -279,8 +277,6 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+     WINDOW_DRAG_BEGIN,
+     WINDOW_DRAG_END,
+     WINDOW_FRAME_CHANGED,
+-    WINDOW_GOT_FOCUS,
+-    WINDOW_LOST_FOCUS,
+     WINDOW_RESIZE_ENDED,
+     WINDOW_RESTORE_REQUESTED,
+     NUM_EVENT_TYPES
+@@ -369,10 +365,6 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+             bool    in_resize;
+             bool    skip_size_move_loop;
+         }                                           window_frame_changed;
+-        struct {
+-            unsigned long   serial;
+-            void           *tried_windows;
+-        }                                           window_got_focus;
+         struct {
+             bool    keep_frame;
+             CGRect  frame;
+
+--- dlls/winemac.drv/systray.c
++++ dlls/winemac.drv/systray.c
+@@ -280,8 +280,7 @@ static BOOL notify_owner(struct tray_icon *icon, UINT msg, int x, int y)
+     }
+ 
+     TRACE("posting msg 0x%04x to hwnd %p id 0x%x\n", msg, icon->owner, icon->id);
+-    if (!NtUserMessageCall(icon->owner, icon->callback_message, wp, lp,
+-                           0, NtUserSendNotifyMessage, FALSE) &&
++    if (!send_notify_message(icon->owner, icon->callback_message, wp, lp) &&
+         (RtlGetLastWin32Error() == ERROR_INVALID_WINDOW_HANDLE))
+     {
+         WARN("window %p was destroyed, removing icon 0x%x\n", icon->owner, icon->id);
+
+--- dlls/winemac.drv/window.c
++++ dlls/winemac.drv/window.c
+@@ -1809,63 +1809,48 @@ void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event)
+ 
+ /***********************************************************************
+  *              macdrv_window_got_focus
+- *
+- * Handler for WINDOW_GOT_FOCUS events.
+  */
+-void macdrv_window_got_focus(HWND hwnd, const macdrv_event *event)
++bool macdrv_window_got_focus(HWND hwnd)
+ {
+     unsigned int style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+ 
+-    if (!hwnd) return;
++    if (!hwnd) return false;
++
++    TRACE("win %p enabled %d visible %d style %08x fg %p\n",
++          hwnd, NtUserIsWindowEnabled(hwnd), NtUserIsWindowVisible(hwnd), style,
++          NtUserGetForegroundWindow());
+ 
+-    TRACE("win %p/%p serial %lu enabled %d visible %d style %08x focus %p active %p fg %p\n",
+-          hwnd, event->window, event->window_got_focus.serial, NtUserIsWindowEnabled(hwnd),
+-          NtUserIsWindowVisible(hwnd), style, get_focus(), get_active_window(GetCurrentThreadId()), NtUserGetForegroundWindow());
++    if (!can_window_become_foreground(hwnd))
++    {
++        TRACE("win %p rejecting focus\n", hwnd);
++        return false;
++    }
+ 
+-    if (can_window_become_foreground(hwnd) && !(style & WS_MINIMIZE))
++    if (!(style & WS_MINIMIZE))
+     {
+         TRACE("setting foreground window to %p\n", hwnd);
+         NtUserSetForegroundWindowInternal(hwnd);
+-        return;
+     }
+ 
+-    TRACE("win %p/%p rejecting focus\n", hwnd, event->window);
+-    macdrv_window_rejected_focus(event);
++    return true;
+ }
+ 
+ 
+ /***********************************************************************
+  *              macdrv_window_lost_focus
+- *
+- * Handler for WINDOW_LOST_FOCUS events.
+  */
+-void macdrv_window_lost_focus(HWND hwnd, const macdrv_event *event)
++void macdrv_window_lost_focus(HWND hwnd)
+ {
+-    if (!hwnd) return;
+-
+-    TRACE("win %p/%p fg %p\n", hwnd, event->window, NtUserGetForegroundWindow());
+-
+-    if (hwnd == NtUserGetForegroundWindow())
+-    {
+-        send_message(hwnd, WM_CANCELMODE, 0, 0);
+-        if (hwnd == NtUserGetForegroundWindow())
+-            NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+-    }
+-}
++    HWND foreground = NtUserGetForegroundWindow();
++    unsigned int style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+ 
++    if (!hwnd) return;
+ 
+-/***********************************************************************
+- *              macdrv_app_deactivated
+- *
+- * Handler for APP_DEACTIVATED events.
+- */
+-void macdrv_app_deactivated(void)
+-{
+-    NtUserClipCursor(NULL);
++    TRACE("win %p style %08x fg %p\n", hwnd, style, foreground);
+ 
+-    if (get_active_window(GetCurrentThreadId()) == NtUserGetForegroundWindow())
++    if (hwnd == foreground && (style & (WS_VISIBLE | WS_MINIMIZE)) == WS_VISIBLE)
+     {
+-        TRACE("setting fg to desktop\n");
++        send_notify_message(hwnd, WM_CANCELMODE, 0, 0);
+         NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+     }
+ }
+

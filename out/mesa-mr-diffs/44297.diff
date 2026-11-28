@@ -1,0 +1,94 @@
+# panfrost: don't treat unknown system memory as zero memory
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44297 state=closed
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+panfrost: don't treat unknown system memory as zero memory
+
+panfrost_can_create_resource() backs the proxy texture test. It asked
+os_get_total_physical_memory() for a budget and returned false when the
+platform could not report one, which the GL frontend turns into
+GL_OUT_OF_MEMORY without attempting the allocation. Every texture then
+fails regardless of size:
+
+    GL_OUT_OF_MEMORY in glTexImage2D(image too large: 8 x 8 x 1, GL_RGBA format)
+
+Only textures consult this path, so buffers and renderbuffers keep
+working, and nothing is logged because the refusal happens before any
+allocation is attempted.
+
+Return true when the budget is unknown and let the allocation decide. The
+separate os_get_total_physical_memory() call goes away with it:
+os_get_gpu_heap_size() already makes that call and returns 0 on failure.
+
+The same zero reached panfrost_init_compute_caps(), where MIN2() then
+advertised max_mem_alloc_size and max_global_size as 0. Fall back to the
+VA range, which is a real bound. caps->video_memory is left alone; zero
+is honest there and it is informational.
+
+Found on a bare-metal target whose libc provides sysconf() but not
+_SC_PHYS_PAGES, which is a glibc extension rather than POSIX. meson probes
+only whether sysconf() exists, so HAVE_SYSCONF selects the sysconf() path
+unconditionally; with the constant supplied by a port header, the call
+returns -1 there. Any libc with the function but not the constant lands
+here. No ordinary Linux configuration does, but stubbing
+sysconf(_SC_PHYS_PAGES) to -1 reproduces the refusal on any device.
+
+Tested with a cross build for aarch64 and four EGL applications on a host
+device model, where the memory size IS reported: unchanged. That does not
+reach the new branch, so it shows no regression rather than the fix
+working.
+
+Cc: mesa-stable
+```
+--- src/gallium/drivers/panfrost/pan_resource.c
++++ src/gallium/drivers/panfrost/pan_resource.c
+@@ -1002,13 +1002,19 @@ panfrost_can_create_resource(struct pipe_screen *screen,
+                                     template->format, 0))
+       return false;
+ 
+-   uint64_t system_memory;
+-   if (!os_get_total_physical_memory(&system_memory))
+-      return false;
+-
+    const float heap_memory_percent = pan_screen(screen)->heap_memory_percent;
+    uint64_t memory = os_get_gpu_heap_size(heap_memory_percent, NULL);
+ 
++   /* Zero means we could not find out how much memory the system has,
++    * not that there is none. This is only a hint used by the GL frontend
++    * to reject a resource before trying to allocate it, so an unknown
++    * budget must not become a budget of zero: that rejects every
++    * resource at every size, and the caller reports it as
++    * GL_OUT_OF_MEMORY. Let the allocation decide instead.
++    */
++   if (!memory)
++      return true;
++
+    return tmp.plane.layout.data_size_B <= memory;
+ }
+ 
+
+--- src/gallium/drivers/panfrost/pan_screen.c
++++ src/gallium/drivers/panfrost/pan_screen.c
+@@ -660,9 +660,15 @@ panfrost_init_compute_caps(struct panfrost_screen *screen)
+    uint64_t user_va_end =
+       pan_clamp_to_usable_va_range(dev->kmod.dev, PAN_VA_USER_END);
+ 
+-   /* We cannot support more than the VA limit */
+-   caps->max_global_size =
+-   caps->max_mem_alloc_size = MIN2(available_ram, user_va_end - user_va_start);
++   /* We cannot support more than the VA limit. available_ram is zero when
++    * the system memory size could not be determined; clamping to it would
++    * advertise a maximum allocation of zero, so fall back to the VA limit
++    * alone, which is a real hardware bound either way.
++    */
++   uint64_t va_size = user_va_end - user_va_start;
++
++   caps->max_global_size = caps->max_mem_alloc_size =
++      available_ram ? MIN2(available_ram, va_size) : va_size;
+ 
+    caps->max_local_size = 32768;
+    caps->max_clock_frequency = 800; /* MHz -- TODO */
+

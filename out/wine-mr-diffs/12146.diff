@@ -1,0 +1,459 @@
+# winebus: USB device ID changes, part 2.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12146 state=closed
+# I've split my old part 2 patches a bit to shrink this MR, I'll do the MacOS changes and USB device interface string changes in a separate MR.
+
+This patch series should give us consistent instance and container IDs for udev devices. It also more closely matches native behavior.
+--- dlls/winebus.sys/bus_iohid.c
++++ dlls/winebus.sys/bus_iohid.c
+@@ -386,6 +386,7 @@ static void handle_DeviceMatchingCallback(void *context, IOReturn result, void *
+     struct device_desc desc =
+     {
+         .interface = -1, .bus_id = -1, .is_hidraw = TRUE,
++        .path = { '/','b','u','s','/','i','o','h','i','d',0 },
+     };
+     struct iohid_device *impl;
+     USAGE_AND_PAGE usages;
+@@ -397,7 +398,7 @@ static void handle_DeviceMatchingCallback(void *context, IOReturn result, void *
+     desc.vid = CFNumberToDWORD(IOHIDDeviceGetProperty(IOHIDDevice, CFSTR(kIOHIDVendorIDKey)));
+     desc.pid = CFNumberToDWORD(IOHIDDeviceGetProperty(IOHIDDevice, CFSTR(kIOHIDProductIDKey)));
+     desc.version = CFNumberToDWORD(IOHIDDeviceGetProperty(IOHIDDevice, CFSTR(kIOHIDVersionNumberKey)));
+-    desc.uid = CFNumberToDWORD(IOHIDDeviceGetProperty(IOHIDDevice, CFSTR(kIOHIDLocationIDKey)));
++    desc.index = CFNumberToDWORD(IOHIDDeviceGetProperty(IOHIDDevice, CFSTR(kIOHIDLocationIDKey)));
+ 
+     if ((str = IOHIDDeviceGetProperty(IOHIDDevice, CFSTR(kIOHIDTransportKey))))
+     {
+
+--- dlls/winebus.sys/bus_sdl.c
++++ dlls/winebus.sys/bus_sdl.c
+@@ -140,6 +140,9 @@ struct sdl_device
+     SDL_GameController *sdl_controller;
+     SDL_JoystickID id;
+     BOOL started;
++    UINT vid;
++    UINT pid;
++    UINT idx;
+ 
+     DWORD effect_support;
+     SDL_Haptic *sdl_haptic;
+@@ -179,6 +182,30 @@ static struct sdl_device *find_device_from_id_and_axis(SDL_JoystickID id, int ax
+     return NULL;
+ }
+ 
++static UINT get_device_index(struct sdl_device *dev, struct list **before)
++{
++    struct sdl_device *impl;
++    UINT index = 0;
++
++    *before = NULL;
++
++    /* The device list is sorted, so just increment the index until it doesn't match an index already in the list */
++    LIST_FOR_EACH_ENTRY(impl, &device_list, struct sdl_device, unix_device.entry)
++    {
++        if (impl->vid == dev->vid && impl->pid == dev->pid && impl->axis_offset == 0)
++        {
++            if (impl->idx != index)
++            {
++                *before = &impl->unix_device.entry;
++                break;
++            }
++            index++;
++        }
++    }
++
++    return index;
++}
++
+ static void set_hat_value(struct unix_device *iface, int index, int value)
+ {
+     LONG x = 0, y = 0;
+@@ -932,6 +959,7 @@ static void sdl_add_device(unsigned int index)
+         .interface = -1,
+         .bus_id = -1,
+         .manufacturer = {'S','D','L',0},
++        .path = { '/','b','u','s','/','s','d','l',0 },
+     };
+     struct sdl_device *impl;
+ 
+@@ -988,9 +1016,12 @@ static void sdl_add_device(unsigned int index)
+         desc.is_gamepad = (axis_count == 6  && button_count >= 14);
+     }
+ 
++    /* Treat each split controller as an interface of a single device. */
++    if (options->split_controllers && axis_count > 6) desc.interface = 0;
+     axis_offset = 0;
+     do
+     {
++        struct list *before = NULL;
+         NTSTATUS status;
+ 
+         if (!axis_offset) strcpy(buffer, product);
+@@ -1000,7 +1031,15 @@ static void sdl_add_device(unsigned int index)
+         TRACE("%s id %d, axis_offset %u, desc %s.\n", controller ? "controller" : "joystick", id, axis_offset, debugstr_device_desc(&desc));
+ 
+         if (!(impl = hid_device_create(&sdl_device_vtbl, sizeof(struct sdl_device)))) return;
+-        list_add_tail(&device_list, &impl->unix_device.entry);
++        impl->vid = desc.vid;
++        impl->pid = desc.pid;
++        /* Index is per-device and not per-interface. */
++        if (!axis_offset)
++            desc.index = impl->idx = get_device_index(impl, &before);
++        if (before)
++            list_add_before(before, &impl->unix_device.entry);
++        else
++            list_add_tail(&device_list, &impl->unix_device.entry);
+         impl->sdl_joystick = joystick;
+         impl->sdl_controller = controller;
+         impl->id = id;
+@@ -1017,6 +1056,7 @@ static void sdl_add_device(unsigned int index)
+ 
+         bus_event_queue_device_created(&event_queue, &impl->unix_device, &desc);
+         axis_offset += (options->split_controllers ? 6 : axis_count);
++        if (desc.interface != -1) desc.interface++;
+     }
+     while (axis_offset < axis_count);
+ }
+
+--- dlls/winebus.sys/bus_udev.c
++++ dlls/winebus.sys/bus_udev.c
+@@ -1155,6 +1155,55 @@ static void get_device_subsystem_info(struct udev_device *dev, const char *subsy
+     }
+ }
+ 
++static void get_usb_udev_device_hub_path_and_port(struct udev_device *dev, struct device_desc *desc)
++{
++    struct udev_device *parent;
++    const char *path, *tmp;
++    char tmp_buf[MAX_PATH];
++    unsigned int class;
++    UINT hub_port;
++
++    /*
++     * This returns the last digits of the device sysname. For a "usb_device"
++     * that is not the root hub, these digits represent the port number of the
++     * USB hub that the device is connected to.
++     */
++    if (!(tmp = udev_device_get_sysnum(dev)) || !sscanf(tmp, "%u", &hub_port))
++    {
++        ERR("Failed to get sysnum for USB device.\n");
++        return;
++    }
++
++    if (!(parent = udev_device_get_parent_with_subsystem_devtype(dev, "usb", "usb_device"))
++            || !(tmp = udev_device_get_sysattr_value(parent, "bDeviceClass"))
++            || !(sscanf(tmp, "%02x", &class)))
++    {
++        ERR("Failed to get parent USB device%s.\n", !parent ? "" : " class");
++        return;
++    }
++    else if (class != 0x09)
++    {
++        ERR("Unexpected parent USB device class %02x.\n", class);
++        return;
++    }
++
++    if (!(path = udev_device_get_property_value(parent, "ID_PATH_WITH_USB_REVISION"))
++            && !(path = udev_device_get_property_value(parent, "ID_PATH")))
++    {
++        ERR("Failed to get path for parent USB hub.\n");
++        return;
++    }
++
++    /*
++     * Combine path and VID/PID of parent to uniquely identify a particular
++     * hub at a position in the USB device tree. This also prevents overlap
++     * for USBv2/USBv3 root hubs, which don't export ID_PATH_WITH_USB_REVISION.
++     */
++    snprintf(tmp_buf, sizeof(tmp_buf), "%s-%s", path, udev_device_get_property_value(parent, "PRODUCT"));
++    ntdll_umbstowcs(tmp_buf, strlen(tmp_buf) + 1, desc->path, ARRAY_SIZE(desc->path));
++    desc->index = hub_port;
++}
++
+ static void get_device_usb_info(struct udev_device *dev, struct device_desc *desc)
+ {
+     UINT class = 0, subclass = 0, protocol = 0, num_ifaces = 0, iface_num = -1;
+@@ -1182,6 +1231,7 @@ static void get_device_usb_info(struct udev_device *dev, struct device_desc *des
+     if (!(tmp = udev_device_get_sysattr_value(usb_dev, "bNumInterfaces")) || !sscanf(tmp, "%u", &num_ifaces))
+         ERR("Failed to get number of USB interfaces.\n");
+ 
++    get_usb_udev_device_hub_path_and_port(usb_dev, desc);
+     if (num_ifaces != 1 && (tmp = udev_device_get_sysattr_value(iface, "bInterfaceNumber"))) sscanf(tmp, "%x", &iface_num);
+     if ((tmp = udev_device_get_sysattr_value(iface, "bInterfaceClass"))) sscanf(tmp, "%x", &class);
+     if ((tmp = udev_device_get_sysattr_value(iface, "bInterfaceSubClass"))) sscanf(tmp, "%x", &subclass);
+@@ -1359,7 +1409,7 @@ static NTSTATUS lnxev_device_create(struct udev_device *dev, int fd, const char
+ static void udev_add_device(struct udev_device *dev, int fd)
+ {
+     struct device_desc desc = { .interface = -1, .bus_id = -1 };
+-    const char *subsystem, *devnode;
++    const char *subsystem, *devnode, *tmp;
+     int bus = 0;
+ 
+     if (!(devnode = udev_device_get_devnode(dev)))
+@@ -1390,6 +1440,12 @@ static void udev_add_device(struct udev_device *dev, int fd)
+         return;
+     }
+ 
++    if (!*desc.path)
++    {
++        ntdll_umbstowcs(subsystem, strlen(subsystem) + 1, desc.path, ARRAY_SIZE(desc.path));
++        if (!(tmp = udev_device_get_sysnum(dev)) || !sscanf(tmp, "%u", &desc.index))
++            ERR("Failed to get device sysnum.\n");
++    }
+     if ((desc.is_hidraw = !strcmp(subsystem, "hidraw")) && !hidraw_device_create(dev, fd, devnode, desc)) return;
+     if (!strcmp(subsystem, "input") && !lnxev_device_create(dev, fd, devnode, desc)) return;
+     close(fd);
+
+--- dlls/winebus.sys/main.c
++++ dlls/winebus.sys/main.c
+@@ -54,6 +54,18 @@ static DEVICE_OBJECT *bus_fdo;
+ static struct bus_options options = {.devices = LIST_INIT(options.devices)};
+ static HANDLE driver_key;
+ 
++typedef struct
++{
++   ULONG Unknown[6];
++   ULONG State[5];
++   ULONG Count[2];
++   UCHAR Buffer[64];
++} SHA_CTX, *PSHA_CTX;
++
++extern void WINAPI A_SHAInit(SHA_CTX *ctx);
++extern void WINAPI A_SHAUpdate(SHA_CTX *ctx, const unsigned char *buffer, UINT size);
++extern void WINAPI A_SHAFinal(SHA_CTX *ctx, ULONG *result);
++
+ struct hid_report
+ {
+     struct list entry;
+@@ -80,8 +92,8 @@ struct device_extension
+     enum device_state state;
+ 
+     struct device_desc desc;
+-    GUID container_id;
+-    DWORD index;
++    BOOL unique_serial;
++    ULONG hash;
+ 
+     BYTE *report_desc;
+     UINT report_desc_length;
+@@ -161,41 +173,45 @@ static void unix_device_set_feature_report(DEVICE_OBJECT *device, HID_XFER_PACKE
+     winebus_call(device_set_feature_report, &params);
+ }
+ 
+-static DWORD get_device_index(struct device_desc *desc, struct list **before)
++static BOOL has_unique_serial_number(struct device_desc *desc)
+ {
+     struct device_extension *ext;
+-    DWORD index = 0;
+ 
+-    *before = NULL;
++    if (!*desc->serialnumber) return FALSE;
+ 
+-    /* The device list is sorted, so just increment the index until it doesn't match an index already in the list */
+     LIST_FOR_EACH_ENTRY(ext, &device_list, struct device_extension, entry)
+     {
+-        if (ext->desc.vid == desc->vid && ext->desc.pid == desc->pid && ext->desc.interface == desc->interface)
++        if (ext->desc.vid == desc->vid && ext->desc.pid == desc->pid && ext->desc.interface == desc->interface
++                && !wcscmp(desc->serialnumber, ext->desc.serialnumber))
+         {
+-            if (ext->index != index)
+-            {
+-                *before = &ext->entry;
+-                break;
+-            }
+-            index++;
++            WARN("Found device with duplicate serial number %s.\n", debugstr_w(desc->serialnumber));
++            return FALSE;
+         }
+     }
+-
+-    return index;
++    return TRUE;
+ }
+ 
+ static WCHAR *get_instance_id(DEVICE_OBJECT *device)
+ {
+     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
+-    const WCHAR *serial_str = !*ext->desc.serialnumber ? L"0000" : ext->desc.serialnumber;
+-    DWORD len = wcslen(serial_str) + 33;
+     WCHAR *dst;
+ 
+-    if ((dst = ExAllocatePool(PagedPool, len * sizeof(WCHAR))))
++    /*
++     * Single interface USB devices (and parent devices of USB interfaces for
++     * composite devices) use their serial number string as the instance ID.
++     * If a second device with the same device ID and serial number string is
++     * added, just fall back to the path based instance ID.
++     */
++    if (ext->desc.interface == -1 && ext->unique_serial)
+     {
+-        swprintf(dst, len, L"%u&%s&%x&%u&%u", ext->desc.version, serial_str,
+-                 ext->desc.uid, ext->index, ext->desc.is_gamepad);
++        if ((dst = ExAllocatePool(PagedPool, (wcslen(ext->desc.serialnumber) + 1) * sizeof(WCHAR))))
++            wcscpy(dst, ext->desc.serialnumber);
++        return dst;
++    }
++
++    if ((dst = ExAllocatePool(PagedPool, 22 * sizeof(WCHAR))))
++    {
++        swprintf(dst, 22, L"1&%08x&0&%x", ext->hash, ext->desc.index);
+     }
+ 
+     return dst;
+@@ -349,8 +365,9 @@ static DEVICE_OBJECT *bus_create_hid_device(struct device_desc *desc, UINT64 uni
+     DEVICE_OBJECT *device;
+     UNICODE_STRING nameW;
+     WCHAR dev_name[256];
+-    struct list *before;
+     NTSTATUS status;
++    ULONG hash[5];
++    SHA_CTX ctx;
+ 
+     TRACE("desc %s, unix_device %#I64x\n", debugstr_device_desc(desc), unix_device);
+ 
+@@ -369,10 +386,15 @@ static DEVICE_OBJECT *bus_create_hid_device(struct device_desc *desc, UINT64 uni
+     ext = (struct device_extension *)device->DeviceExtension;
+     ext->device             = device;
+     ext->desc               = *desc;
+-    ext->index              = get_device_index(desc, &before);
++    ext->unique_serial      = has_unique_serial_number(desc);
+     ext->unix_device        = unix_device;
+     list_init(&ext->reports);
+ 
++    A_SHAInit(&ctx);
++    A_SHAUpdate(&ctx, (BYTE *)desc->path, wcslen(desc->path));
++    A_SHAFinal(&ctx, hash);
++    ext->hash = hash[0];
++
+     if (desc->is_hidraw && (desc->bus_type == BUS_TYPE_BLUETOOTH) && is_dualshock4_gamepad(desc->vid, desc->pid))
+     {
+         TRACE("Enabling report fixup for Bluetooth DualShock4 device %p\n", device);
+@@ -388,10 +410,7 @@ static DEVICE_OBJECT *bus_create_hid_device(struct device_desc *desc, UINT64 uni
+     ext->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": cs");
+ 
+     /* add to list of pnp devices */
+-    if (before)
+-        list_add_before(before, &ext->entry);
+-    else
+-        list_add_tail(&device_list, &ext->entry);
++    list_add_tail(&device_list, &ext->entry);
+ 
+     RtlLeaveCriticalSection(&device_list_cs);
+ 
+@@ -737,6 +756,21 @@ static NTSTATUS handle_IRP_MN_QUERY_DEVICE_RELATIONS(IRP *irp)
+     return status;
+ }
+ 
++#define GUID_STRING_LENGTH 39
++static WCHAR *get_container_id(struct device_extension *ext)
++{
++    WCHAR *dst;
++
++    if ((dst = ExAllocatePool(PagedPool, GUID_STRING_LENGTH * sizeof(WCHAR))))
++    {
++        swprintf(dst, GUID_STRING_LENGTH, L"{%08lX-%04X-%04X-%04X-%08X0000}",
++                ext->hash, ext->desc.vid, ext->desc.pid, ext->desc.version, ext->desc.index);
++        TRACE("Returning container ID %s.\n", debugstr_w(dst));
++    }
++
++    return dst;
++}
++
+ static NTSTATUS handle_IRP_MN_QUERY_ID(DEVICE_OBJECT *device, IRP *irp)
+ {
+     NTSTATUS status = irp->IoStatus.Status;
+@@ -764,9 +798,25 @@ static NTSTATUS handle_IRP_MN_QUERY_ID(DEVICE_OBJECT *device, IRP *irp)
+             irp->IoStatus.Information = (ULONG_PTR)get_instance_id(device);
+             break;
+         case BusQueryContainerID:
++        {
++            struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
++
+             TRACE("BusQueryContainerID\n");
++
++            /*
++             * Each interface of a multi interface device is expected to have
++             * the same container ID. On native this comes from their parent
++             * device, but since we currently don't replicate the full device
++             * hierachy we will create a matching container ID here ourselves.
++             */
++            if (ext->desc.interface != -1)
++            {
++                irp->IoStatus.Information = (ULONG_PTR)get_container_id(ext);
++                break;
++            }
+             irp->IoStatus.Information = 0;
+             return STATUS_NOT_SUPPORTED;
++        }
+         default:
+             WARN("Unhandled type %08x\n", type);
+             return status;
+
+--- dlls/winebus.sys/unixlib.c
++++ dlls/winebus.sys/unixlib.c
+@@ -108,6 +108,8 @@ static const struct device_desc mouse_device_desc =
+     .pid = 0x0001,
+     .interface = -1,
+     .bus_id = -1,
++    .path = {'/','b','u','s','/','w','i','n','e',0},
++    .index = 0,
+     .manufacturer = {'T','h','e',' ','W','i','n','e',' ','P','r','o','j','e','c','t',0},
+     .product = {'W','i','n','e',' ','H','I','D',' ','m','o','u','s','e',0},
+     .serialnumber = {'0','0','0','0',0},
+@@ -204,6 +206,8 @@ static const struct device_desc keyboard_device_desc =
+     .pid = 0x0002,
+     .interface = -1,
+     .bus_id = -1,
++    .path = {'/','b','u','s','/','w','i','n','e',0},
++    .index = 1,
+     .manufacturer = {'T','h','e',' ','W','i','n','e',' ','P','r','o','j','e','c','t',0},
+     .product = {'W','i','n','e',' ','H','I','D',' ','k','e','y','b','o','a','r','d',0},
+     .serialnumber = {'0','0','0','0',0},
+
+--- dlls/winebus.sys/unixlib.h
++++ dlls/winebus.sys/unixlib.h
+@@ -37,12 +37,33 @@ struct device_desc
+     UINT pid;
+     UINT version;
+     UINT interface;
+-    UINT uid;
+     UINT bus_type;
+     UINT bus_id; /* USB: class << 16 | subclass << 8 | protocol, -1 when unset */
+     BOOL is_gamepad;
+     BOOL is_hidraw;
+ 
++    /*
++     * The path string represents an abstract physical location that is
++     * different for each back end. The index value is relative to this string
++     * value, for example:
++     *
++     * A udev devnode at /dev/hidraw6 would have its path as "hidraw" and its
++     * index as 6.
++     *
++     * IOHID devices have a path of "/bus/iohid" and use location ID as the index,
++     * which is a value that is unique across the entire system.
++     *
++     * SDL devices have a path of "/bus/sdl", and use the number of devices
++     * with the same VID/PID connected at the time of device creation as an index
++     * value.
++     *
++     * These values won't overlap for any two devices connected at the same
++     * time, and should result in a more stable instance ID when combined
++     * together.
++     */
++    WCHAR path[MAX_PATH];
++    UINT index;
++
+     WCHAR manufacturer[MAX_PATH];
+     WCHAR product[MAX_PATH];
+     WCHAR serialnumber[MAX_PATH];
+@@ -160,8 +181,8 @@ enum unix_funcs
+ static inline const char *debugstr_device_desc(struct device_desc *desc)
+ {
+     if (!desc) return "(null)";
+-    return wine_dbg_sprintf("{vid %04x, pid %04x, version %04x, interface %d, uid %08x, is_gamepad %u, is_hidraw %u, bus_type %u, bus_id %08x}",
+-                            desc->vid, desc->pid, desc->version, desc->interface, desc->uid,
++    return wine_dbg_sprintf("{vid %04x, pid %04x, version %04x, interface %d, index %08x, is_gamepad %u, is_hidraw %u, bus_type %u, bus_id %08x}",
++                            desc->vid, desc->pid, desc->version, desc->interface, desc->index,
+                             desc->is_gamepad, desc->is_hidraw, desc->bus_type, desc->bus_id);
+ }
+ 
+

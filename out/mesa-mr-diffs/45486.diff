@@ -1,0 +1,37 @@
+# kk: Skip attachment if load & store ops are none
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45486 state=closed
+# We can simply skip attachments that use `LOAD_ACTION_NONE` + `STORE_ACTION_NONE`.
+
+This is particularly relevant for DXVK:
+
+DXVK has an optional tiler mode which records draw calls into secondary command buffers to collect information about load & store actions before actually starting the render pass.
+For attachments that never actually get used, it sets load+store action to NONE. A lot of of D3D games never actually unset the depth buffer if they don't need it anymore.
+For example the D3D9 renderer of Crysis 1 ends up having the depth buffer attached during almost all of the pure color fullscreen passes.
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -52,12 +52,19 @@ static void
+ kk_attachment_init(struct kk_attachment *att,
+                    const VkRenderingAttachmentInfo *info)
+ {
+-   if (info == NULL || info->imageView == VK_NULL_HANDLE) {
+-      *att = (struct kk_attachment){
+-         .iview = NULL,
+-      };
++   *att = (struct kk_attachment){
++      .iview = NULL,
++   };
++
++   if (info == NULL || info->imageView == VK_NULL_HANDLE)
++      return;
++
++   bool access_none = info->loadOp == VK_ATTACHMENT_LOAD_OP_NONE &&
++                      info->storeOp == VK_ATTACHMENT_STORE_OP_NONE;
++   bool resolve = info->resolveMode != VK_RESOLVE_MODE_NONE &&
++                  info->resolveImageView != VK_NULL_HANDLE;
++   if (access_none && !resolve)
+       return;
+-   }
+ 
+    VK_FROM_HANDLE(kk_image_view, iview, info->imageView);
+    *att = (struct kk_attachment){
+

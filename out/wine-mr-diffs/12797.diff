@@ -1,0 +1,212 @@
+# win32u: Measure the glyphs of fonts with embedded bitmaps like they are drawn.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12797 state=opened
+# Monochrome text is drawn with the advance widths of the embedded bitmaps, but GetTextExtentPoint32(), GetCharWidth32() and GGO_METRICS measured the hinted outlines, so the measured width of a string differed from the drawn one. Windows takes the advance widths from the embedded bitmaps at the sizes that have them, regardless of the antialiasing, and measures monochrome text with the monochrome hinting.
+
+d3dx9 took the glyph cells of ID3DXFont from GGO_GRAY8_BITMAP, which then no longer matches GGO_METRICS at these sizes. The first commit sizes the cells from GGO_METRICS with the one pixel border the d3dx9 tests expect, and places the antialiased bitmap relative to the glyph origin.
+
+Tahoma Bold 9-13 pixels, no antialiasing; the blue bar is the GetTextExtentPoint32() width, the text is drawn with ExtTextOut():
+
+![win32u-strike-metrics-compare-en-v2](/uploads/c3c585c2b7f35fc869df4fd1ae1834b7/win32u-strike-metrics-compare-en-v2.png)
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60741
+--- dlls/d3dx9_36/tests/core.c
++++ dlls/d3dx9_36/tests/core.c
+@@ -619,9 +619,9 @@ static void test_ID3DXFont(IDirect3DDevice9 *device)
+         ret = ID3DXFont_GetTextMetricsW(font, &tm);
+         ok(ret, "Unexpected ret %#x.\n", ret);
+ 
+-        todo_wine ok(blackbox.right - blackbox.left == glyph_metrics.gmBlackBoxX + 2, "Got %ld, expected %d.\n",
++        ok(blackbox.right - blackbox.left == glyph_metrics.gmBlackBoxX + 2, "Got %ld, expected %d.\n",
+                 blackbox.right - blackbox.left, glyph_metrics.gmBlackBoxX + 2);
+-        todo_wine ok(blackbox.bottom - blackbox.top == glyph_metrics.gmBlackBoxY + 2, "Got %ld, expected %d.\n",
++        ok(blackbox.bottom - blackbox.top == glyph_metrics.gmBlackBoxY + 2, "Got %ld, expected %d.\n",
+                 blackbox.bottom - blackbox.top, glyph_metrics.gmBlackBoxY + 2);
+         ok(cellinc.x == glyph_metrics.gmptGlyphOrigin.x - 1, "Got %ld, expected %ld.\n",
+                 cellinc.x, glyph_metrics.gmptGlyphOrigin.x - 1);
+
+--- dlls/d3dx9_36/font.c
++++ dlls/d3dx9_36/font.c
+@@ -303,7 +303,8 @@ static HRESULT WINAPI ID3DXFontImpl_PreloadGlyphs(ID3DXFont *iface, UINT first,
+     unsigned int size, stride, glyph, x, y;
+     struct d3dx_glyph *current_glyph;
+     D3DLOCKED_RECT lockrect;
+-    GLYPHMETRICS metrics;
++    GLYPHMETRICS metrics, bitmap_metrics;
++    int left, top, offset_x, offset_y;
+     BOOL mapped = FALSE;
+     DWORD *pixel_data;
+     BYTE *buffer;
+@@ -334,7 +335,13 @@ static HRESULT WINAPI ID3DXFontImpl_PreloadGlyphs(ID3DXFont *iface, UINT first,
+         current_glyph->texture = NULL;
+         wine_rb_put(&font->glyph_tree, ULongToPtr(current_glyph->id), &current_glyph->entry);
+ 
+-        size = GetGlyphOutlineW(font->hdc, glyph, GGO_GLYPH_INDEX | GGO_GRAY8_BITMAP, &metrics, 0, NULL, &mat);
++        if (GetGlyphOutlineW(font->hdc, glyph, GGO_GLYPH_INDEX | GGO_METRICS, &metrics, 0, NULL, &mat) == GDI_ERROR)
++        {
++            WARN("GetGlyphOutlineW failed.\n");
++            continue;
++        }
++
++        size = GetGlyphOutlineW(font->hdc, glyph, GGO_GLYPH_INDEX | GGO_GRAY8_BITMAP, &bitmap_metrics, 0, NULL, &mat);
+         if (size == GDI_ERROR)
+         {
+             WARN("GetGlyphOutlineW failed.\n");
+@@ -351,7 +358,7 @@ static HRESULT WINAPI ID3DXFontImpl_PreloadGlyphs(ID3DXFont *iface, UINT first,
+             return E_OUTOFMEMORY;
+         }
+ 
+-        GetGlyphOutlineW(font->hdc, glyph, GGO_GLYPH_INDEX | GGO_GRAY8_BITMAP, &metrics, size, buffer, &mat);
++        GetGlyphOutlineW(font->hdc, glyph, GGO_GLYPH_INDEX | GGO_GRAY8_BITMAP, &bitmap_metrics, size, buffer, &mat);
+ 
+         if (font->texture_pos == font->glyphs_per_texture)
+         {
+@@ -394,22 +401,36 @@ static HRESULT WINAPI ID3DXFontImpl_PreloadGlyphs(ID3DXFont *iface, UINT first,
+         x = morton_decode(font->texture_pos) * font->glyph_size;
+         y = morton_decode(font->texture_pos >> 1) * font->glyph_size;
+ 
+-        current_glyph->black_box.left = x - metrics.gmptGlyphOrigin.x + font->glyph_size / 2
+-                - metrics.gmBlackBoxX / 2;
+-        current_glyph->black_box.top = y - metrics.gmptGlyphOrigin.y + font->metrics.tmAscent + 1;
+-        current_glyph->black_box.right = current_glyph->black_box.left + metrics.gmBlackBoxX;
+-        current_glyph->black_box.bottom = current_glyph->black_box.top + metrics.gmBlackBoxY;
++        /* The black box has a one pixel border around the glyph metrics, the
++         * antialiased bitmap is placed relative to the glyph origin. */
++        left = x - metrics.gmptGlyphOrigin.x + font->glyph_size / 2 - metrics.gmBlackBoxX / 2;
++        top = y - metrics.gmptGlyphOrigin.y + font->metrics.tmAscent + 1;
++        current_glyph->black_box.left = left - 1;
++        current_glyph->black_box.top = top - 1;
++        current_glyph->black_box.right = left + metrics.gmBlackBoxX + 1;
++        current_glyph->black_box.bottom = top + metrics.gmBlackBoxY + 1;
+         current_glyph->cell_inc.x = metrics.gmptGlyphOrigin.x - 1;
+         current_glyph->cell_inc.y = font->metrics.tmAscent - metrics.gmptGlyphOrigin.y - 1;
+         current_glyph->texture = current_texture;
+ 
++        offset_x = left + bitmap_metrics.gmptGlyphOrigin.x - metrics.gmptGlyphOrigin.x;
++        offset_y = top + metrics.gmptGlyphOrigin.y - bitmap_metrics.gmptGlyphOrigin.y;
+         pixel_data = lockrect.pBits;
+-        stride = (metrics.gmBlackBoxX + 3) & ~3;
+-        for (y = 0; y < metrics.gmBlackBoxY; ++y)
+-            for (x = 0; x < metrics.gmBlackBoxX; ++x)
+-                pixel_data[(current_glyph->black_box.top + y) * lockrect.Pitch / 4
+-                        + current_glyph->black_box.left + x] =
++        stride = (bitmap_metrics.gmBlackBoxX + 3) & ~3;
++        for (y = 0; y < bitmap_metrics.gmBlackBoxY; ++y)
++        {
++            if (offset_y + (int)y < current_glyph->black_box.top
++                    || offset_y + (int)y >= current_glyph->black_box.bottom)
++                continue;
++            for (x = 0; x < bitmap_metrics.gmBlackBoxX; ++x)
++            {
++                if (offset_x + (int)x < current_glyph->black_box.left
++                        || offset_x + (int)x >= current_glyph->black_box.right)
++                    continue;
++                pixel_data[(offset_y + y) * lockrect.Pitch / 4 + offset_x + x] =
+                         (buffer[y * stride + x] * 255 / 64 << 24) | 0x00ffffffu;
++            }
++        }
+ 
+         free(buffer);
+         ++font->texture_pos;
+
+--- dlls/gdi32/tests/font.c
++++ dlls/gdi32/tests/font.c
+@@ -7651,6 +7651,74 @@ static void test_char_width(void)
+     ReleaseDC(NULL, dc);
+ }
+ 
++static void test_mono_char_width(void)
++{
++    static const MAT2 mat = {{0, 1}, {0, 0}, {0, 0}, {0, 1}};
++    static const LONG weights[] = {FW_NORMAL, FW_BOLD};
++    HFONT hfont, old_hfont;
++    GLYPHMETRICS gm;
++    LOGFONTA lf;
++    char str[0x7f - 0x20];
++    int i, c, height, width, total, mismatches, extent_mismatches;
++    DWORD ret;
++    SIZE size;
++    HDC hdc;
++
++    if (!is_truetype_font_installed("Tahoma"))
++    {
++        skip("Tahoma is not installed\n");
++        return;
++    }
++
++    hdc = CreateCompatibleDC(0);
++    memset(&lf, 0, sizeof(lf));
++    strcpy(lf.lfFaceName, "Tahoma");
++    lf.lfCharSet = DEFAULT_CHARSET;
++    lf.lfQuality = NONANTIALIASED_QUALITY;
++    for (c = 0x20; c < 0x7f; c++) str[c - 0x20] = c;
++
++    mismatches = extent_mismatches = 0;
++    for (i = 0; i < ARRAY_SIZE(weights); i++)
++    {
++        for (height = 8; height <= 16; height++)
++        {
++            winetest_push_context("weight %ld, height %d", weights[i], height);
++            lf.lfHeight = -height;
++            lf.lfWeight = weights[i];
++            hfont = CreateFontIndirectA(&lf);
++            ok(hfont != NULL, "CreateFontIndirectA failed\n");
++            old_hfont = SelectObject(hdc, hfont);
++
++            total = 0;
++            for (c = 0x20; c < 0x7f; c++)
++            {
++                ret = GetGlyphOutlineA(hdc, c, GGO_BITMAP, &gm, 0, NULL, &mat);
++                ok(ret != GDI_ERROR, "GetGlyphOutlineA(%#x) failed\n", c);
++                ret = GetCharWidth32A(hdc, c, c, &width);
++                ok(ret, "GetCharWidth32A(%#x) failed\n", c);
++                if (width != gm.gmCellIncX)
++                {
++                    if (winetest_debug > 1) trace("%#x: width %d, GGO_BITMAP advance %d\n", c, width, gm.gmCellIncX);
++                    mismatches++;
++                }
++                total += gm.gmCellIncX;
++            }
++            ret = GetTextExtentPoint32A(hdc, str, ARRAY_SIZE(str), &size);
++            ok(ret, "GetTextExtentPoint32A failed\n");
++            if (size.cx != total) extent_mismatches++;
++
++            SelectObject(hdc, old_hfont);
++            DeleteObject(hfont);
++            winetest_pop_context();
++        }
++    }
++    ok(!mismatches, "%d characters have a width different from the GGO_BITMAP advance\n", mismatches);
++    ok(!extent_mismatches, "%d text extents differ from the sum of the GGO_BITMAP advances\n",
++       extent_mismatches);
++
++    DeleteDC(hdc);
++}
++
+ static void test_GetCharacterPlacement_kerning(void)
+ {
+     LOGFONTA lf;
+@@ -8095,6 +8163,7 @@ START_TEST(font)
+     test_ttf_names();
+     test_lang_names();
+     test_char_width();
++    test_mono_char_width();
+     test_select_object();
+     test_font_weight();
+     test_add_font_path();
+
+--- dlls/win32u/freetype.c
++++ dlls/win32u/freetype.c
+@@ -3119,7 +3119,11 @@ static UINT freetype_get_glyph_outline( struct gdi_font *font, UINT glyph, UINT
+ 
+     vertical_metrics = (tategaki && FT_HAS_VERTICAL(ft_face));
+ 
+-    if (matrices || format != GGO_BITMAP) load_flags |= FT_LOAD_NO_BITMAP;
++    if (format == GGO_METRICS && !(load_flags & FT_LOAD_NO_HINTING) &&
++        freetype_get_aa_flags( font, GGO_GRAY4_BITMAP, FALSE ) == GGO_BITMAP)
++        load_flags = get_load_flags( GGO_BITMAP );
++
++    if (matrices || (format != GGO_BITMAP && format != GGO_METRICS)) load_flags |= FT_LOAD_NO_BITMAP;
+     if (vertical_metrics) load_flags |= FT_LOAD_VERTICAL_LAYOUT;
+ 
+     err = pFT_Load_Glyph(ft_face, glyph, load_flags & FT_LOAD_NO_HINTING ? load_flags : load_flags | FT_LOAD_PEDANTIC);
+

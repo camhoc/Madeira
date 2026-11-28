@@ -1,0 +1,53 @@
+# winebus: Set HID product name from the USB descriptor interface, if any
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11355 state=opened
+# Some USB devices expose multiple USB HID endpoints and let apps/games know which one is which based on the USB descriptor interface field. If the product name is set incorrectly, affected applications are unable to find the device they want to work with.
+
+For more context: I have a rhythm game that comes with a special controller. The controller is a USB device that exposes multiple HID devices and the game determines which endpoints it wants to use based on the HID product strings. If I run `udevadm info --name=/dev/hidraw3 --attribute-walk` then the required string is indeed available under `ATTRS{interface}` - when tested on Windows with libusb's [hidapi](https://github.com/libusb/hidapi) + [hidapitester](https://github.com/todbot/hidapitester), the USB interface string is printed as the HID product name, while under Wine the more generic USB product name is printed instead (which is the same for all devices the controller exposes, which breaks the game).
+
+After digging in, hidapi calls [HidD_GetProductString](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/hidsdi/nf-hidsdi-hidd_getproductstring) to get that info. Docs say that the HID product name is set based on the USB descriptor's interface, which matches what hidapitester prints. Wine tries to do this with `get_device_subsystem_info(dev, "usb", "usb_device", ...);` in the function, but gets it subtly wrong when the controller creates a device chain that looks like this (from udevadm):
+
+```
+  looking at device '/devices/pci0000:00/0000:00:14.0/usb1/1-9/1-9:1.2/0003:0CA3:0021.0010/hidraw/hidraw3':
+    KERNEL=="hidraw3"
+    SUBSYSTEM=="hidraw"
+    DRIVER==""
+    ...
+
+  looking at parent device '/devices/pci0000:00/0000:00:14.0/usb1/1-9/1-9:1.2/0003:0CA3:0021.0010':
+    KERNELS=="0003:0CA3:0021.0010"
+    SUBSYSTEMS=="hid"
+    DRIVERS=="hid-generic"
+    ...
+
+  looking at parent device '/devices/pci0000:00/0000:00:14.0/usb1/1-9/1-9:1.2':
+    KERNELS=="1-9:1.2"
+    SUBSYSTEMS=="usb"
+    DRIVERS=="usb
+--- dlls/winebus.sys/bus_udev.c
++++ dlls/winebus.sys/bus_udev.c
+@@ -1347,7 +1347,8 @@ static NTSTATUS lnxev_device_create(struct udev_device *dev, int fd, const char
+ static void udev_add_device(struct udev_device *dev, int fd)
+ {
+     struct device_desc desc = { .input = -1 };
+-    const char *subsystem, *devnode;
++    const char *subsystem, *devnode, *interface;
++    struct udev_device * usb_parent = NULL;
+     int bus = 0;
+ 
+     if (!(devnode = udev_device_get_devnode(dev)))
+@@ -1377,6 +1378,14 @@ static void udev_add_device(struct udev_device *dev, int fd)
+         return;
+     }
+ 
++    if (!strcmp(subsystem, "hidraw"))
++    {
++        /* HID devices on USB can have their product string set from the USB descriptor "interface" */
++        usb_parent = udev_device_get_parent_with_subsystem_devtype(dev, "usb", NULL);
++        if (usb_parent && (interface = udev_device_get_sysattr_value(usb_parent, "interface")))
++            ntdll_umbstowcs(interface, strlen(interface) + 1, desc.product, ARRAY_SIZE(desc.product));
++    }
++
+     if ((desc.is_hidraw = !strcmp(subsystem, "hidraw")) && !hidraw_device_create(dev, fd, devnode, desc)) return;
+     if (!strcmp(subsystem, "input") && !lnxev_device_create(dev, fd, devnode, desc)) return;
+     close(fd);
+

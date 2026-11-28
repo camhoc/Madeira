@@ -1,0 +1,92 @@
+# kk: add propagate invariant option for pre-rasterization shader geometry
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46519 state=merged
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+AI was used to investigate the flickering issue in the mentioned game. I contemplated having it on by default always as RADV does, but decided not to. If more games hit the same issue, we can revisit.
+
+```
+kk: add propagate invariant option for pre-rasterization shader geometry
+
+Certain apps expect geometry outputs to be invariant even when they don't
+declare them in shaders. Marvel's Future Fight is one of those.
+
+Assisted-by: LLM
+Signed-off-by: Aitor Camacho <aitor@lunarg.com>
+```
+--- src/kosmickrisp/vulkan/00-kk-defaults.conf
++++ src/kosmickrisp/vulkan/00-kk-defaults.conf
+@@ -1,6 +1,9 @@
+ <?xml version="1.0"?>
+ <driconf>
+     <device driver="kk">
++        <application name="Marvel Future Fight" application_name_match="Future Fight">
++            <option name="vs_position_always_invariant" value="true" />
++        </application>
+         <engine engine_name_match="idTech">
+            <!--
+               IdTech 6+ requires support for the depth bounds test.
+
+--- src/kosmickrisp/vulkan/kk_drirc_gen.py
++++ src/kosmickrisp/vulkan/kk_drirc_gen.py
+@@ -19,6 +19,9 @@ def declare_options():
+         B("kk_fake_depth_bounds", False,
+           "Reports support for depth bounds test even if the hardware does not support it",
+           c_name="fake_depth_bounds"),
++        B("vs_position_always_invariant", False,
++          "Forces all pre-rasterization shader geometry outputs to be invariant",
++          c_name="position_always_invariant"),
+     ]
+     debug_options = []
+     features_options = []
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -977,6 +977,10 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
+    _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
+                        sizeof(instance->driver_build_sha));
+ 
++   _mesa_blake3_update(&blake3_ctx,
++                       &instance->drirc.misc.position_always_invariant,
++                       sizeof(instance->drirc.misc.position_always_invariant));
++
+    unsigned char blake3[BLAKE3_KEY_LEN];
+    _mesa_blake3_final(&blake3_ctx, blake3);
+ 
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -12,6 +12,7 @@
+ #include "kk_descriptor_set_layout.h"
+ #include "kk_device.h"
+ #include "kk_format.h"
++#include "kk_instance.h"
+ #include "kk_nir_lower_vbo.h"
+ #include "kk_physical_device.h"
+ #include "kk_sampler.h"
+@@ -66,9 +67,13 @@ kk_get_spirv_options(struct vk_physical_device *vk_pdev,
+ }
+ 
+ static void
+-kk_preprocess_nir(UNUSED struct vk_physical_device *vk_pdev, nir_shader *nir,
++kk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
+                   UNUSED const struct vk_pipeline_robustness_state *rs)
+ {
++   struct kk_physical_device *pdev =
++      container_of(vk_pdev, struct kk_physical_device, vk);
++   struct kk_instance *instance = kk_physical_device_instance(pdev);
++
+    /* Gather info before preprocess_nir but after some general lowering, so
+     * inputs_read and system_values_read are accurately set.
+     */
+@@ -76,6 +81,9 @@ kk_preprocess_nir(UNUSED struct vk_physical_device *vk_pdev, nir_shader *nir,
+ 
+    msl_preprocess_nir(nir);
+ 
++   if (instance->drirc.misc.position_always_invariant)
++      NIR_PASS(_, nir, nir_propagate_invariant, true);
++
+    /* Cannot be part of msl_preprocess_nir since clc does not expose
+     * has_base_workgroup_id */
+    nir_lower_compute_system_values_options csv_options = {
+

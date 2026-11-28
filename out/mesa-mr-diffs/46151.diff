@@ -1,0 +1,22 @@
+# hk: remove input attachment offset from tex instructions
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46151 state=merged
+# The texture offset comes from an input attachment array index, but that's already encoded in the previous attachment array deref (so already part of the texture handle).
+
+This fixes about 700 CTS tests under `dEQP-VK.binding_model.descriptorset_random*`
+
+Fixes: d6ce4b6228c ("nir/lower_input_attachments: Pass through input attachment information")
+--- src/asahi/vulkan/hk_nir_lower_descriptors.c
++++ src/asahi/vulkan/hk_nir_lower_descriptors.c
+@@ -605,6 +605,11 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
+ {
+    b->cursor = nir_before_instr(&tex->instr);
+ 
++   /* Remove texture offset as it's already encoded in the attachment array deref */
++   if (tex->input_attachment_index) {
++      nir_steal_tex_src(tex, nir_tex_src_texture_offset);
++   }
++
+    nir_def *texture = nir_steal_tex_src(tex, nir_tex_src_texture_deref);
+    nir_def *sampler = nir_steal_tex_src(tex, nir_tex_src_sampler_deref);
+    if (!texture) {
+

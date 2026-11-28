@@ -1,0 +1,30 @@
+# win32u: fix inactive minotor will came with invalid display mode cause wine crash
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11508 state=closed
+# `dmPelsWidth`/`dmPelsHeight` in source physical/current sometimes will be all zero.
+cause `make_ratio` passing `dpi * scale_x.num, scale_x.den` will end up `0, 0`
+and in `make_ratio` `num`/`den` will using by `gcd`. `gcd` will also return 
+zero due to `num`/`den` will also be zero. Next code execute `num / d` and trigger
+divide by zero exception. This patch is for fixing the divide by zero issue. 
+
+the reason why its zero due to inactive monitor. For some reason it seems not cause crash on every user.
+```
+446809.077:0178:017c:trace:system:set_winstation_monitors increment 1
+446809.077:0178:017c:trace:system:set_winstation_monitors   flags 0x4 virt (0,0)-(0,0) dpi 96:1 raw (0,0)-(0,0) raw_dpi 1:0
+446809.077:0178:017c:trace:system:set_winstation_monitors   flags 0x1 virt (0,0)-(1920,1080) dpi 96:1 raw (0,0)-(1920,1080) raw_dpi 96:1
+```
+
+Patch from @rbernon thanks for the proper fix.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=59970
+--- dlls/win32u/sysparams.c
++++ dlls/win32u/sysparams.c
+@@ -2340,7 +2340,7 @@ static struct ratio monitor_get_dpi( struct monitor *monitor, MONITOR_DPI_TYPE t
+     UINT dpi;
+ 
+     if (!source || !(dpi = source->dpi)) dpi = system_dpi;
+-    if (source && type != MDT_EFFECTIVE_DPI)
++    if (source && type != MDT_EFFECTIVE_DPI && (source->state_flags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
+     {
+         scale_x.num = source->physical.dmPelsWidth;
+         scale_x.den = source->current.dmPelsWidth;
+

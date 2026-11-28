@@ -1,0 +1,68 @@
+# ntdll: Fix target unwinding to nested exception handlers on x86-64.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12419 state=opened
+# The search pass selects an __except handler; the unwind pass must clean up
+only scopes exited on the way to it. An enclosing __finally in the same frame
+should not run prematurely.
+
+In msvcrt/handler4.c, call_catch_block4() uses this nesting for C++ rethrows.
+The outer __finally runs before the inner __except sets ctx.rethrow, then
+runs again when that handler rethrows the original exception. This double
+cleanup caused the NULL dereference observed in __CxxUnregisterExceptionObject()
+while unlinking an already removed frame.
+
+During EXCEPTION_TARGET_UNWIND, stop scanning at the __except entry whose
+ImageBase + JumpTarget matches TargetIp. Enclosing __finally handlers must
+be preserved until their scopes are actually exited.
+
+Example (pseudocode): one stack frame F with nested lexical scopes A and B.
+
+    nested() {                         /* frame F */
+        __try {                        /* scope A */
+            __try {                    /* scope B */
+                raise(E);
+            } __except (accept(E)) {   /* handler H, still inside A */
+                rethrow(E);            /* to a handler in the caller */
+            }
+        } __finally {
+            cleanup();
+        }
+    }
+
+An illustrative scope table for F could contain the following records.
+The filter and cleanup routines are at RVAs 0x300 and 0x400 respectively.
+
+    Scope       BeginAddress  EndAddress  HandlerAddress  JumpTarget
+    B           0x100         0x180       0x300           0x200
+    A[0]        0x100         0x180       0x400           0
+    A[1]        0x200         0x240       0x400           0
+
+A[0] and A[1] describe two code ranges of the same lexical scope A;
+they are not separate stack frames.
+
+When E selects handler H, suppose ScopeIndex = 0, ControlPc = base + 0x140
+and TargetIp = base + 0x200, where base is ImageBase. The unwind flags
+include EXCEPTION_UNWINDING and EXCEPTION_TARGET_UNWIND. Skipping B reaches
+A[0], whose range excludes TargetIp, so cleanup runs too 
+--- dlls/ntdll/unwind.c
++++ dlls/ntdll/unwind.c
+@@ -2265,7 +2265,18 @@ EXCEPTION_DISPOSITION WINAPI __C_specific_handler( EXCEPTION_RECORD *rec, void *
+         {
+             if (pc < base + table->ScopeRecord[i].BeginAddress) continue;
+             if (pc >= base + table->ScopeRecord[i].EndAddress) continue;
+-            if (table->ScopeRecord[i].JumpTarget) continue;
++            /* Stop at the selected __except scope during target unwind.
++             * Its landing pad may lie outside an enclosing __finally's
++             * recorded range even though that scope has not been exited.
++             */
++            if (table->ScopeRecord[i].JumpTarget)
++            {
++                if ((rec->ExceptionFlags & EXCEPTION_TARGET_UNWIND) &&
++                    dispatch->TargetIp ==
++                      base + table->ScopeRecord[i].JumpTarget)
++                    break;
++                continue;
++            }
+ 
+             if (rec->ExceptionFlags & EXCEPTION_TARGET_UNWIND &&
+                 dispatch->TargetIp >= base + table->ScopeRecord[i].BeginAddress &&
+

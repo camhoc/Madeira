@@ -1,0 +1,25 @@
+# ntdll/tests: Initialize the desktop before starting WoW64 GUI children.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12469 state=opened
+# Call GetDesktopWindow() at the start of test_peb_teb() to work around an explorer startup race. If the last desktop user exits before the desktop window owner is established, the shutdown timeout is not armed. (`server/winstation.c remove_desktop_user()`)
+
+I encountered this hang during make test on OpenBSD, and again while debugging another ntdll test. The ports framework captures test output through tee. An explorer can keep the logging pipe open, preventing make test from finishing even after the test process has exited.
+
+With this workaround, I did not observe this particular hang in two subsequent test runs. Some other tests still timed out.
+
+I may investigate the underlying issue separately. My current hypothesis is that the test exits before explorer finishes initializing, which is less likely to happen with typical applications.
+--- dlls/ntdll/tests/wow64.c
++++ dlls/ntdll/tests/wow64.c
+@@ -941,6 +941,12 @@ static void test_peb_teb(void)
+     WOW64INFO *wow64info = (WOW64INFO *)buffer;
+     BOOLEAN wow64;
+ 
++    /* FIXME: Work around an explorer startup race. If the last desktop user
++     * exits before the desktop window owner is established, the shutdown
++     * timeout is not armed.
++     */
++    GetDesktopWindow();
++
+     Wow64DisableWow64FsRedirection( &redir );
+ 
+     if (CreateProcessA( "C:\\windows\\syswow64\\msinfo32.exe", NULL, NULL, NULL,
+

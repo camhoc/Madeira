@@ -1,0 +1,1262 @@
+# kk: stitch consecutive load/store render passes with suspend/resume
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46515 state=opened
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+Engines that split a layer across worker threads submit many render passes that load and store the same attachments. On a tile GPU each one round-trips the targets through tile memory. This records such passes as suspending/resuming Metal 4 encoders and commits consecutive ones with matching attachments as a single pass.
+
+Notes for review:
+
+• Multisampled passes are only stitched when they start a command buffer.
+• Vertex work in a resuming encoder is not ordered by Metal 4 queue barriers. A fence taken by a small compute encoder before each stitched chain orders it. The second commit narrows that wait to the stages the chain actually depends on.
+• Each stitched command buffer gets its own command allocator; reusing one after a stitched commit stalls the queue.
+• Disable with MESA_KK_DEBUG=no_merge_passes.
+
+Results (GPU ms, without -> with):
+
+• M1 Pro, a game scene: no MSAA 26.6 -> 24.8, 2x 28.6 -> 26.0, 4x 30.6 -> 28.1. The second commit adds about 1.5%.
+• M5 Pro, s&box benchmark: citizens 50.2 -> 37.6, cubes 13.9 -> 8.3, directional light 11.9 -> 8.2. Bloom, spot, static light and AO are 5-7% faster. Most other scenes are within noise.
+
+Known cost: a stitched pass needs an opener, a closer and a fence, so it only pays off when it chains with others. In s&box, light.point is about 6% slower (7.47 -> 7.90 ms) because most of its passes don't chain. With no_merge_passes it is back to 7.51 ms.
+
+Tested: Vulkan CTS 1.4.7.1 renderpasses (81687 cases) and synchronization (146489 cases), no failures and identical results to main. Metal API validation clean on renderpasses (the 130 m10_feedback_loop cases fail the same way on main, pre-existing). I also checked the dEQP-VK renderpasses non-random subset on M5 Pro: identical per-case results on main and this branch.
+
+This overlaps with !46247 (barrier rework) in kk_cmd_buffer.c and kk_event.c; I will rebase on whichever la
+--- docs/drivers/kosmickrisp.rst
++++ docs/drivers/kosmickrisp.rst
+@@ -75,7 +75,7 @@ Environment variables
+ 
+ KosmicKrisp specific environment variables:
+ 
+-- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders.
++- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders. ``no_merge_passes`` to disable stitching of consecutive render passes.
+ - ``MESA_KK_GPU_CAPTURE``: Enables Metal capture, can be controlled using debug utils labels or using ``MESA_KK_GPU_CAPTURE_IMMEDIATELY``. Set to ``1`` to activate.
+ - ``MESA_KK_GPU_CAPTURE_IMMEDIATELY``: Starts Metal capture at device creation and ends it at device destruction. Set to ``1`` to activate.
+ - ``MESA_KK_GPU_CAPTURE_DIRECTORY``: Metal capture will be saved to the specified directory. Defaults to Xcode if no path is provided.
+
+--- src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -144,6 +144,14 @@ mtl_new_render_command_encoder_with_descriptor(
+    return NULL;
+ }
+ 
++mtl_render_encoder *
++mtl_new_render_command_encoder_with_options(
++   mtl_command_buffer *command_buffer, mtl_render_pass_descriptor *descriptor,
++   bool suspending, bool resuming)
++{
++   return NULL;
++}
++
+ void
+ mtl_set_viewports(mtl_render_encoder *encoder, struct mtl_viewport *viewports,
+                   uint32_t count)
+
+--- src/kosmickrisp/bridge/stubs/mtl_render_state.c
++++ src/kosmickrisp/bridge/stubs/mtl_render_state.c
+@@ -18,6 +18,12 @@ mtl_new_render_pass_descriptor(void)
+    return NULL;
+ }
+ 
++mtl_render_pass_descriptor *
++mtl_new_render_pass_descriptor_copy(mtl_render_pass_descriptor *descriptor)
++{
++   return NULL;
++}
++
+ mtl_render_pass_attachment_descriptor *
+ mtl_render_pass_descriptor_get_color_attachment(
+    mtl_render_pass_descriptor *descriptor, uint32_t index)
+@@ -167,6 +173,12 @@ mtl_render_pass_descriptor_set_visibility_buffer(
+ {
+ }
+ 
++void
++mtl_render_pass_descriptor_set_visibility_accumulate(
++   mtl_render_pass_descriptor *descriptor)
++{
++}
++
+ /* Stencil descriptor */
+ mtl_stencil_descriptor *
+ mtl_new_stencil_descriptor(void)
+
+--- src/kosmickrisp/bridge/mtl_encoder.h
++++ src/kosmickrisp/bridge/mtl_encoder.h
+@@ -9,6 +9,7 @@
+ 
+ #include "mtl_types.h"
+ 
++#include <stdbool.h>
+ #include <stdint.h>
+ 
+ /* Common encoder utils */
+@@ -81,6 +82,10 @@ void mtl_dispatch_threads_with_indirect_buffer(mtl_compute_encoder *encoder,
+ mtl_render_encoder *mtl_new_render_command_encoder_with_descriptor(
+    mtl_command_buffer *command_buffer, mtl_render_pass_descriptor *descriptor);
+ 
++mtl_render_encoder *mtl_new_render_command_encoder_with_options(
++   mtl_command_buffer *command_buffer, mtl_render_pass_descriptor *descriptor,
++   bool suspending, bool resuming);
++
+ void mtl_set_viewports(mtl_render_encoder *encoder,
+                        struct mtl_viewport *viewports, uint32_t count);
+ 
+
+--- src/kosmickrisp/bridge/mtl_encoder.m
++++ src/kosmickrisp/bridge/mtl_encoder.m
+@@ -10,6 +10,7 @@
+ #include <Metal/MTL4ComputeCommandEncoder.h>
+ #include <Metal/MTL4Counters.h>
+ #include <Metal/MTL4RenderCommandEncoder.h>
++#include <Metal/MTL4RenderPass.h>
+ #include <Metal/MTLRenderPass.h>
+ 
+ /* Common encoder utils */
+@@ -298,6 +299,22 @@ mtl_new_render_command_encoder_with_descriptor(
+    }
+ }
+ 
++mtl_render_encoder *
++mtl_new_render_command_encoder_with_options(
++   mtl_command_buffer *command_buffer, mtl_render_pass_descriptor *descriptor,
++   bool suspending, bool resuming)
++{
++   @autoreleasepool {
++      id<MTL4CommandBuffer> cmd = (id<MTL4CommandBuffer>)command_buffer;
++      MTL4RenderPassDescriptor *desc = (MTL4RenderPassDescriptor *)descriptor;
++      MTL4RenderEncoderOptions options =
++         (suspending ? MTL4RenderEncoderOptionSuspending : 0) |
++         (resuming ? MTL4RenderEncoderOptionResuming : 0);
++      return [[cmd renderCommandEncoderWithDescriptor:desc
++                                              options:options] retain];
++   }
++}
++
+ void
+ mtl_set_viewports(mtl_render_encoder *encoder, struct mtl_viewport *viewports,
+                   uint32_t count)
+
+--- src/kosmickrisp/bridge/mtl_render_state.h
++++ src/kosmickrisp/bridge/mtl_render_state.h
+@@ -22,6 +22,9 @@ enum VkStencilOp;
+ /* Render pass descriptor */
+ mtl_render_pass_descriptor *mtl_new_render_pass_descriptor(void);
+ 
++mtl_render_pass_descriptor *
++mtl_new_render_pass_descriptor_copy(mtl_render_pass_descriptor *descriptor);
++
+ mtl_render_pass_attachment_descriptor *
+ mtl_render_pass_descriptor_get_color_attachment(
+    mtl_render_pass_descriptor *descriptor, uint32_t index);
+@@ -102,6 +105,9 @@ void mtl_render_pass_descriptor_set_sample_positions(
+ void mtl_render_pass_descriptor_set_visibility_buffer(
+    mtl_render_pass_descriptor *descriptor, mtl_buffer *visibility_buffer);
+ 
++void mtl_render_pass_descriptor_set_visibility_accumulate(
++   mtl_render_pass_descriptor *descriptor);
++
+ /* Stencil descriptor */
+ mtl_stencil_descriptor *mtl_new_stencil_descriptor(void);
+ 
+
+--- src/kosmickrisp/bridge/mtl_render_state.m
++++ src/kosmickrisp/bridge/mtl_render_state.m
+@@ -26,6 +26,14 @@ mtl_new_render_pass_descriptor(void)
+    }
+ }
+ 
++mtl_render_pass_descriptor *
++mtl_new_render_pass_descriptor_copy(mtl_render_pass_descriptor *descriptor)
++{
++   @autoreleasepool {
++      return [(MTL4RenderPassDescriptor *)descriptor copy];
++   }
++}
++
+ mtl_render_pass_attachment_descriptor *
+ mtl_render_pass_descriptor_get_color_attachment(
+    mtl_render_pass_descriptor *descriptor, uint32_t index)
+@@ -270,6 +278,16 @@ mtl_render_pass_descriptor_set_visibility_buffer(mtl_render_pass_descriptor *des
+    }
+ }
+ 
++void
++mtl_render_pass_descriptor_set_visibility_accumulate(
++   mtl_render_pass_descriptor *descriptor)
++{
++   @autoreleasepool {
++      MTL4RenderPassDescriptor *desc = (MTL4RenderPassDescriptor *)descriptor;
++      desc.visibilityResultType = MTLVisibilityResultTypeAccumulate;
++   }
++}
++
+ /* Stencil descriptor */
+ mtl_stencil_descriptor *
+ mtl_new_stencil_descriptor()
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -9,6 +9,7 @@
+ 
+ #include "kk_buffer.h"
+ #include "kk_cmd_pool.h"
++#include "kk_debug.h"
+ #include "kk_descriptor_set_layout.h"
+ #include "kk_entrypoints.h"
+ #include "kk_format.h"
+@@ -60,6 +61,176 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+    util_dynarray_clear(&cmd->ts_stage_map);
+ }
+ 
++static void
++kk_cmd_release_segments(struct kk_cmd_buffer *cmd)
++{
++   struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
++
++   util_dynarray_foreach(&cmd->metal.segments, struct kk_cmd_segment, seg) {
++      kk_cmd_pool_return_cmd_buf(pool, seg->cmd_buf);
++      if (seg->merge_desc)
++         mtl_release(seg->merge_desc);
++      if (seg->allocator)
++         kk_cmd_pool_return_merge_allocator(pool, seg->allocator);
++   }
++   util_dynarray_clear(&cmd->metal.segments);
++
++   if (cmd->metal.segment.merge_desc)
++      mtl_release(cmd->metal.segment.merge_desc);
++   if (cmd->metal.segment.allocator)
++      kk_cmd_pool_return_merge_allocator(pool, cmd->metal.segment.allocator);
++   memset(&cmd->metal.segment, 0, sizeof(cmd->metal.segment));
++   cmd->metal.segment_has_work = false;
++   cmd->metal.barrier_image_count = 0u;
++   cmd->metal.barrier_all = false;
++}
++
++static bool
++kk_cmd_pending_barrier_hits(const struct kk_cmd_buffer *cmd,
++                            const struct kk_merge_key *key)
++{
++   if (cmd->metal.barrier_all)
++      return true;
++
++   for (uint32_t i = 0; i < cmd->metal.barrier_image_count; i++) {
++      const struct vk_image *image = cmd->metal.barrier_images[i];
++      for (uint32_t c = 0; c < KK_MAX_RTS; c++) {
++         if (key->color[c] && key->color[c]->vk.image == image)
++            return true;
++      }
++      if (key->depth && key->depth->vk.image == image)
++         return true;
++      if (key->stencil && key->stencil->vk.image == image)
++         return true;
++   }
++   return false;
++}
++
++static enum mtl_stages
++kk_vertex_wait_stages(VkPipelineStageFlags2 src)
++{
++   const VkPipelineStageFlags2 geometry =
++      VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
++      VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
++      VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
++      VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
++      VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
++      VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
++      VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
++      VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |
++      VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
++      VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT;
++   const VkPipelineStageFlags2 fragment =
++      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
++      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
++      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
++      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
++   const VkPipelineStageFlags2 none =
++      VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
++
++   if (src &
++       ~(geometry | fragment | none | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT))
++      return MTL_STAGE_ALL;
++
++   enum mtl_stages stages = 0;
++   if (src & geometry)
++      stages |= MTL_STAGE_VERTEX | MTL_STAGE_OBJECTS | MTL_STAGE_MESH |
++                MTL_STAGE_DISPATCH;
++   if (src & fragment)
++      stages |= MTL_STAGE_FRAGMENT | MTL_STAGE_TILE;
++   if (src & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
++      stages |= MTL_STAGE_DISPATCH | MTL_STAGE_BLIT;
++   return stages;
++}
++
++void
++kk_cmd_track_vertex_dependencies(struct kk_cmd_buffer *cmd,
++                                 const VkDependencyInfo *dep)
++{
++   const VkPipelineStageFlags2 vertex =
++      VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
++      VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
++      VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
++      VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
++      VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
++      VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
++      VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
++      VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |
++      VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
++      VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT |
++      VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
++      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
++      VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
++   enum mtl_stages *wait = &cmd->metal.segment.vertex_wait;
++
++   for (uint32_t i = 0; i < dep->memoryBarrierCount; i++) {
++      if (dep->pMemoryBarriers[i].dstStageMask & vertex)
++         *wait |= kk_vertex_wait_stages(dep->pMemoryBarriers[i].srcStageMask);
++   }
++   for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount; i++) {
++      if (dep->pBufferMemoryBarriers[i].dstStageMask & vertex)
++         *wait |=
++            kk_vertex_wait_stages(dep->pBufferMemoryBarriers[i].srcStageMask);
++   }
++   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++) {
++      if (dep->pImageMemoryBarriers[i].dstStageMask & vertex)
++         *wait |=
++            kk_vertex_wait_stages(dep->pImageMemoryBarriers[i].srcStageMask);
++   }
++}
++
++static void
++kk_cmd_track_barriers(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep)
++{
++   const VkAccessFlags2 attachment_write =
++      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
++      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
++      VK_ACCESS_2_MEMORY_WRITE_BIT;
++
++   kk_cmd_track_vertex_dependencies(cmd, dep);
++
++   for (uint32_t i = 0; i < dep->memoryBarrierCount; i++) {
++      if (dep->pMemoryBarriers[i].srcAccessMask & attachment_write)
++         cmd->metal.barrier_all = true;
++   }
++   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++) {
++      if (cmd->metal.barrier_image_count == KK_MAX_PENDING_BARRIER_IMAGES) {
++         cmd->metal.barrier_all = true;
++         break;
++      }
++      VK_FROM_HANDLE(vk_image, image, dep->pImageMemoryBarriers[i].image);
++      cmd->metal.barrier_images[cmd->metal.barrier_image_count++] = image;
++   }
++}
++
++static void
++kk_cmd_split_segment(struct kk_cmd_buffer *cmd, bool merge)
++{
++   struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
++   mtl_command_buffer *next = kk_cmd_pool_get_cmd_buf(pool);
++   mtl_command_allocator *allocator =
++      merge ? kk_cmd_pool_get_merge_allocator(pool) : NULL;
++   if (next == NULL || (merge && allocator == NULL)) {
++      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return;
++   }
++
++   mtl_end_command_buffer(cmd->metal.cmd_buf);
++   if (cmd->metal.segment_has_work || cmd->metal.segment.merge_desc) {
++      cmd->metal.segment.cmd_buf = cmd->metal.cmd_buf;
++      util_dynarray_append(&cmd->metal.segments, cmd->metal.segment);
++   } else {
++      kk_cmd_pool_return_cmd_buf(pool, cmd->metal.cmd_buf);
++   }
++   memset(&cmd->metal.segment, 0, sizeof(cmd->metal.segment));
++   cmd->metal.segment_has_work = false;
++
++   cmd->metal.cmd_buf = next;
++   cmd->metal.segment.allocator = allocator;
++   mtl_begin_command_buffer(cmd->metal.cmd_buf,
++                            merge ? allocator : cmd->metal.allocator);
++}
++
+ /* Ends Metal command buffer recording and returns allocator to pool for reuse */
+ static void
+ end_recording(struct kk_cmd_buffer *cmd)
+@@ -68,6 +239,9 @@ end_recording(struct kk_cmd_buffer *cmd)
+       return;
+ 
+    cs_end(cmd);
++   if (cmd->metal.segment.merge_desc)
++      cmd->metal.segment.break_after =
++         kk_cmd_pending_barrier_hits(cmd, &cmd->metal.segment.key);
+    mtl_end_command_buffer(cmd->metal.cmd_buf);
+    kk_cmd_pool_return_allocator(kk_cmd_buffer_pool(cmd), cmd->metal.allocator);
+    cmd->metal.allocator = NULL;
+@@ -85,6 +259,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+ 
+    /* Ensure closed command buffer for safe returns to pool */
+    end_recording(cmd);
++   kk_cmd_release_segments(cmd);
+    if (cmd->metal.cmd_buf)
+       kk_cmd_pool_return_cmd_buf(pool, cmd->metal.cmd_buf);
+    cmd->metal.cmd_buf = NULL;
+@@ -96,6 +271,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+ 
+    kk_cmd_release_resources(dev, cmd);
+    util_dynarray_fini(&cmd->large_bos);
++   util_dynarray_fini(&cmd->metal.segments);
+    util_dynarray_fini(&cmd->post_render_writes);
+    util_dynarray_fini(&cmd->ts_resolves);
+    util_dynarray_fini(&cmd->ts_stage_map);
+@@ -131,6 +307,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+    cmd->ts_resolves = UTIL_DYNARRAY_INIT;
+    cmd->ts_stage_map = UTIL_DYNARRAY_INIT;
+    cmd->post_render_writes = UTIL_DYNARRAY_INIT;
++   cmd->metal.segments = UTIL_DYNARRAY_INIT;
+ 
+    {
+       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
+@@ -165,6 +342,7 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+ 
+    /* Ensure closed command buffer so we can start it again */
+    end_recording(cmd);
++   kk_cmd_release_segments(cmd);
+    kk_cmd_release_resources(dev, cmd);
+ 
+    cmd->uploader.bo = NULL;
+@@ -269,8 +447,27 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+    /* Ensure no other active encoder, aka compute */
+    cs_end(cmd);
+ 
+-   cmd->metal.render = mtl_new_render_command_encoder_with_descriptor(
+-      cmd->metal.cmd_buf, state->render_pass_descriptor);
++   const bool merge = state->merge_descriptor != NULL;
++   if (cmd->metal.segment.merge_desc || merge)
++      kk_cmd_split_segment(cmd, merge);
++
++   if (merge) {
++      mtl_retain(state->merge_descriptor);
++      cmd->metal.segment.merge_desc = state->merge_descriptor;
++      cmd->metal.segment.key = state->merge_key;
++      cmd->metal.segment.break_before =
++         kk_cmd_pending_barrier_hits(cmd, &state->merge_key);
++      cmd->metal.render = mtl_new_render_command_encoder_with_options(
++         cmd->metal.cmd_buf, state->merge_descriptor, true, true);
++   } else {
++      cmd->metal.render = mtl_new_render_command_encoder_with_descriptor(
++         cmd->metal.cmd_buf, state->render_pass_descriptor);
++   }
++   cmd->metal.render_merge = merge;
++   cmd->state.encoder_count++;
++   cmd->metal.segment_has_work = true;
++   cmd->metal.barrier_image_count = 0u;
++   cmd->metal.barrier_all = false;
+ 
+    kk_encoder_update_debug(cmd, cmd->metal.render);
+    /* Starting a new render pass means we already flushed and no barrier is
+@@ -324,7 +521,11 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+    }
+ 
+    if (cmd->metal.compute == NULL) {
++      if (cmd->metal.segment.merge_desc)
++         kk_cmd_split_segment(cmd, false);
++      cmd->metal.segment_has_work = true;
+       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
++      cmd->state.encoder_count++;
+       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
+       kk_encoder_update_debug(cmd, cmd->metal.compute);
+    }
+@@ -333,13 +534,21 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+ }
+ 
+ static void
+-end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
++end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder, bool merge)
+ {
+    /* TODO_KOSMICKRISP This is probably overkill */
+-   mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   if (!merge)
++      mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+    mtl_end_encoding(encoder);
+    mtl_release(encoder);
+ 
++   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) >
++       0) {
++      if (cmd->metal.segment.merge_desc)
++         kk_cmd_split_segment(cmd, false);
++      cmd->metal.segment_has_work = true;
++   }
++
+    /* Fold the pending timestamp counter-heap resolves into `cmd_buf` */
+    util_dynarray_foreach(&cmd->ts_resolves, struct kk_ts_resolve, r) {
+       mtl_command_resolve_counter_heap(cmd->metal.cmd_buf, r->heap, r->index,
+@@ -372,8 +581,9 @@ cs_end(struct kk_cmd_buffer *cmd)
+ 
+    /* Render first as it may open a compute encoder for post render writes. */
+    if (cmd->metal.render) {
+-      end_encoder(cmd, cmd->metal.render);
++      end_encoder(cmd, cmd->metal.render, cmd->metal.render_merge);
+       cmd->metal.render = NULL;
++      cmd->metal.render_merge = false;
+ 
+       /* The stage map is only valid for the current render encoder */
+       util_dynarray_clear(&cmd->ts_stage_map);
+@@ -381,7 +591,7 @@ cs_end(struct kk_cmd_buffer *cmd)
+    }
+ 
+    if (cmd->metal.compute) {
+-      end_encoder(cmd, cmd->metal.compute);
++      end_encoder(cmd, cmd->metal.compute, false);
+       cmd->metal.compute = NULL;
+    }
+ }
+@@ -462,6 +672,8 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+                        const VkDependencyInfo *pDependencyInfo)
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   if (!KK_DEBUG(NO_MERGE_PASSES))
++      kk_cmd_track_barriers(cmd, pDependencyInfo);
+ 
+    /* TODO_KOSMICKRISP Lighten barriers according to the actual requested
+     * barrier. To take advantage of this we need to remove the chaining of
+@@ -474,6 +686,7 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+       if (cmd->state.gfx.render.samples > 1 ||
+           kk_barrier_requires_encoder_split(cmd, pDependencyInfo)) {
+          kk_apply_attachment_store_ops(cmd, true);
++         cmd->metal.barrier_all = true;
+          cs_end(cmd);
+          cs_start_render(cmd);
+       } else
+@@ -930,7 +1143,7 @@ kk_get_attachment_store_op(const struct kk_attachment *attachment,
+ void
+ kk_apply_attachment_store_ops(struct kk_cmd_buffer *cmd, bool force_store)
+ {
+-   if (!cmd->metal.render)
++   if (!cmd->metal.render || cmd->metal.render_merge)
+       return;
+ 
+    struct kk_rendering_state *render = &cmd->state.gfx.render;
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -143,6 +143,28 @@ enum kk_dirty {
+    KK_DIRTY_OCCLUSION = BITFIELD_BIT(1),
+ };
+ 
++struct kk_merge_key {
++   const struct kk_image_view *color[KK_MAX_RTS];
++   const struct kk_image_view *depth;
++   const struct kk_image_view *stencil;
++   uint8_t color_map[KK_MAX_RTS];
++   VkRect2D area;
++   uint32_t layer_count;
++   uint32_t view_mask;
++};
++
++struct kk_cmd_segment {
++   mtl_command_buffer *cmd_buf;
++   mtl_command_allocator *allocator;
++   mtl_render_pass_descriptor *merge_desc;
++   struct kk_merge_key key;
++   bool break_before;
++   bool break_after;
++   enum mtl_stages vertex_wait;
++};
++
++#define KK_MAX_PENDING_BARRIER_IMAGES 16
++
+ struct kk_graphics_state {
+    struct kk_rendering_state render;
+    struct kk_descriptor_state descriptors;
+@@ -150,6 +172,8 @@ struct kk_graphics_state {
+ 
+    mtl_depth_stencil_state *depth_stencil_state;
+    mtl_render_pass_descriptor *render_pass_descriptor;
++   mtl_render_pass_descriptor *merge_descriptor;
++   struct kk_merge_key merge_key;
+    bool is_depth_stencil_dynamic;
+    bool is_cull_front_and_back;
+    bool need_to_start_render_pass;
+@@ -242,6 +266,13 @@ struct kk_cmd_buffer {
+       mtl_command_buffer *cmd_buf;
+       mtl_render_encoder *render;
+       mtl_compute_encoder *compute;
++      struct util_dynarray segments;
++      struct kk_cmd_segment segment;
++      bool segment_has_work;
++      bool render_merge;
++      const struct vk_image *barrier_images[KK_MAX_PENDING_BARRIER_IMAGES];
++      uint32_t barrier_image_count;
++      bool barrier_all;
+    } metal;
+    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
+    struct util_dynarray ts_resolves;
+@@ -264,6 +295,8 @@ struct kk_cmd_buffer {
+       uint64_t root_addr;
+       /* Only tracks graphics shaders since compute is always bound for now. */
+       uint32_t dirty_shaders;
++      /* Metal encoders created in this command buffer so far */
++      uint32_t encoder_count;
+    } state;
+ 
+    struct kk_uploader uploader;
+@@ -429,6 +462,9 @@ void kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
+ 
+ void kk_cmd_write(struct kk_cmd_buffer *cmd, struct libkk_imm_write write);
+ 
++void kk_cmd_track_vertex_dependencies(struct kk_cmd_buffer *cmd,
++                                      const VkDependencyInfo *dep);
++
+ void kk_cmd_buffer_set_label(struct kk_cmd_buffer *cb, const char *label);
+ 
+ #endif
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -11,6 +11,7 @@
+ 
+ #include "kk_buffer.h"
+ #include "kk_cmd_buffer.h"
++#include "kk_debug.h"
+ #include "kk_format.h"
+ #include "kk_image_view.h"
+ #include "kk_physical_device.h"
+@@ -248,6 +249,100 @@ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
+    }
+ }
+ 
++static bool
++kk_attachment_can_merge(const struct kk_attachment *att)
++{
++   if (!att->iview)
++      return true;
++
++   return att->load_op == VK_ATTACHMENT_LOAD_OP_LOAD &&
++          att->store_op == VK_ATTACHMENT_STORE_OP_STORE &&
++          att->resolve_mode == VK_RESOLVE_MODE_NONE;
++}
++
++static bool
++kk_attachment_is_multisampled(const struct kk_attachment *att)
++{
++   if (!att->iview)
++      return false;
++
++   const struct kk_image *image =
++      container_of(att->iview->vk.image, struct kk_image, vk);
++   return image->vk.samples != VK_SAMPLE_COUNT_1_BIT;
++}
++
++static void
++kk_setup_merge_descriptor(struct kk_cmd_buffer *cmd,
++                          mtl_render_pass_descriptor *pass_descriptor)
++{
++   struct kk_graphics_state *gfx = &cmd->state.gfx;
++   const struct kk_rendering_state *render = &gfx->render;
++
++   if (KK_DEBUG(NO_MERGE_PASSES) || render->flags != 0 || render->fsr_att.iview)
++      return;
++
++   bool any = render->depth_att.iview || render->stencil_att.iview;
++   if (!kk_attachment_can_merge(&render->depth_att) ||
++       !kk_attachment_can_merge(&render->stencil_att))
++      return;
++   for (uint32_t i = 0; i < render->color_att_count; i++) {
++      if (!kk_attachment_can_merge(&render->color_att[i]))
++         return;
++      any |= render->color_att[i].iview != NULL;
++   }
++   if (!any)
++      return;
++
++   /* Only merge a multisampled pass when it is the first encoder of the
++    * command buffer. Every merged pass waits for all earlier work before its
++    * vertex stage (see kk_queue_merge_wait), and merging the multisampled
++    * passes that follow other encoders as well measured slower than leaving
++    * them unmerged.
++    * TODO_KOSMICKRISP Order merged passes against earlier work with fences
++    * updated by the producing encoders instead of a full wait, then revisit
++    * this restriction. */
++   bool multisampled = kk_attachment_is_multisampled(&render->depth_att) ||
++                       kk_attachment_is_multisampled(&render->stencil_att);
++   for (uint32_t i = 0; i < render->color_att_count; i++)
++      multisampled |= kk_attachment_is_multisampled(&render->color_att[i]);
++   if (multisampled && cmd->state.encoder_count != 0u)
++      return;
++
++   struct kk_merge_key *key = &gfx->merge_key;
++   memset(key, 0, sizeof(*key));
++   key->area = render->area;
++   key->layer_count = render->layer_count;
++   key->view_mask = render->view_mask;
++   memcpy(key->color_map, render->color_map, sizeof(key->color_map));
++
++   mtl_render_pass_descriptor *copy =
++      mtl_new_render_pass_descriptor_copy(pass_descriptor);
++   for (uint32_t i = 0; i < render->color_att_count; i++) {
++      const uint8_t logical_index = render->color_map[i];
++      key->color[i] = render->color_att[i].iview;
++      if (!render->color_att[i].iview ||
++          logical_index == MESA_VK_ATTACHMENT_UNUSED)
++         continue;
++      mtl_render_pass_attachment_descriptor_set_store_action(
++         mtl_render_pass_descriptor_get_color_attachment(copy, logical_index),
++         MTL_STORE_ACTION_STORE);
++   }
++   if (render->depth_att.iview) {
++      key->depth = render->depth_att.iview;
++      mtl_render_pass_attachment_descriptor_set_store_action(
++         mtl_render_pass_descriptor_get_depth_attachment(copy),
++         MTL_STORE_ACTION_STORE);
++   }
++   if (render->stencil_att.iview) {
++      key->stencil = render->stencil_att.iview;
++      mtl_render_pass_attachment_descriptor_set_store_action(
++         mtl_render_pass_descriptor_get_stencil_attachment(copy),
++         MTL_STORE_ACTION_STORE);
++   }
++   mtl_render_pass_descriptor_set_visibility_accumulate(copy);
++   gfx->merge_descriptor = copy;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                      const VkRenderingInfo *pRenderingInfo)
+@@ -439,8 +534,10 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+    /* Rendering with no attachments requires pushing the start of the render
+     * pass to first pipeline binding to know sample count. */
+    cmd->state.gfx.render_pass_descriptor = pass_descriptor;
+-   if (!no_framebuffer)
++   if (!no_framebuffer) {
++      kk_setup_merge_descriptor(cmd, pass_descriptor);
+       cs_start_render(cmd);
++   }
+ 
+    /* Store descriptor in case we need to restart the pass at pipeline barrier,
+     * but force loads */
+@@ -632,6 +729,10 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+    cs_end(cmd);
+    mtl_release(cmd->state.gfx.render_pass_descriptor);
+    cmd->state.gfx.render_pass_descriptor = NULL;
++   if (cmd->state.gfx.merge_descriptor) {
++      mtl_release(cmd->state.gfx.merge_descriptor);
++      cmd->state.gfx.merge_descriptor = NULL;
++   }
+ 
+    if (render->flags &
+        (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_CUSTOM_RESOLVE_BIT_EXT))
+@@ -958,6 +1059,10 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
+          color_attachment_map_changed = true;
+       }
+    }
++   if (needs_restart && cmd->state.gfx.merge_descriptor) {
++      mtl_release(cmd->state.gfx.merge_descriptor);
++      cmd->state.gfx.merge_descriptor = NULL;
++   }
+    /* If render pass state changes and the pass is currently active, end the
+     * current encoder and prepare to restart it */
+    bool active_render = cmd->metal.render != NULL;
+
+--- src/kosmickrisp/vulkan/kk_cmd_pool.c
++++ src/kosmickrisp/vulkan/kk_cmd_pool.c
+@@ -104,6 +104,26 @@ kk_cmd_pool_return_allocator(struct kk_cmd_pool *pool,
+    util_dynarray_append(&pool->metal.free_allocators, allocator);
+ }
+ 
++mtl_command_allocator *
++kk_cmd_pool_get_merge_allocator(struct kk_cmd_pool *pool)
++{
++   if (util_dynarray_num_elements(&pool->metal.free_merge_allocators,
++                                  mtl_command_allocator *) > 0u)
++      return util_dynarray_pop(&pool->metal.free_merge_allocators,
++                               mtl_command_allocator *);
++
++   struct kk_device *dev = kk_cmd_pool_device(pool);
++   return mtl_new_command_allocator(dev->mtl_handle);
++}
++
++void
++kk_cmd_pool_return_merge_allocator(struct kk_cmd_pool *pool,
++                                   mtl_command_allocator *allocator)
++{
++   mtl_command_allocator_reset(allocator);
++   util_dynarray_append(&pool->metal.free_merge_allocators, allocator);
++}
++
+ mtl_command_buffer *
+ kk_cmd_pool_get_cmd_buf(struct kk_cmd_pool *pool)
+ {
+@@ -145,6 +165,7 @@ kk_CreateCommandPool(VkDevice _device,
+    }
+ 
+    pool->metal.free_allocators = UTIL_DYNARRAY_INIT;
++   pool->metal.free_merge_allocators = UTIL_DYNARRAY_INIT;
+    pool->metal.free_cmd_bufs = UTIL_DYNARRAY_INIT;
+ 
+    list_inithead(&pool->free_bos);
+@@ -163,6 +184,12 @@ kk_cmd_pool_release_mtl_objects(struct kk_cmd_pool *pool)
+    }
+    util_dynarray_clear(&pool->metal.free_allocators);
+ 
++   util_dynarray_foreach(&pool->metal.free_merge_allocators,
++                         mtl_command_allocator *, allocator) {
++      mtl_release(*allocator);
++   }
++   util_dynarray_clear(&pool->metal.free_merge_allocators);
++
+    util_dynarray_foreach(&pool->metal.free_cmd_bufs, mtl_command_buffer *,
+                          cmd_buf) {
+       mtl_release(*cmd_buf);
+@@ -184,6 +211,7 @@ kk_DestroyCommandPool(VkDevice _device, VkCommandPool commandPool,
+    kk_cmd_pool_destroy_bos(pool);
+    kk_cmd_pool_release_mtl_objects(pool);
+    util_dynarray_fini(&pool->metal.free_allocators);
++   util_dynarray_fini(&pool->metal.free_merge_allocators);
+    util_dynarray_fini(&pool->metal.free_cmd_bufs);
+    vk_free2(&device->vk.alloc, pAllocator, pool);
+ }
+
+--- src/kosmickrisp/vulkan/kk_cmd_pool.h
++++ src/kosmickrisp/vulkan/kk_cmd_pool.h
+@@ -34,6 +34,7 @@ struct kk_cmd_pool {
+ 
+    struct {
+       struct util_dynarray free_allocators;
++      struct util_dynarray free_merge_allocators;
+       struct util_dynarray free_cmd_bufs;
+    } metal;
+ };
+@@ -55,6 +56,10 @@ void kk_cmd_pool_free_bo_list(struct kk_cmd_pool *pool, struct list_head *bos);
+ mtl_command_allocator *kk_cmd_pool_get_allocator(struct kk_cmd_pool *pool);
+ void kk_cmd_pool_return_allocator(struct kk_cmd_pool *pool,
+                                   mtl_command_allocator *allocator);
++mtl_command_allocator *
++kk_cmd_pool_get_merge_allocator(struct kk_cmd_pool *pool);
++void kk_cmd_pool_return_merge_allocator(struct kk_cmd_pool *pool,
++                                        mtl_command_allocator *allocator);
+ mtl_command_buffer *kk_cmd_pool_get_cmd_buf(struct kk_cmd_pool *pool);
+ void kk_cmd_pool_return_cmd_buf(struct kk_cmd_pool *pool,
+                                 mtl_command_buffer *cmd_buf);
+
+--- src/kosmickrisp/vulkan/kk_debug.c
++++ src/kosmickrisp/vulkan/kk_debug.c
+@@ -11,6 +11,7 @@ const struct debug_named_value debug_flags[] = {
+    {"nir", KK_DEBUG_NIR},
+    {"msl", KK_DEBUG_MSL},
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
++   {"no_merge_passes", KK_DEBUG_NO_MERGE_PASSES},
+    {NULL, 0},
+ };
+ 
+
+--- src/kosmickrisp/vulkan/kk_debug.h
++++ src/kosmickrisp/vulkan/kk_debug.h
+@@ -12,6 +12,7 @@ enum kk_debug {
+    KK_DEBUG_MSL = 1ull << 1,
+    /* Forces robustness for all shaders */
+    KK_DEBUG_FORCE_ROBUSTNESS = 1ull << 2,
++   KK_DEBUG_NO_MERGE_PASSES = 1ull << 3,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+
+--- src/kosmickrisp/vulkan/kk_event.c
++++ src/kosmickrisp/vulkan/kk_event.c
+@@ -112,5 +112,7 @@ kk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
+                   const VkEvent *pEvents,
+                   const VkDependencyInfo *pDependencyInfos)
+ {
+-   /* We do nothing, event should already be set by the time we are here. */
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   for (uint32_t i = 0; i < eventCount; i++)
++      kk_cmd_track_vertex_dependencies(cmd, &pDependencyInfos[i]);
+ }
+
+--- src/kosmickrisp/vulkan/kk_queue.c
++++ src/kosmickrisp/vulkan/kk_queue.c
+@@ -8,6 +8,7 @@
+ #include "kk_queue.h"
+ #include "kk_buffer.h"
+ #include "kk_cmd_buffer.h"
++#include "kk_debug.h"
+ #include "kk_device.h"
+ #include "kk_entrypoints.h"
+ #include "kk_physical_device.h"
+@@ -27,7 +28,7 @@ static void
+ kk_queue_wait_for_commits(struct kk_queue *queue)
+ {
+    mtx_lock(&queue->mutex);
+-   while (queue->commits_in_flight > 0u)
++   while (queue->commits_in_flight > 0u || queue->merge_commits_in_flight > 0u)
+       cnd_wait(&queue->cond, &queue->mutex);
+    mtx_unlock(&queue->mutex);
+ }
+@@ -89,18 +90,238 @@ kk_cmd_buffer_has_work(struct kk_cmd_buffer *cmd)
+    return cmd->metal.cmd_buf;
+ }
+ 
++struct kk_merge_commit {
++   struct kk_queue *queue;
++   struct util_dynarray bookends;
++};
++
++static void
++merge_commit_callback(struct mtl_feedback_data *data)
++{
++   struct kk_merge_commit *merge = (struct kk_merge_commit *)data->user_data;
++   struct kk_queue *queue = merge->queue;
++   struct kk_device *dev = kk_queue_device(queue);
++
++   mtx_lock(&queue->mutex);
++   util_dynarray_append_dynarray(&queue->merge_bookends, &merge->bookends);
++   if (--queue->merge_commits_in_flight == 0u)
++      cnd_broadcast(&queue->cond);
++   mtx_unlock(&queue->mutex);
++
++   util_dynarray_fini(&merge->bookends);
++   vk_free(&dev->vk.alloc, merge);
++}
++
++static struct kk_merge_commit *
++kk_queue_begin_merge(struct kk_queue *queue)
++{
++   struct kk_device *dev = kk_queue_device(queue);
++   struct kk_merge_commit *merge = vk_alloc(&dev->vk.alloc, sizeof(*merge), 8,
++                                            VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
++   if (merge == NULL)
++      return NULL;
++
++   merge->queue = queue;
++   merge->bookends = UTIL_DYNARRAY_INIT;
++
++   mtx_lock(&queue->mutex);
++   queue->merge_commits_in_flight++;
++   mtx_unlock(&queue->mutex);
++
++   return merge;
++}
++
++static mtl_command_buffer *
++kk_queue_begin_bookend(struct kk_queue *queue, struct kk_merge_commit *merge)
++{
++   struct kk_device *dev = kk_queue_device(queue);
++   struct kk_bookend bookend = {0};
++
++   mtx_lock(&queue->mutex);
++   if (util_dynarray_num_elements(&queue->merge_bookends, struct kk_bookend) >
++       0u)
++      bookend = util_dynarray_pop(&queue->merge_bookends, struct kk_bookend);
++   mtx_unlock(&queue->mutex);
++   if (bookend.cmd_buf == NULL) {
++      bookend.cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
++      bookend.allocator = mtl_new_command_allocator(dev->mtl_handle);
++   } else {
++      mtl_command_allocator_reset(bookend.allocator);
++   }
++
++   mtl_begin_command_buffer(bookend.cmd_buf, bookend.allocator);
++   util_dynarray_append(&merge->bookends, bookend);
++   return bookend.cmd_buf;
++}
++
++static mtl_command_buffer *
++kk_queue_bookend(struct kk_queue *queue, struct kk_merge_commit *merge,
++                 mtl_render_pass_descriptor *descriptor, bool suspending)
++{
++   mtl_command_buffer *cmd_buf = kk_queue_begin_bookend(queue, merge);
++   mtl_render_encoder *encoder = mtl_new_render_command_encoder_with_options(
++      cmd_buf, descriptor, suspending, !suspending);
++   if (suspending)
++      mtl_wait_for_fence(encoder, queue->merge_fence, MTL_STAGE_VERTEX);
++   else
++      mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   mtl_end_encoding(encoder);
++   mtl_release(encoder);
++   mtl_end_command_buffer(cmd_buf);
++   return cmd_buf;
++}
++
++/* Vertex work recorded in resuming render encoders is not held back by queue
++ * barriers: neither by the producer barriers ending earlier encoders nor by
++ * consumer barriers in the merged pass itself. Fragment work is. Fences are
++ * honored, so wait here for the earlier stages that vertex work recorded since
++ * the last wait depends on, and update the fence the opener waits on before
++ * its vertex stage. */
++static mtl_command_buffer *
++kk_queue_merge_wait(struct kk_queue *queue, struct kk_merge_commit *merge,
++                    enum mtl_stages stages)
++{
++   mtl_command_buffer *cmd_buf = kk_queue_begin_bookend(queue, merge);
++   mtl_compute_encoder *encoder = mtl_new_compute_command_encoder(cmd_buf);
++   mtl_barrier_after_queue_stages(encoder, stages, MTL_STAGE_DISPATCH);
++   mtl_update_fence(encoder, queue->merge_fence, MTL_STAGE_DISPATCH);
++   mtl_end_encoding(encoder);
++   mtl_release(encoder);
++   mtl_end_command_buffer(cmd_buf);
++   return cmd_buf;
++}
++
++static mtl_command_buffer *
++kk_queue_merge_fence(struct kk_queue *queue, struct kk_merge_commit *merge)
++{
++   mtl_command_buffer *cmd_buf = kk_queue_begin_bookend(queue, merge);
++   mtl_compute_encoder *encoder = mtl_new_compute_command_encoder(cmd_buf);
++   mtl_barrier_after_queue_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   mtl_end_encoding(encoder);
++   mtl_release(encoder);
++   mtl_end_command_buffer(cmd_buf);
++   return cmd_buf;
++}
++
++static bool
++kk_segments_chain(const struct kk_cmd_segment *a,
++                  const struct kk_cmd_segment *b)
++{
++   return a->merge_desc && b->merge_desc && !a->break_after &&
++          !b->break_before && memcmp(&a->key, &b->key, sizeof(a->key)) == 0;
++}
++
++static void
++kk_queue_commit_group(struct kk_queue *queue, struct util_dynarray *cmd_bufs,
++                      mtl_feedback_handler_callback callback, void *user_data,
++                      struct kk_merge_commit *merge)
++{
++   mtl_commit_options *options = mtl_new_commit_options();
++   if (callback)
++      mtl_commit_options_add_feedback_handler(options, callback, user_data);
++   if (merge)
++      mtl_commit_options_add_feedback_handler(options, merge_commit_callback,
++                                              merge);
++   mtl_command_queue_commit(
++      queue->mtl_handle, util_dynarray_begin(cmd_bufs),
++      util_dynarray_num_elements(cmd_bufs, mtl_command_buffer *), options);
++   mtl_release(options);
++   util_dynarray_clear(cmd_bufs);
++}
++
++static void
++kk_queue_commit_segments(struct kk_queue *queue,
++                         const struct kk_cmd_segment *segments, uint32_t count,
++                         mtl_feedback_handler_callback callback,
++                         void *user_data)
++{
++   struct kk_device *dev = kk_queue_device(queue);
++   struct util_dynarray cmd_bufs = UTIL_DYNARRAY_INIT;
++   struct kk_merge_commit *merge = NULL;
++
++   for (uint32_t i = 0; i < count; i++) {
++      const struct kk_cmd_segment *segment = &segments[i];
++      if (segment->merge_desc && merge == NULL) {
++         merge = kk_queue_begin_merge(queue);
++         if (merge == NULL) {
++            vk_device_set_lost(&dev->vk, "Out of memory merging render passes");
++            util_dynarray_fini(&cmd_bufs);
++            return;
++         }
++      }
++
++      const bool chain_prev =
++         i > 0u && kk_segments_chain(&segments[i - 1u], segment);
++      const bool chain_next =
++         i + 1u < count && kk_segments_chain(segment, &segments[i + 1u]);
++
++      if (segment->merge_desc && !chain_prev) {
++         if (util_dynarray_num_elements(&cmd_bufs, mtl_command_buffer *))
++            kk_queue_commit_group(queue, &cmd_bufs, NULL, NULL, NULL);
++         if (queue->vertex_wait) {
++            util_dynarray_append(
++               &cmd_bufs,
++               kk_queue_merge_wait(queue, merge, queue->vertex_wait));
++            queue->vertex_wait = 0;
++         }
++         mtl_command_buffer *opener =
++            kk_queue_bookend(queue, merge, segment->merge_desc, true);
++         util_dynarray_append(&cmd_bufs, opener);
++      }
++      util_dynarray_append(&cmd_bufs, segment->cmd_buf);
++      queue->vertex_wait |= segment->vertex_wait;
++      if (segment->merge_desc && !chain_next) {
++         mtl_command_buffer *closer =
++            kk_queue_bookend(queue, merge, segment->merge_desc, false);
++         util_dynarray_append(&cmd_bufs, closer);
++         util_dynarray_append(&cmd_bufs, kk_queue_merge_fence(queue, merge));
++         if (i + 1u < count)
++            kk_queue_commit_group(queue, &cmd_bufs, NULL, NULL, NULL);
++      }
++   }
++
++   kk_queue_commit_group(queue, &cmd_bufs, callback, user_data, merge);
++   util_dynarray_fini(&cmd_bufs);
++}
++
++static void
++kk_cmd_buffer_append_segments(struct kk_cmd_buffer *cmd,
++                              struct util_dynarray *segments)
++{
++   struct kk_cmd_segment last = cmd->metal.segment;
++   last.cmd_buf = cmd->metal.cmd_buf;
++
++   util_dynarray_append_dynarray(segments, &cmd->metal.segments);
++   util_dynarray_append(segments, last);
++}
++
+ static void
+ kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
+                 mtl_feedback_handler_callback callback, void *user_data)
+ {
+    assert(kk_cmd_buffer_has_work(cmd));
+ 
+-   mtl_commit_options *options = mtl_new_commit_options();
+-   mtl_commit_options_add_feedback_handler(options, callback, user_data);
++   struct util_dynarray segments = UTIL_DYNARRAY_INIT;
++   kk_cmd_buffer_append_segments(cmd, &segments);
++   kk_queue_commit_segments(
++      queue, util_dynarray_begin(&segments),
++      util_dynarray_num_elements(&segments, struct kk_cmd_segment), callback,
++      user_data);
++   util_dynarray_fini(&segments);
++}
+ 
+-   mtl_command_queue_commit(queue->mtl_handle, &cmd->metal.cmd_buf, 1u,
+-                            options);
+-   mtl_release(options);
++static void
++kk_queue_flush_batch(struct kk_queue *queue, struct util_dynarray *batch)
++{
++   const uint32_t count =
++      util_dynarray_num_elements(batch, struct kk_cmd_segment);
++   if (count == 0u)
++      return;
++
++   kk_queue_commit_segments(queue, util_dynarray_begin(batch), count,
++                            commit_callback, kk_queue_device(queue));
++   util_dynarray_clear(batch);
+ }
+ 
+ static VkResult
+@@ -160,9 +381,9 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
+    kk_device_make_resources_resident(dev);
+ 
+    queue->commits_in_flight++;
+-   kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
+-
+    mtx_unlock(&queue->mutex);
++
++   kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
+    return VK_SUCCESS;
+ 
+ release:
+@@ -187,6 +408,7 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+       struct kk_sync_timeline *sync =
+          container_of(wait->sync, struct kk_sync_timeline, base);
+       mtl_wait_for_event(queue->mtl_handle, sync->mtl_handle, wait->wait_value);
++      queue->vertex_wait = MTL_STAGE_ALL;
+    }
+ 
+    /* Ensure any changes to residency are propagated before we submit any
+@@ -194,9 +416,15 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+     * Otherwise, users are playing with fire. */
+    kk_device_make_resources_resident(dev);
+ 
++   struct util_dynarray batch = UTIL_DYNARRAY_INIT;
+    for (uint32_t i = 0; i < submit->command_buffer_count; ++i) {
+       struct kk_cmd_buffer *cmd_buffer =
+          container_of(submit->command_buffers[i], struct kk_cmd_buffer, vk);
++      const bool standalone = cmd_buffer->drawable || cmd_buffer->submitted ||
++                              KK_DEBUG(NO_MERGE_PASSES);
++
++      if (standalone)
++         kk_queue_flush_batch(queue, &batch);
+ 
+       if (cmd_buffer->drawable) {
+          mtl_command_queue_wait_for_drawable(queue->mtl_handle,
+@@ -207,10 +435,15 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+        * submissions. */
+       if (cmd_buffer->submitted) {
+          VkResult result = rerecord_and_commit_cmd_buffer(queue, cmd_buffer);
+-         if (result != VK_SUCCESS)
++         if (result != VK_SUCCESS) {
++            util_dynarray_fini(&batch);
+             return result;
++         }
+       } else if (kk_cmd_buffer_has_work(cmd_buffer)) {
+-         kk_queue_commit(queue, cmd_buffer, commit_callback, dev);
++         if (standalone)
++            kk_queue_commit(queue, cmd_buffer, commit_callback, dev);
++         else
++            kk_cmd_buffer_append_segments(cmd_buffer, &batch);
+       }
+ 
+       cmd_buffer->submitted = true;
+@@ -222,6 +455,8 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+          cmd_buffer->drawable = NULL;
+       }
+    }
++   kk_queue_flush_batch(queue, &batch);
++   util_dynarray_fini(&batch);
+ 
+    for (uint32_t i = 0u; i < submit->signal_count; ++i) {
+       struct vk_sync_signal *signal = &submit->signals[i];
+@@ -283,10 +518,14 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+ 
+    queue->free_cmd_buffers = UTIL_DYNARRAY_INIT;
+    queue->commits_in_flight = 0u;
++   queue->merge_bookends = UTIL_DYNARRAY_INIT;
++   queue->merge_commits_in_flight = 0u;
+    mtx_init(&queue->mutex, mtx_plain);
+    cnd_init(&queue->cond);
+ 
+    queue->mtl_handle = mtl_new_command_queue(dev->mtl_handle);
++   queue->merge_fence = mtl_new_fence(dev->mtl_handle);
++   queue->vertex_wait = MTL_STAGE_ALL;
+    mtl_command_queue_add_residency_set(queue->mtl_handle,
+                                        dev->residency_set.handle);
+ 
+@@ -304,9 +543,15 @@ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
+    mtl_command_queue_remove_residency_set(queue->mtl_handle,
+                                           dev->residency_set.handle);
+    mtl_release(queue->mtl_handle);
++   mtl_release(queue->merge_fence);
+ 
+    kk_DestroyCommandPool(kk_device_to_handle(dev),
+                          kk_cmd_pool_to_handle(queue->cmd_pool), NULL);
++   util_dynarray_foreach(&queue->merge_bookends, struct kk_bookend, bookend) {
++      mtl_release(bookend->cmd_buf);
++      mtl_release(bookend->allocator);
++   }
++   util_dynarray_fini(&queue->merge_bookends);
+    util_dynarray_fini(&queue->free_cmd_buffers);
+    cnd_destroy(&queue->cond);
+    mtx_destroy(&queue->mutex);
+
+--- src/kosmickrisp/vulkan/kk_queue.h
++++ src/kosmickrisp/vulkan/kk_queue.h
+@@ -18,6 +18,11 @@
+ 
+ #include "c11/threads.h"
+ 
++struct kk_bookend {
++   mtl_command_buffer *cmd_buf;
++   mtl_command_allocator *allocator;
++};
++
+ struct kk_queue {
+    struct vk_queue vk;
+    struct mtl_command_queue *mtl_handle;
+@@ -29,6 +34,12 @@ struct kk_queue {
+    struct kk_cmd_pool *cmd_pool;
+    struct util_dynarray free_cmd_buffers;
+    uint32_t commits_in_flight;
++   struct util_dynarray merge_bookends;
++   uint32_t merge_commits_in_flight;
++   /* Orders the vertex stage of merged render passes after earlier work, see
++    * kk_queue_merge_wait */
++   mtl_fence *merge_fence;
++   enum mtl_stages vertex_wait;
+    mtx_t mutex;
+    cnd_t cond;
+ };
+

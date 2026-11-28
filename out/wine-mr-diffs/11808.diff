@@ -1,0 +1,17 @@
+# ntdll: Avoid exposing x86-64 syscall dispatcher to the client side.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11808 state=opened
+# 
+--- dlls/ntdll/unix/dwarf.h
++++ dlls/ntdll/unix/dwarf.h
+@@ -1033,6 +1033,7 @@ static void apply_frame_state( CONTEXT *context, struct frame_state *state,
+ 
+ #elif defined(__x86_64__)
+ 
++#define DW_OP_rax DW_OP_breg0
+ #define DW_OP_rcx DW_OP_breg2
+ #define DW_OP_rbp DW_OP_breg6
+ #define DW_OP_rsp DW_OP_breg7
+
+--- dlls/ntdll/unix/signal_x86_64.c
++++ dlls/ntdll/unix/signal_x86_64.c
+

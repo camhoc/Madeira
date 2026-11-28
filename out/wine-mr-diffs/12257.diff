@@ -1,0 +1,26 @@
+# ntdll: Reserve a slightly different top-down area on macOS.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12257 state=closed
+# On macOS, go back to reserving the top-down area at `0x7ff000000000` (as was done until c2aaafcf10c5f4b90fa7eac8bf70b2da0b0cfe77).
+
+With x86_64 Wine under Rosetta, the reservation at `0x7ffff0000000` is failing because that area is used by the dyld shared cache + Rosetta runtime (on my system that extends down to `0x7ff1020e7000`). We were seeing some crashes because of this, although they were not consistently reproducible.
+
+On ARM64, that part of the address space is totally unused, but the `0x7ffff0000000` - `0x7ffffe000000` reservation runs right up to the address space limit which for some reason caused `exec()` after a `fork()` to fail with `EFAULT`. Still investigating that, but moving the reservation away from the limit also solves that.
+--- dlls/ntdll/unix/virtual.c
++++ dlls/ntdll/unix/virtual.c
+@@ -716,8 +716,15 @@ static void mmap_init( const struct preload_info *preload_info )
+ #endif
+         reserve_area( user_space_limit, 0 );
+ 
++#else
++#ifdef __APPLE__
++    /* On macOS, allocate this lower to avoid the dyld shared cache (on Intel/Rosetta)
++     * and the address space limit (on ARM64).
++     */
++    reserve_area( (void *)0x7ff000000000, (void *)0x7ff00e000000 ); /* top-down area */
+ #else
+     reserve_area( (void *)0x7ffff0000000, (void *)0x7ffffe000000 ); /* top-down area */
++#endif
+     if (preload_info) return;
+     reserve_area( (void *)0x000000010000, (void *)0x000068000000 );
+     reserve_area( (void *)0x00007f000000, (void *)0x00007fff0000 );
+

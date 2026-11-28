@@ -1,0 +1,39 @@
+# dwrite: Lookup tag prefixes for neutral fallback locales.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12009 state=closed
+# i'm not quite sure this exact algorithm is correct for what windows does, but seems inline with their help pages about fallback languages
+
+fixes a regression on steam game infinite evo (appid 4288940)
+--- dlls/dwrite/analyzer.c
++++ dlls/dwrite/analyzer.c
+@@ -547,16 +547,28 @@ static HRESULT fallback_locale_add_mapping(struct fallback_locale *locale, size_
+     return S_OK;
+ }
+ 
+-/* TODO: potentially needs improvement to consider partially matching locale names. */
+ static struct fallback_locale * font_fallback_get_locale(const struct list *locales,
+         const WCHAR *locale_name, bool use_neutral)
+ {
++    size_t len = wcslen(locale_name), best_match = 0;
+     struct fallback_locale *locale, *neutral = NULL;
+ 
+     LIST_FOR_EACH_ENTRY(locale, locales, struct fallback_locale, entry)
+     {
+         if (!wcsicmp(locale->name, locale_name)) return locale;
+-        if (use_neutral && !*locale->name) neutral = locale;
++        if (!use_neutral) continue;
++
++        if (!wcsnicmp(locale->name, locale_name, len))
++        {
++            size_t tag_len = wcslen(locale->name);
++
++            if (tag_len > best_match && tag_len >= len && locale->name[len] == L'-')
++            {
++                neutral = locale;
++                best_match = tag_len;
++            }
++        }
++        else if (!neutral && !*locale->name) neutral = locale;
+     }
+ 
+     return neutral;
+

@@ -1,0 +1,14 @@
+# cscript: Build as ARM64X.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12671 state=merged
+# `cscript.exe` is built as ARM64X on Windows 11 (as of build 26100 at least).
+--- programs/cscript/Makefile.in
++++ programs/cscript/Makefile.in
+@@ -2,6 +2,7 @@ MODULE    = cscript.exe
+ IMPORTS   = uuid shell32 oleaut32 ole32 user32 advapi32
+ EXTRADEFS = -DCSCRIPT_BUILD
+ PARENTSRC = ../wscript
++ENABLE_ARCHS = $(PE_ARCHS)
+ 
+ EXTRADLLFLAGS = -mconsole -municode
+ 
+

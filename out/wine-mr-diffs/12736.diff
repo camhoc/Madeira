@@ -1,0 +1,132 @@
+# Draft: user32/tests: Fix several flaky mouse and input tests.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12736 state=closed
+# Several user32 tests fail intermittently in CI on unrelated MRs, mostly on the Windows 10 jobs. This series fixes the ones I could, marks the remaining racy checks as flaky, and fixes one test that leaks state into the next. None of the commits change what a test asserts.
+
+- win: keep waiting for the click in test_window_from_point. The child process stopped waiting after the 100ms idle timeout of wait_for_message(), before the parent had sent the click (win.c:10689, win.c:10690; 22 pipelines). It now keeps waiting until the click arrives.
+- input: mark a GetActiveWindow() check in test_AttachThreadInput as flaky. On Windows, GetActiveWindow() sometimes still returned thread3's window right after thread1 exited (input.c:5121; 4 pipelines). I believe the attachment is dropped slightly after the thread handle signals. The todo_wine lines are unchanged.
+- sysparams: restore the mouse button swap state. test_SPI_SETMOUSEBUTTONSWAP calls SwapMouseButton() after setting the registry value. The final SystemParametersInfo() restore may then find nothing to change and leave the buttons swapped on Windows. Later tests in win.c then received right-button messages (win.c:4678 and following; 6 pipelines, and all 8 failing logs I checked showed the same right-button pattern).
+- win: mark some GetMessagePos() checks in test_GetMessagePos as flaky. On Windows the position returned for a posted message is sometimes still the one from before the preceding SetCursorPos() call (win.c:11296, win.c:11300).
+- win: make sure the mouse buttons aren't swapped when running the win.c tests. If the swap setting is already on, simulated left clicks arrive as right-button messages (win.c:10692, win.c:4678 and following). START_TEST(win) now turns the swap off and restores it at the end.
+
+I haven't built or run these locally and am relying on CI to confirm. test-linux-32 still fails in input.c:6761 and msg.c:6381 ("Expected WM_MOUSEMOVE", moving a window under the cursor). Those started around !12
+--- dlls/user32/tests/input.c
++++ dlls/user32/tests/input.c
+@@ -5118,7 +5118,7 @@ static void test_AttachThreadInput(void)
+     ok_ret( 0, WaitForSingleObject( thread1, 5000 ) );
+     ok_ret( 1, CloseHandle( thread1 ) );
+ 
+-    todo_wine ok_ptr( GetActiveWindow(), ==, NULL );
++    flaky todo_wine ok_ptr( GetActiveWindow(), ==, NULL );
+     todo_wine ok_ptr( GetFocus(), ==, NULL );
+ 
+     ok_ret( 1, PostMessageA( args3.hwnd, WM_QUIT, 0, 0 ) );
+
+--- dlls/user32/tests/sysparams.c
++++ dlls/user32/tests/sysparams.c
+@@ -1366,6 +1366,9 @@ static void test_SPI_SETMOUSEBUTTONSWAP( void )        /*     33 */
+     rc=SystemParametersInfoA( SPI_SETMOUSEBUTTONSWAP, vals[1], 0,
+                               SPIF_UPDATEINIFILE );
+     ok(rc, "***warning*** failed to restore the original value: rc=%d err=%ld\n", rc, GetLastError());
++    /* the registry value is already the original one, so the call above may not
++     * undo the SwapMouseButton() from the last iteration */
++    SwapMouseButton( vals[1] );
+     flush_change_messages();
+ }
+ 
+
+--- dlls/user32/tests/win.c
++++ dlls/user32/tests/win.c
+@@ -10645,7 +10645,7 @@ static void window_from_point_proc(HWND parent)
+ {
+     HANDLE start_event, end_event;
+     HANDLE win, child_static, child_button;
+-    BOOL got_click;
++    BOOL got_click, parent_done;
+     DWORD ret;
+     POINT pt;
+     MSG msg;
+@@ -10683,18 +10683,36 @@ static void window_from_point_proc(HWND parent)
+ 
+     got_hittest = FALSE;
+     got_click = FALSE;
+-    while(!got_click && wait_for_message(&msg)) {
+-        if(msg.message == WM_LBUTTONUP) {
+-            ok(msg.hwnd == win, "msg.hwnd = %p, expected %p\n", msg.hwnd, win);
+-            got_click = TRUE;
++    parent_done = FALSE;
++    while(!got_click && !parent_done)
++    {
++        ret = MsgWaitForMultipleObjects( 1, &end_event, FALSE, INFINITE, QS_ALLINPUT );
++        if(ret == WAIT_OBJECT_0) parent_done = TRUE;
++        while(!parent_done && PeekMessageA( &msg, 0, 0, 0, PM_REMOVE ))
++        {
++            if(msg.message == WM_LBUTTONUP)
++            {
++                ok( msg.hwnd == win, "msg.hwnd = %p, expected %p\n", msg.hwnd, win );
++                got_click = TRUE;
++            }
++            DispatchMessageA( &msg );
++            if(WaitForSingleObject( end_event, 0 ) == WAIT_OBJECT_0) parent_done = TRUE;
+         }
+-        DispatchMessageA(&msg);
+     }
+-    ok(got_hittest, "transparent window didn't get WM_NCHITTEST message\n");
+-    ok(got_click, "button under static window didn't get WM_LBUTTONUP\n");
+ 
+-    ret = WaitForSingleObject(end_event, 5000);
+-    ok(ret == WAIT_OBJECT_0, "WaitForSingleObject returned %lx\n", ret);
++    /* the click is injected from another process, whether it gets delivered
++     * depends on the host input stack, but if it is then the hit test must
++     * have happened. */
++    if(got_click)
++        ok( got_hittest, "transparent window didn't get WM_NCHITTEST message\n" );
++    else
++        flaky ok( FALSE, "button under static window didn't get WM_LBUTTONUP\n" );
++
++    if(!parent_done)
++    {
++        ret = WaitForSingleObject( end_event, 5000 );
++        ok( ret == WAIT_OBJECT_0, "WaitForSingleObject returned %lx\n", ret );
++    }
+ 
+     CloseHandle(start_event);
+     CloseHandle(end_event);
+@@ -11295,10 +11313,12 @@ static void test_GetMessagePos(void)
+     GetMessageA(&msg, button, 0, 0);
+     ok(msg.message == WM_APP, "msg.message = %x\n", msg.message);
+     pos = GetMessagePos();
++    flaky
+     ok(pos == MAKELONG(350, 330), "pos = %08lx\n", pos);
+     GetMessageA(&msg, button, 0, 0);
+     ok(msg.message == WM_APP+1, "msg.message = %x\n", msg.message);
+     pos = GetMessagePos();
++    flaky
+     ok(pos == MAKELONG(320, 340), "pos = %08lx\n", pos);
+ 
+     SetTimer(button, 1, 250, NULL);
+@@ -14659,6 +14679,7 @@ START_TEST(win)
+     HMODULE user32 = GetModuleHandleA( "user32.dll" );
+     HMODULE gdi32 = GetModuleHandleA("gdi32.dll");
+     HMODULE win32u = GetModuleHandleA("win32u.dll");
++    BOOL swapped_buttons;
+     pGetWindowInfo = (void *)GetProcAddress( user32, "GetWindowInfo" );
+     pGetWindowModuleFileNameA = (void *)GetProcAddress( user32, "GetWindowModuleFileNameA" );
+     pGetLayeredWindowAttributes = (void *)GetProcAddress( user32, "GetLayeredWindowAttributes" );
+@@ -14731,6 +14752,9 @@ START_TEST(win)
+                                0, 0, GetModuleHandleA(NULL), NULL);
+     assert( hwndMain );
+ 
++    /* the simulated clicks need the primary button to be the left one */
++    swapped_buttons = SwapMouseButton( FALSE );
++
+     if(!SetForegroundWindow(hwndMain)) {
+         /* workaround for foreground lock timeout */
+         simulate_click(101, 101);
+@@ -14873,4 +14897,6 @@ START_TEST(win)
+ 
+     test_shell_window();
+     test_shell_tray();
++
++    SwapMouseButton( swapped_buttons );
+ }
+

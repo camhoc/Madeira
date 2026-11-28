@@ -1,0 +1,1001 @@
+# winevulkan, opengl32, win32u: reduce CPU overhead in OpenGL and Vulkan apps
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12024 state=closed
+# This MR reduces CPU overhead when running Vulkan and OpenGL applications. Since I tested it on an overly powerful Intel Xeon E5-2699v4 server CPU and a weak graphics card. I would like to see results on Core 2 Duo and Core 2 Quad and first generations i3 i5 i7, as they are much weaker in ~15-20 times or other older CPUs — I hope there are such users here.
+
+So, here’s the most interesting thing I found out as part research project
+
+In OpenGL, perf-combined branch provides a measurable reduction in CPU system time by 5.8% (from 1.20s to 1.13s) use lock-free cache of WGL contexts in TEB and the skipping of unnecessary user_lock locks during frame presentation
+
+In Vulkan, CPU time in userspace also decreased slightly (from 1.31s to 1.28s) use binary search in loader_thunks and stack buffer queue submission
+
+Summary in percentage (Xeon E5-2699v4):
+- -2.2% CPU time in openGL (reduction in kernel sys time by -5.8%) and -0.1% in Vulkan
+- avg RSS +0.5% in OpenGL and -0.2% lower RAM consumption in Vulkan 
+
+![image](/uploads/79f7725928cf524d6007ee209a3e066c/image.png){width=900 height=395}
+
+![image](/uploads/7c5cc883db0f6677ca409844e7deb19e/image.png){width=900 height=568}
+
+![image](/uploads/afc3498116e682a0c99ce56885325b11/image.png){width=717 height=552}
+
+No regression was observed in FurMark2 benchmarks on Radeon HD 7750.
+
+![image](/uploads/c2ef04578b8ae8f0687cd4b28f32f0ba/image.png){width=900 height=397}
+--- dlls/d3dcompiler_43/compiler.c
++++ dlls/d3dcompiler_43/compiler.c
+@@ -151,7 +151,7 @@ static const char *get_line(const char **ptr)
+     const char *p, *q;
+ 
+     p = *ptr;
+-    if (!(q = strstr(p, "\n")))
++    if (!(q = strchr(p, '\n')))
+     {
+         if (!*p)
+             return NULL;
+
+--- dlls/ntdll/locale.c
++++ dlls/ntdll/locale.c
+@@ -685,21 +685,16 @@ LONG WINAPI RtlCompareUnicodeStrings( const WCHAR *s1, SIZE_T len1, const WCHAR
+ BOOLEAN WINAPI RtlPrefixUnicodeString( const UNICODE_STRING *s1, const UNICODE_STRING *s2,
+                                        BOOLEAN ignore_case )
+ {
+-    unsigned int i;
+-
+     if (s1->Length > s2->Length) return FALSE;
+     if (ignore_case)
+     {
++        unsigned int i;
+         for (i = 0; i < s1->Length / sizeof(WCHAR); i++)
+             if (casemap( nls_info.UpperCaseTable, s1->Buffer[i] ) !=
+                 casemap( nls_info.UpperCaseTable, s2->Buffer[i] )) return FALSE;
++        return TRUE;
+     }
+-    else
+-    {
+-        for (i = 0; i < s1->Length / sizeof(WCHAR); i++)
+-            if (s1->Buffer[i] != s2->Buffer[i]) return FALSE;
+-    }
+-    return TRUE;
++    return !memcmp( s1->Buffer, s2->Buffer, s1->Length );
+ }
+ 
+ 
+
+--- dlls/ntdll/rtlbitmap.c
++++ dlls/ntdll/rtlbitmap.c
+@@ -43,11 +43,6 @@ static const BYTE NTDLL_leastSignificant[16] = {
+   0, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0
+ };
+ 
+-/* Last set bit in a nibble; used for determining most significant bit */
+-static const signed char NTDLL_mostSignificant[16] = {
+-  -1, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3
+-};
+-
+ static inline ULONG maskbits( ULONG idx )
+ {
+     return ~0u << (idx & 31);
+@@ -230,7 +225,21 @@ ULONG WINAPI RtlFindSetBits(PCRTL_BITMAP lpBits, ULONG ulCount, ULONG ulHint)
+ 
+   while (ulPos < ulEnd)
+   {
+-    /* FIXME: This could be made a _lot_ more efficient */
++    if (!lpBits->Buffer[ulPos / 32])
++    {
++      ulPos = (ulPos | 31) + 1;
++      if (ulPos >= ulEnd)
++      {
++        if (ulHint)
++        {
++          ulEnd = ulHint;
++          ulPos = ulHint = 0;
++          continue;
++        }
++        break;
++      }
++    }
++
+     if (RtlAreBitsSet(lpBits, ulPos, ulCount))
+       return ulPos;
+ 
+@@ -277,7 +286,21 @@ ULONG WINAPI RtlFindClearBits(PCRTL_BITMAP lpBits, ULONG ulCount, ULONG ulHint)
+ 
+   while (ulPos < ulEnd)
+   {
+-    /* FIXME: This could be made a _lot_ more efficient */
++    if (lpBits->Buffer[ulPos / 32] == ~0U)
++    {
++      ulPos = (ulPos | 31) + 1;
++      if (ulPos >= ulEnd)
++      {
++        if (ulHint)
++        {
++          ulEnd = ulHint;
++          ulPos = ulHint = 0;
++          continue;
++        }
++        break;
++      }
++    }
++
+     if (RtlAreBitsClear(lpBits, ulPos, ulCount))
+       return ulPos;
+ 
+@@ -387,30 +410,14 @@ ULONG WINAPI RtlNumberOfClearBits(PCRTL_BITMAP lpBits)
+  */
+ CCHAR WINAPI RtlFindMostSignificantBit(ULONGLONG ulLong)
+ {
+-    signed char ret = 32;
+-    DWORD dw;
+-
+-    if (!(dw = (ulLong >> 32)))
+-    {
+-        ret = 0;
+-        dw = (DWORD)ulLong;
+-    }
+-    if (dw & 0xffff0000)
+-    {
+-        dw >>= 16;
+-        ret += 16;
+-    }
+-    if (dw & 0xff00)
+-    {
+-        dw >>= 8;
+-        ret += 8;
+-    }
+-    if (dw & 0xf0)
+-    {
+-        dw >>= 4;
+-        ret += 4;
+-    }
+-    return ret + NTDLL_mostSignificant[dw];
++    unsigned long index;
++#if defined(_WIN64) || __has_builtin(_BitScanReverse64)
++    return _BitScanReverse64( &index, ulLong ) ? (CCHAR)index : -1;
++#else
++    if (_BitScanReverse( &index, (DWORD)(ulLong >> 32) )) return (CCHAR)(index + 32);
++    if (_BitScanReverse( &index, (DWORD)ulLong )) return (CCHAR)index;
++    return -1;
++#endif
+ }
+ 
+ /*************************************************************************
+@@ -423,30 +430,14 @@ CCHAR WINAPI RtlFindMostSignificantBit(ULONGLONG ulLong)
+  */
+ CCHAR WINAPI RtlFindLeastSignificantBit(ULONGLONG ulLong)
+ {
+-    signed char ret = 0;
+-    DWORD dw;
+-
+-    if (!(dw = (DWORD)ulLong))
+-    {
+-        ret = 32;
+-        if (!(dw = ulLong >> 32)) return -1;
+-    }
+-    if (!(dw & 0xffff))
+-    {
+-        dw >>= 16;
+-        ret += 16;
+-    }
+-    if (!(dw & 0xff))
+-    {
+-        dw >>= 8;
+-        ret += 8;
+-    }
+-    if (!(dw & 0x0f))
+-    {
+-        dw >>= 4;
+-        ret += 4;
+-    }
+-    return ret + NTDLL_leastSignificant[dw & 0x0f];
++    unsigned long index;
++#if defined(_WIN64) || __has_builtin(_BitScanForward64)
++    return _BitScanForward64( &index, ulLong ) ? (CCHAR)index : -1;
++#else
++    if (_BitScanForward( &index, (DWORD)ulLong )) return (CCHAR)index;
++    if (_BitScanForward( &index, (DWORD)(ulLong >> 32) )) return (CCHAR)(index + 32);
++    return -1;
++#endif
+ }
+ 
+ /*************************************************************************
+
+--- dlls/ntdll/rtlstr.c
++++ dlls/ntdll/rtlstr.c
+@@ -435,6 +435,7 @@ LONG WINAPI RtlCompareUnicodeString( const UNICODE_STRING *s1, const UNICODE_STR
+ BOOLEAN WINAPI RtlEqualString( const STRING *s1, const STRING *s2, BOOLEAN CaseInsensitive )
+ {
+     if (s1->Length != s2->Length) return FALSE;
++    if (!CaseInsensitive) return !memcmp( s1->Buffer, s2->Buffer, s1->Length );
+     return !RtlCompareString( s1, s2, CaseInsensitive );
+ }
+ 
+@@ -448,6 +449,7 @@ BOOLEAN WINAPI RtlEqualUnicodeString( const UNICODE_STRING *s1, const UNICODE_ST
+                                       BOOLEAN CaseInsensitive )
+ {
+     if (s1->Length != s2->Length) return FALSE;
++    if (!CaseInsensitive) return !memcmp( s1->Buffer, s2->Buffer, s1->Length );
+     return !RtlCompareUnicodeString( s1, s2, CaseInsensitive );
+ }
+ 
+@@ -467,20 +469,15 @@ BOOLEAN WINAPI RtlEqualUnicodeString( const UNICODE_STRING *s1, const UNICODE_ST
+  */
+ BOOLEAN WINAPI RtlPrefixString( const STRING *s1, const STRING *s2, BOOLEAN ignore_case )
+ {
+-    unsigned int i;
+-
+     if (s1->Length > s2->Length) return FALSE;
+     if (ignore_case)
+     {
++        unsigned int i;
+         for (i = 0; i < s1->Length; i++)
+             if (RtlUpperChar(s1->Buffer[i]) != RtlUpperChar(s2->Buffer[i])) return FALSE;
++        return TRUE;
+     }
+-    else
+-    {
+-        for (i = 0; i < s1->Length; i++)
+-            if (s1->Buffer[i] != s2->Buffer[i]) return FALSE;
+-    }
+-    return TRUE;
++    return !memcmp( s1->Buffer, s2->Buffer, s1->Length );
+ }
+ 
+ 
+
+--- dlls/oledb32/datainit.c
++++ dlls/oledb32/datainit.c
+@@ -824,7 +824,7 @@ static int get_propvalue_length(DBPROP *prop)
+     {
+         length = SysStringLen(V_BSTR(v));
+         /* Quotes values with '\"' if the value contains semicolons */
+-        if (wcsstr(V_BSTR(v), L";"))
++        if (wcschr(V_BSTR(v), ';'))
+             length += 2;
+         return length;
+     }
+@@ -835,7 +835,7 @@ static int get_propvalue_length(DBPROP *prop)
+     {
+         length = SysStringLen(V_BSTR(&str));
+         /* Quotes values with '\"' if the value contains semicolons */
+-        if (wcsstr(V_BSTR(&str), L";"))
++        if (wcschr(V_BSTR(&str), ';'))
+             length += 2;
+         VariantClear(&str);
+         return length;
+@@ -852,7 +852,7 @@ static void write_propvalue_str(WCHAR *str, DBPROP *prop)
+ 
+     if (V_VT(v) == VT_BSTR)
+     {
+-        if (wcsstr(V_BSTR(v), L";"))
++        if (wcschr(V_BSTR(v), ';'))
+         {
+             lstrcatW(str, L"\"");
+             lstrcatW(str, V_BSTR(v));
+@@ -869,7 +869,7 @@ static void write_propvalue_str(WCHAR *str, DBPROP *prop)
+     hr = VariantChangeType(&vstr, v, VARIANT_ALPHABOOL, VT_BSTR);
+     if (hr == S_OK)
+     {
+-        if (wcsstr(V_BSTR(&vstr), L";"))
++        if (wcschr(V_BSTR(&vstr), ';'))
+         {
+             lstrcatW(str, L"\"");
+             lstrcatW(str, V_BSTR(&vstr));
+
+--- dlls/opengl32/wgl.c
++++ dlls/opengl32/wgl.c
+@@ -47,6 +47,7 @@ static const MAT2 identity = { {0,1},{0,0},{0,0},{0,1} };
+ #define WINE_GL_RESERVED_FORMATS_PTR      3
+ #define WINE_GL_RESERVED_FORMATS_NUM      4
+ #define WINE_GL_RESERVED_FORMATS_ONSCREEN 5
++#define WINE_GL_RESERVED_CURRENT_CONTEXT  6
+ 
+ static CRITICAL_SECTION wgl_cs;
+ static CRITICAL_SECTION_DEBUG wgl_cs_debug = {
+@@ -695,10 +696,9 @@ static void free_client_context( struct handle_entry *ptr )
+     free( context );
+ }
+ 
+-static struct context *get_current_context(void)
++static inline struct context *get_current_context(void)
+ {
+-    HGLRC current = NtCurrentTeb()->glCurrentRC;
+-    return current ? context_from_handle( current ) : NULL;
++    return NtCurrentTeb()->glReserved1[WINE_GL_RESERVED_CURRENT_CONTEXT];
+ }
+ 
+ static void *grow_string_entry( struct context *ctx, void *ptr, UINT len )
+@@ -1170,6 +1170,7 @@ BOOL WINAPI wglMakeContextCurrentARB( HDC draw_hdc, HDC read_hdc, HGLRC handle )
+     teb->glCurrentRC = handle;
+     teb->glReserved1[0] = draw_hdc;
+     teb->glReserved1[1] = read_hdc;
++    teb->glReserved1[WINE_GL_RESERVED_CURRENT_CONTEXT] = context ? context_from_opengl_client_context( context ) : NULL;
+     return TRUE;
+ }
+ 
+@@ -1247,14 +1248,22 @@ void set_context_attribute( GLenum name, const void *value, size_t size )
+ 
+     if (!(ctx = get_current_context())) return;
+ 
++    if (name == -1)
++    {
++        if (ctx->used == -1) return;
++        WARN( "Unsupported attribute on context %p\n", ctx );
++        ctx->used = -1;
++        return;
++    }
++
+     if (name == GL_FRAMEBUFFER)
+     {
+         set_context_attribute( GL_READ_FRAMEBUFFER, value, size );
+         name = GL_DRAW_FRAMEBUFFER;
+     }
+ 
+-    if (name != -1 && (desc = bsearch( &key, context_attributes, ARRAY_SIZE(context_attributes),
+-                                       sizeof(*context_attributes), compare_context_attributes )))
++    if ((desc = bsearch( &key, context_attributes, ARRAY_SIZE(context_attributes),
++                         sizeof(*context_attributes), compare_context_attributes )))
+     {
+         if (size && size != desc->size) ERR( "Invalid state attrib %#x parameter size %#Ix\n", name, size );
+         else
+@@ -2823,7 +2832,7 @@ GLhandleARB WINAPI glGetHandleARB( GLenum pname )
+     if ((status = UNIX_CALL( glGetHandleARB, &args ))) WARN( "glGetHandleARB returned %#lx\n", status );
+     if (!args.ret) return args.ret;
+ 
+-    if (!(ctx = context_from_handle( args.teb->glCurrentRC ))) return 0;
++    if (!(ctx = get_current_context())) return 0;
+     if (!(table = get_object_table( ctx, OBJ_TYPE_SHADER, FALSE ))) return 0;
+ 
+     AcquireSRWLockShared( &table->lock );
+@@ -2846,7 +2855,7 @@ void WINAPI glGetAttachedObjectsARB( GLhandleARB container, GLsizei max_count, G
+     args.containerObj = *map_context_objects( OBJ_TYPE_SHADER, 1, &container );
+     if ((status = UNIX_CALL( glGetAttachedObjectsARB, &args ))) WARN( "glGetAttachedObjectsARB returned %#lx\n", status );
+ 
+-    if (!(ctx = context_from_handle( args.teb->glCurrentRC ))) return;
++    if (!(ctx = get_current_context())) return;
+     if (!(table = get_object_table( ctx, OBJ_TYPE_SHADER, FALSE ))) return;
+ 
+     AcquireSRWLockShared( &table->lock );
+@@ -2871,7 +2880,7 @@ void WINAPI glGetAttachedShaders( GLuint program, GLsizei max_count, GLsizei *co
+     args.program = *map_context_objects( OBJ_TYPE_SHADER, 1, &program );
+     if ((status = UNIX_CALL( glGetAttachedShaders, &args ))) WARN( "glGetAttachedShaders returned %#lx\n", status );
+ 
+-    if (!(ctx = context_from_handle( args.teb->glCurrentRC ))) return;
++    if (!(ctx = get_current_context())) return;
+     if (!(table = get_object_table( ctx, OBJ_TYPE_SHADER, FALSE ))) return;
+ 
+     AcquireSRWLockShared( &table->lock );
+@@ -2936,7 +2945,7 @@ GLsync WINAPI glCreateSyncFromCLeventARB( struct _cl_context *context, struct _c
+ 
+     TRACE( "context %p, event %p, flags %d\n", context, event, flags );
+ 
+-    if (!(ctx = context_from_handle( teb->glCurrentRC ))) return NULL;
++    if (!(ctx = get_current_context())) return NULL;
+     if (!(ptr = alloc_client_sync( ctx ))) return NULL;
+     args.ret = ptr->user_data;
+ 
+@@ -2958,7 +2967,7 @@ void WINAPI glDeleteSync( GLsync sync )
+ 
+     TRACE( "sync %p\n", sync );
+ 
+-    if (!(ctx = context_from_handle( teb->glCurrentRC ))) return;
++    if (!(ctx = get_current_context())) return;
+     if (!(ptr = get_handle_ptr( &ctx->lists->syncs, sync ))) return set_gl_error( GL_INVALID_VALUE );
+     args.sync = ptr->user_data;
+ 
+@@ -2976,7 +2985,7 @@ GLsync WINAPI glFenceSync( GLenum condition, GLbitfield flags )
+ 
+     TRACE( "condition %d, flags %d\n", condition, flags );
+ 
+-    if (!(ctx = context_from_handle( teb->glCurrentRC ))) return NULL;
++    if (!(ctx = get_current_context())) return NULL;
+     if (!(ptr = alloc_client_sync( ctx ))) return NULL;
+     args.ret = ptr->user_data;
+ 
+@@ -2998,7 +3007,7 @@ GLsync WINAPI glImportSyncEXT( GLenum external_sync_type, GLintptr external_sync
+ 
+     TRACE( "external_sync_type %d, external_sync %Id, flags %d\n", external_sync_type, external_sync, flags );
+ 
+-    if (!(ctx = context_from_handle( teb->glCurrentRC ))) return NULL;
++    if (!(ctx = get_current_context())) return NULL;
+     if (!(ptr = alloc_client_sync( ctx ))) return NULL;
+     args.ret = ptr->user_data;
+ 
+@@ -3118,7 +3127,7 @@ const GLubyte * WINAPI glGetString( GLenum name )
+ 
+     TRACE( "name %d\n", name );
+ 
+-    if (!(ctx = context_from_handle( NtCurrentTeb()->glCurrentRC ))) return NULL;
++    if (!(ctx = get_current_context())) return NULL;
+ 
+     switch (name)
+     {
+@@ -3159,7 +3168,7 @@ const GLchar * WINAPI wglQueryCurrentRendererStringWINE( GLenum attribute )
+ 
+     TRACE( "attribute %d\n", attribute );
+ 
+-    if (!(ctx = context_from_handle( NtCurrentTeb()->glCurrentRC ))) return NULL;
++    if (!(ctx = get_current_context())) return NULL;
+ 
+     args.ret = wow64_str = alloc_string_entry( ctx, unix_wglQueryCurrentRendererStringWINE, attribute, 0, 64 );
+     while ((status = UNIX_CALL( wglQueryCurrentRendererStringWINE, &args )) == STATUS_BUFFER_TOO_SMALL && wow64_str)
+@@ -3185,7 +3194,7 @@ const GLchar * WINAPI wglQueryRendererStringWINE( HDC dc, GLint renderer, GLenum
+ 
+     TRACE( "dc %p, renderer %d, attribute %d\n", dc, renderer, attribute );
+ 
+-    if (!(ctx = context_from_handle( NtCurrentTeb()->glCurrentRC ))) return NULL;
++    if (!(ctx = get_current_context())) return NULL;
+ 
+     args.ret = wow64_str = alloc_string_entry( ctx, unix_wglQueryRendererStringWINE, attribute, 0, 64 );
+     while ((status = UNIX_CALL( wglQueryRendererStringWINE, &args )) == STATUS_BUFFER_TOO_SMALL && wow64_str)
+
+--- dlls/wbemprox/query.c
++++ dlls/wbemprox/query.c
+@@ -96,7 +96,7 @@ void destroy_view( struct view *view )
+ 
+ static BOOL eval_like( const WCHAR *text, const WCHAR *pattern )
+ {
+-    if (wcsstr( pattern, L"[" )) FIXME( "character ranges (i.e. [abc], [^a-z]) are not supported\n" );
++    if (wcschr( pattern, '[' )) FIXME( "character ranges (i.e. [abc], [^a-z]) are not supported\n" );
+ 
+     while (*text)
+     {
+
+--- dlls/win32u/dce.c
++++ dlls/win32u/dce.c
+@@ -759,6 +759,8 @@ void flush_window_surfaces( BOOL idle )
+     DWORD now;
+     struct window_surface *surface;
+ 
++    if (list_empty( &window_surfaces )) return;
++
+     pthread_mutex_lock( &surfaces_lock );
+     now = NtGetTickCount();
+     if (idle) last_idle = now;
+
+--- dlls/win32u/message.c
++++ dlls/win32u/message.c
+@@ -3378,19 +3378,20 @@ void check_for_events( UINT flags )
+ /* monotonic timer tick for throttling driver event checks */
+ static inline LONGLONG get_driver_check_time(void)
+ {
+-    LARGE_INTEGER counter, freq;
+-    NtQueryPerformanceCounter( &counter, &freq );
+-    return counter.QuadPart * 8000 / freq.QuadPart; /* 8kHz */
++    LARGE_INTEGER counter;
++    NtQueryPerformanceCounter( &counter, NULL );
++    return counter.QuadPart / 1250; /* 10MHz / 8kHz = 1250 */
+ }
+ 
+ /* check for driver events if we detect that the app is not properly consuming messages */
+ static inline void check_for_driver_events(void)
+ {
+-    if (get_user_thread_info()->last_driver_time != get_driver_check_time())
++    LONGLONG now = get_driver_check_time();
++    if (get_user_thread_info()->last_driver_time != now)
+     {
+         flush_window_surfaces( FALSE );
+         process_driver_events( QS_ALLINPUT, 0, 0 );
+-        get_user_thread_info()->last_driver_time = get_driver_check_time();
++        get_user_thread_info()->last_driver_time = now;
+     }
+ }
+ 
+@@ -3572,20 +3573,27 @@ BOOL WINAPI NtUserPeekMessage( MSG *msg_out, HWND hwnd, UINT first, UINT last, U
+     {
+         if (!ret)
+         {
+-            struct thunk_lock_params params = {.dispatch.callback = thunk_lock_callback};
+-            void *ret_ptr;
+-            ULONG ret_len;
+-
+             flush_window_surfaces( TRUE );
+ 
+-            if (!KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len ) &&
+-                ret_len == sizeof(params.locks))
++            if (thunk_lock_callback)
++            {
++                struct thunk_lock_params params = {.dispatch.callback = thunk_lock_callback};
++                void *ret_ptr;
++                ULONG ret_len;
++
++                if (!KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len ) &&
++                    ret_len == sizeof(params.locks))
++                {
++                    params.locks = *(DWORD *)ret_ptr;
++                    params.restore = TRUE;
++                }
++                NtYieldExecution();
++                KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len );
++            }
++            else if (!(flags & PM_NOYIELD) && !(flags & PM_REMOVE))
+             {
+-                params.locks = *(DWORD *)ret_ptr;
+-                params.restore = TRUE;
++                NtYieldExecution();
+             }
+-            NtYieldExecution();
+-            KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len );
+         }
+         return FALSE;
+     }
+
+--- dlls/win32u/opengl.c
++++ dlls/win32u/opengl.c
+@@ -600,6 +600,8 @@ struct framebuffer_surface
+ {
+     struct opengl_drawable  base;
+     struct opengl_drawable *target;         /* driver drawable to present to */
++    GLuint                  read_buffers[2];
++    GLuint                  draw_buffers[2];
+ };
+ 
+ static const struct opengl_drawable_funcs framebuffer_surface_funcs;
+@@ -771,7 +773,7 @@ static void destroy_framebuffer_attachment( struct opengl_drawable *drawable, GL
+     TRACE( "drawable %p/%u destroyed %s buffer %#x/%u\n", drawable, fbo, kind, attachment, name );
+ }
+ 
+-static GLuint create_framebuffer( struct opengl_drawable *drawable, const struct wgl_pixel_format *desc, SIZE size )
++static GLuint create_framebuffer( struct opengl_drawable *drawable, const struct wgl_pixel_format *desc, SIZE size, GLuint *buffers )
+ {
+     const struct opengl_funcs *funcs = &display_funcs;
+     GLuint count = 1, fbo, name;
+@@ -797,6 +799,7 @@ static GLuint create_framebuffer( struct opengl_drawable *drawable, const struct
+             init_framebuffer_attachment( drawable, fbo, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE, name, desc, size );
+             funcs->p_glFramebufferTexture( GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, name, 0 );
+         }
++        if (buffers && i < 2) buffers[i] = name;
+         TRACE( "drawable %p/%u created color buffer %#x/%u, %s\n", drawable, fbo, GL_COLOR_ATTACHMENT0 + i, name, wine_dbgstr_point( (POINT *)&size ) );
+     }
+ 
+@@ -889,20 +892,19 @@ static void blit_framebuffer_surface( struct opengl_drawable *drawable )
+ 
+     if (drawable->read_fbo == drawable->draw_fbo && use_default_gamma_ramp())
+     {
++        GLenum filter = (src.cx == dst.cx && src.cy == dst.cy) ? GL_NEAREST : GL_LINEAR;
+         funcs->p_glReadBuffer( GL_COLOR_ATTACHMENT0 );
+-        funcs->p_glBlitFramebuffer( 0, 0, src.cx, src.cy, 0, 0, dst.cx, dst.cy, GL_COLOR_BUFFER_BIT, GL_LINEAR );
++        funcs->p_glBlitFramebuffer( 0, 0, src.cx, src.cy, 0, 0, dst.cx, dst.cy, GL_COLOR_BUFFER_BIT, filter );
+     }
+     else
+     {
+-        GLint front;
+         GLuint vao;
+ 
+         pthread_once( &once, init_framebuffer_program );
+         funcs->p_glUseProgram( framebuffer_program );
+ 
+         funcs->p_glActiveTexture( GL_TEXTURE0 );
+-        funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &front );
+-        funcs->p_glBindTexture( GL_TEXTURE_2D, front );
++        funcs->p_glBindTexture( GL_TEXTURE_2D, framebuffer_from_opengl_drawable( drawable )->read_buffers[0] );
+ 
+         pthread_mutex_lock( &gamma_lock );
+         if (get_float_gamma_ramp( ramp_data, &gamma_serial ))
+@@ -977,18 +979,20 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
+ 
+     if (drawable->doublebuffer)
+     {
+-        GLint front, back;
++        GLuint tmp;
+ 
+         if (drawable->draw_fbo != drawable->read_fbo)
+         {
+             funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, drawable->draw_fbo );
+-            funcs->p_glGetFramebufferAttachmentParameteriv( GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, (GLint *)&front );
+-            funcs->p_glGetFramebufferAttachmentParameteriv( GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, (GLint *)&back );
+-            funcs->p_glFramebufferRenderbuffer( GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, back );
+-            funcs->p_glFramebufferRenderbuffer( GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_RENDERBUFFER, front );
++            funcs->p_glFramebufferRenderbuffer( GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, surface->draw_buffers[1] );
++            funcs->p_glFramebufferRenderbuffer( GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_RENDERBUFFER, surface->draw_buffers[0] );
++            tmp = surface->draw_buffers[0];
++            surface->draw_buffers[0] = surface->draw_buffers[1];
++            surface->draw_buffers[1] = tmp;
+ 
+             if (drawable->stereo)
+             {
++                GLint front, back;
+                 funcs->p_glGetFramebufferAttachmentParameteriv( GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &front );
+                 funcs->p_glGetFramebufferAttachmentParameteriv( GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT3, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &back );
+                 funcs->p_glFramebufferTexture( GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, back, 0 );
+@@ -997,13 +1001,15 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
+         }
+ 
+         funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, drawable->read_fbo );
+-        funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &front );
+-        funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &back );
+-        funcs->p_glFramebufferTexture( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, back, 0 );
+-        funcs->p_glFramebufferTexture( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, front, 0 );
++        funcs->p_glFramebufferTexture( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, surface->read_buffers[1], 0 );
++        funcs->p_glFramebufferTexture( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, surface->read_buffers[0], 0 );
++        tmp = surface->read_buffers[0];
++        surface->read_buffers[0] = surface->read_buffers[1];
++        surface->read_buffers[1] = tmp;
+ 
+         if (drawable->stereo)
+         {
++            GLint front, back;
+             funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &front );
+             funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT3, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &back );
+             funcs->p_glFramebufferTexture( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, back, 0 );
+@@ -1059,11 +1065,16 @@ static struct opengl_drawable *framebuffer_surface_create( int format, struct cl
+     make_internal_context_current( NULL, NULL );
+ 
+     read_desc.samples = read_desc.sample_buffers = 0;
+-    surface->base.read_fbo = create_framebuffer( &surface->base, &read_desc, surface->base.virtual_size );
++    surface->base.read_fbo = create_framebuffer( &surface->base, &read_desc, surface->base.virtual_size, surface->read_buffers );
+     if (!surface->base.read_fbo) ERR( "Failed to create read framebuffer object\n" );
+ 
+-    if (!draw_desc.sample_buffers) surface->base.draw_fbo = surface->base.read_fbo;
+-    else surface->base.draw_fbo = create_framebuffer( &surface->base, &draw_desc, surface->base.virtual_size );
++    if (!draw_desc.sample_buffers)
++    {
++        surface->base.draw_fbo = surface->base.read_fbo;
++        surface->draw_buffers[0] = surface->read_buffers[0];
++        surface->draw_buffers[1] = surface->read_buffers[1];
++    }
++    else surface->base.draw_fbo = create_framebuffer( &surface->base, &draw_desc, surface->base.virtual_size, surface->draw_buffers );
+     if (!surface->base.draw_fbo) ERR( "Failed to create draw framebuffer object\n" );
+ 
+     make_client_context_current();
+@@ -1422,6 +1433,9 @@ static struct opengl_context *egldrv_context_create( int format, struct opengl_c
+             }
+             name = EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR;
+             break;
++        case WGL_CONTEXT_RELEASE_BEHAVIOR_ARB:
++            name = EGL_CONTEXT_RELEASE_BEHAVIOR_KHR;
++            break;
+         default:
+             name = EGL_NONE;
+             FIXME( "Unhandled attributes: %#x %#x\n", attribs[0], attribs[1] );
+@@ -2015,6 +2029,11 @@ void set_window_opengl_drawable( HWND hwnd, struct opengl_drawable *new_drawable
+     if ((win = get_win_ptr( hwnd )) && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+     {
+         struct opengl_drawable **ptr = current ? &win->current_drawable : &win->unused_drawable;
++        if (*ptr == new_drawable)
++        {
++            release_win_ptr( win );
++            return;
++        }
+         old_drawable = *ptr;
+         if ((*ptr = new_drawable)) opengl_drawable_add_ref( new_drawable );
+         release_win_ptr( win );
+
+--- dlls/win32u/sysparams.c
++++ dlls/win32u/sysparams.c
+@@ -1377,7 +1377,8 @@ const char *gpu_device_name( UINT16 vendor, UINT16 device, const char *default_n
+     case MAKELONG(0x1002, 0x6739): return "AMD Radeon HD 6800 Series";
+     case MAKELONG(0x1002, 0x6719): return "AMD Radeon HD 6900 Series";
+     case MAKELONG(0x1002, 0x9901): return "AMD Radeon HD 7660D";
+-    case MAKELONG(0x1002, 0x683d): return "AMD Radeon HD 7700 Series";
++    case MAKELONG(0x1002, 0x683d):
++    case MAKELONG(0x1002, 0x683f): return "AMD Radeon HD 7700 Series";
+     case MAKELONG(0x1002, 0x6819): return "AMD Radeon HD 7800 Series";
+     case MAKELONG(0x1002, 0x6818): return "AMD Radeon HD 7870 Series";
+     case MAKELONG(0x1002, 0x679a): return "AMD Radeon HD 7900 Series";
+@@ -2942,11 +2943,7 @@ static LONG gamma_serial;
+ 
+ BOOL use_default_gamma_ramp(void)
+ {
+-    BOOL ret;
+-    pthread_mutex_lock( &display_lock );
+-    ret = !gamma_serial;
+-    pthread_mutex_unlock( &display_lock );
+-    return ret;
++    return !ReadNoFence( &gamma_serial );
+ }
+ 
+ BOOL get_float_gamma_ramp( float *data, LONG *serial )
+
+--- dlls/win32u/vulkan.c
++++ dlls/win32u/vulkan.c
+@@ -2001,21 +2001,26 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+         client_surface_present( surface->client );
+ 
+         if (swapchain_res < VK_SUCCESS) continue;
+-        if (!get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ))
++        if (surface->client->updated)
+         {
+-            WARN( "Swapchain window %p is invalid, returning VK_ERROR_OUT_OF_DATE_KHR\n", surface->hwnd );
+-            if (present_info->pResults) present_info->pResults[i] = VK_ERROR_OUT_OF_DATE_KHR;
+-            if (res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
++            if (!get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ))
++            {
++                WARN( "Swapchain window %p is invalid, returning VK_ERROR_OUT_OF_DATE_KHR\n", surface->hwnd );
++                if (present_info->pResults) present_info->pResults[i] = VK_ERROR_OUT_OF_DATE_KHR;
++                if (res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
++            }
++            else if (swapchain_res)
++                WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
++            else if (!extents_equals( &swapchain->extents, &client_rect ))
++            {
++                WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
++                      swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
++                if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
++                if (!res) res = VK_SUBOPTIMAL_KHR;
++            }
+         }
+         else if (swapchain_res)
+             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
+-        else if (!extents_equals( &swapchain->extents, &client_rect ))
+-        {
+-            WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
+-                  swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
+-            if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
+-            if (!res) res = VK_SUBOPTIMAL_KHR;
+-        }
+     }
+ 
+     if (swapchains != swapchains_buffer) free( swapchains );
+@@ -2156,12 +2161,14 @@ static VkResult win32u_vkQueueSubmit( VkQueue client_queue, uint32_t count, cons
+     struct vulkan_queue *queue = vulkan_queue_from_handle( client_queue );
+     struct vulkan_device *device = queue->device;
+     VkResult res = VK_ERROR_OUT_OF_HOST_MEMORY;
+-    VkTimelineSemaphoreSubmitInfo *timelines;
++    VkTimelineSemaphoreSubmitInfo timelines_buf[4];
++    VkTimelineSemaphoreSubmitInfo *timelines = timelines_buf;
+     struct mempool pool = {0};
+ 
+     TRACE( "queue %p, count %u, submits %p, fence %p\n", queue, count, submits, fence );
+ 
+-    if (!(timelines = mem_alloc( &pool, count * sizeof(*timelines) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++    if (count > ARRAY_SIZE(timelines_buf) && !(timelines = mem_alloc( &pool, count * sizeof(*timelines) )))
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
+     memset( timelines, 0, count * sizeof(*timelines) );
+ 
+     for (uint32_t i = 0; i < count; i++)
+
+--- dlls/win32u/window.c
++++ dlls/win32u/window.c
+@@ -432,6 +432,8 @@ void client_surface_present( struct client_surface *surface )
+     HDC hdc = 0;
+     HWND hwnd;
+ 
++    if (!surface->offscreen) return;
++
+     pthread_mutex_lock( &surfaces_lock );
+     if ((hwnd = surface->hwnd))
+     {
+
+--- dlls/wined3d/utils.c
++++ dlls/wined3d/utils.c
+@@ -1920,7 +1920,7 @@ static void parse_channel_desc(struct wined3d_format *format, const char *channe
+     unsigned int attrs = 0;
+     unsigned int j;
+ 
+-    for (j = 0; j < strlen(channel_desc); ++j)
++    for (j = 0; channel_desc[j]; ++j)
+     {
+         enum wined3d_channel_type channel_type = map_channel_type(channel_desc[j]);
+ 
+
+--- dlls/winevulkan/loader.c
++++ dlls/winevulkan/loader.c
+@@ -115,15 +115,11 @@ PFN_vkVoidFunction WINAPI vkGetInstanceProcAddr(VkInstance instance, const char
+             return (PFN_vkVoidFunction)vkGetPhysicalDeviceWin32PresentationSupportKHR;
+     }
+ 
+-    if (!is_available_instance_function(instance, name))
+-        return NULL;
+-
+     func = wine_vk_get_instance_proc_addr(name);
+-    if (func) return func;
++    if (!func) func = wine_vk_get_device_proc_addr(name);
+ 
+-    /* vkGetInstanceProcAddr also loads any children of instance, so device functions as well. */
+-    func = wine_vk_get_device_proc_addr(name);
+-    if (func) return func;
++    if (func && is_available_instance_function(instance, name))
++        return func;
+ 
+     WARN("Unsupported device or instance function: %s.\n", debugstr_a(name));
+     return NULL;
+@@ -167,12 +163,9 @@ PFN_vkVoidFunction WINAPI vkGetDeviceProcAddr(VkDevice device, const char *name)
+      * vkCommandBuffer or vkQueue.
+      * Loader takes care of filtering of extensions which are enabled or not.
+      */
+-    if (is_available_device_function(device, name))
+-    {
+-        func = wine_vk_get_device_proc_addr(name);
+-        if (func)
+-            return func;
+-    }
++    func = wine_vk_get_device_proc_addr(name);
++    if (func && is_available_device_function(device, name))
++        return func;
+ 
+     /* vkGetDeviceProcAddr was intended for loading device and subdevice functions.
+      * idTech 6 titles such as Doom and Wolfenstein II, however use it also for
+
+--- dlls/winevulkan/make_vulkan
++++ dlls/winevulkan/make_vulkan
+@@ -2496,58 +2496,61 @@ class Generator(object):
+             f.write(func.gen_thunk())
+ 
+         f.write("static const struct vulkan_func vk_device_dispatch_table[] =\n{\n")
+-        for func in Type.all(Function, Function.is_client_device):
++        for func in Type.all(Function, Function.is_client_device, by_name=True):
+             f.write(f"    {{\"{func.name}\", {func.name}}},\n")
+         f.write("};\n\n")
+ 
+         f.write("static const struct vulkan_func vk_phys_dev_dispatch_table[] =\n{\n")
+-        for func in Type.all(Function, Function.is_client_physical_device):
++        for func in Type.all(Function, Function.is_client_physical_device, by_name=True):
+             f.write(f"    {{\"{func.name}\", {func.name}}},\n")
+         f.write("};\n\n")
+ 
+         f.write("static const struct vulkan_func vk_instance_dispatch_table[] =\n{\n")
+-        for func in Type.all(Function, Function.is_client_instance):
++        for func in Type.all(Function, Function.is_client_instance, by_name=True):
+             f.write(f"    {{\"{func.name}\", {func.name}}},\n")
+         f.write("};\n\n")
+ 
++        f.write("static int vulkan_func_cmp(const void *key, const void *elem)\n")
++        f.write("{\n")
++        f.write("    const struct vulkan_func *func = elem;\n")
++        f.write("    return strcmp(key, func->name);\n")
++        f.write("}\n\n")
++
+         f.write("void *wine_vk_get_device_proc_addr(const char *name)\n")
+         f.write("{\n")
+-        f.write("    unsigned int i;\n")
+-        f.write("    for (i = 0; i < ARRAY_SIZE(vk_device_dispatch_table); i++)\n")
++        f.write("    const struct vulkan_func *func;\n")
++        f.write("    func = bsearch(name, vk_device_dispatch_table, ARRAY_SIZE(vk_device_dispatch_table),\n")
++        f.write("                   sizeof(*vk_device_dispatch_table), vulkan_func_cmp);\n")
++        f.write("    if (func)\n")
+         f.write("    {\n")
+-        f.write("        if (strcmp(vk_device_dispatch_table[i].name, name) == 0)\n")
+-        f.write("        {\n")
+-        f.write("            TRACE(\"Found name=%s in device table\\n\", debugstr_a(name));\n")
+-        f.write("            return vk_device_dispatch_table[i].func;\n")
+-        f.write("        }\n")
++        f.write("        TRACE(\"Found name=%s in device table\\n\", debugstr_a(name));\n")
++        f.write("        return func->func;\n")
+         f.write("    }\n")
+         f.write("    return NULL;\n")
+         f.write("}\n\n")
+ 
+         f.write("void *wine_vk_get_phys_dev_proc_addr(const char *name)\n")
+         f.write("{\n")
+-        f.write("    unsigned int i;\n")
+-        f.write("    for (i = 0; i < ARRAY_SIZE(vk_phys_dev_dispatch_table); i++)\n")
++        f.write("    const struct vulkan_func *func;\n")
++        f.write("    func = bsearch(name, vk_phys_dev_dispatch_table, ARRAY_SIZE(vk_phys_dev_dispatch_table),\n")
++        f.write("                   sizeof(*vk_phys_dev_dispatch_table), vulkan_func_cmp);\n")
++        f.write("    if (func)\n")
+         f.write("    {\n")
+-        f.write("        if (strcmp(vk_phys_dev_dispatch_table[i].name, name) == 0)\n")
+-        f.write("        {\n")
+-        f.write("            TRACE(\"Found name=%s in physical device table\\n\", debugstr_a(name));\n")
+-        f.write("            return vk_phys_dev_dispatch_table[i].func;\n")
+-        f.write("        }\n")
++        f.write("        TRACE(\"Found name=%s in physical device table\\n\", debugstr_a(name));\n")
++        f.write("        return func->func;\n")
+         f.write("    }\n")
+         f.write("    return NULL;\n")
+         f.write("}\n\n")
+ 
+         f.write("void *wine_vk_get_instance_proc_addr(const char *name)\n")
+         f.write("{\n")
+-        f.write("    unsigned int i;\n")
+-        f.write("    for (i = 0; i < ARRAY_SIZE(vk_instance_dispatch_table); i++)\n")
++        f.write("    const struct vulkan_func *func;\n")
++        f.write("    func = bsearch(name, vk_instance_dispatch_table, ARRAY_SIZE(vk_instance_dispatch_table),\n")
++        f.write("                   sizeof(*vk_instance_dispatch_table), vulkan_func_cmp);\n")
++        f.write("    if (func)\n")
+         f.write("    {\n")
+-        f.write("        if (strcmp(vk_instance_dispatch_table[i].name, name) == 0)\n")
+-        f.write("        {\n")
+-        f.write("            TRACE(\"Found name=%s in instance table\\n\", debugstr_a(name));\n")
+-        f.write("            return vk_instance_dispatch_table[i].func;\n")
+-        f.write("        }\n")
++        f.write("        TRACE(\"Found name=%s in instance table\\n\", debugstr_a(name));\n")
++        f.write("        return func->func;\n")
+         f.write("    }\n")
+         f.write("    return NULL;\n")
+         f.write("}\n")
+
+--- dlls/winevulkan/vulkan_private.h
++++ dlls/winevulkan/vulkan_private.h
+@@ -77,8 +77,11 @@ static inline void init_conversion_context(struct conversion_context *pool)
+ static inline void free_conversion_context(struct conversion_context *pool)
+ {
+     struct list *entry, *next;
+-    LIST_FOR_EACH_SAFE(entry, next, &pool->alloc_entries)
+-        free(entry);
++    if (!list_empty(&pool->alloc_entries))
++    {
++        LIST_FOR_EACH_SAFE(entry, next, &pool->alloc_entries)
++            free(entry);
++    }
+ }
+ 
+ static inline void *conversion_context_alloc(struct conversion_context *pool, size_t size)
+
+--- dlls/winex11.drv/init.c
++++ dlls/winex11.drv/init.c
+@@ -280,6 +280,7 @@ static void x11drv_client_surface_detach( struct client_surface *client )
+ 
+     TRACE( "%s\n", debugstr_client_surface( client ) );
+ 
++    surface->attached = FALSE;
+     if ((data = get_win_data( hwnd )))
+     {
+         detach_client_window( data, client_window );
+@@ -317,9 +318,10 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
+ 
+     if (InterlockedExchange( &surface->client.offscreen, offscreen ) == offscreen)
+     {
+-        if (!offscreen && (data = get_win_data( hwnd )))
++        if (!offscreen && !surface->attached && (data = get_win_data( hwnd )))
+         {
+             attach_client_window( data, surface->window );
++            surface->attached = TRUE;
+             release_win_data( data );
+         }
+         return;
+@@ -363,8 +365,16 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
+ 
+     if ((data = get_win_data( hwnd )))
+     {
+-        if (offscreen) detach_client_window( data, surface->window );
+-        else attach_client_window( data, surface->window );
++        if (offscreen)
++        {
++            detach_client_window( data, surface->window );
++            surface->attached = FALSE;
++        }
++        else
++        {
++            attach_client_window( data, surface->window );
++            surface->attached = TRUE;
++        }
+         release_win_data( data );
+     }
+ }
+
+--- dlls/winex11.drv/x11drv.h
++++ dlls/winex11.drv/x11drv.h
+@@ -374,6 +374,7 @@ struct x11drv_client_surface
+ 
+     HDC hdc_src;
+     HDC hdc_dst;
++    BOOL attached;
+ };
+ 
+ extern struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client );
+
+--- programs/wusa/main.c
++++ programs/wusa/main.c
+@@ -543,7 +543,7 @@ static WCHAR *expand_expression(struct assembly_entry *assembly, const WCHAR *ex
+     {
+         strbuf_append(&buf, pos, next - pos);
+         pos = next + 2;
+-        if (!(next = wcsstr(pos, L")")))
++        if (!(next = wcschr(pos, ')')))
+         {
+             strbuf_append(&buf, L"$(", 2);
+             break;
+@@ -685,7 +685,7 @@ static WCHAR *parse_multisz(const WCHAR *input, DWORD *size)
+     for (pos = input; pos[0] == '"'; pos++)
+     {
+         pos++;
+-        if (!(next = wcsstr(pos, L"\""))) goto error;
++        if (!(next = wcschr(pos, '"'))) goto error;
+         strbuf_append(&buf, pos, next - pos);
+         strbuf_append(&buf, L"", ARRAY_SIZE(L""));
+ 
+
+--- tools/winebuild/import.c
++++ tools/winebuild/import.c
+@@ -1319,7 +1319,7 @@ static void build_windows_import_lib( const char *lib_name, DLLSPEC *spec, struc
+ 
+     /* make sure assemble_files doesn't strip suffixes */
+     dll_name = encode_dll_name( spec->file_name );
+-    for (i = 0; i < strlen( dll_name ); ++i) if (dll_name[i] == '.') dll_name[i] = '_';
++    for (i = 0; dll_name[i]; ++i) if (dll_name[i] == '.') dll_name[i] = '_';
+ 
+     import_desc = strmake( "__wine_import_%s_desc", dll_name );
+     import_name = strmake( "__wine_import_%s_name", dll_name );
+

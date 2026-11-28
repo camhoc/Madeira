@@ -1,0 +1,35 @@
+# kk: preserve NaN constant bit patterns in MSL
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46688 state=opened
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+emit_src_component printed every float NaN constant as the MSL NAN literal, which is the canonical quiet NaN 0x7fc00000. A 32-bit constant used both as a float and as raw bits, such as a 0xffffffff sentinel that a later integer compare tests, then reached the shader with other bits, and the compare took the wrong side.
+
+Print 32-bit and 16-bit NaN constants as their exact bit pattern through as_type, so the value matches the NIR constant.
+
+Seen in a recompiled PS5 compute shader that initialises a lane mask register to 0xffffffff: the MSL read
+
+```
+r3215 = as_type<uint>(float((NAN)));
+```
+
+and lanes that never wrote the register passed a "!= 0xffffffff" check.
+--- src/kosmickrisp/compiler/msl_type_inference.c
++++ src/kosmickrisp/compiler/msl_type_inference.c
+@@ -763,7 +763,13 @@ emit_src_component(struct nir_to_msl_ctx *ctx, nir_src *src, unsigned comp)
+       } else if (v == -INFINITY) {
+          P(ctx, "(-INFINITY");
+       } else if (isnan(v)) {
+-         P(ctx, "(NAN");
++         if (src->ssa->bit_size == 16) {
++            P(ctx, "(as_type<half>(ushort(%" PRIu64 "u))",
++              nir_src_comp_as_uint(*src, comp));
++         } else {
++            P(ctx, "(as_type<float>(%" PRIu64 "u)",
++              nir_src_comp_as_uint(*src, comp));
++         }
+       } else {
+          /* Building the types explicitly is required since the MSL compiler is
+           * too dumb to understand that "max(as_type<int>(t53), -2147483648)" is
+

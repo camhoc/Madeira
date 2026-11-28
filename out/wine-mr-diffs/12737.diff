@@ -1,0 +1,31 @@
+# Draft: ntdll: Implement NtYieldExecution() with thread_switch() on macOS.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12737 state=closed
+# On macOS, sched_yield() drops a thread's priority for 10 ms.
+
+Use thread_switch() to depress its priority for only 1 ms.
+
+See:
+https://bugs.webkit.org/show_bug.cgi?id=204871, https://bugs.webkit.org/show_bug.cgi?id=215248, https://chromium-review.googlesource.com/c/chromium/src/+/3545090
+--- dlls/ntdll/unix/sync.c
++++ dlls/ntdll/unix/sync.c
+@@ -56,6 +56,7 @@
+ #include <time.h>
+ #ifdef __APPLE__
+ # include <mach/mach_time.h>
++# include <mach/thread_switch.h>
+ #endif
+ #ifdef HAVE_KQUEUE
+ # include <sys/event.h>
+@@ -2397,7 +2398,10 @@ NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
+  */
+ NTSTATUS WINAPI NtYieldExecution(void)
+ {
+-#ifdef HAVE_SCHED_YIELD
++#if defined(__APPLE__)
++    thread_switch( MACH_PORT_NULL, SWITCH_OPTION_DEPRESS, 1 /* ms */ );
++    return STATUS_SUCCESS;
++#elif defined(HAVE_SCHED_YIELD)
+ #ifdef RUSAGE_THREAD
+     struct rusage u1, u2;
+     int ret;
+

@@ -1,0 +1,184 @@
+# Draft: combase: Implement remaining restricted WinRT error handling APIs.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11993 state=opened
+# Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=58900
+
+Depends on !9332 and !10659.
+
+This is a follow-up to the restricted WinRT error handling work in !9332 and !10659.
+
+The implementation was reworked to use the restricted error infrastructure introduced by !9332 instead of maintaining a separate restricted error object implementation.
+
+This series adds implementations and tests for:
+
+- RoClearError()
+- RoGetMatchingRestrictedErrorInfo()
+- RoCaptureErrorContext()
+- RoTransformError()
+- RoTransformErrorW()
+
+It also improves the existing RoReportUnhandledError() semi-stub by handling the supplied IRestrictedErrorInfo object.
+
+RoClearError clears the current thread error object without creating COM TLS state when none exists.
+
+RoGetMatchingRestrictedErrorInfo returns the current restricted error information when its HRESULT matches the requested value, and otherwise originates matching restricted error information.
+
+RoCaptureErrorContext captures a stack backtrace and stores it in Wine's restricted error object for later error-context handling.
+
+RoTransformError() and RoTransformErrorW() implement HRESULT transformation, message handling, error reporting flag handling, restricted error creation, and preservation of captured error context.
+
+RoReportUnhandledError validates and handles the supplied restricted error information. Windows Global Error Handler / WER integration is still not implemented.
+
+Conformance tests are added for the new functionality under dlls/combase/tests.
+
+The combase tests pass locally in a 32-bit Wine prefix.
+
+The first eight commits in this MR belong to the prerequisite !9332 and !10659 series. Once those merge, this branch can be rebased onto current master so that only the follow-up commits remain.
+--- dlls/combase/tests/Makefile.in
++++ dlls/combase/tests/Makefile.in
+@@ -1,5 +1,5 @@
+ TESTDLL   = combase.dll
+-IMPORTS   = combase uuid user32
++IMPORTS   = combase kernel32 oleaut32 uuid user32
+ 
+ SOURCES = \
+ 	combase.rc \
+
+--- dlls/combase/tests/roapi.c
++++ dlls/combase/tests/roapi.c
+
+--- dlls/combase/combase.spec
++++ dlls/combase/combase.spec
+@@ -288,8 +288,8 @@
+ @ stdcall PropVariantCopy(ptr ptr)
+ @ stub ReleaseFuncDescs
+ @ stdcall RoActivateInstance(ptr ptr)
+-@ stub RoCaptureErrorContext
+-@ stub RoClearError
++@ stdcall RoCaptureErrorContext(long)
++@ stdcall RoClearError()
+ @ stdcall RoFailFastWithErrorContext(long)
+ @ stub RoFreeParameterizedTypeExtra
+ @ stub RoGetActivatableClassRegistration
+@@ -297,7 +297,7 @@
+ @ stdcall RoGetAgileReference(long ptr ptr ptr)
+ @ stdcall RoGetApartmentIdentifier(ptr)
+ @ stdcall RoGetErrorReportingFlags(ptr)
+-@ stub RoGetMatchingRestrictedErrorInfo
++@ stdcall RoGetMatchingRestrictedErrorInfo(long ptr)
+ @ stdcall RoGetParameterizedTypeInstanceIID(long ptr ptr ptr ptr)
+ @ stdcall RoGetServerActivatableClasses(ptr ptr ptr)
+ @ stdcall RoInitialize(long)
+@@ -315,8 +315,8 @@
+ @ stub RoResolveRestrictedErrorInfoReference
+ @ stub RoRevokeActivationFactories
+ @ stdcall RoSetErrorReportingFlags(long)
+-@ stub RoTransformError
+-@ stub RoTransformErrorW
++@ stdcall RoTransformError(long long ptr)
++@ stdcall RoTransformErrorW(long long long ptr)
+ @ stdcall RoUninitialize()
+ @ stub RoUnregisterForApartmentShutdown
+ @ stub SetCleanupFlag
+
+--- dlls/combase/combase_private.h
++++ dlls/combase/combase_private.h
+@@ -268,3 +268,5 @@ HRESULT ipid_get_dispatch_params(const IPID *ipid, struct apartment **stub_apt,
+ HRESULT ipid_get_dest_context(const IPID *ipid, MSHCTX *dest_context, void **dest_context_data);
+ HRESULT start_apartment_remote_unknown(struct apartment *apt);
+ void get_process_secret(GUID *process_secret);
++HRESULT set_error_info(IErrorInfo *error_info);
++HRESULT get_error_info(IErrorInfo **error_info);
+
+--- dlls/combase/errorinfo.c
++++ dlls/combase/errorinfo.c
+@@ -340,17 +340,14 @@ HRESULT WINAPI CreateErrorInfo(ICreateErrorInfo **ret)
+     return S_OK;
+ }
+ 
+-/***********************************************************************
+- *                GetErrorInfo    (combase.@)
+- */
+-HRESULT WINAPI GetErrorInfo(ULONG reserved, IErrorInfo **error_info)
++HRESULT get_error_info(IErrorInfo **error_info)
+ {
+     struct tlsdata *tlsdata;
+     HRESULT hr;
+ 
+-    TRACE("%lu, %p\n", reserved, error_info);
++    TRACE("%p\n", error_info);
+ 
+-    if (reserved || !error_info)
++    if (!error_info)
+         return E_INVALIDARG;
+ 
+     if (FAILED(hr = com_get_tlsdata(&tlsdata)))
+@@ -369,17 +366,20 @@ HRESULT WINAPI GetErrorInfo(ULONG reserved, IErrorInfo **error_info)
+ }
+ 
+ /***********************************************************************
+- *               SetErrorInfo    (combase.@)
++ *                GetErrorInfo    (combase.@)
+  */
+-HRESULT WINAPI SetErrorInfo(ULONG reserved, IErrorInfo *error_info)
++HRESULT WINAPI GetErrorInfo(ULONG reserved, IErrorInfo **error_info)
++{
++    TRACE("%lu, %p\n", reserved, error_info);
++    return reserved ? E_INVALIDARG : get_error_info(error_info);
++}
++
++HRESULT set_error_info(IErrorInfo *error_info)
+ {
+     struct tlsdata *tlsdata;
+     HRESULT hr;
+ 
+-    TRACE("%lu, %p\n", reserved, error_info);
+-
+-    if (reserved)
+-        return E_INVALIDARG;
++    TRACE("%p\n", error_info);
+ 
+     if (FAILED(hr = com_get_tlsdata(&tlsdata)))
+         return hr;
+@@ -393,3 +393,12 @@ HRESULT WINAPI SetErrorInfo(ULONG reserved, IErrorInfo *error_info)
+ 
+     return S_OK;
+ }
++
++/***********************************************************************
++ *               SetErrorInfo    (combase.@)
++ */
++HRESULT WINAPI SetErrorInfo(ULONG reserved, IErrorInfo *error_info)
++{
++    TRACE("%lu, %p\n", reserved, error_info);
++    return reserved ? E_INVALIDARG : set_error_info(error_info);
++}
+
+--- dlls/combase/roapi.c
++++ dlls/combase/roapi.c
+
+--- include/roerrorapi.h
++++ include/roerrorapi.h
+@@ -36,14 +36,22 @@ typedef enum
+     RO_ERROR_REPORTING_SUPPRESSSETERRORINFO = 0x8,
+ } RO_ERROR_REPORTING_FLAGS;
+ 
++#define EXCEPTION_RO_ORIGINATEERROR 0x40080201
++#define EXCEPTION_RO_TRANSFORMERROR 0x40080202
++
+ HRESULT WINAPI GetRestrictedErrorInfo(IRestrictedErrorInfo **info);
++HRESULT WINAPI RoCaptureErrorContext(HRESULT hr);
++void    WINAPI RoClearError(void);
+ void    WINAPI RoFailFastWithErrorContext(HRESULT hr);
+ HRESULT WINAPI RoGetErrorReportingFlags(UINT32 *flags);
++HRESULT WINAPI RoGetMatchingRestrictedErrorInfo(HRESULT hr, IRestrictedErrorInfo **info);
+ BOOL    WINAPI RoOriginateError(HRESULT error, HSTRING message);
+ BOOL    WINAPI RoOriginateErrorW(HRESULT error, UINT max_len, const WCHAR *message);
+ BOOL    WINAPI RoOriginateLanguageException(HRESULT error, HSTRING message, IUnknown *language_exception);
+ HRESULT WINAPI RoReportUnhandledError(IRestrictedErrorInfo *info);
+ HRESULT WINAPI RoSetErrorReportingFlags(UINT32 flags);
++BOOL    WINAPI RoTransformError(HRESULT old_error, HRESULT new_error, HSTRING message);
++BOOL    WINAPI RoTransformErrorW(HRESULT old_error, HRESULT new_error, UINT max_len, const WCHAR *message);
+ HRESULT WINAPI SetRestrictedErrorInfo(IRestrictedErrorInfo *info);
+ 
+ #ifdef __cplusplus
+

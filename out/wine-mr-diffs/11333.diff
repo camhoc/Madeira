@@ -1,0 +1,153 @@
+# winemac, ntdll: Convert the main thread to a Wine system thread when needed.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11333 state=closed
+# Similar to what https://gitlab.winehq.org/wine/wine/-/merge_requests/9579 and https://gitlab.winehq.org/wine/wine/-/merge_requests/10058 were doing.
+
+This is just for winemac, the magic happens in ntdll where CFRunLoopRun start proc is treated specifically by `spawn_thread` and doesn't actually spawns a new thread but schedules a server_init_thread call in the pre-existing main loop, initializing Wine thread data and recursively calling the macOS main loop without (I think?) returning from it.
+
+It then makes it possible at least to use Wine tracing subsystem in winemac main thread, and ultimately should make it possible to call some win32u functions directly from it too. We cannot process window messages there, it's a system thread without a user stack, but it can interact with win32u state and post messages to other threads. It's still going to be a long road ahead if we want to replace winemac internal events (which I think would be nice), because many things still expect some winemac specific threading, but it would be possible at least.
+
+Ultimately I still think that it would be nice to generalize this "main" system thread into a ntdll "sched"-uling subsystem that could back all of the win32u drivers host fd polling / UI event processing / scheduling needs, including for an in-process window compositor, as well as any extra unixlib fd polling / timer / scheduling we might find useful to have. There was for instance some discussion about how to integrate DBus connection polling nicely, and this could use it. On macOS this would be the main thread, on other platforms a system thread would be spawned as needed.
+--- dlls/ntdll/unix/thread.c
++++ dlls/ntdll/unix/thread.c
+@@ -64,6 +64,7 @@
+ 
+ #ifdef __APPLE__
+ #include <mach/mach.h>
++#include <CoreFoundation/CoreFoundation.h>
+ #endif
+ #ifdef __FreeBSD__
+ #include <sys/thr.h>
+@@ -1316,6 +1317,24 @@ static NTSTATUS spawn_thread( struct thread_data *data )
+     pthread_attr_t attr;
+     NTSTATUS status = STATUS_SUCCESS;
+ 
++#ifdef __APPLE__
++    if (data->start == CFRunLoopRun)
++    {
++        CFRunLoopSourceContext context = { .perform = (void *)server_init_thread, .info = data };
++        CFRunLoopSourceRef source;
++
++        if (!(source = CFRunLoopSourceCreate( NULL, 0, &context ))) return STATUS_NO_MEMORY;
++
++        InterlockedIncrement( &nb_threads );
++        CFRunLoopAddSource( CFRunLoopGetMain(), source, kCFRunLoopCommonModes );
++        CFRunLoopSourceSignal( source );
++        CFRunLoopWakeUp( CFRunLoopGetMain() );
++        CFRelease( source );
++
++        return STATUS_SUCCESS;
++    }
++#endif /* __APPLE__ */
++
+     pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
+     pthread_attr_init( &attr );
+     pthread_attr_setstack( &attr, get_kernel_stack( data ), kernel_stack_size );
+
+--- dlls/winemac.drv/cocoa_main.m
++++ dlls/winemac.drv/cocoa_main.m
+@@ -100,6 +100,14 @@ static void run_cocoa_app(void* info)
+     }
+ }
+ 
++void macdrv_init_cocoa_threads(void)
++{
++    /* Make sure Cocoa is in multi-threading mode by detaching a
++       do-nothing thread. */
++    [NSThread detachNewThreadSelector:@selector(self)
++                             toTarget:[NSThread class]
++                           withObject:nil];
++}
+ 
+ /***********************************************************************
+  *              macdrv_start_cocoa_app
+@@ -114,36 +122,26 @@ int macdrv_start_cocoa_app(unsigned long long tickcount)
+ {
+     int ret = -1;
+     CFRunLoopSourceRef source;
+-    struct cocoa_app_startup_info startup_info;
++    struct cocoa_app_startup_info startup_info = { .tickcount = tickcount };
+     uint64_t uptime_mach = mach_absolute_time();
+     mach_timebase_info_data_t mach_timebase;
+     NSDate* timeLimit;
+     CFRunLoopSourceContext source_context = { 0 };
+ 
+-    /* Make sure Cocoa is in multi-threading mode by detaching a
+-       do-nothing thread. */
+-    [NSThread detachNewThreadSelector:@selector(self)
+-                             toTarget:[NSThread class]
+-                           withObject:nil];
+-
+-    startup_info.lock = [[NSConditionLock alloc] initWithCondition:COCOA_APP_NOT_RUNNING];
+-    startup_info.tickcount = tickcount;
+-    startup_info.success = FALSE;
++    if (!(timeLimit = [NSDate dateWithTimeIntervalSinceNow:5])) return -1;
++    if (!(startup_info.lock = [[NSConditionLock alloc] initWithCondition:COCOA_APP_NOT_RUNNING])) return -1;
+ 
+     mach_timebase_info(&mach_timebase);
+     startup_info.uptime_ns = uptime_mach * mach_timebase.numer / mach_timebase.denom;
+ 
+-    timeLimit = [NSDate dateWithTimeIntervalSinceNow:5];
+-
+     source_context.info = &startup_info;
+     source_context.perform = run_cocoa_app;
+-    source = CFRunLoopSourceCreate(NULL, 0, &source_context);
+-
+-    if (source && startup_info.lock && timeLimit)
++    if ((source = CFRunLoopSourceCreate(NULL, 0, &source_context)))
+     {
+         CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+         CFRunLoopSourceSignal(source);
+         CFRunLoopWakeUp(CFRunLoopGetMain());
++        CFRelease(source);
+ 
+         if ([startup_info.lock lockWhenCondition:COCOA_APP_RUNNING beforeDate:timeLimit])
+         {
+@@ -152,8 +150,6 @@ int macdrv_start_cocoa_app(unsigned long long tickcount)
+         }
+     }
+ 
+-    if (source)
+-        CFRelease(source);
+     [startup_info.lock release];
+     return ret;
+ }
+
+--- dlls/winemac.drv/macdrv_cocoa.h
++++ dlls/winemac.drv/macdrv_cocoa.h
+@@ -200,6 +200,7 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+     return point;
+ }
+ 
++extern void macdrv_init_cocoa_threads(void);
+ extern int macdrv_start_cocoa_app(unsigned long long tickcount);
+ extern void macdrv_window_rejected_focus(const struct macdrv_event *event);
+ extern void macdrv_beep(void);
+
+--- dlls/winemac.drv/macdrv_main.c
++++ dlls/winemac.drv/macdrv_main.c
+@@ -428,6 +428,7 @@ static NTSTATUS macdrv_init(void *arg)
+     struct init_params *params = arg;
+     SessionAttributeBits attributes;
+     OSStatus status;
++    HANDLE thread;
+ 
+     app_icon_callback = params->app_icon_callback;
+     app_quit_request_callback = params->app_quit_request_callback;
+@@ -442,6 +443,16 @@ static NTSTATUS macdrv_init(void *arg)
+     setup_options();
+     load_strings(params->strings);
+ 
++    macdrv_init_cocoa_threads();
++
++    /* convert the main thread to a Wine thread */
++    if ((status = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, 0, NULL, (void *)CFRunLoopRun, NULL)))
++    {
++        ERR("Failed to spawn main thread, status %#x\n", status);
++        return STATUS_UNSUCCESSFUL;
++    }
++    NtClose(thread);
++
+     macdrv_err_on = ERR_ON(macdrv);
+     if (macdrv_start_cocoa_app(NtGetTickCount()))
+     {
+

@@ -1,0 +1,311 @@
+# kk: Work around compute dispatch spilling issue on M1/2
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46159 state=merged
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+AI was used to investigate the issue and potential workarounds.
+
+```
+kk: Work around compute dispatch spilling issue on M1/2
+
+Fixes Vulkan CTS tests:
+dEQP-VK.clipping.*vert_tess_geom*
+dEQP-VK.tessellation.geometry_interaction.*
+
+See changes in docs/drivers/kosmickrisp/workarounds.rst for detailed
+explanation on the bug and how we are working around it.
+
+Assisted-by: LLM
+Signed-off-by: Aitor Camacho <aitor@lunarg.com>
+```
+--- docs/drivers/kosmickrisp/workarounds.rst
++++ docs/drivers/kosmickrisp/workarounds.rst
+@@ -49,6 +49,22 @@ info on what was updated.
+ Workarounds
+ ===========
+ 
++KK_WORKAROUND_19
++----------------
++| macOS version: 26 and 27
++| Metal ticket: FB25516856 (@aitor)
++| Metal ticket status: Waiting resolution
++| CTS test failure: ``dEQP-VK.clipping.*vert_tess_geom*`` and ``dEQP-VK.tessellation.geometry_interaction.*``
++| Comments:
++
++Only affects M1/2. When a kernel has enough register pressure, the compiler may
++spill registers to threadgroup memory. Whether it does depends on the pipeline's
++``maxTotalThreadsPerThreadgroup``. Under ``dispatchThreadsWithIndirectBuffer:``,
++only the first few bytes of a threadgroup's spill area work and spilled values
++beyond that read back as zero. A simple workaround is to add a 16 byte
++``[[threadgroup(0)]]`` argument and a conditional read and write in the shader
++that will never execute to stop the compiler from spilling.
++
+ KK_WORKAROUND_18
+ ----------------
+ | macOS version: 26.x
+
+--- src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -111,6 +111,12 @@ mtl_compute_set_argument_table(mtl_compute_encoder *encoder,
+ {
+ }
+ 
++void
++mtl_set_threadgroup_memory_length(mtl_compute_encoder *encoder, uint32_t length,
++                                  uint32_t index)
++{
++}
++
+ void
+ mtl_dispatch_threads(mtl_compute_encoder *encoder, struct mtl_size grid_size,
+                      struct mtl_size local_size)
+
+--- src/kosmickrisp/bridge/mtl_encoder.h
++++ src/kosmickrisp/bridge/mtl_encoder.h
+@@ -64,6 +64,9 @@ void mtl_compute_set_pipeline_state(mtl_compute_encoder *encoder,
+ void mtl_compute_set_argument_table(mtl_compute_encoder *encoder,
+                                     mtl_argument_table *table);
+ 
++void mtl_set_threadgroup_memory_length(mtl_compute_encoder *encoder,
++                                       uint32_t length, uint32_t index);
++
+ void mtl_dispatch_threads(mtl_compute_encoder *encoder,
+                           struct mtl_size grid_size,
+                           struct mtl_size local_size);
+
+--- src/kosmickrisp/bridge/mtl_encoder.m
++++ src/kosmickrisp/bridge/mtl_encoder.m
+@@ -235,6 +235,16 @@ mtl_compute_set_argument_table(mtl_compute_encoder *encoder,
+    }
+ }
+ 
++void
++mtl_set_threadgroup_memory_length(mtl_compute_encoder *encoder, uint32_t length,
++                                  uint32_t index)
++{
++   @autoreleasepool {
++      id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
++      [enc setThreadgroupMemoryLength:length atIndex:index];
++   }
++}
++
+ void
+ mtl_dispatch_threads(mtl_compute_encoder *encoder,
+                      struct mtl_size grid_size, struct mtl_size local_size)
+
+--- src/kosmickrisp/clc/kk_clc.c
++++ src/kosmickrisp/clc/kk_clc.c
+@@ -314,7 +314,10 @@ main(int argc, char **argv)
+          } while (progress);
+ 
+          nir_shader_gather_info(s, nir_shader_get_entrypoint(s));
+-         struct nir_to_msl_options options = {};
++         /* KK_WORKAROUND_19 No precompiled shader will be dispatched with the
++          * buggy Metal entry point. */
++         struct nir_to_msl_options options = {.disabled_workarounds =
++                                                 BITFIELD64_BIT(19)};
+          const char *msl = nir_to_msl(s, &options);
+          print_shader(fp_c, libfunc->name, target, v, msl, s);
+          ralloc_free((void *)msl);
+
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -100,6 +100,9 @@ emit_inputs(struct nir_to_msl_ctx *ctx, nir_shader *shader)
+    default:
+       break;
+    }
++   if (!(ctx->disabled_workarounds & BITFIELD64_BIT(19))) {
++      P_IND(ctx, "threadgroup uint32_t *kk_wa19_tg [[threadgroup(0)]],\n");
++   }
+    P_IND(ctx, "constant Buffer &buf0 [[buffer(0)]],\n");
+    P_IND(ctx, "constant SamplerTable &sampler_table [[buffer(1)]]");
+    if (ctx->uses_per_draw_data) {
+@@ -2539,6 +2542,17 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
+    P(&ctx, ")\n");
+    P(&ctx, "{\n");
+    ctx.indentlevel++;
++
++   /* KK_WORKAROUND_19 */
++   if (!(ctx.disabled_workarounds & BITFIELD64_BIT(19))) {
++      P_IND(&ctx, "/* KK_WORKAROUND_19 */\n");
++      P_IND(&ctx, "if (buf0.contents[0] == 0xFFFFFFFFFFFFFFFFul) {\n"
++                  "    kk_wa19_tg[0] = 1u;\n"
++                  "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
++                  "    *(device uint *)(buf0.contents[0]) = kk_wa19_tg[1];\n"
++                  "}\n");
++   }
++
+    msl_emit_output_var(&ctx, shader);
+    emit_local_vars(&ctx, shader);
+    predeclare_ssa_values(&ctx, impl);
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -805,6 +805,9 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
+                     bool pre_gfx, enum libkk_program idx, void *data,
+                     size_t data_size)
+ {
++   /* KK_WORKAROUND_19 */
++   assert(grid.mode != KK_GRID_INDIRECT_LOCAL);
++
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    struct kk_precompiled_shader *prog = &dev->precompiled_cache.shaders[idx];
+ 
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -2209,6 +2209,8 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+                      const struct kk_draw_command *data,
+                      struct kk_draw_data draw, bool restart)
+ {
++   struct kk_physical_device *pdev =
++      kk_device_physical(kk_cmd_buffer_device(cmd));
+    struct kk_graphics_state *gfx = &cmd->state.gfx;
+    struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+    struct kk_shader *tes = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+@@ -2265,6 +2267,10 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+    struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
+    mtl_compute_encoder *enc = cs_get_compute(cmd);
+ 
++   /* KK_WORKAROUND_19 */
++   if (!(pdev->settings.disabled_workarounds & BITFIELD64_BIT(19)))
++      mtl_set_threadgroup_memory_length(enc, 16u, 0u);
++
+    mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+                                     MTL_STAGE_DISPATCH);
+    mtl_compute_set_pipeline_state(
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1141,6 +1141,7 @@ kk_parse_environment_options(struct kk_physical_device *pdev)
+    }
+    if (pdev->info.gpu_apple_family >= 9) {
+       settings->disabled_workarounds |= BITFIELD64_BIT(10);
++      settings->disabled_workarounds |= BITFIELD64_BIT(19);
+    }
+ }
+ 
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -989,7 +989,7 @@ kk_nir_lower_vertex_id_zero_base(struct nir_shader *nir)
+ static void
+ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+                const struct vk_graphics_pipeline_state *state,
+-               struct msl_compile_data *data)
++               struct msl_compile_data *data, const bool apply_wa19)
+ {
+    NIR_PASS(_, nir, kk_nir_lower_poly);
+ 
+@@ -1000,6 +1000,10 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+       .mem_ctx = NULL,
+       .disabled_workarounds = pdev->settings.disabled_workarounds,
+    };
++
++   if (!apply_wa19)
++      translate_options.disabled_workarounds |= BITFIELD64_BIT(19);
++
+    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+       for (uint32_t i = 0u; i < MAX_DRAW_BUFFERS; ++i) {
+          /* If the attachment is unused, default to 4 to avoid issues with alpha
+@@ -1041,7 +1045,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+                   const struct vk_pipeline_robustness_state *robustness,
+                   const struct vk_graphics_pipeline_state *state,
+                   const VkAllocationCallbacks *pAllocator,
+-                  struct kk_shader **shader_out)
++                  struct kk_shader **shader_out, bool apply_wa19)
+ {
+    assert(nir->info.io_lowered && "nir must have lowered io");
+    struct kk_physical_device *pdev = kk_device_physical(dev);
+@@ -1050,6 +1054,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+    VkResult result = VK_SUCCESS;
+ 
+    mesa_shader_stage stage = nir->info.stage;
++   mesa_shader_stage next_stage = nir->info.next_stage;
+    shader = vk_shader_zalloc(&dev->vk, &kk_shader_ops, stage, pAllocator,
+                              sizeof(*shader));
+    if (shader == NULL) {
+@@ -1074,7 +1079,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       /* VBO lowering needs to go here otherwise, the linking step removes all
+        * inputs since we read vertex attributes from UBOs. */
+       kk_lower_vs_vbo(nir, state, robustness);
+-      if (nir->info.next_stage != MESA_SHADER_FRAGMENT) {
++      if (next_stage != MESA_SHADER_FRAGMENT) {
+          /* TODO_KOSMICKRISP: Poly lowering breaks with vectorized I/O less than
+           * 32-bit, which we support. Lower vertex outputs to scalar. */
+          NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL,
+@@ -1115,7 +1120,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+        * 32-bit, which we support. Lower TES inputs to scalar, and outputs too
+        * when a GS reads them from memory. */
+       nir_variable_mode modes = nir_var_shader_in;
+-      if (nir->info.next_stage == MESA_SHADER_GEOMETRY)
++      if (next_stage == MESA_SHADER_GEOMETRY)
+          modes |= nir_var_shader_out;
+       NIR_PASS(_, nir, nir_lower_io_to_scalar, modes, NULL, NULL);
+ 
+@@ -1124,7 +1129,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       shader->info.tess.info.spacing = nir->info.tess.spacing;
+       shader->info.tess.info.mode = nir->info.tess._primitive_mode;
+ 
+-      bool to_hw_vs = nir->info.next_stage != MESA_SHADER_GEOMETRY;
++      bool to_hw_vs = next_stage != MESA_SHADER_GEOMETRY;
+       /* This destroys info so it needs to happen after the gather */
+       NIR_PASS(_, nir, poly_nir_lower_tes, to_hw_vs);
+       if (!to_hw_vs) {
+@@ -1151,7 +1156,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       nir->info.stage = MESA_SHADER_COMPUTE;
+       memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+       nir->xfb_info = NULL;
+-      kk_compile_msl(pdev, nir, state, &shader->gs_main);
++      kk_compile_msl(pdev, nir, state, &shader->gs_main, apply_wa19);
+ 
+       /* From here on, nir is the rasterization VS of the GS */
+       nir = rast;
+@@ -1167,7 +1172,10 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       NIR_PASS(_, nir, kk_nir_lower_descriptors, robustness, 0, NULL);
+    }
+ 
+-   kk_compile_msl(pdev, nir, state, &shader->msl_data[stage]);
++   /* KK_WORKAROUND_19 Only the stage that feeds geometry will be dispatched
++    * through the buggy Metal entry point. */
++   apply_wa19 &= next_stage == MESA_SHADER_GEOMETRY;
++   kk_compile_msl(pdev, nir, state, &shader->msl_data[stage], apply_wa19);
+ 
+    *shader_out = shader;
+ 
+@@ -1195,7 +1203,7 @@ kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
+    struct kk_shader *shader = NULL;
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+    VkResult result =
+-      kk_compile_shader(dev, nir, NULL, &rs_none, NULL, alloc, &shader);
++      kk_compile_shader(dev, nir, NULL, &rs_none, NULL, alloc, &shader, false);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -1729,12 +1737,16 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+       total_shaders += 1u;
+    }
+ 
++   /* KK_WORKAROUND_19 */
++   bool apply_wa19 = false;
++
+    /* nir_opt_varyings_bulk removes a GS primitive ID output that the FS does
+     * not read as an input. The FS is last and a GS right before it. */
+    if (total_shaders >= 2u &&
+        nir_shaders[total_shaders - 2u]->info.stage == MESA_SHADER_GEOMETRY) {
+       kk_forward_gs_primitive_id(nir_shaders[total_shaders - 2u],
+                                  nir_shaders[total_shaders - 1u]);
++      apply_wa19 = !(pdev->settings.disabled_workarounds & BITFIELD64_BIT(19));
+    }
+ 
+    nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
+@@ -1749,7 +1761,7 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+       struct kk_shader *prev_stage = i > 0 ? shaders[i - 1] : NULL;
+       result =
+          kk_compile_shader(dev, nir_shaders[i], prev_stage, vertex_robustness,
+-                           state, pAllocator, &shaders[i]);
++                           state, pAllocator, &shaders[i], apply_wa19);
+ 
+       if (result != VK_SUCCESS) {
+          /* Clean up all the shaders before this point */
+

@@ -1,0 +1,278 @@
+# kk: Fake depth bounds support for idTech
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45318 state=merged
+# Support for depth bounds is the only thing blocking Doom 2016 from running on Kosmickrisp on M1-M4.
+
+ANV fakes depthBounds support for idTech and it seems to be fine.
+So just do the same in Kosmickrisp.
+--- src/kosmickrisp/vulkan/00-kk-defaults.conf
++++ src/kosmickrisp/vulkan/00-kk-defaults.conf
+@@ -0,0 +1,12 @@
++<?xml version="1.0"?>
++<driconf>
++    <device driver="kk">
++        <engine engine_name_match="idTech">
++           <!--
++              IdTech 6+ requires support for the depth bounds test.
++              It only uses it as an optimization and renders correctly without it.
++           -->
++           <option name="kk_fake_depth_bounds" value="true" />
++       </engine>
++    </device>
++</driconf>
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1460,7 +1460,7 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+ 
+    if ((IS_DIRTY(DS_DEPTH_BOUNDS_TEST_ENABLE) ||
+         IS_DIRTY(DS_DEPTH_BOUNDS_TEST_BOUNDS)) &&
+-       pdev->vk.supported_features.depthBounds) {
++       kk_gpu_supports_depth_bounds(&pdev->info)) {
+       /* Metal does not expose a separate flag for enabling the depth bounds
+        * test. Instead, it treats [0, 1] as disabled. */
+       bool bounds_enable = dyn->ds.depth.bounds_test.enable;
+
+--- src/kosmickrisp/vulkan/kk_drirc_gen.py
++++ src/kosmickrisp/vulkan/kk_drirc_gen.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++# Copyright 2024 Valve Corporation
++# Copyright 2024 Alyssa Rosenzweig
++# SPDX-License-Identifier: MIT
++
++import argparse
++import sys
++
++VALID_COMMON_VK_OPTIONS = {
++    "force_vk_vendor",
++}
++
++def declare_options():
++    import drirc_gen
++
++    B = drirc_gen.DrircBool
++
++    misc_options = [
++        B("kk_fake_depth_bounds", False,
++          "Reports support for depth bounds test even if the hardware does not support it",
++          c_name="fake_depth_bounds"),
++    ]
++    debug_options = []
++    features_options = []
++    performance_options = []
++
++    drirc_gen.add_common_vk_options(debug_options, features_options, misc_options,
++                                    valid_options=VALID_COMMON_VK_OPTIONS)
++    drirc_gen.add_common_vk_wsi_options(debug_options, performance_options)
++
++    return [
++        drirc_gen.DrircSection("Debugging", debug_options, c_name="debug"),
++        drirc_gen.DrircSection("Performance", performance_options, c_name="performance"),
++        drirc_gen.DrircSection("Miscellaneous", misc_options, c_name="misc"),
++    ]
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('-p', '--import-path', required=True)
++    parser.add_argument('--drirc-src', required=True)
++    parser.add_argument('--drirc-hdr', required=True)
++    parser.add_argument('--validate', required=True)
++    args = parser.parse_args()
++
++    sys.path.insert(0, args.import_path)
++    import drirc_gen
++
++    options = declare_options()
++
++    drirc_gen.drirc_validate([args.validate], options)
++
++    drirc_gen.drirc_generate(args.drirc_src, args.drirc_hdr, "kk", options)
++
++
++if __name__ == '__main__':
++    main()
+
+--- src/kosmickrisp/vulkan/kk_instance.c
++++ src/kosmickrisp/vulkan/kk_instance.c
+@@ -85,6 +85,20 @@ kk_EnumerateInstanceExtensionProperties(const char *pLayerName,
+       &instance_extensions, pPropertyCount, pProperties);
+ }
+ 
++static void
++kk_init_dri_options(struct kk_instance *instance)
++{
++   kk_parse_dri_options(
++      &instance->drirc,
++      &(driConfigFileParseParams){
++         .driverName = "kk",
++         .applicationName = instance->vk.app_info.app_name,
++         .applicationVersion = instance->vk.app_info.app_version,
++         .engineName = instance->vk.app_info.engine_name,
++         .engineVersion = instance->vk.app_info.engine_version,
++      });
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ kk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+                   const VkAllocationCallbacks *pAllocator,
+@@ -112,6 +126,8 @@ kk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+    if (result != VK_SUCCESS)
+       goto fail_alloc;
+ 
++   kk_init_dri_options(instance);
++
+    instance->vk.physical_devices.enumerate = kk_enumerate_physical_devices;
+    instance->vk.physical_devices.destroy = kk_physical_device_destroy;
+ 
+@@ -157,6 +173,9 @@ kk_DestroyInstance(VkInstance _instance,
+    if (!instance)
+       return;
+ 
++   driDestroyOptionCache(&instance->drirc.options);
++   driDestroyOptionInfo(&instance->drirc.available_options);
++
+    vk_instance_finish(&instance->vk);
+    vk_free(&instance->vk.alloc, instance);
+ }
+
+--- src/kosmickrisp/vulkan/kk_instance.h
++++ src/kosmickrisp/vulkan/kk_instance.h
+@@ -11,13 +11,15 @@
+ #include "kk_private.h"
+ 
+ #include "util/xmlconfig.h"
++#include "kk_drirc.h"
+ #include "vk_instance.h"
+ 
+ struct kk_instance {
+    struct vk_instance vk;
+ 
++   struct kk_drirc drirc;
++
+    uint8_t driver_build_sha[VK_UUID_SIZE];
+-   uint32_t force_vk_vendor;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_instance, vk.base, VkInstance,
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -219,7 +219,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+ 
+ static void
+ kk_get_device_features(
+-   const struct kk_physical_device *pdev,
++   const struct kk_device_info *info, const struct kk_instance *instance,
+    const struct vk_device_extension_table *supported_extensions,
+    struct vk_features *features)
+ {
+@@ -227,7 +227,8 @@ kk_get_device_features(
+       /* Vulkan 1.0 */
+       .alphaToOne = true,
+       .depthBiasClamp = true,
+-      .depthBounds = pdev->info.gpu_apple_family >= 10,
++      .depthBounds = kk_gpu_supports_depth_bounds(info) ||
++                     instance->drirc.misc.fake_depth_bounds,
+       .depthClamp = true,
+       .drawIndirectFirstInstance = true,
+       .dualSrcBlend = true,
+@@ -260,7 +261,7 @@ kk_get_device_features(
+       .shaderUniformBufferArrayDynamicIndexing = true,
+       .tessellationShader = true,
+       .textureCompressionASTC_LDR = true,
+-      .textureCompressionBC = pdev->info.supports_bc_texture_compression,
++      .textureCompressionBC = info->supports_bc_texture_compression,
+       .textureCompressionETC2 = true,
+       .vertexPipelineStoresAndAtomics = true,
+ 
+@@ -509,7 +510,7 @@ kk_get_device_features(
+       .shaderBufferFloat32AtomicAdd = true,
+       .shaderSharedFloat32Atomics = true,
+       .shaderSharedFloat32AtomicAdd =
+-         pdev->info.msl_version >= MTL_LANGUAGE_VERSION_4_1,
++         info->msl_version >= MTL_LANGUAGE_VERSION_4_1,
+ 
+       /* VK_EXT_vertex_attribute_robustness */
+       .vertexAttributeRobustness = true,
+@@ -546,8 +547,9 @@ kk_get_device_properties(
+    *properties = (struct vk_properties){
+       .apiVersion = kk_get_vk_version(),
+       .driverVersion = vk_get_driver_version(),
+-      .vendorID =
+-         instance->force_vk_vendor != 0 ? instance->force_vk_vendor : 0x106b,
++      .vendorID = instance->drirc.debug.force_vk_vendor != 0
++                     ? instance->drirc.debug.force_vk_vendor
++                     : 0x106b,
+       .deviceID = 100,
+       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
+ 
+@@ -1171,7 +1173,8 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
+    kk_get_device_extensions(instance, pdev, &supported_extensions);
+ 
+    struct vk_features supported_features;
+-   kk_get_device_features(pdev, &supported_extensions, &supported_features);
++   kk_get_device_features(&pdev->info, instance, &supported_extensions,
++                          &supported_features);
+ 
+    struct vk_properties properties;
+    kk_get_device_properties(pdev, instance, &supported_extensions, &properties);
+
+--- src/kosmickrisp/vulkan/kk_physical_device.h
++++ src/kosmickrisp/vulkan/kk_physical_device.h
+@@ -101,6 +101,12 @@ kk_physical_device_instance(struct kk_physical_device *pdev)
+ VkResult kk_enumerate_physical_devices(struct vk_instance *_instance);
+ void kk_physical_device_destroy(struct vk_physical_device *vk_device);
+ 
++static inline bool
++kk_gpu_supports_depth_bounds(const struct kk_device_info *info)
++{
++   return info->gpu_apple_family >= 10;
++}
++
+ #if defined(VK_USE_PLATFORM_WAYLAND_KHR) ||                                    \
+    defined(VK_USE_PLATFORM_XCB_KHR) || defined(VK_USE_PLATFORM_XLIB_KHR) ||    \
+    defined(VK_USE_PLATFORM_DISPLAY_KHR) || defined(VK_USE_PLATFORM_METAL_EXT)
+
+--- src/kosmickrisp/vulkan/meson.build
++++ src/kosmickrisp/vulkan/meson.build
+@@ -114,6 +114,19 @@ kk_files = files(
+   'kk_wsi.c',
+ )
+ 
++kk_drirc = custom_target(
++  'kk_drirc',
++  input  : [files('kk_drirc_gen.py'), drirc_gen, '00-kk-defaults.conf'],
++  output : ['kk_drirc.c', 'kk_drirc.h'],
++  command : [
++    prog_python, '@INPUT0@',
++    '--import-path', join_paths(dir_source_root, 'src/util'),
++    '--drirc-src', '@OUTPUT0@',
++    '--drirc-hdr', '@OUTPUT1@',
++    '--validate', '@INPUT2@',
++  ],
++)
++
+ kk_entrypoints = custom_target(
+   'kk_entrypoints',
+   input : [vk_entrypoints_gen, vk_api_xml],
+@@ -148,6 +161,7 @@ libkk = static_library(
+   [
+     kk_files,
+     kk_entrypoints,
++    kk_drirc,
+     sha1_h,
+   ],
+   include_directories : [
+
+--- src/util/meson.build
++++ src/util/meson.build
+@@ -244,6 +244,7 @@ foreach i : [
+   [with_gallium_freedreno, 'src/gallium/drivers/freedreno', '00-msm-defaults.conf'],
+   [with_gallium_d3d12, 'src/gallium/drivers/d3d12', '00-d3d12-defaults.conf'],
+   [with_gallium_svga, 'src/gallium/drivers/svga', '00-vmwgfx-defaults.conf'],
++  [with_kosmickrisp_vk, 'src/kosmickrisp/vulkan', '00-kk-defaults.conf'],
+ ]
+   if i[0]
+     driver_folder = dir_source_root / i[1]
+

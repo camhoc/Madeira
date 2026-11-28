@@ -1,0 +1,84 @@
+# kk: Add a device-local memory type for tiled images
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44929 state=closed
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+kk: Add a device-local memory type for tiled images
+
+Imported host memory has no MTLHeap, and tiled images need one. Venus
+imports guest memory as host pointers on kk, so tiled guest images were
+landing there and hitting the assert in kk_image_plane_bind.
+
+This adds a DEVICE_LOCAL-only memory type. Tiled images only use that
+one, and host pointer imports only get the host-visible one, so they
+can't meet.
+
+Dropped the HOST_TRANSFER filter too: with two types it breaks
+identicalMemoryTypeRequirements, and host image copy doesn't map memory
+anyway.
+
+CTS memory, api.info, external memory and buffer requirements all pass.
+23,040 host_image_copy cases go from Pass to NotSupported because they
+ask for host-visible memory on OPTIMAL images.
+```
+--- src/kosmickrisp/vulkan/kk_device_memory.c
++++ src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -79,8 +79,12 @@ kk_GetMemoryHostPointerPropertiesEXT(
+    default:
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    }
+-   pMemoryHostPointerProperties->memoryTypeBits =
+-      BITFIELD_MASK(pdev->mem_type_count);
++   pMemoryHostPointerProperties->memoryTypeBits = 0;
++   for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
++      if (pdev->mem_types[i].propertyFlags &
++          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
++         pMemoryHostPointerProperties->memoryTypeBits |= BITFIELD_BIT(i);
++   }
+ 
+    return VK_SUCCESS;
+ }
+
+--- src/kosmickrisp/vulkan/kk_image.c
++++ src/kosmickrisp/vulkan/kk_image.c
+@@ -666,13 +666,14 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
+    struct kk_physical_device *pdev = kk_device_physical(dev);
+    uint32_t memory_types = (1 << pdev->mem_type_count) - 1;
+ 
+-   /* Remove non host visible heaps from the types for host image copy in case
+-    * of potential issues. This should be removed when we get ReBAR.
++   /* Tiled textures need a heap, which memory imported from a host pointer
++    * doesn't have. Keep them off the host visible types, the only ones such
++    * memory can have.
+     */
+-   if (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) {
++   if (image->vk.tiling == VK_IMAGE_TILING_OPTIMAL) {
+       for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
+-         if (!(pdev->mem_types[i].propertyFlags &
+-               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
++         if (pdev->mem_types[i].propertyFlags &
++             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+             memory_types &= ~BITFIELD_BIT(i);
+       }
+    }
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1192,6 +1192,14 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
+       .used = kk_get_sysmem_heap_used,
+    };
+ 
++   /* Tiled images only take this type (kk_get_image_memory_requirements), so
++    * they can't be bound to memory imported from a host pointer, which has no
++    * heap for them */
++   pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
++      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++      .heapIndex = sysmem_heap_idx,
++   };
++
+    pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
+       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+

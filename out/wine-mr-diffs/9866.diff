@@ -1,0 +1,33 @@
+# Revert "ntdll: Switch to CLOCK_BOOTTIME for monotonic counters when available."
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/9866 state=closed
+# This reverts commit 3d373e452388b60bea9dca6d5c4cf3f8b20a0c54.
+
+CLOCK_MONOTONIC_RAW is used in vulkan to correlate QPC timestamps, and there's no equivalent of CLOCK_BOOTTIME there. Using CLOCK_BOOTTIME for QPC breaks the vulkan side with no proper way to fix it.
+--- dlls/ntdll/unix/sync.c
++++ dlls/ntdll/unix/sync.c
+@@ -97,8 +97,8 @@ static inline ULONGLONG monotonic_counter(void)
+     return mach_continuous_time() * timebase.numer / timebase.denom / 100;
+ #elif defined(HAVE_CLOCK_GETTIME)
+     struct timespec ts;
+-#ifdef CLOCK_BOOTTIME
+-    if (!clock_gettime( CLOCK_BOOTTIME, &ts ))
++#ifdef CLOCK_MONOTONIC_RAW
++    if (!clock_gettime( CLOCK_MONOTONIC_RAW, &ts ))
+         return ts.tv_sec * (ULONGLONG)TICKSPERSEC + ts.tv_nsec / 100;
+ #endif
+     if (!clock_gettime( CLOCK_MONOTONIC, &ts ))
+
+--- server/request.c
++++ server/request.c
+@@ -515,8 +515,8 @@ timeout_t monotonic_counter(void)
+     return mach_continuous_time() * timebase.numer / timebase.denom / 100;
+ #elif defined(HAVE_CLOCK_GETTIME)
+     struct timespec ts;
+-#ifdef CLOCK_BOOTTIME
+-    if (!clock_gettime( CLOCK_BOOTTIME, &ts ))
++#ifdef CLOCK_MONOTONIC_RAW
++    if (!clock_gettime( CLOCK_MONOTONIC_RAW, &ts ))
+         return (timeout_t)ts.tv_sec * TICKS_PER_SEC + ts.tv_nsec / 100;
+ #endif
+     if (!clock_gettime( CLOCK_MONOTONIC, &ts ))
+

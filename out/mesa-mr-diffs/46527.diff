@@ -1,0 +1,671 @@
+# kk: use stand-in textures for null image and texel buffer descriptors
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46527 state=opened
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+kk: use stand-in textures for null image and texel buffer descriptors
+
+With nullDescriptor enabled, kk_nir_lower_null_images wraps every image and texel buffer access in an if (handle != 0) branch. DXVK and vkd3d-proton always enable nullDescriptor, so every texture read in those applications pays for the branch.
+
+This MR creates one 1x1 stand-in texture per texture type and component class at device creation (only when nullDescriptor is enabled). Their resource IDs are stored in a small buffer whose address is in the root descriptor table. Reads and queries (image load, size, samples, levels and non-sparse tex) now select the stand-in's ID when the handle is null and select zero for the result, so no branch is needed. Stores, atomics, sparse operations and fences keep the branch. Kinds without a stand-in (multisampled depth arrays, writable cube and multisampled images, other component types) also keep the branch.
+
+The first commit fixes an existing issue: the image fence emitted after a store or atomic was not covered by the null check, so it executed on a null descriptor. A fence directly after the null check around a store or atomic on the same image is now moved into that check.
+
+MESA_KK_DEBUG=force_null_descriptor lowers as if nullDescriptor were enabled, for testing the path with every test.
+
+Testing (Apple M5 Pro, macOS 27.2, CTS 83573e36d58): dEQP-VK.robustness.* (96,147 cases) with force_null_descriptor: no new failures compared to main. A 79,312-case regression list: no new failures. Under MTL_DEBUG_LAYER and MTL_SHADER_VALIDATION, no case is worse than main.
+
+Not covered by CTS: null descriptors of depth images and combined image samplers.
+```
+--- docs/drivers/kosmickrisp.rst
++++ docs/drivers/kosmickrisp.rst
+@@ -75,7 +75,7 @@ Environment variables
+ 
+ KosmicKrisp specific environment variables:
+ 
+-- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders.
++- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders. ``force_null_descriptor`` to handle null image and texel buffer descriptors in all shaders, as if ``nullDescriptor`` was enabled.
+ - ``MESA_KK_GPU_CAPTURE``: Enables Metal capture, can be controlled using debug utils labels or using ``MESA_KK_GPU_CAPTURE_IMMEDIATELY``. Set to ``1`` to activate.
+ - ``MESA_KK_GPU_CAPTURE_IMMEDIATELY``: Starts Metal capture at device creation and ends it at device destruction. Set to ``1`` to activate.
+ - ``MESA_KK_GPU_CAPTURE_DIRECTORY``: Metal capture will be saved to the specified directory. Defaults to Xcode if no path is provided.
+
+--- src/kosmickrisp/bridge/stubs/mtl_heap.c
++++ src/kosmickrisp/bridge/stubs/mtl_heap.c
+@@ -36,6 +36,12 @@ mtl_new_texture_with_descriptor(mtl_heap *heap,
+    return NULL;
+ }
+ 
++mtl_texture *
++mtl_new_device_texture(mtl_device *device, const struct kk_image_layout *layout)
++{
++   return NULL;
++}
++
+ void
+ mtl_heap_set_label(mtl_heap *heap, const char *label)
+ {
+
+--- src/kosmickrisp/bridge/mtl_heap.h
++++ src/kosmickrisp/bridge/mtl_heap.h
+@@ -26,6 +26,8 @@ mtl_buffer *mtl_new_buffer_with_length(mtl_heap *heap, uint64_t size_B,
+                                        uint64_t offset_B);
+ mtl_texture *mtl_new_texture_with_descriptor(
+    mtl_heap *heap, const struct kk_image_layout *layout, uint64_t offset);
++mtl_texture *mtl_new_device_texture(mtl_device *device,
++                                    const struct kk_image_layout *layout);
+ 
+ void mtl_heap_set_label(mtl_heap *heap, const char *label);
+ void mtl_resource_set_label(mtl_resource *resource, const char *label);
+
+--- src/kosmickrisp/bridge/mtl_heap.m
++++ src/kosmickrisp/bridge/mtl_heap.m
+@@ -82,6 +82,19 @@ mtl_new_texture_with_descriptor(mtl_heap *heap,
+    }
+ }
+ 
++mtl_texture *
++mtl_new_device_texture(mtl_device *device, const struct kk_image_layout *layout)
++{
++   @autoreleasepool {
++      id<MTLDevice> dev = (id<MTLDevice>)device;
++      MTLTextureDescriptor *descriptor =
++         [mtl_new_texture_descriptor(layout) autorelease];
++      descriptor.resourceOptions =
++         MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked;
++      return [dev newTextureWithDescriptor:descriptor];
++   }
++}
++
+ void
+ mtl_heap_set_label(mtl_heap *heap, const char *label)
+ {
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -767,6 +767,7 @@ uint64_t
+ kk_upload_descriptor_root(struct kk_cmd_buffer *cmd,
+                           VkPipelineBindPoint bind_point)
+ {
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    struct kk_descriptor_state *desc = kk_get_descriptors_state(cmd, bind_point);
+    struct kk_root_descriptor_table *root = &desc->root;
+    struct kk_ptr root_ptr = kk_pool_alloc(cmd, sizeof(*root), 8u);
+@@ -774,6 +775,8 @@ kk_upload_descriptor_root(struct kk_cmd_buffer *cmd,
+       return 0u;
+ 
+    root->addr = root_ptr.gpu;
++   root->null_textures =
++      dev->null_textures.bo ? dev->null_textures.bo->gpu : 0u;
+ 
+    memcpy(root_ptr.cpu, root, sizeof(*root));
+    desc->root_dirty = false;
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -60,6 +60,9 @@ struct kk_root_descriptor_table {
+ 
+    /* Start index in dynamic_buffers where each set starts */
+    uint8_t set_dynamic_buffer_start[KK_MAX_SETS];
++
++   /* Address of the null-descriptor stand-in resource IDs, or 0 */
++   uint64_t null_textures;
+ };
+ 
+ struct kk_descriptor_state {
+
+--- src/kosmickrisp/vulkan/kk_debug.c
++++ src/kosmickrisp/vulkan/kk_debug.c
+@@ -11,6 +11,7 @@ const struct debug_named_value debug_flags[] = {
+    {"nir", KK_DEBUG_NIR},
+    {"msl", KK_DEBUG_MSL},
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
++   {"force_null_descriptor", KK_DEBUG_FORCE_NULL_DESCRIPTOR},
+    {NULL, 0},
+ };
+ 
+
+--- src/kosmickrisp/vulkan/kk_debug.h
++++ src/kosmickrisp/vulkan/kk_debug.h
+@@ -12,6 +12,8 @@ enum kk_debug {
+    KK_DEBUG_MSL = 1ull << 1,
+    /* Forces robustness for all shaders */
+    KK_DEBUG_FORCE_ROBUSTNESS = 1ull << 2,
++   /* Forces nullDescriptor lowering and stand-in allocation on every device */
++   KK_DEBUG_FORCE_NULL_DESCRIPTOR = 1ull << 3,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+
+--- src/kosmickrisp/vulkan/kk_device.c
++++ src/kosmickrisp/vulkan/kk_device.c
+@@ -10,6 +10,7 @@
+ #include "kk_buffer.h"
+ #include "kk_buffer_view.h"
+ #include "kk_cmd_buffer.h"
++#include "kk_debug.h"
+ #include "kk_entrypoints.h"
+ #include "kk_image.h"
+ #include "kk_image_view.h"
+@@ -253,6 +254,162 @@ kk_get_timestamp(struct vk_device *device, uint64_t *timestamp)
+    return VK_SUCCESS;
+ }
+ 
++/* Null-descriptor stand-ins: one 1x1 texture per enum kk_null_texture_slot.
++ * The BO starts with their resource IDs and holds the backing store of the
++ * texel buffer stand-ins at KK_NULL_TEXEL_BUF_OFFSET. */
++#define KK_NULL_TEXTURES_BO_SIZE 512u
++#define KK_NULL_TEXEL_BUF_OFFSET 256u
++static_assert(KK_NULL_TEX_COUNT * sizeof(uint64_t) <= KK_NULL_TEXEL_BUF_OFFSET,
++              "null texture resource IDs overlap the texel buffer storage");
++
++static void
++kk_device_add_texture_to_residency_set(struct kk_device *dev, mtl_texture *tex)
++{
++   simple_mtx_lock(&dev->residency_set.mutex);
++   mtl_residency_set_add_allocation(dev->residency_set.handle, tex);
++   simple_mtx_unlock(&dev->residency_set.mutex);
++}
++
++static void
++kk_device_remove_texture_from_residency_set(struct kk_device *dev,
++                                            mtl_texture *tex)
++{
++   simple_mtx_lock(&dev->residency_set.mutex);
++   mtl_residency_set_remove_allocation(dev->residency_set.handle, tex);
++   simple_mtx_unlock(&dev->residency_set.mutex);
++}
++
++static void
++kk_device_finish_null_textures(struct kk_device *dev)
++{
++   if (dev->null_textures.bo == NULL)
++      return;
++
++   for (unsigned i = 0; i < KK_NULL_TEX_COUNT; i++) {
++      if (!dev->null_textures.tex[i])
++         continue;
++      if (!dev->null_textures.is_buf[i])
++         kk_device_remove_texture_from_residency_set(dev,
++                                                     dev->null_textures.tex[i]);
++      mtl_release(dev->null_textures.tex[i]);
++      dev->null_textures.tex[i] = NULL;
++   }
++
++   kk_destroy_bo(dev, dev->null_textures.bo);
++   dev->null_textures.bo = NULL;
++}
++
++static VkResult
++kk_device_init_null_textures(struct kk_device *dev)
++{
++   /* Storage images may be declared read_write in MSL, so stand-ins of the
++    * types that can be storage images need shader write usage even though
++    * they are never written. */
++   static const struct {
++      enum mtl_texture_type type;
++      uint8_t samples;
++      enum mtl_texture_usage usage;
++      enum pipe_format pipe_fmt;
++      enum mtl_pixel_format mtl_fmt;
++   } specs[KK_NULL_TEX_COUNT] = {
++#define COLOR_TRIPLE(slot_prefix, tex_type, samp, use)                         \
++   [KK_NULL_TEX_##slot_prefix##_FLOAT] = {tex_type, samp, use,                 \
++                                          PIPE_FORMAT_R32_FLOAT,               \
++                                          MTL_PIXEL_FORMAT_R32_FLOAT},         \
++   [KK_NULL_TEX_##slot_prefix##_SINT] = {tex_type, samp, use,                  \
++                                         PIPE_FORMAT_R32_SINT,                 \
++                                         MTL_PIXEL_FORMAT_R32_SINT},           \
++   [KK_NULL_TEX_##slot_prefix##_UINT] = {                                      \
++      tex_type, samp, use, PIPE_FORMAT_R32_UINT, MTL_PIXEL_FORMAT_R32_UINT}
++      COLOR_TRIPLE(
++         2D, MTL_TEXTURE_TYPE_2D, 1,
++         MTL_TEXTURE_USAGE_SHADER_READ | MTL_TEXTURE_USAGE_SHADER_WRITE),
++      COLOR_TRIPLE(
++         2D_ARRAY, MTL_TEXTURE_TYPE_2D_ARRAY, 1,
++         MTL_TEXTURE_USAGE_SHADER_READ | MTL_TEXTURE_USAGE_SHADER_WRITE),
++      COLOR_TRIPLE(
++         3D, MTL_TEXTURE_TYPE_3D, 1,
++         MTL_TEXTURE_USAGE_SHADER_READ | MTL_TEXTURE_USAGE_SHADER_WRITE),
++      COLOR_TRIPLE(CUBE, MTL_TEXTURE_TYPE_CUBE, 1,
++                   MTL_TEXTURE_USAGE_SHADER_READ),
++      COLOR_TRIPLE(CUBE_ARRAY, MTL_TEXTURE_TYPE_CUBE_ARRAY, 1,
++                   MTL_TEXTURE_USAGE_SHADER_READ),
++      COLOR_TRIPLE(2D_MS, MTL_TEXTURE_TYPE_2D_MULTISAMPLE, 4,
++                   MTL_TEXTURE_USAGE_SHADER_READ),
++      COLOR_TRIPLE(2D_MS_ARRAY, MTL_TEXTURE_TYPE_2D_ARRAY_MULTISAMPLE, 4,
++                   MTL_TEXTURE_USAGE_SHADER_READ),
++      COLOR_TRIPLE(
++         BUFFER, MTL_TEXTURE_TYPE_TEXTURE_BUFFER, 1,
++         MTL_TEXTURE_USAGE_SHADER_READ | MTL_TEXTURE_USAGE_SHADER_WRITE),
++#undef COLOR_TRIPLE
++      [KK_NULL_TEX_DEPTH_2D] = {MTL_TEXTURE_TYPE_2D, 1,
++                                MTL_TEXTURE_USAGE_SHADER_READ,
++                                PIPE_FORMAT_Z32_FLOAT,
++                                MTL_PIXEL_FORMAT_Z32_FLOAT},
++      [KK_NULL_TEX_DEPTH_2D_ARRAY] = {MTL_TEXTURE_TYPE_2D_ARRAY, 1,
++                                      MTL_TEXTURE_USAGE_SHADER_READ,
++                                      PIPE_FORMAT_Z32_FLOAT,
++                                      MTL_PIXEL_FORMAT_Z32_FLOAT},
++      [KK_NULL_TEX_DEPTH_CUBE] = {MTL_TEXTURE_TYPE_CUBE, 1,
++                                  MTL_TEXTURE_USAGE_SHADER_READ,
++                                  PIPE_FORMAT_Z32_FLOAT,
++                                  MTL_PIXEL_FORMAT_Z32_FLOAT},
++      [KK_NULL_TEX_DEPTH_CUBE_ARRAY] = {MTL_TEXTURE_TYPE_CUBE_ARRAY, 1,
++                                        MTL_TEXTURE_USAGE_SHADER_READ,
++                                        PIPE_FORMAT_Z32_FLOAT,
++                                        MTL_PIXEL_FORMAT_Z32_FLOAT},
++      [KK_NULL_TEX_DEPTH_2D_MS] = {MTL_TEXTURE_TYPE_2D_MULTISAMPLE, 4,
++                                   MTL_TEXTURE_USAGE_SHADER_READ,
++                                   PIPE_FORMAT_Z32_FLOAT,
++                                   MTL_PIXEL_FORMAT_Z32_FLOAT},
++   };
++
++   VkResult result = kk_alloc_bo(dev, &dev->vk.base, KK_NULL_TEXTURES_BO_SIZE,
++                                 8u, &dev->null_textures.bo);
++   if (result != VK_SUCCESS)
++      return result;
++
++   memset(dev->null_textures.bo->cpu, 0, KK_NULL_TEXTURES_BO_SIZE);
++   uint64_t *rids = (uint64_t *)dev->null_textures.bo->cpu;
++
++   for (unsigned i = 0; i < KK_NULL_TEX_COUNT; i++) {
++      const bool is_buf = specs[i].type == MTL_TEXTURE_TYPE_TEXTURE_BUFFER;
++      struct kk_image_layout layout = {
++         .width_px = 1u,
++         .height_px = 1u,
++         .depth_px = 1u,
++         .layers = 1u,
++         .type = specs[i].type,
++         .sample_count_sa = specs[i].samples,
++         .levels = 1u,
++         .linear = is_buf,
++         .optimized_layout = !is_buf && specs[i].samples == 1u,
++         .usage = specs[i].usage,
++         .format = {.pipe = specs[i].pipe_fmt, .mtl = specs[i].mtl_fmt},
++         .linear_stride_B = is_buf ? KK_MIN_TEXEL_BUFFER_ALIGNMENT : 0u,
++      };
++
++      mtl_texture *tex =
++         is_buf
++            ? mtl_new_texture_with_descriptor_linear(
++                 dev->null_textures.bo->map, &layout, KK_NULL_TEXEL_BUF_OFFSET)
++            : mtl_new_device_texture(dev->mtl_handle, &layout);
++      if (tex == NULL) {
++         kk_device_finish_null_textures(dev);
++         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      }
++
++      dev->null_textures.tex[i] = tex;
++      dev->null_textures.is_buf[i] = is_buf;
++      /* Texel buffer stand-ins live in the BO, which is already resident */
++      if (!is_buf)
++         kk_device_add_texture_to_residency_set(dev, tex);
++      rids[i] = mtl_texture_get_gpu_resource_id(tex);
++   }
++
++   return VK_SUCCESS;
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+                 const VkDeviceCreateInfo *pCreateInfo,
+@@ -327,9 +484,16 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (result != VK_SUCCESS)
+       goto fail_query_table;
+ 
++   if (dev->vk.enabled_features.nullDescriptor ||
++       KK_DEBUG(FORCE_NULL_DESCRIPTOR)) {
++      result = kk_device_init_null_textures(dev);
++      if (result != VK_SUCCESS)
++         goto fail_sampler_heap;
++   }
++
+    result = kk_device_init_lib(dev);
+    if (result != VK_SUCCESS)
+-      goto fail_sampler_heap;
++      goto fail_null_textures;
+ 
+    if (pdev->settings.gpu_capture_immediately) {
+       mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
+@@ -340,6 +504,8 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    return VK_SUCCESS;
+ 
++fail_null_textures:
++   kk_device_finish_null_textures(dev);
+ fail_sampler_heap:
+    kk_destroy_sampler_heap(dev, &dev->samplers);
+ fail_query_table:
+@@ -382,6 +548,7 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    kk_device_finish_lib(dev);
+    kk_query_table_finish(dev, &dev->occlusion_queries);
+    kk_destroy_sampler_heap(dev, &dev->samplers);
++   kk_device_finish_null_textures(dev);
+ 
+    /* Geometry heap */
+    if (dev->heap)
+
+--- src/kosmickrisp/vulkan/kk_device.h
++++ src/kosmickrisp/vulkan/kk_device.h
+@@ -101,6 +101,15 @@ struct kk_device {
+ 
+    struct vk_meta_device meta;
+ 
++   /* Stand-in textures for null descriptors: a BO holding their resource IDs
++    * (indexed by enum kk_null_texture_slot), followed by the backing store of
++    * the texel buffer stand-ins. NULL unless nullDescriptor is enabled. */
++   struct {
++      struct kk_bo *bo;
++      mtl_texture *tex[KK_NULL_TEX_COUNT];
++      bool is_buf[KK_NULL_TEX_COUNT];
++   } null_textures;
++
+    /* Geomtry heap */
+    struct kk_bo *heap;
+    util_once_flag heap_init_once;
+
+--- src/kosmickrisp/vulkan/kk_nir_lower_null_images.c
++++ src/kosmickrisp/vulkan/kk_nir_lower_null_images.c
+@@ -8,9 +8,123 @@
+  */
+ #include "kk_shader.h"
+ 
++#include "kosmickrisp/compiler/nir_to_msl.h"
++#include "kk_cmd_buffer.h"
++
+ #include "compiler/nir/nir.h"
+ #include "compiler/nir/nir_builder.h"
+ 
++static int
++standin_index_for_handle(const nir_intrinsic_instr *handle_intr)
++{
++   enum glsl_sampler_dim dim = nir_intrinsic_image_dim(handle_intr);
++   bool is_array = nir_intrinsic_image_array(handle_intr);
++
++   if (handle_intr->intrinsic == nir_intrinsic_load_depth_texture_kk) {
++      switch (dim) {
++      case GLSL_SAMPLER_DIM_2D:
++         return is_array ? KK_NULL_TEX_DEPTH_2D_ARRAY : KK_NULL_TEX_DEPTH_2D;
++      case GLSL_SAMPLER_DIM_CUBE:
++         return is_array ? KK_NULL_TEX_DEPTH_CUBE_ARRAY
++                         : KK_NULL_TEX_DEPTH_CUBE;
++      case GLSL_SAMPLER_DIM_MS:
++         return is_array ? -1 : KK_NULL_TEX_DEPTH_2D_MS;
++      default:
++         return -1;
++      }
++   }
++
++   if (handle_intr->intrinsic != nir_intrinsic_load_texture_handle_kk)
++      return -1;
++
++   enum msl_tex_access_flag access = nir_intrinsic_flags(handle_intr);
++   if ((access == MSL_ACCESS_WRITE || access == MSL_ACCESS_READ_WRITE) &&
++       (dim == GLSL_SAMPLER_DIM_CUBE || dim == GLSL_SAMPLER_DIM_MS))
++      return -1;
++
++   int sc = -1;
++   switch (nir_intrinsic_dest_type(handle_intr)) {
++   case nir_type_float16:
++   case nir_type_float32:
++      sc = 0;
++      break;
++   case nir_type_int16:
++   case nir_type_int32:
++      sc = 1;
++      break;
++   case nir_type_uint16:
++   case nir_type_uint32:
++      sc = 2;
++      break;
++   default:
++      return -1;
++   }
++
++   switch (dim) {
++   case GLSL_SAMPLER_DIM_2D:
++      return (is_array ? KK_NULL_TEX_2D_ARRAY_FLOAT : KK_NULL_TEX_2D_FLOAT) +
++             sc;
++   case GLSL_SAMPLER_DIM_3D:
++      return is_array ? -1 : (KK_NULL_TEX_3D_FLOAT + sc);
++   case GLSL_SAMPLER_DIM_CUBE:
++      return (is_array ? KK_NULL_TEX_CUBE_ARRAY_FLOAT
++                       : KK_NULL_TEX_CUBE_FLOAT) +
++             sc;
++   case GLSL_SAMPLER_DIM_MS:
++      return (is_array ? KK_NULL_TEX_2D_MS_ARRAY_FLOAT
++                       : KK_NULL_TEX_2D_MS_FLOAT) +
++             sc;
++   case GLSL_SAMPLER_DIM_BUF:
++      return is_array ? -1 : (KK_NULL_TEX_BUFFER_FLOAT + sc);
++   default:
++      return -1;
++   }
++}
++
++static bool
++lower_read_or_query(nir_builder *b, nir_instr *instr, nir_src *handle_src,
++                    nir_def *def)
++{
++   nir_instr *parent = nir_def_instr(handle_src->ssa);
++   if (parent->type != nir_instr_type_intrinsic)
++      return false;
++
++   nir_intrinsic_instr *handle_intr = nir_instr_as_intrinsic(parent);
++   int slot = standin_index_for_handle(handle_intr);
++   if (slot < 0)
++      return false;
++
++   b->cursor = nir_before_instr(instr);
++
++   nir_def *orig_addr = handle_intr->src[0].ssa;
++   nir_def *rid = nir_build_load_global_constant(
++      b, 1, 64, orig_addr, .align_mul = 8, .access = ACCESS_CAN_SPECULATE);
++   nir_def *is_null = nir_ieq_imm(b, rid, 0);
++
++   nir_def *root = nir_load_buffer_ptr_kk(b, 1, 64, .binding = 0);
++   nir_def *table_base = nir_build_load_global_constant(
++      b, 1, 64,
++      nir_iadd_imm(b, root,
++                   offsetof(struct kk_root_descriptor_table, null_textures)),
++      .align_mul = 8, .access = ACCESS_CAN_SPECULATE);
++   nir_def *standin_addr =
++      nir_iadd_imm(b, table_base, (uint64_t)slot * sizeof(uint64_t));
++   nir_def *safe_addr = nir_bcsel(b, is_null, standin_addr, orig_addr);
++
++   nir_intrinsic_instr *clone =
++      nir_instr_as_intrinsic(nir_instr_clone(b->shader, &handle_intr->instr));
++   clone->src[0] = nir_src_for_ssa(safe_addr);
++   nir_builder_instr_insert(b, &clone->instr);
++   nir_src_rewrite(handle_src, &clone->def);
++
++   b->cursor = nir_after_instr(instr);
++   nir_def *zero = nir_imm_zero(b, def->num_components, def->bit_size);
++   nir_def *masked = nir_bcsel(b, is_null, zero, def);
++   nir_def_rewrite_uses_after(def, masked);
++
++   return true;
++}
++
+ static nir_def *
+ tex_handle_to_resource_id(nir_builder *b, nir_def *handle)
+ {
+@@ -21,25 +135,72 @@ tex_handle_to_resource_id(nir_builder *b, nir_def *handle)
+    return nir_load_global_constant(b, 1, 64, intr->src[0].ssa);
+ }
+ 
+-static nir_def *
+-get_is_null(nir_builder *b, nir_instr *instr, nir_def **def)
++static bool
++try_hoist_fence_into_prev_if(nir_intrinsic_instr *fence_intr)
++{
++   nir_instr *instr = &fence_intr->instr;
++   if (instr != nir_block_first_instr(instr->block))
++      return false;
++
++   nir_cf_node *prev = nir_cf_node_prev(&instr->block->cf_node);
++   if (!prev || prev->type != nir_cf_node_if)
++      return false;
++
++   nir_if *nif = nir_cf_node_as_if(prev);
++   nir_block *then_block = nir_if_last_then_block(nif);
++   nir_instr *last = nir_block_last_instr(then_block);
++   if (!last || last->type != nir_instr_type_intrinsic)
++      return false;
++
++   nir_intrinsic_instr *prev_intr = nir_instr_as_intrinsic(last);
++   switch (prev_intr->intrinsic) {
++   case nir_intrinsic_bindless_image_store:
++   case nir_intrinsic_bindless_image_atomic:
++   case nir_intrinsic_bindless_image_atomic_swap:
++      if (prev_intr->src[0].ssa != fence_intr->src[0].ssa)
++         return false;
++      nir_instr_remove(instr);
++      nir_instr_insert(nir_after_block(then_block), instr);
++      return true;
++   default:
++      return false;
++   }
++}
++
++static bool
++lower(nir_builder *b, nir_instr *instr, UNUSED void *data)
+ {
+-   *def = NULL;
++   if (instr->type == nir_instr_type_intrinsic &&
++       nir_instr_as_intrinsic(instr)->intrinsic ==
++          nir_intrinsic_bindless_image_fence_kk &&
++       try_hoist_fence_into_prev_if(nir_instr_as_intrinsic(instr)))
++      return true;
++
++   b->cursor = nir_before_instr(instr);
++
++   nir_def *def = NULL;
++   nir_src *read_handle_src = NULL;
+    nir_def *handle = NULL;
+ 
+    if (instr->type == nir_instr_type_intrinsic) {
+       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+       switch (intr->intrinsic) {
+       case nir_intrinsic_bindless_image_load:
++      case nir_intrinsic_bindless_image_size:
++      case nir_intrinsic_bindless_image_samples:
++      case nir_intrinsic_bindless_image_levels:
++         def = &intr->def;
++         read_handle_src = &intr->src[0];
++         handle = intr->src[0].ssa;
++         break;
++
+       case nir_intrinsic_bindless_image_sparse_load:
+       case nir_intrinsic_bindless_image_store:
+       case nir_intrinsic_bindless_image_atomic:
+       case nir_intrinsic_bindless_image_atomic_swap:
+-      case nir_intrinsic_bindless_image_size:
+-      case nir_intrinsic_bindless_image_samples:
+-      case nir_intrinsic_bindless_image_levels:
++      case nir_intrinsic_bindless_image_fence_kk:
+          if (nir_intrinsic_infos[intr->intrinsic].has_dest)
+-            *def = &intr->def;
++            def = &intr->def;
+ 
+          handle = intr->src[0].ssa;
+          break;
+@@ -49,28 +210,25 @@ get_is_null(nir_builder *b, nir_instr *instr, nir_def **def)
+       }
+    } else if (instr->type == nir_instr_type_tex) {
+       nir_tex_instr *tex = nir_instr_as_tex(instr);
+-      *def = &tex->def;
++      def = &tex->def;
+ 
+-      handle = nir_get_tex_src(tex, nir_tex_src_texture_handle);
++      int idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_handle);
++      if (idx >= 0) {
++         handle = tex->src[idx].src.ssa;
++         if (!tex->is_sparse)
++            read_handle_src = &tex->src[idx].src;
++      }
+    }
+ 
+    if (!handle)
+-      return NULL;
+-
+-   nir_def *resource_id = tex_handle_to_resource_id(b, handle);
+-   return nir_ieq_imm(b, resource_id, 0);
+-}
+-
+-static bool
+-lower(nir_builder *b, nir_instr *instr, UNUSED void *data)
+-{
+-   b->cursor = nir_before_instr(instr);
++      return false;
+ 
+-   nir_def *def;
+-   nir_def *is_null = get_is_null(b, instr, &def);
++   if (read_handle_src && def &&
++       lower_read_or_query(b, instr, read_handle_src, def))
++      return true;
+ 
+-   if (!is_null)
+-      return false;
++   nir_def *resource_id = tex_handle_to_resource_id(b, handle);
++   nir_def *is_null = nir_ieq_imm(b, resource_id, 0);
+ 
+    nir_def *zero = NULL;
+    nir_if *nif = nir_push_if(b, nir_inot(b, is_null));
+
+--- src/kosmickrisp/vulkan/kk_private.h
++++ src/kosmickrisp/vulkan/kk_private.h
+@@ -54,4 +54,38 @@ struct kk_addr_range {
+    uint64_t range;
+ };
+ 
++/* Stand-in textures read in place of null descriptors (nullDescriptor) */
++enum kk_null_texture_slot {
++   KK_NULL_TEX_2D_FLOAT = 0,
++   KK_NULL_TEX_2D_SINT,
++   KK_NULL_TEX_2D_UINT,
++   KK_NULL_TEX_2D_ARRAY_FLOAT,
++   KK_NULL_TEX_2D_ARRAY_SINT,
++   KK_NULL_TEX_2D_ARRAY_UINT,
++   KK_NULL_TEX_3D_FLOAT,
++   KK_NULL_TEX_3D_SINT,
++   KK_NULL_TEX_3D_UINT,
++   KK_NULL_TEX_CUBE_FLOAT,
++   KK_NULL_TEX_CUBE_SINT,
++   KK_NULL_TEX_CUBE_UINT,
++   KK_NULL_TEX_CUBE_ARRAY_FLOAT,
++   KK_NULL_TEX_CUBE_ARRAY_SINT,
++   KK_NULL_TEX_CUBE_ARRAY_UINT,
++   KK_NULL_TEX_2D_MS_FLOAT,
++   KK_NULL_TEX_2D_MS_SINT,
++   KK_NULL_TEX_2D_MS_UINT,
++   KK_NULL_TEX_2D_MS_ARRAY_FLOAT,
++   KK_NULL_TEX_2D_MS_ARRAY_SINT,
++   KK_NULL_TEX_2D_MS_ARRAY_UINT,
++   KK_NULL_TEX_BUFFER_FLOAT,
++   KK_NULL_TEX_BUFFER_SINT,
++   KK_NULL_TEX_BUFFER_UINT,
++   KK_NULL_TEX_DEPTH_2D,
++   KK_NULL_TEX_DEPTH_2D_ARRAY,
++   KK_NULL_TEX_DEPTH_CUBE,
++   KK_NULL_TEX_DEPTH_CUBE_ARRAY,
++   KK_NULL_TEX_DEPTH_2D_MS,
++   KK_NULL_TEX_COUNT,
++};
++
+ #endif
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -181,7 +181,7 @@ kk_make_feature_key(const struct vk_features *feats,
+    enum kk_feature_key key = 0;
+    if (feats->customBorderColors)
+       key |= KK_FEAT_CUSTOM_BORDER;
+-   if (feats->nullDescriptor)
++   if (feats->nullDescriptor || KK_DEBUG(FORCE_NULL_DESCRIPTOR))
+       key |= KK_FEAT_NULL_DESCRIPTOR;
+    /* Emulated in shader on M5 and below */
+    if (feats->minLod && pdev->info.gpu_apple_family < 11)
+

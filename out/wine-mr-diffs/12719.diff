@@ -1,0 +1,25 @@
+# Build certain applications as ARM64EC due to lack of ARM64 Gecko
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12719 state=merged
+# Jacek has indicated that ARM64 Gecko is unlikely to be ready before the Wine 12.0 release date. As such, the ARM64 native builds of `hh.exe` and `iexplore.exe` are effectively useless, with no fallback other than to use the i386 builds. I propose we build these as ARM64EC until such time as an updated Gecko is available, when these patches can be reverted.
+
+While investigating these issues, it also became apparent that the build system is failing to link .res files into ARM64EC-only binaries. My proposed change to `makedep` fixes that.
+--- programs/hh/Makefile.in
++++ programs/hh/Makefile.in
+@@ -1,4 +1,5 @@
+ MODULE    = hh.exe
++ENABLE_ARCHS = i386 x86_64 arm64ec
+ 
+ EXTRADLLFLAGS = -mwindows
+ 
+
+--- programs/iexplore/Makefile.in
++++ programs/iexplore/Makefile.in
+@@ -1,6 +1,7 @@
+ MODULE    = iexplore.exe
+ IMPORTS   = ieframe
+ DELAYIMPORTS = advpack version user32
++ENABLE_ARCHS = i386 x86_64 arm64ec
+ 
+ EXTRADLLFLAGS = -mwindows -municode -Wl,--large-address-aware
+ 
+

@@ -1,0 +1,359 @@
+# winemac: Handle windowDidMiniaturize fully on the main thread.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12555 state=merged
+# This allows removing of the WINDOW_DID_MINIMIZE event and the macdrv_is_any_wine_window_visible helper.
+--- dlls/winemac.drv/cocoa_app.h
++++ dlls/winemac.drv/cocoa_app.h
+@@ -128,6 +128,7 @@ - (void) flipRect:(NSRect*)rect;
+     - (NSPoint) flippedMouseLocation:(NSPoint)point;
+ 
+     - (WineWindow*) frontWineWindow;
++    - (BOOL) isAnyWineWindowVisible;
+     - (void) adjustWindowLevels;
+     - (void) updateFullscreenWindows;
+ 
+
+--- dlls/winemac.drv/cocoa_app.m
++++ dlls/winemac.drv/cocoa_app.m
+@@ -2712,14 +2712,3 @@ void macdrv_set_cocoa_retina_mode(bool new_mode)
+         [[WineApplicationController sharedController] setRetinaMode:new_mode];
+     });
+ }
+-
+-bool macdrv_is_any_wine_window_visible(void)
+-{
+-    __block bool ret = false;
+-
+-    OnMainThread(^{
+-        ret = [[WineApplicationController sharedController] isAnyWineWindowVisible];
+-    });
+-
+-    return ret;
+-}
+
+--- dlls/winemac.drv/cocoa_window.m
++++ dlls/winemac.drv/cocoa_window.m
+@@ -1696,8 +1696,6 @@ - (void) doOrderOut
+             [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_BROUGHT_FORWARD) |
+                                              event_mask_for_type(WINDOW_GOT_FOCUS) |
+                                              event_mask_for_type(WINDOW_LOST_FOCUS) |
+-                                             event_mask_for_type(WINDOW_MAXIMIZE_REQUESTED) |
+-                                             event_mask_for_type(WINDOW_MINIMIZE_REQUESTED) |
+                                              event_mask_for_type(WINDOW_RESTORE_REQUESTED)
+                                    forWindow:self];
+             return;
+@@ -1733,8 +1731,6 @@ - (void) doOrderOut
+         [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_BROUGHT_FORWARD) |
+                                          event_mask_for_type(WINDOW_GOT_FOCUS) |
+                                          event_mask_for_type(WINDOW_LOST_FOCUS) |
+-                                         event_mask_for_type(WINDOW_MAXIMIZE_REQUESTED) |
+-                                         event_mask_for_type(WINDOW_MINIMIZE_REQUESTED) |
+                                          event_mask_for_type(WINDOW_RESTORE_REQUESTED)
+                                forWindow:self];
+     }
+@@ -2403,9 +2399,7 @@ - (void) miniaturize:(id)sender
+             return;
+         }
+ 
+-        macdrv_event* event = macdrv_create_event(WINDOW_MINIMIZE_REQUESTED, self);
+-        [queue postEvent:event];
+-        macdrv_release_event(event);
++        macdrv_window_minimize_requested(self.hwnd);
+ 
+         WineWindow* parent = (WineWindow*)self.parentWindow;
+         if ([parent isKindOfClass:[WineWindow class]])
+@@ -2734,14 +2728,14 @@ - (void) windowDidFailToExitFullScreen:(NSWindow*)window
+ 
+     - (void)windowDidMiniaturize:(NSNotification *)notification
+     {
+-        macdrv_event* event;
++        WineApplicationController* controller = [WineApplicationController sharedController];
+ 
+         if (fullscreen && [self isOnActiveSpace])
+-            [[WineApplicationController sharedController] updateFullscreenWindows];
++            [controller updateFullscreenWindows];
+ 
+-        event = macdrv_create_event(WINDOW_DID_MINIMIZE, self);
+-        [queue postEvent:event];
+-        macdrv_release_event(event);
++        /* If all our windows are minimized, disable cursor clipping. */
++        if (![controller isAnyWineWindowVisible])
++            NtUserClipCursor(NULL);
+     }
+ 
+     - (void)windowDidMove:(NSNotification *)notification
+@@ -2814,9 +2808,7 @@ - (BOOL) windowShouldZoom:(NSWindow*)window toFrame:(NSRect)newFrame
+         }
+         else if (!resizable)
+         {
+-            macdrv_event* event = macdrv_create_event(WINDOW_MAXIMIZE_REQUESTED, self);
+-            [queue postEvent:event];
+-            macdrv_release_event(event);
++            macdrv_window_maximize_requested(self.hwnd);
+             return NO;
+         }
+ 
+
+--- dlls/winemac.drv/event.c
++++ dlls/winemac.drv/event.c
+@@ -55,15 +55,12 @@ static const char *dbgstr_event(int type)
+         "STATUS_ITEM_MOUSE_MOVE",
+         "WINDOW_BROUGHT_FORWARD",
+         "WINDOW_CLOSE_REQUESTED",
+-        "WINDOW_DID_MINIMIZE",
+         "WINDOW_DID_UNMINIMIZE",
+         "WINDOW_DRAG_BEGIN",
+         "WINDOW_DRAG_END",
+         "WINDOW_FRAME_CHANGED",
+         "WINDOW_GOT_FOCUS",
+         "WINDOW_LOST_FOCUS",
+-        "WINDOW_MAXIMIZE_REQUESTED",
+-        "WINDOW_MINIMIZE_REQUESTED",
+         "WINDOW_RESIZE_ENDED",
+         "WINDOW_RESTORE_REQUESTED",
+     };
+@@ -129,8 +126,6 @@ static macdrv_event_mask get_event_mask(DWORD mask)
+         event_mask |= event_mask_for_type(WINDOW_CLOSE_REQUESTED);
+         event_mask |= event_mask_for_type(WINDOW_DRAG_BEGIN);
+         event_mask |= event_mask_for_type(WINDOW_DRAG_END);
+-        event_mask |= event_mask_for_type(WINDOW_MAXIMIZE_REQUESTED);
+-        event_mask |= event_mask_for_type(WINDOW_MINIMIZE_REQUESTED);
+         event_mask |= event_mask_for_type(WINDOW_RESIZE_ENDED);
+         event_mask |= event_mask_for_type(WINDOW_RESTORE_REQUESTED);
+     }
+@@ -371,9 +366,6 @@ void macdrv_handle_event(const macdrv_event *event)
+     case WINDOW_CLOSE_REQUESTED:
+         macdrv_window_close_requested(hwnd);
+         break;
+-    case WINDOW_DID_MINIMIZE:
+-        macdrv_window_did_minimize(hwnd);
+-        break;
+     case WINDOW_DID_UNMINIMIZE:
+         macdrv_window_did_unminimize(hwnd);
+         break;
+@@ -392,12 +384,6 @@ void macdrv_handle_event(const macdrv_event *event)
+     case WINDOW_LOST_FOCUS:
+         macdrv_window_lost_focus(hwnd, event);
+         break;
+-    case WINDOW_MAXIMIZE_REQUESTED:
+-        macdrv_window_maximize_requested(hwnd);
+-        break;
+-    case WINDOW_MINIMIZE_REQUESTED:
+-        macdrv_window_minimize_requested(hwnd);
+-        break;
+     case WINDOW_RESIZE_ENDED:
+         macdrv_window_resize_ended(hwnd);
+         break;
+
+--- dlls/winemac.drv/keyboard.c
++++ dlls/winemac.drv/keyboard.c
+@@ -1044,7 +1044,7 @@ void macdrv_keyboard_changed(const macdrv_event *event)
+ 
+     NtUserActivateKeyboardLayout(thread_data->active_keyboard_layout, 0);
+ 
+-    send_message(get_active_window(), WM_CANCELMODE, 0, 0);
++    send_message(get_active_window(GetCurrentThreadId()), WM_CANCELMODE, 0, 0);
+ }
+ 
+ 
+
+--- dlls/winemac.drv/macdrv.h
++++ dlls/winemac.drv/macdrv.h
+@@ -136,6 +136,7 @@ static inline RECT rect_from_cgrect(CGRect cgrect)
+     WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS,
+     WM_MACDRV_CREATE_REMOTE_LAYER,
+     WM_MACDRV_RELEASE_REMOTE_LAYER,
++    WM_MACDRV_INACTIVE_WINDOW_COMMAND,
+ };
+ 
+ struct macdrv_thread_data
+@@ -271,7 +272,6 @@ extern void macdrv_ime_set_text(HWND hwnd, CFStringRef text, bool complete,
+ extern void macdrv_app_quit_requested(const macdrv_event *event);
+ extern void macdrv_window_maximize_requested(HWND hwnd);
+ extern void macdrv_window_minimize_requested(HWND hwnd);
+-extern void macdrv_window_did_minimize(HWND hwnd);
+ extern void macdrv_window_did_unminimize(HWND hwnd);
+ extern void macdrv_window_brought_forward(HWND hwnd);
+ extern void macdrv_window_resize_ended(HWND hwnd);
+@@ -336,11 +336,11 @@ static inline LRESULT send_message_timeout(HWND hwnd, UINT msg, WPARAM wparam, L
+     return res;
+ }
+ 
+-static inline HWND get_active_window(void)
++static inline HWND get_active_window(DWORD thread_id)
+ {
+     GUITHREADINFO info;
+     info.cbSize = sizeof(info);
+-    return NtUserGetGUIThreadInfo(GetCurrentThreadId(), &info) ? info.hwndActive : 0;
++    return NtUserGetGUIThreadInfo(thread_id, &info) ? info.hwndActive : 0;
+ }
+ 
+ static inline HWND get_capture(void)
+
+--- dlls/winemac.drv/macdrv_cocoa.h
++++ dlls/winemac.drv/macdrv_cocoa.h
+@@ -275,15 +275,12 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+     STATUS_ITEM_MOUSE_MOVE,
+     WINDOW_BROUGHT_FORWARD,
+     WINDOW_CLOSE_REQUESTED,
+-    WINDOW_DID_MINIMIZE,
+     WINDOW_DID_UNMINIMIZE,
+     WINDOW_DRAG_BEGIN,
+     WINDOW_DRAG_END,
+     WINDOW_FRAME_CHANGED,
+     WINDOW_GOT_FOCUS,
+     WINDOW_LOST_FOCUS,
+-    WINDOW_MAXIMIZE_REQUESTED,
+-    WINDOW_MINIMIZE_REQUESTED,
+     WINDOW_RESIZE_ENDED,
+     WINDOW_RESTORE_REQUESTED,
+     NUM_EVENT_TYPES
+@@ -517,7 +514,6 @@ extern void macdrv_order_cocoa_window(WineWindow *window, WineWindow *prev,
+ extern uint32_t macdrv_window_background_color(void);
+ extern bool macdrv_send_keydown_to_input_source(int keyc, unsigned int flags, int repeat, void *update);
+ extern void macdrv_clear_ime_text(void);
+-extern bool macdrv_is_any_wine_window_visible(void);
+ 
+ 
+ /* keyboard */
+
+--- dlls/winemac.drv/window.c
++++ dlls/winemac.drv/window.c
+@@ -1020,6 +1020,39 @@ static LRESULT move_window(HWND hwnd, WPARAM wparam)
+ }
+ 
+ 
++/***********************************************************************
++ *              perform_inactive_window_command
++ */
++static void perform_inactive_window_command(HWND hwnd, WORD command, WORD hittest)
++{
++    LRESULT ma;
++
++    TRACE("win %p command 0x%04x hittest 0x%04x\n", hwnd, command, hittest);
++
++    ma = send_message(hwnd, WM_MOUSEACTIVATE, (WPARAM)NtUserGetAncestor(hwnd, GA_ROOT),
++                      MAKELPARAM(hittest, WM_NCLBUTTONDOWN));
++    switch (ma)
++    {
++        case MA_NOACTIVATEANDEAT:
++        case MA_ACTIVATEANDEAT:
++            TRACE("not changing win %p mouse-activate result %ld\n", hwnd, ma);
++            return;
++        case MA_NOACTIVATE:
++            break;
++        case MA_ACTIVATE:
++        case 0:
++            NtUserSetActiveWindow(hwnd);
++            break;
++        default:
++            WARN("unknown WM_MOUSEACTIVATE code %ld\n", ma);
++            break;
++    }
++
++    TRACE("changing win %p\n", hwnd);
++    NtUserPostMessage(hwnd, WM_SYSCOMMAND, command, 0);
++}
++
++
+ /***********************************************************************
+  *              perform_window_command
+  */
+@@ -1037,26 +1070,10 @@ static void perform_window_command(HWND hwnd, unsigned int style_any, unsigned i
+         return;
+     }
+ 
+-    if (get_active_window() != hwnd)
++    if (get_active_window(NtUserGetWindowThread(hwnd, NULL)) != hwnd)
+     {
+-        LRESULT ma = send_message(hwnd, WM_MOUSEACTIVATE, (WPARAM)NtUserGetAncestor(hwnd, GA_ROOT),
+-                                  MAKELPARAM(hittest, WM_NCLBUTTONDOWN));
+-        switch (ma)
+-        {
+-            case MA_NOACTIVATEANDEAT:
+-            case MA_ACTIVATEANDEAT:
+-                TRACE("not changing win %p mouse-activate result %ld\n", hwnd, ma);
+-                return;
+-            case MA_NOACTIVATE:
+-                break;
+-            case MA_ACTIVATE:
+-            case 0:
+-                NtUserSetActiveWindow(hwnd);
+-                break;
+-            default:
+-                WARN("unknown WM_MOUSEACTIVATE code %ld\n", ma);
+-                break;
+-        }
++        NtUserPostMessage(hwnd, WM_MACDRV_INACTIVE_WINDOW_COMMAND, command, hittest);
++        return;
+     }
+ 
+     TRACE("changing win %p\n", hwnd);
+@@ -1548,6 +1565,9 @@ LRESULT macdrv_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+         activate_on_following_focus();
+         TRACE("WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS time %u\n", activate_on_focus_time);
+         return 0;
++    case WM_MACDRV_INACTIVE_WINDOW_COMMAND:
++        perform_inactive_window_command(hwnd, wp, lp);
++        return 0;
+     case WM_MACDRV_CREATE_REMOTE_LAYER:
+         if ((data = get_win_data(hwnd)))
+         {
+@@ -1800,7 +1820,7 @@ void macdrv_window_got_focus(HWND hwnd, const macdrv_event *event)
+ 
+     TRACE("win %p/%p serial %lu enabled %d visible %d style %08x focus %p active %p fg %p\n",
+           hwnd, event->window, event->window_got_focus.serial, NtUserIsWindowEnabled(hwnd),
+-          NtUserIsWindowVisible(hwnd), style, get_focus(), get_active_window(), NtUserGetForegroundWindow());
++          NtUserIsWindowVisible(hwnd), style, get_focus(), get_active_window(GetCurrentThreadId()), NtUserGetForegroundWindow());
+ 
+     if (can_window_become_foreground(hwnd) && !(style & WS_MINIMIZE))
+     {
+@@ -1843,7 +1863,7 @@ void macdrv_app_deactivated(void)
+ {
+     NtUserClipCursor(NULL);
+ 
+-    if (get_active_window() == NtUserGetForegroundWindow())
++    if (get_active_window(GetCurrentThreadId()) == NtUserGetForegroundWindow())
+     {
+         TRACE("setting fg to desktop\n");
+         NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+@@ -1854,7 +1874,7 @@ void macdrv_app_deactivated(void)
+ /***********************************************************************
+  *              macdrv_window_maximize_requested
+  *
+- * Handler for WINDOW_MAXIMIZE_REQUESTED events.
++ * Handle a maximize request from Cocoa.
+  */
+ void macdrv_window_maximize_requested(HWND hwnd)
+ {
+@@ -1865,7 +1885,7 @@ void macdrv_window_maximize_requested(HWND hwnd)
+ /***********************************************************************
+  *              macdrv_window_minimize_requested
+  *
+- * Handler for WINDOW_MINIMIZE_REQUESTED events.
++ * Handle a minimize request from Cocoa.
+  */
+ void macdrv_window_minimize_requested(HWND hwnd)
+ {
+@@ -1873,21 +1893,6 @@ void macdrv_window_minimize_requested(HWND hwnd)
+ }
+ 
+ 
+-/***********************************************************************
+- *              macdrv_window_did_minimize
+- *
+- * Handler for WINDOW_DID_MINIMIZE events.
+- */
+-void macdrv_window_did_minimize(HWND hwnd)
+-{
+-    TRACE("win %p\n", hwnd);
+-
+-    /* If all our windows are minimized, disable cursor clipping. */
+-    if (!macdrv_is_any_wine_window_visible())
+-        NtUserClipCursor(NULL);
+-}
+-
+-
+ /***********************************************************************
+  *              macdrv_window_did_unminimize
+  *
+

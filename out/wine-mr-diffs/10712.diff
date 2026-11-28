@@ -1,0 +1,119 @@
+# wineandroid: fix desktop sizing and repaint on resolution changes
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/10712 state=opened
+# This series fixes two related issues in wineandroid affecting desktop
+initialization and repaint behavior when using the virtual desktop mode.
+
+First, launching explorer.exe with an empty desktop size
+("/desktop=shell,,android") does not behave as intended on wineandroid.
+
+When the size is omitted, explorer attempts to determine the desktop
+resolution via get_default_desktop_size(). If no matching registry entry
+is found, it falls back to a hardcoded default (typically 800x600).
+Later, even if the wineandroid backend sets the correct display size
+through pCreateDesktop, explorer overrides it again during
+initialize_display_settings(), restoring the default resolution.
+
+As a result, the desktop ends up stuck at 800x600 regardless of the
+actual display size reported by the backend.
+
+To address this, the desktop is now launched with a size of "-1x-1".
+This value is accepted by parse_size(), but does not correspond to a
+valid resolution. As a result, explorer does not fall back to the default
+resolution, and also avoids overriding the backend-provided size during
+initialization. This allows the desktop to retain the correct resolution
+as configured by wineandroid.
+
+Second, window repainting on resolution changes is fixed.
+
+Previously, WM_ANDROID_REFRESH used NtUserExposeWindowSurface(), which
+only exposes existing surface contents without invalidating the window.
+This prevents WM_PAINT and WM_ERASEBKGND from being generated. When the
+desktop or other windows are resized (e.g. after applying a new display
+mode), they may retain stale contents instead of repainting.
+
+This is resolved by replacing NtUserExposeWindowSurface() with
+NtUserRedrawWindow(), ensuring proper invalidation and repaint of window
+contents. This fixes cases where the desktop background is not redrawn
+after a resolution change.
+
+Together, these changes ensure that the desktop starts with the correct
+resolution and that windows are properly repainted when display settings
+change.
+--- dlls/win32u/window.c
++++ dlls/win32u/window.c
+@@ -3756,7 +3756,7 @@ static BOOL fixup_swp_flags( WINDOWPOS *winpos, const RECT *old_window_rect, int
+     else if (winpos->cy > 32767) winpos->cy = 32767;
+ 
+     parent = NtUserGetAncestor( winpos->hwnd, GA_PARENT );
+-    if (!is_window_visible( parent )) winpos->flags |= SWP_NOREDRAW;
++    if (parent && !is_window_visible( parent )) winpos->flags |= SWP_NOREDRAW;
+ 
+     if (win->dwStyle & WS_VISIBLE) winpos->flags &= ~SWP_SHOWWINDOW;
+     else
+
+--- dlls/wineandroid.drv/android.h
++++ dlls/wineandroid.drv/android.h
+@@ -130,6 +130,7 @@ extern MONITORINFOEXW default_monitor;
+ enum android_window_messages
+ {
+     WM_ANDROID_REFRESH = WM_WINE_FIRST_DRIVER_MSG,
++    WM_ANDROID_FORCE_RESOLUTION,
+ };
+ 
+ extern void init_monitors( int width, int height );
+
+--- dlls/wineandroid.drv/window.c
++++ dlls/wineandroid.drv/window.c
+@@ -175,6 +175,7 @@ static struct list event_queue = LIST_INIT( event_queue );
+ static struct java_event *current_event;
+ int event_source = -1;
+ static DWORD desktop_tid;
++static BOOL desktop_resolution_fixed;
+ 
+ extern int event_sink;
+ 
+@@ -1043,6 +1044,22 @@ void ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UI
+     UINT new_style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+     HWND owner = 0;
+ 
++    /* explorer forces its own screen resolution once at startup, from the registry defaults
++     * or from /desktop=name,WxH command-line parsing, clobbering the real resolution we
++     * already reported to win32u in ANDROID_CreateDesktop(). Post a message to re-apply our
++     * known real resolution once this call returns: calling NtUserChangeDisplaySettings()
++     * (which ends up calling NtUserSetWindowPos() on this same window) synchronously from
++     * here re-enters apply_window_pos() for the SetWindowPos call currently in progress.
++     * That reentrant call either corrupts window state or silently no-ops (apply_display_settings()
++     * fails to acquire its own lock, since the outer call already holds it) depending on timing.
++     * Guarded to fire only once, the first time explorer clobbers it. */
++    if (!desktop_resolution_fixed && hwnd == NtUserGetDesktopWindow() &&
++        (new_rects->window.right != screen_width || new_rects->window.bottom != screen_height))
++    {
++        desktop_resolution_fixed = TRUE;
++        NtUserPostMessage( hwnd, WM_ANDROID_FORCE_RESOLUTION, 0, 0 );
++    }
++
+     if (!(data = get_win_data( hwnd ))) return;
+     data->rects = *new_rects;
+ 
+@@ -1184,6 +1201,20 @@ LRESULT ANDROID_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
+             NtUserExposeWindowSurface( hwnd, 0, NULL );
+         }
+         return 0;
++    case WM_ANDROID_FORCE_RESOLUTION:
++    {
++        /* NtUserCallNoParam_DisplayModeChanged (via init_monitors()) only refreshes the
++         * list of available modes; it does not override whatever mode explorer already
++         * committed as "current" via ChangeDisplaySettingsEx. Redo that call ourselves,
++         * with our real resolution, so it actually sticks this time. */
++        DEVMODEW devmode = {.dmSize = sizeof(devmode)};
++
++        devmode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
++        devmode.dmPelsWidth = screen_width;
++        devmode.dmPelsHeight = screen_height;
++        NtUserChangeDisplaySettings( NULL, &devmode, NULL, 0, NULL );
++        return 0;
++    }
+     default:
+         FIXME( "got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp );
+         return 0;
+

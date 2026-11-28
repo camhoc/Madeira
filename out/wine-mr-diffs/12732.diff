@@ -1,0 +1,281 @@
+# combase: Fix IContextCallback::ContextCallback() into another apartment.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12732 state=closed
+# C++/WinRT's apartment_context and resume_foreground() use ContextCallback() to get back to an apartment. On Wine this fails with RPC_E_DISCONNECTED when the target apartment hasn't marshalled anything yet, because its IRundown is never exported, so the callback never runs. Minecraft Bedrock hits this when importing a world.
+
+The fix exports IRundown from CoGetContextToken(), on the apartment's own thread. I first tried starting remoting from the caller instead, but that deadlocks when the target is a second STA.
+
+With calls getting through, the new tests turned up a second bug: the callback sometimes saw a freshly generated logical thread id instead of the caller's, depending on which RPC thread handled the call. That's fixed in rpc_execute_call(), which also lets an existing todo_wine in test_CoGetObjectContext() go.
+
+I tested on macOS with both 64-bit and 32-bit (wow64) builds. The ole32, combase and msvcp140 tests show no new failures at any commit, and compobj passed 20 runs in a row on each. Reverting any part of either fix makes the new tests fail. dragdrop is flaky on master and is no worse with this.
+
+### Not tested
+
+- Windows, Linux.
+--- dlls/combase/combase.c
++++ dlls/combase/combase.c
+@@ -2873,6 +2873,10 @@ HRESULT WINAPI CoGetContextToken(ULONG_PTR *token)
+         tlsdata->context_token = &context->IObjContext_iface;
+     }
+ 
++    /* other apartments call into this context through the apartment's IRundown */
++    if (!apt->remunk_exported)
++        rpc_start_remoting(apt);
++
+     *token = (ULONG_PTR)tlsdata->context_token;
+     TRACE("context_token %p\n", tlsdata->context_token);
+ 
+
+--- dlls/combase/rpc.c
++++ dlls/combase/rpc.c
+@@ -1876,6 +1876,7 @@ void rpc_execute_call(struct dispatch_params *params)
+     ORPC_EXTENT_ARRAY orpc_ext_array;
+     WIRE_ORPC_EXTENT *first_wire_orpc_extent;
+     GUID old_causality_id;
++    DWORD old_uuid_flag;
+     struct tlsdata *tlsdata;
+     struct apartment *apt;
+ 
+@@ -1969,11 +1970,14 @@ void rpc_execute_call(struct dispatch_params *params)
+      * messages received during the SendReceive will appear to originate from
+      * this call - this should be checked with what Windows does */
+     old_causality_id = tlsdata->causality_id;
++    old_uuid_flag = tlsdata->flags & OLETLS_UUIDINITIALIZED;
+     tlsdata->causality_id = orpcthis.cid;
++    tlsdata->flags |= OLETLS_UUIDINITIALIZED;
+     tlsdata->pending_call_count_server++;
+     params->hr = IRpcStubBuffer_Invoke(params->stub, params->msg, params->chan);
+     tlsdata->pending_call_count_server--;
+     tlsdata->causality_id = old_causality_id;
++    tlsdata->flags = (tlsdata->flags & ~OLETLS_UUIDINITIALIZED) | old_uuid_flag;
+ 
+     /* the invoke allocated a new buffer, so free the old one */
+     if (message_state->bypass_rpcrt && original_buffer != msg->Buffer)
+
+--- dlls/ole32/tests/compobj.c
++++ dlls/ole32/tests/compobj.c
+@@ -2008,7 +2008,6 @@ struct context_callback_arg
+     ULONG_PTR token;
+     BOOL is_mta;
+     GUID logical_thread_id;
+-    BOOL todo_thread_id;
+ };
+ 
+ static HRESULT WINAPI context_callback_func(ComCallData *arg)
+@@ -2022,7 +2021,7 @@ static HRESULT WINAPI context_callback_func(ComCallData *arg)
+ 
+     hr = CoGetCurrentLogicalThreadId(&thread_id);
+     ok_ole_success(hr, "CoGetCurrentLgoicalThreadId");
+-    todo_wine_if(ctx->todo_thread_id) ok(IsEqualIID(&thread_id, &ctx->logical_thread_id),
++    ok(IsEqualIID(&thread_id, &ctx->logical_thread_id),
+             "thread_id = %s\n", wine_dbgstr_guid(&thread_id));
+ 
+     hr = pCoGetContextToken(&token);
+@@ -2048,10 +2047,8 @@ static DWORD WINAPI context_callback_thread(void *arg)
+     SET_EXPECT(context_callback_func);
+     ctx->logical_thread_id = id;
+     /* TODO: native calls the callback in current thread after temporarily converting it to MTA */
+-    if (ctx->is_mta) ctx->todo_thread_id = TRUE;
+     hr = IContextCallback_ContextCallback(ctx->context_callback, context_callback_func,
+             (ComCallData *)ctx, &IID_IContextCallback, 2, NULL);
+-    ctx->todo_thread_id = FALSE;
+     CHECK_CALLED(context_callback_func, 1);
+     ok(hr == S_FALSE, "got 0x%08lx\n", hr);
+ 
+@@ -2164,7 +2161,6 @@ static void test_CoGetObjectContext(void)
+     IObjContext_Release((IObjContext *)callback_arg.token);
+     callback_arg.is_mta = FALSE;
+     callback_arg.logical_thread_id = id2;
+-    callback_arg.todo_thread_id = FALSE;
+ 
+     SET_EXPECT(context_callback_func);
+     hr = IContextCallback_ContextCallback(pContextCallback, context_callback_func,
+@@ -2232,7 +2228,6 @@ static void test_CoGetObjectContext(void)
+     IObjContext_Release((IObjContext *)callback_arg.token);
+     callback_arg.is_mta = TRUE;
+     callback_arg.logical_thread_id = id2;
+-    callback_arg.todo_thread_id = FALSE;
+ 
+     SET_EXPECT(context_callback_func);
+     hr = IContextCallback_ContextCallback(pContextCallback, context_callback_func,
+@@ -2258,6 +2253,172 @@ static void test_CoGetObjectContext(void)
+     CoUninitialize();
+ }
+ 
++/* wait for handle while dispatching messages, at most 10 seconds */
++static DWORD wait_dispatching(HANDLE handle)
++{
++    DWORD start = GetTickCount(), elapsed, ret;
++    MSG msg;
++
++    while ((elapsed = GetTickCount() - start) < 10000)
++    {
++        ret = MsgWaitForMultipleObjects(1, &handle, FALSE, 10000 - elapsed, QS_ALLINPUT);
++        if (ret != WAIT_OBJECT_0 + 1) return ret;
++        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
++    }
++    return WAIT_TIMEOUT;
++}
++
++static DWORD WINAPI context_callback_remote_thread(void *arg)
++{
++    struct context_callback_arg *ctx = arg;
++    HRESULT hr;
++
++    CoInitializeEx(NULL, ctx->is_mta ? COINIT_APARTMENTTHREADED : COINIT_MULTITHREADED);
++
++    hr = CoGetCurrentLogicalThreadId(&ctx->logical_thread_id);
++    ok_ole_success(hr, "CoGetCurrentLogicalThreadId");
++
++    SET_EXPECT(context_callback_func);
++    hr = IContextCallback_ContextCallback(ctx->context_callback, context_callback_func,
++            (ComCallData *)ctx, &IID_IContextCallback, 2, NULL);
++    CHECK_CALLED(context_callback_func, 1);
++    ok(hr == S_FALSE, "got 0x%08lx\n", hr);
++
++    CoUninitialize();
++    return 0;
++}
++
++static BOOL call_context_callback_remote(struct context_callback_arg *arg)
++{
++    HANDLE thread;
++    DWORD ret;
++
++    thread = CreateThread(NULL, 0, context_callback_remote_thread, arg, 0, NULL);
++    ok(thread != NULL, "CreateThread failed\n");
++    ret = wait_dispatching(thread);
++    ok(!ret, "caller thread did not finish, ret %#lx\n", ret);
++    CloseHandle(thread);
++    return !ret;
++}
++
++struct context_callback_target
++{
++    struct context_callback_arg arg;
++    DWORD model;
++    HANDLE ready, done, thread;
++};
++
++static DWORD WINAPI context_callback_target_thread(void *arg)
++{
++    struct context_callback_target *t = arg;
++    HRESULT hr;
++    GUID id;
++
++    CoInitializeEx(NULL, t->model);
++
++    /* nothing is marshalled by this apartment */
++    hr = pCoGetObjectContext(&IID_IContextCallback, (void **)&t->arg.context_callback);
++    ok_ole_success(hr, "CoGetObjectContext");
++    hr = pCoGetContextToken(&t->arg.token);
++    ok_ole_success(hr, "CoGetContextToken");
++
++    SetEvent(t->ready);
++    wait_dispatching(t->done);
++
++    /* the incoming call does not leave the caller's logical thread id behind */
++    hr = CoGetCurrentLogicalThreadId(&id);
++    ok_ole_success(hr, "CoGetCurrentLogicalThreadId");
++    ok(!IsEqualGUID(&id, &GUID_NULL) && !IsEqualGUID(&id, &t->arg.logical_thread_id),
++            "thread_id = %s\n", wine_dbgstr_guid(&id));
++
++    IContextCallback_Release(t->arg.context_callback);
++    CoUninitialize();
++    return 0;
++}
++
++static BOOL start_context_callback_target(struct context_callback_target *t, DWORD model)
++{
++    DWORD ret;
++
++    t->model = model;
++    t->ready = CreateEventW(NULL, FALSE, FALSE, NULL);
++    t->done = CreateEventW(NULL, FALSE, FALSE, NULL);
++    t->thread = CreateThread(NULL, 0, context_callback_target_thread, t, 0, NULL);
++    ok(t->thread != NULL, "CreateThread failed\n");
++    ret = WaitForSingleObject(t->ready, 10000);
++    ok(!ret, "target thread not ready, ret %#lx\n", ret);
++    return !ret;
++}
++
++static BOOL stop_context_callback_target(struct context_callback_target *t)
++{
++    DWORD ret;
++
++    SetEvent(t->done);
++    ret = WaitForSingleObject(t->thread, 10000);
++    ok(!ret, "target thread did not finish, ret %#lx\n", ret);
++    CloseHandle(t->thread);
++    CloseHandle(t->ready);
++    CloseHandle(t->done);
++    return !ret;
++}
++
++static void test_ContextCallback_remote(void)
++{
++    static struct context_callback_target sta_target, mta_target;
++    static struct context_callback_arg arg;
++    GUID id, id2;
++    HRESULT hr;
++
++    if (!pCoGetObjectContext)
++    {
++        win_skip("CoGetObjectContext not present\n");
++        return;
++    }
++
++    /* main STA, nothing marshalled before the MTA caller calls into its context */
++    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++    hr = CoGetCurrentLogicalThreadId(&id);
++    ok_ole_success(hr, "CoGetCurrentLogicalThreadId");
++    hr = pCoGetObjectContext(&IID_IContextCallback, (void **)&arg.context_callback);
++    ok_ole_success(hr, "CoGetObjectContext");
++    hr = pCoGetContextToken(&arg.token);
++    ok_ole_success(hr, "CoGetContextToken");
++    arg.is_mta = FALSE;
++    if (!call_context_callback_remote(&arg))
++    {
++        CoUninitialize();
++        return;
++    }
++    /* the incoming call restores this thread's logical thread id */
++    hr = CoGetCurrentLogicalThreadId(&id2);
++    ok_ole_success(hr, "CoGetCurrentLogicalThreadId");
++    ok(IsEqualGUID(&id2, &id), "thread_id = %s\n", wine_dbgstr_guid(&id2));
++    IContextCallback_Release(arg.context_callback);
++    CoUninitialize();
++
++    /* non-main STA, this thread keeps the main STA */
++    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++    if (!start_context_callback_target(&sta_target, COINIT_APARTMENTTHREADED))
++    {
++        CoUninitialize();
++        return;
++    }
++    sta_target.arg.is_mta = FALSE;
++    if (!call_context_callback_remote(&sta_target.arg) || !stop_context_callback_target(&sta_target))
++    {
++        CoUninitialize();
++        return;
++    }
++    CoUninitialize();
++
++    /* MTA, called from an STA */
++    if (!start_context_callback_target(&mta_target, COINIT_MULTITHREADED)) return;
++    mta_target.arg.is_mta = TRUE;
++    if (call_context_callback_remote(&mta_target.arg))
++        stop_context_callback_target(&mta_target);
++}
++
+ typedef struct {
+     IUnknown IUnknown_iface;
+     LONG refs;
+@@ -4712,6 +4873,7 @@ START_TEST(compobj)
+     test_registered_object_thread_affinity();
+     test_CoFreeUnusedLibraries();
+     test_CoGetObjectContext();
++    test_ContextCallback_remote();
+     test_CoGetCallContext();
+     test_CoGetContextToken();
+     test_TreatAsClass();
+

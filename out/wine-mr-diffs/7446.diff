@@ -1,0 +1,59 @@
+# oleaut32: Implement OleLoadPictureFileEx()
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/7446 state=opened
+# As per documentation.
+
+Signed-off-by: Edward O'Callaghan <edward@antitrust.cc>
+--- dlls/oleaut32/oleaut32.spec
++++ dlls/oleaut32/oleaut32.spec
+@@ -378,7 +378,7 @@
+ 398 stub UserMSG_free_inst
+ 399 stub UserMSG_free_local
+ 401 stdcall OleLoadPictureEx(ptr long long ptr long long long ptr)
+-402 stub OleLoadPictureFileEx
++402 stdcall OleLoadPictureFileEx(int128 long long long ptr) OleLoadPictureFileEx
+ 411 stdcall SafeArrayCreateVector(long long long)
+ 412 stdcall SafeArrayCopyData(ptr ptr)
+ 413 stdcall VectorFromBstr(ptr ptr)
+
+--- dlls/oleaut32/olepicture.c
++++ dlls/oleaut32/olepicture.c
+@@ -2523,6 +2523,38 @@ static HRESULT create_stream(const WCHAR *filename, IStream **stream)
+     return hr;
+ }
+ 
++/***********************************************************************
++ * OleLoadPictureFileEx (OLEAUT32.402)
++ */
++HRESULT WINAPI OleLoadPictureFileEx(
++        VARIANT    varFileName,
++        DWORD      xSizeDesired,
++        DWORD      ySizeDesired,
++        DWORD      dwFlags,
++        LPDISPATCH *lplpdispPicture /* out */)
++{
++    IStream *stream;
++    HRESULT hr;
++
++    TRACE("(%s,%p)\n", wine_dbgstr_variant(&varFileName), lplpdispPicture);
++
++    if (V_VT(&varFileName) != VT_BSTR)
++        return CTL_E_FILENOTFOUND;
++
++    hr = create_stream(V_BSTR(&varFileName), &stream);
++    if (hr != S_OK) {
++        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))
++            return CTL_E_FILENOTFOUND;
++
++        return CTL_E_PATHFILEACCESSERROR;
++    }
++
++    hr = OleLoadPictureEx(stream, 0, FALSE,
++            &IID_IDispatch, xSizeDesired, ySizeDesired, dwFlags, (void **)lplpdispPicture);
++    IStream_Release(stream);
++    return hr;
++}
++
+ /***********************************************************************
+  * OleLoadPictureFile (OLEAUT32.422)
+  */
+

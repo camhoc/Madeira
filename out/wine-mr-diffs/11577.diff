@@ -1,0 +1,144 @@
+# conhost: Validate VT-related console mode flags.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11577 state=closed
+# Return STATUS_INVALID_PARAMETER when an application tries to enable ENABLE_VIRTUAL_TERMINAL_PROCESSING or DISABLE_NEWLINE_AUTO_RETURN on the screen buffer (output handle), or ENABLE_VIRTUAL_TERMINAL_INPUT on the console (input handle), on a non-unix console (wineconsole).
+
+Unix consoles process VT sequences natively, but wineconsole does not support them. Previously SetConsoleMode silently accepted these flags, causing applications like Turbo Vision, BusyBox, and PowerShell Core to emit escape sequences as garbage instead of falling back to the legacy Console API.
+
+Pls tell me if any other test case(s) need to be added/removed from this MR.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=49780
+--- dlls/kernel32/tests/console.c
++++ dlls/kernel32/tests/console.c
+@@ -4493,6 +4493,75 @@ static void test_FreeConsole(HANDLE input, HANDLE orig_output)
+     CloseHandle(output);
+ }
+ 
++static void test_SetConsoleMode(HANDLE input, HANDLE output)
++{
++    DWORD mode, prev_mode;
++    BOOL ret;
++
++    /* Test output handle - ENABLE_VIRTUAL_TERMINAL_PROCESSING */
++    ret = GetConsoleMode(output, &prev_mode);
++    ok(ret, "GetConsoleMode failed: %lu\n", GetLastError());
++
++    mode = prev_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
++    ret = SetConsoleMode(output, mode);
++    if (!ret)
++    {
++        ok(GetLastError() == ERROR_INVALID_PARAMETER,
++           "SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_PROCESSING) error: expecting %u got %lu\n",
++           ERROR_INVALID_PARAMETER, GetLastError());
++    }
++    else
++    {
++        DWORD new_mode;
++        ret = GetConsoleMode(output, &new_mode);
++        ok(ret, "GetConsoleMode failed: %lu\n", GetLastError());
++        ok(new_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING,
++           "ENABLE_VIRTUAL_TERMINAL_PROCESSING not set: %lx\n", new_mode);
++        SetConsoleMode(output, prev_mode);
++    }
++
++    /* Test output handle - DISABLE_NEWLINE_AUTO_RETURN */
++    mode = prev_mode | DISABLE_NEWLINE_AUTO_RETURN;
++    ret = SetConsoleMode(output, mode);
++    if (!ret)
++    {
++        ok(GetLastError() == ERROR_INVALID_PARAMETER,
++           "SetConsoleMode(DISABLE_NEWLINE_AUTO_RETURN) error: expecting %u got %lu\n",
++           ERROR_INVALID_PARAMETER, GetLastError());
++    }
++    else
++    {
++        DWORD new_mode;
++        ret = GetConsoleMode(output, &new_mode);
++        ok(ret, "GetConsoleMode failed: %lu\n", GetLastError());
++        ok(new_mode & DISABLE_NEWLINE_AUTO_RETURN,
++           "DISABLE_NEWLINE_AUTO_RETURN not set: %lx\n", new_mode);
++        SetConsoleMode(output, prev_mode);
++    }
++
++    /* Test input handle - ENABLE_VIRTUAL_TERMINAL_INPUT */
++    ret = GetConsoleMode(input, &prev_mode);
++    ok(ret, "GetConsoleMode failed: %lu\n", GetLastError());
++
++    mode = prev_mode | ENABLE_VIRTUAL_TERMINAL_INPUT;
++    ret = SetConsoleMode(input, mode);
++    if (!ret)
++    {
++        ok(GetLastError() == ERROR_INVALID_PARAMETER,
++           "SetConsoleMode(ENABLE_VIRTUAL_TERMINAL_INPUT) error: expecting %u got %lu\n",
++           ERROR_INVALID_PARAMETER, GetLastError());
++    }
++    else
++    {
++        DWORD new_mode;
++        ret = GetConsoleMode(input, &new_mode);
++        ok(ret, "GetConsoleMode failed: %lu\n", GetLastError());
++        ok(new_mode & ENABLE_VIRTUAL_TERMINAL_INPUT,
++           "ENABLE_VIRTUAL_TERMINAL_INPUT not set: %lx\n", new_mode);
++        SetConsoleMode(input, prev_mode);
++    }
++}
++
+ static void test_SetConsoleScreenBufferInfoEx(HANDLE std_output)
+ {
+     BOOL ret;
+@@ -5977,6 +6046,7 @@ START_TEST(console)
+     test_CreateFileW();
+     test_OpenCON();
+     test_VerifyConsoleIoHandle(hConOut);
++    test_SetConsoleMode(hConIn, hConOut);
+     test_GetSetStdHandle();
+     test_DuplicateConsoleHandle();
+     test_GetNumberOfConsoleInputEvents(hConIn);
+
+--- programs/conhost/conhost.c
++++ programs/conhost/conhost.c
+@@ -2599,10 +2599,18 @@ static NTSTATUS screen_buffer_ioctl( struct screen_buffer *screen_buffer, unsign
+         }
+ 
+     case IOCTL_CONDRV_SET_MODE:
+-        if (in_size != sizeof(unsigned int) || *out_size) return STATUS_INVALID_PARAMETER;
+-        screen_buffer->mode = *(unsigned int *)in_data;
+-        TRACE( "set %x mode\n", screen_buffer->mode );
+-        return STATUS_SUCCESS;
++        {
++            unsigned int mode;
++
++            if (in_size != sizeof(unsigned int) || *out_size) return STATUS_INVALID_PARAMETER;
++            mode = *(unsigned int *)in_data;
++            /* VT sequences are not supported. */
++            if (mode & (ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN))
++                return STATUS_INVALID_PARAMETER;
++            screen_buffer->mode = mode;
++            TRACE( "set %x mode\n", screen_buffer->mode );
++            return STATUS_SUCCESS;
++        }
+ 
+     case IOCTL_CONDRV_IS_UNIX:
+         return screen_buffer->console->is_unix ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+@@ -2680,10 +2688,17 @@ static NTSTATUS console_input_ioctl( struct console *console, unsigned int code,
+         }
+ 
+     case IOCTL_CONDRV_SET_MODE:
+-        if (in_size != sizeof(unsigned int) || *out_size) return STATUS_INVALID_PARAMETER;
+-        console->mode = *(unsigned int *)in_data;
+-        TRACE( "set %x mode\n", console->mode );
+-        return STATUS_SUCCESS;
++        {
++            unsigned int mode;
++
++            if (in_size != sizeof(unsigned int) || *out_size) return STATUS_INVALID_PARAMETER;
++            mode = *(unsigned int *)in_data;
++            if (mode & ENABLE_VIRTUAL_TERMINAL_INPUT)
++                return STATUS_INVALID_PARAMETER;
++            console->mode = mode;
++            TRACE( "set %x mode\n", console->mode );
++            return STATUS_SUCCESS;
++        }
+ 
+     case IOCTL_CONDRV_IS_UNIX:
+         return console->is_unix ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+

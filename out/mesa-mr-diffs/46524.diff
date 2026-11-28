@@ -1,0 +1,786 @@
+# Draft kk: Narrow render encoder end barriers behind MESA_KK_BARRIERS=narrow
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46524 state=closed
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+kk: Narrow render encoder end barriers behind
+
+Every KosmicKrisp encoder currently ends with an ALL to ALL barrier, preventing vertex work of the next render pass from overlapping fragment work of the previous one.
+
+Behind MESA_KK_BARRIERS=narrow (off by default), render encoders that drew without meta passes or visibility results end with beforeStages = ALL & ~(VERTEX | OBJECT | MESH). Vulkan pipeline barriers, vkCmdWaitEvents2, and vertex-stage timestamp writes record fragment-to-vertex and vertex-to-vertex dependencies and enforce them as consumer barriers at render encoder start (or in-place / by splitting an open render encoder). Recorded waits stay sticky across encoders until a compute encoder that ran a direct non-zero dispatch ends with ALL to ALL.
+
+MESA_KK_BARRIER_LOG=1 logs narrow-barrier counters via mesa_logi.
+
+Testing (Apple M5 Pro, macOS 27.2, MESA_KK_BARRIERS=narrow):
+
+dEQP-VK: 0 new failures against the base on sync (2,229), paths (1,456), standing (79,312), and non-sparse (449,481) case lists; power (178,121) hit 1 flaky case (non_zero_vertex_instance_indirect_draw, passed 5/5 on retry).
+Valid-Vulkan trigger check (vkCmdDispatch -> render pass -> vkCmdPipelineBarrier2 split -> vkCmdWriteTimestamp2(VERTEX)): verified in-place, split, and vertex-timestamp consumer paths.
+Metal transitive ordering through a non-empty compute encoder (narrow render end -> compute -> render vertex without consumer): 0 misses in 297 rounds at 800, 2000, and 8000 writer iterations.
+
+Assisted-by: LLM
+```
+--- docs/drivers/kosmickrisp.rst
++++ docs/drivers/kosmickrisp.rst
+@@ -84,6 +84,8 @@ KosmicKrisp specific environment variables:
+   - ``custom_border`` to advertise ``VK_EXT_custom_border_color`` and ``VK_EXT_border_color_swizzle``.
+   - ``image_view_min_lod`` to advertise ``VK_EXT_image_view_min_lod`` for M1-M5 GPUs.
+   - ``optimize_e5r9g9b9`` to use allowGPUOptimizedContents with this format, which causes some CTS tests for vkCmdCopyImage() to fail
++- ``MESA_KK_BARRIERS``: Set to ``narrow`` to allow vertex work in subsequent render encoders to overlap fragment work of earlier render encoders, enforcing Vulkan pipeline barriers, ``vkCmdWaitEvents2``, and vertex-stage timestamp dependencies as consumer barriers.
++- ``MESA_KK_BARRIER_LOG``: Set to ``1`` to log narrow-barrier counters via ``mesa_logi``.
+ 
+ Metal workarounds
+ *****************
+
+--- src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -18,12 +18,26 @@ mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+ {
+ }
+ 
++void
++mtl_barrier_after_stages_options(void *encoder, enum mtl_stages after_stages,
++                                 enum mtl_stages before_queue_stages,
++                                 enum mtl_visibility_options visibility)
++{
++}
++
+ void
+ mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
+                                  enum mtl_stages before_queue_stages)
+ {
+ }
+ 
++void
++mtl_barrier_after_encoder_stages_options(void *encoder, enum mtl_stages after_stages,
++                                         enum mtl_stages before_queue_stages,
++                                         enum mtl_visibility_options visibility)
++{
++}
++
+ void
+ mtl_barrier_after_queue_stages(void *encoder,
+                                enum mtl_stages after_queue_stages,
+@@ -31,6 +45,14 @@ mtl_barrier_after_queue_stages(void *encoder,
+ {
+ }
+ 
++void
++mtl_barrier_after_queue_stages_options(void *encoder,
++                                       enum mtl_stages after_queue_stages,
++                                       enum mtl_stages before_stages,
++                                       enum mtl_visibility_options visibility)
++{
++}
++
+ void
+ mtl_update_fence(void *encoder, mtl_fence *fence, enum mtl_stages after_stages)
+ {
+
+--- src/kosmickrisp/bridge/mtl_encoder.h
++++ src/kosmickrisp/bridge/mtl_encoder.h
+@@ -15,13 +15,25 @@
+ void mtl_end_encoding(void *encoder);
+ void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+                               enum mtl_stages before_queue_stages);
++void mtl_barrier_after_stages_options(void *encoder,
++                                      enum mtl_stages after_stages,
++                                      enum mtl_stages before_queue_stages,
++                                      enum mtl_visibility_options visibility);
+ void mtl_barrier_after_encoder_stages(void *encoder,
+                                       enum mtl_stages after_stages,
+                                       enum mtl_stages before_queue_stages);
++void mtl_barrier_after_encoder_stages_options(void *encoder,
++                                              enum mtl_stages after_stages,
++                                              enum mtl_stages before_queue_stages,
++                                              enum mtl_visibility_options visibility);
+ 
+ void mtl_barrier_after_queue_stages(void *encoder,
+                                     enum mtl_stages after_queue_stages,
+                                     enum mtl_stages before_stages);
++void mtl_barrier_after_queue_stages_options(void *encoder,
++                                            enum mtl_stages after_queue_stages,
++                                            enum mtl_stages before_stages,
++                                            enum mtl_visibility_options visibility);
+ 
+ void mtl_update_fence(void *encoder, mtl_fence *fence,
+                       enum mtl_stages after_stages);
+
+--- src/kosmickrisp/bridge/mtl_encoder.m
++++ src/kosmickrisp/bridge/mtl_encoder.m
+@@ -23,42 +23,68 @@ mtl_end_encoding(void *encoder)
+ }
+ 
+ void
+-mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+-                         enum mtl_stages before_queue_stages)
++mtl_barrier_after_stages_options(void *encoder, enum mtl_stages after_stages,
++                                 enum mtl_stages before_queue_stages,
++                                 enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+-      /* TODO_KOSMICKRISP Expose visibility option since resource alias should only be required
+-       * if occlusion queries are used */
+       [enc barrierAfterStages:(MTLStages)after_stages beforeQueueStages:(MTLStages)before_queue_stages
+-           visibilityOptions:MTL4VisibilityOptionResourceAlias];
++           visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
+ void
+-mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
+-                                 enum mtl_stages before_queue_stages)
++mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
++                         enum mtl_stages before_queue_stages)
++{
++   mtl_barrier_after_stages_options(encoder, after_stages, before_queue_stages,
++                                    MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++}
++
++void
++mtl_barrier_after_encoder_stages_options(void *encoder, enum mtl_stages after_stages,
++                                         enum mtl_stages before_queue_stages,
++                                         enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+       [enc barrierAfterEncoderStages:(MTLStages)after_stages beforeEncoderStages:(MTLStages)before_queue_stages
+-           visibilityOptions:MTL4VisibilityOptionResourceAlias];
++           visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
+ void
+-mtl_barrier_after_queue_stages(void *encoder,
+-                               enum mtl_stages after_queue_stages,
+-                               enum mtl_stages before_stages)
++mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
++                                 enum mtl_stages before_queue_stages)
++{
++   mtl_barrier_after_encoder_stages_options(encoder, after_stages, before_queue_stages,
++                                           MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++}
++
++void
++mtl_barrier_after_queue_stages_options(void *encoder,
++                                       enum mtl_stages after_queue_stages,
++                                       enum mtl_stages before_stages,
++                                       enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+       [enc barrierAfterQueueStages:(MTLStages)after_queue_stages
+                       beforeStages:(MTLStages)before_stages
+-                 visibilityOptions:MTL4VisibilityOptionResourceAlias];
++                 visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
++void
++mtl_barrier_after_queue_stages(void *encoder,
++                               enum mtl_stages after_queue_stages,
++                               enum mtl_stages before_stages)
++{
++   mtl_barrier_after_queue_stages_options(encoder, after_queue_stages, before_stages,
++                                         MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++}
++
+ void
+ mtl_update_fence(void *encoder, mtl_fence *fence, enum mtl_stages after_stages)
+ {
+
+--- src/kosmickrisp/bridge/mtl_types.h
++++ src/kosmickrisp/bridge/mtl_types.h
+@@ -252,6 +252,12 @@ enum mtl_barrier_scope {
+    MTL_BARRIER_SCOPE_RENDER_TARGETS = 1 << 2,
+ };
+ 
++enum mtl_visibility_options {
++   MTL_VISIBILITY_OPTION_NONE = 0,
++   MTL_VISIBILITY_OPTION_DEVICE = 1 << 0,
++   MTL_VISIBILITY_OPTION_RESOURCE_ALIAS = 1 << 1,
++};
++
+ enum mtl_stages {
+    MTL_STAGE_VERTEX = 1 << 0,
+    MTL_STAGE_FRAGMENT = 1 << 1,
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -27,6 +27,8 @@
+ #include "vk_format.h"
+ #include "vk_pipeline_layout.h"
+ 
++#include "util/log.h"
++
+ static void
+ kk_descriptor_state_fini(struct kk_cmd_buffer *cmd,
+                          struct kk_descriptor_state *desc)
+@@ -227,6 +229,15 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    }
+    mtl_begin_command_buffer(cmd->metal.cmd_buf, cmd->metal.allocator);
+ 
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   if (dev->barriers.narrow) {
++      /* Barriers cover earlier command buffers on the queue, and the previous
++       * one may have ended with a narrow render end and no encoder open. */
++      memset(&cmd->state.barrier, 0, sizeof(cmd->state.barrier));
++      cmd->state.barrier.wait_f = !dev->barriers.nobegin;
++      cmd->state.barrier.wait_v = !dev->barriers.nobegin;
++   }
++
+    return VK_SUCCESS;
+ 
+ fail_allocator:
+@@ -259,6 +270,60 @@ kk_encoder_update_debug(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
+       mtl_encoder_push_debug_group(encoder, label->pLabelName);
+ }
+ 
++void
++kk_barrier_log_print(struct kk_device *dev, const char *tag)
++{
++   const uint64_t *c = dev->barriers.counts;
++   mesa_logi("%s start=%" PRIu64 " narrow=%" PRIu64 " occl=%" PRIu64
++             " nodraw=%" PRIu64 " meta=%" PRIu64 " creal=%" PRIu64
++             " cother=%" PRIu64 " consf=%" PRIu64 " consv=%" PRIu64
++             " inplace=%" PRIu64 " split=%" PRIu64 " vts=%" PRIu64,
++             tag, c[KK_BARRIER_COUNT_START_RENDER],
++             c[KK_BARRIER_COUNT_END_NARROW],
++             c[KK_BARRIER_COUNT_END_OCCLUSION], c[KK_BARRIER_COUNT_END_NO_DRAW],
++             c[KK_BARRIER_COUNT_END_META], c[KK_BARRIER_COUNT_END_COMPUTE_REAL],
++             c[KK_BARRIER_COUNT_END_COMPUTE_OTHER],
++             c[KK_BARRIER_COUNT_CONSUMER_F], c[KK_BARRIER_COUNT_CONSUMER_V],
++             c[KK_BARRIER_COUNT_IN_PLACE], c[KK_BARRIER_COUNT_SPLIT],
++             c[KK_BARRIER_COUNT_VERTEX_TS]);
++}
++
++static void
++kk_barrier_count(struct kk_cmd_buffer *cmd, enum kk_barrier_count count)
++{
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   if (likely(!dev->barriers.log))
++      return;
++
++   uint64_t total = p_atomic_inc_return(&dev->barriers.counts[count]);
++   if (count == KK_BARRIER_COUNT_START_RENDER && !(total % 20000))
++      kk_barrier_log_print(dev, "KKBN");
++}
++
++#define KK_BARRIER_VERTEX_MTL_STAGES                                           \
++   (MTL_STAGE_VERTEX | MTL_STAGE_OBJECTS | MTL_STAGE_MESH)
++
++/* Issues the consumers on the open render encoder */
++static void
++kk_barrier_apply_waits(struct kk_cmd_buffer *cmd, bool wait_f, bool wait_v)
++{
++   if (kk_cmd_buffer_device(cmd)->barriers.nowait)
++      return;
++
++   if (wait_f) {
++      mtl_barrier_after_queue_stages_options(
++         cmd->metal.render, MTL_STAGE_FRAGMENT | MTL_STAGE_TILE,
++         KK_BARRIER_VERTEX_MTL_STAGES, MTL_VISIBILITY_OPTION_DEVICE);
++      kk_barrier_count(cmd, KK_BARRIER_COUNT_CONSUMER_F);
++   }
++   if (wait_v) {
++      mtl_barrier_after_queue_stages_options(
++         cmd->metal.render, KK_BARRIER_VERTEX_MTL_STAGES,
++         KK_BARRIER_VERTEX_MTL_STAGES, MTL_VISIBILITY_OPTION_DEVICE);
++      kk_barrier_count(cmd, KK_BARRIER_COUNT_CONSUMER_V);
++   }
++}
++
+ void
+ cs_start_render(struct kk_cmd_buffer *cmd)
+ {
+@@ -272,6 +337,19 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+    cmd->metal.render = mtl_new_render_command_encoder_with_descriptor(
+       cmd->metal.cmd_buf, state->render_pass_descriptor);
+ 
++   if (kk_cmd_buffer_device(cmd)->barriers.narrow) {
++      /* After cs_end: a compute end there can clear the waits and set held. */
++      cmd->state.barrier.enc_had_draw = false;
++      cmd->state.barrier.enc_wait_f =
++         cmd->state.barrier.wait_f || cmd->state.barrier.held;
++      cmd->state.barrier.enc_wait_v =
++         cmd->state.barrier.wait_v || cmd->state.barrier.held;
++      cmd->state.barrier.held = false;
++      kk_barrier_count(cmd, KK_BARRIER_COUNT_START_RENDER);
++      kk_barrier_apply_waits(cmd, cmd->state.barrier.wait_f,
++                             cmd->state.barrier.wait_v);
++   }
++
+    kk_encoder_update_debug(cmd, cmd->metal.render);
+    /* Starting a new render pass means we already flushed and no barrier is
+     * needed. */
+@@ -335,8 +413,54 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+ static void
+ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
+ {
+-   /* TODO_KOSMICKRISP This is probably overkill */
+-   mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   /* Every encoder ends with a full ALL -> ALL barrier. Pipeline barriers
++    * recorded while no encoder is open and vkCmdWaitEvents2 emit nothing, so
++    * they rely on this one.
++    *
++    * Occlusion query results are written to the visibility buffer and read
++    * back through another address of the same memory, so a render encoder
++    * that had visibility results enabled flushes with ResourceAlias. Other
++    * render encoders only make their writes visible to the device. Compute
++    * encoders keep ResourceAlias.
++    */
++   const bool vis_enabled = cmd->state.gfx.occlusion.vis_enabled;
++   const bool device_only = encoder == cmd->metal.render && !vis_enabled;
++   if (encoder == cmd->metal.render)
++      cmd->state.gfx.occlusion.vis_enabled = false;
++
++   /* Under MESA_KK_BARRIERS=narrow, later vertex work may overlap a render
++    * encoder that had draws (not meta, no visibility results); waits are
++    * issued where barriers ask for them. Only a compute encoder that surely
++    * did work clears those waits: Metal might not chain through an empty one. */
++   enum mtl_stages before = MTL_STAGE_ALL;
++   if (kk_cmd_buffer_device(cmd)->barriers.narrow) {
++      if (encoder == cmd->metal.render) {
++         if (vis_enabled) {
++            kk_barrier_count(cmd, KK_BARRIER_COUNT_END_OCCLUSION);
++         } else if (!cmd->state.barrier.enc_had_draw) {
++            kk_barrier_count(cmd, KK_BARRIER_COUNT_END_NO_DRAW);
++         } else if (cmd->state.barrier.meta_depth) {
++            kk_barrier_count(cmd, KK_BARRIER_COUNT_END_META);
++         } else {
++            before = MTL_STAGE_ALL & ~KK_BARRIER_VERTEX_MTL_STAGES;
++            kk_barrier_count(cmd, KK_BARRIER_COUNT_END_NARROW);
++         }
++      } else if (cmd->state.barrier.compute_real) {
++         cmd->state.barrier.compute_real = false;
++         cmd->state.barrier.wait_f = false;
++         cmd->state.barrier.wait_v = false;
++         cmd->state.barrier.chain_f = 0;
++         cmd->state.barrier.chain_v = 0;
++         cmd->state.barrier.held = true;
++         kk_barrier_count(cmd, KK_BARRIER_COUNT_END_COMPUTE_REAL);
++      } else {
++         kk_barrier_count(cmd, KK_BARRIER_COUNT_END_COMPUTE_OTHER);
++      }
++   }
++   mtl_barrier_after_stages_options(encoder, MTL_STAGE_ALL, before,
++                                    device_only
++                                       ? MTL_VISIBILITY_OPTION_DEVICE
++                                       : MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+    mtl_end_encoding(encoder);
+    mtl_release(encoder);
+ 
+@@ -457,16 +581,163 @@ kk_barrier_requires_encoder_split(struct kk_cmd_buffer *cmd,
+           (dst & VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+ }
+ 
++/* Everything not named in either list counts as both fragment and vertex, so an
++ * unknown stage conservatively adds a wait. */
++#define KK_BARRIER_VK_VERTEX_STAGES                                            \
++   (VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |                                     \
++    VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |                                      \
++    VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |                           \
++    VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |                                    \
++    VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |                      \
++    VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |                   \
++    VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |                                  \
++    VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |                        \
++    VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT |                                  \
++    VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT)
++
++#define KK_BARRIER_VK_FRAGMENT_STAGES                                          \
++   (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |                             \
++    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |                              \
++    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |                                  \
++    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT)
++
++static void
++kk_barrier_record_member(struct kk_cmd_buffer *cmd, VkPipelineStageFlags2 src,
++                         VkPipelineStageFlags2 dst)
++{
++   const VkPipelineStageFlags2 common_src =
++      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_HOST_BIT |
++      VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
++   /* A source mask also covers logically earlier stages, so a fragment source
++    * covers vertex work; a vertex source doesn't cover fragment work. */
++   const VkPipelineStageFlags2 non_vertex_dst =
++      KK_BARRIER_VK_FRAGMENT_STAGES | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
++      VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
++
++   const bool src_f = src & ~(common_src | KK_BARRIER_VK_VERTEX_STAGES);
++   const bool src_v = src & ~common_src;
++   const bool dst_v = dst & ~non_vertex_dst;
++
++   if (src_f || (src & cmd->state.barrier.chain_f)) {
++      cmd->state.barrier.chain_f |= dst;
++      if (dst_v)
++         cmd->state.barrier.wait_f = true;
++   }
++   if (src_v || (src & cmd->state.barrier.chain_v)) {
++      cmd->state.barrier.chain_v |= dst;
++      if (dst_v)
++         cmd->state.barrier.wait_v = true;
++   }
++}
++
++static void
++kk_barrier_record(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep)
++{
++   /* Everything earlier has finished, or will have before anything later
++    * starts, because of a compute encoder's ALL->ALL end. */
++   if (cmd->state.barrier.held ||
++       (cmd->metal.compute && cmd->state.barrier.compute_real))
++      return;
++
++   /* Twice, so that a chain inside one dependency is found in any order */
++   for (uint32_t pass = 0; pass < 2; pass++) {
++      for (uint32_t i = 0; i < dep->memoryBarrierCount; i++)
++         kk_barrier_record_member(cmd, dep->pMemoryBarriers[i].srcStageMask,
++                                  dep->pMemoryBarriers[i].dstStageMask);
++      for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount; i++)
++         kk_barrier_record_member(cmd,
++                                  dep->pBufferMemoryBarriers[i].srcStageMask,
++                                  dep->pBufferMemoryBarriers[i].dstStageMask);
++      for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++)
++         kk_barrier_record_member(cmd,
++                                  dep->pImageMemoryBarriers[i].srcStageMask,
++                                  dep->pImageMemoryBarriers[i].dstStageMask);
++   }
++}
++
++/* Makes the recorded waits hold on the open render encoder. A consumer only
++ * covers work in earlier encoders. Returns true if it started a new encoder. */
++static bool
++kk_barrier_enforce(struct kk_cmd_buffer *cmd)
++{
++   if (!cmd->metal.render || kk_cmd_buffer_device(cmd)->barriers.nowait)
++      return false;
++
++   const bool need_f =
++      cmd->state.barrier.wait_f && !cmd->state.barrier.enc_wait_f;
++   const bool need_v =
++      cmd->state.barrier.wait_v && !cmd->state.barrier.enc_wait_v;
++   if (!need_f && !need_v)
++      return false;
++
++   if (!cmd->state.barrier.enc_had_draw) {
++      kk_barrier_apply_waits(cmd, need_f, need_v);
++      cmd->state.barrier.enc_wait_f |= need_f;
++      cmd->state.barrier.enc_wait_v |= need_v;
++      kk_barrier_count(cmd, KK_BARRIER_COUNT_IN_PLACE);
++      return false;
++   }
++
++   kk_barrier_count(cmd, KK_BARRIER_COUNT_SPLIT);
++   kk_apply_attachment_store_ops(cmd, true);
++   cs_end(cmd);
++   cs_start_render(cmd);
++   return true;
++}
++
++/* A vertex-stage timestamp must latch after earlier vertex work completes */
++void
++kk_barrier_vertex_timestamp(struct kk_cmd_buffer *cmd)
++{
++   if (!kk_cmd_buffer_device(cmd)->barriers.narrow || !cmd->metal.render)
++      return;
++
++   kk_barrier_count(cmd, KK_BARRIER_COUNT_VERTEX_TS);
++
++   /* For this encoder only: a later timestamp enforces for itself */
++   const bool wait_v = cmd->state.barrier.wait_v;
++   cmd->state.barrier.wait_v = true;
++   kk_barrier_enforce(cmd);
++   if (!wait_v)
++      cmd->state.barrier.wait_v = false;
++}
++
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
++                  const VkEvent *pEvents,
++                  const VkDependencyInfo *pDependencyInfos)
++{
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++
++   /* The event is already set by the time we are here, only the ordering of
++    * its dependency is left. */
++   if (!kk_cmd_buffer_device(cmd)->barriers.narrow)
++      return;
++
++   for (uint32_t i = 0; i < eventCount; i++) {
++      kk_barrier_record(cmd, &pDependencyInfos[i]);
++      kk_barrier_enforce(cmd);
++   }
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+                        const VkDependencyInfo *pDependencyInfo)
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+ 
++   bool split = false;
++   if (kk_cmd_buffer_device(cmd)->barriers.narrow) {
++      kk_barrier_record(cmd, pDependencyInfo);
++      split = kk_barrier_enforce(cmd);
++   }
++
+    /* TODO_KOSMICKRISP Lighten barriers according to the actual requested
+     * barrier. To take advantage of this we need to remove the chaining of
+     * encoders. */
+-   if (cmd->metal.render) {
++   if (split) {
++      /* A new render encoder has no earlier work inside it to order against */
++   } else if (cmd->metal.render) {
+       /* Multisample attachments require render pass split always. Then based on
+        * the barrier and if we are using depth/stencil or not, we may have to
+        * break the render pass. See comment in kk_barrier_requires_encoder_split
+@@ -828,11 +1099,15 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
+       .z = prog->info.workgroup_size[2],
+    };
+ 
+-   if (grid.mode == KK_GRID_DIRECT)
++   if (grid.mode == KK_GRID_DIRECT) {
++      if (kk_cmd_buffer_device(cmd)->barriers.narrow && grid.size.x &&
++          grid.size.y && grid.size.z)
++         cmd->state.barrier.compute_real = true;
+       mtl_dispatch_threads(encoder, grid.size, local_size);
+-   else
++   } else {
+       mtl_dispatch_threadgroups_with_indirect_buffer(encoder, grid.addr,
+                                                      local_size);
++   }
+    mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
+                                     MTL_STAGE_DISPATCH);
+ 
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -164,6 +164,11 @@ struct kk_graphics_state {
+        * There can only be one active at a time (hardware constraint).
+        */
+       uint16_t index;
++
++      /* Visibility results were enabled at some point in the open render
++       * encoder, so it may have written them.
++       */
++      bool vis_enabled;
+    } occlusion;
+ 
+    /* Index buffer */
+@@ -264,6 +269,26 @@ struct kk_cmd_buffer {
+       uint64_t root_addr;
+       /* Only tracks graphics shaders since compute is always bound for now. */
+       uint32_t dirty_shaders;
++      /* Narrow end-of-encoder render barriers:
++       * - Render encoders with draws (not meta, no visibility results) end
++       *   without blocking later vertex/object/mesh stages.
++       * - wait_f / wait_v are sticky across encoders until a compute encoder
++       *   that executed at least one direct non-zero dispatch ends ALL -> ALL.
++       * - held records that such a compute encoder already ordered earlier
++       *   encoders, so barrier recording skips until the next render start.
++       * - BeginCommandBuffer starts with wait_f/wait_v set (conservative
++       *   across command buffers on the queue).
++       * - Barriers inside an open render encoder add consumers in place if
++       *   !enc_had_draw, otherwise split the encoder. */
++      struct {
++         VkPipelineStageFlags2 chain_f, chain_v;
++         uint32_t meta_depth;
++         bool wait_f, wait_v;
++         bool held;
++         bool compute_real;
++         bool enc_wait_f, enc_wait_v;
++         bool enc_had_draw;
++      } barrier;
+    } state;
+ 
+    struct kk_uploader uploader;
+@@ -315,6 +340,8 @@ kk_get_descriptors_state(struct kk_cmd_buffer *cmd,
+ void cs_start_render(struct kk_cmd_buffer *cmd);
+ mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
+ mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd);
++void kk_barrier_vertex_timestamp(struct kk_cmd_buffer *cmd);
++void kk_barrier_log_print(struct kk_device *dev, const char *tag);
+ void cs_end(struct kk_cmd_buffer *cmd);
+ void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
+                                         uint64_t addr);
+
+--- src/kosmickrisp/vulkan/kk_cmd_dispatch.c
++++ src/kosmickrisp/vulkan/kk_cmd_dispatch.c
+@@ -108,6 +108,8 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
+       };
+ 
+       kk_flush_compute_state(cmd);
++      if (kk_cmd_buffer_device(cmd)->barriers.narrow)
++         cmd->state.barrier.compute_real = true;
+       mtl_dispatch_threads(encoder, grid_size, local_size);
+    }
+ }
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1513,6 +1513,8 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+    }
+ 
+    if (gfx->dirty & KK_DIRTY_OCCLUSION) {
++      gfx->occlusion.vis_enabled |=
++         gfx->occlusion.mode != MTL_VISIBILITY_RESULT_MODE_DISABLED;
+       mtl_set_visibility_result_mode(enc, gfx->occlusion.mode,
+                                      gfx->occlusion.index * sizeof(uint64_t));
+    }
+@@ -1808,6 +1810,8 @@ static void
+ kk_dispatch_draw(struct kk_cmd_buffer *cmd, struct kk_draw_data data)
+ {
+    mtl_render_encoder *enc = cs_get_render(cmd);
++   if (kk_cmd_buffer_device(cmd)->barriers.narrow)
++      cmd->state.barrier.enc_had_draw = true;
+ 
+    if (kk_grid_is_indirect(data.grid)) {
+       if (data.index.el_size_B) {
+
+--- src/kosmickrisp/vulkan/kk_cmd_meta.c
++++ src/kosmickrisp/vulkan/kk_cmd_meta.c
+@@ -96,6 +96,8 @@ kk_meta_begin(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
+    struct kk_descriptor_state *desc = kk_get_descriptors_state(cmd, bind_point);
+ 
+    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
++      if (kk_cmd_buffer_device(cmd)->barriers.narrow)
++         cmd->state.barrier.meta_depth++;
+       save->dynamic = cmd->vk.dynamic_graphics_state;
+       save->_dynamic_vi = cmd->state.gfx._dynamic_vi;
+       save->_dynamic_sl = cmd->state.gfx._dynamic_sl;
+@@ -163,6 +165,8 @@ kk_meta_end(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
+    }
+ 
+    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
++      if (kk_cmd_buffer_device(cmd)->barriers.narrow)
++         cmd->state.barrier.meta_depth--;
+       /* Restore the dynamic state */
+       assert(save->dynamic.vi == &cmd->state.gfx._dynamic_vi);
+       assert(save->dynamic.ms.sample_locations == &cmd->state.gfx._dynamic_sl);
+
+--- src/kosmickrisp/vulkan/kk_device.c
++++ src/kosmickrisp/vulkan/kk_device.c
+@@ -29,6 +29,8 @@
+ #include "vulkan/wsi/wsi_common.h"
+ #include "vk_pipeline_cache.h"
+ 
++#include "util/log.h"
++
+ #include <time.h>
+ 
+ struct kk_mtl_compiler {
+@@ -331,6 +333,26 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (result != VK_SUCCESS)
+       goto fail_sampler_heap;
+ 
++   const char *barriers = debug_get_option("MESA_KK_BARRIERS", NULL);
++   if (barriers && *barriers) {
++      if (!strcmp(barriers, "narrow")) {
++         dev->barriers.narrow = true;
++      }
++#ifndef NDEBUG
++      else if (!strcmp(barriers, "narrow-nowait")) {
++         dev->barriers.narrow = true;
++         dev->barriers.nowait = true;
++      } else if (!strcmp(barriers, "narrow-nobegin")) {
++         dev->barriers.narrow = true;
++         dev->barriers.nobegin = true;
++      }
++#endif
++      else {
++         mesa_logw("kk: unknown MESA_KK_BARRIERS=%s\n", barriers);
++      }
++   }
++   dev->barriers.log = debug_get_bool_option("MESA_KK_BARRIER_LOG", false);
++
+    if (pdev->settings.gpu_capture_immediately) {
+       mtl_start_gpu_capture(dev->mtl_handle, pdev->settings.gpu_capture_dir);
+       dev->gpu_capture_active = true;
+@@ -392,6 +414,9 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+       dev->has_queue = false;
+    }
+ 
++   if (dev->barriers.log)
++      kk_barrier_log_print(dev, "KKBNEND");
++
+    /* Release the residency set last once all BOs are released. */
+    mtl_release(dev->residency_set.handle);
+    simple_mtx_destroy(&dev->residency_set.mutex);
+
+--- src/kosmickrisp/vulkan/kk_device.h
++++ src/kosmickrisp/vulkan/kk_device.h
+@@ -77,6 +77,22 @@ struct kk_precompiled_cache {
+    struct kk_precompiled_shader shaders[LIBKK_NUM_PROGRAMS];
+ };
+ 
++enum kk_barrier_count {
++   KK_BARRIER_COUNT_END_NARROW,
++   KK_BARRIER_COUNT_END_OCCLUSION,
++   KK_BARRIER_COUNT_END_NO_DRAW,
++   KK_BARRIER_COUNT_END_META,
++   KK_BARRIER_COUNT_END_COMPUTE_REAL,
++   KK_BARRIER_COUNT_END_COMPUTE_OTHER,
++   KK_BARRIER_COUNT_START_RENDER,
++   KK_BARRIER_COUNT_CONSUMER_F,
++   KK_BARRIER_COUNT_CONSUMER_V,
++   KK_BARRIER_COUNT_IN_PLACE,
++   KK_BARRIER_COUNT_SPLIT,
++   KK_BARRIER_COUNT_VERTEX_TS,
++   KK_BARRIER_COUNT_MAX,
++};
++
+ struct kk_device {
+    struct vk_device vk;
+ 
+@@ -96,6 +112,15 @@ struct kk_device {
+ 
+    struct kk_precompiled_cache precompiled_cache;
+ 
++   /* Narrow end-of-encoder render barriers (MESA_KK_BARRIERS=narrow) */
++   struct {
++      bool narrow;
++      bool nowait;  /* debug-only: skip consumer waits and splits */
++      bool nobegin; /* debug-only: skip command-buffer-begin waits */
++      bool log;     /* MESA_KK_BARRIER_LOG=1: log counters via mesa_logi */
++      uint64_t counts[KK_BARRIER_COUNT_MAX];
++   } barriers;
++
+    bool has_queue;
+    struct kk_queue queue;
+ 
+
+--- src/kosmickrisp/vulkan/kk_event.c
++++ src/kosmickrisp/vulkan/kk_event.c
+@@ -106,11 +106,3 @@ kk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    kk_cmd_write(cmd, (struct libkk_imm_write){event->addr, VK_EVENT_RESET});
+ }
+-
+-VKAPI_ATTR void VKAPI_CALL
+-kk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
+-                  const VkEvent *pEvents,
+-                  const VkDependencyInfo *pDependencyInfos)
+-{
+-   /* We do nothing, event should already be set by the time we are here. */
+-}
+
+--- src/kosmickrisp/vulkan/kk_query_pool.c
++++ src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -384,6 +384,13 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+ 
+    uint32_t heap_index = query;
+ 
++   /* Vertex-class stage. TOP and NONE also map to the vertex stage but need no
++    * wait. */
++   if ((mtl_stage & (MTL_RENDER_STAGE_VERTEX | MTL_RENDER_STAGE_OBJECT |
++                     MTL_RENDER_STAGE_MESH)) &&
++       (stage & ~VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT))
++      kk_barrier_vertex_timestamp(cmd);
++
+    if (cmd->metal.render) {
+       /* If we've already issued a timestamp write for a render stage, reuse it
+        * because reissuing might return a 0 timestamp
+

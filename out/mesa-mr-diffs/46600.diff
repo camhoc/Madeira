@@ -1,0 +1,28 @@
+# meson: use zero-init-padding-bits=unions to clear unions
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46600 state=merged
+# Starting with gcc 15, union foo f = {0}; only sets the first member of foo to zero,
+leaving any padding bytes uninitialized. The pattern is used a lot in mesa, so
+instead of fixing each individually, we restore the old behaviour via compiler flag.
+
+Found this in asahi:
+Each application is compiling & caching some precompiled shaders on startup, every time under a different cache key, even though the shaders are the same.
+Turns out that only the first byte of the asahi_shader_key union is zeroed on gcc >= 15, the remaining are whatever is on the stack right now.
+--- meson.build
++++ meson.build
+@@ -1435,6 +1435,7 @@ else
+     '-Qunused-arguments',
+     '-fno-common',
+     '-Wno-unknown-pragmas',
++    '-fzero-init-padding-bits=unions',
+     # Clang
+     '-Wno-microsoft-enum-value',
+     '-Wno-unused-function',
+@@ -1457,6 +1458,7 @@ else
+     # For now we disable this optimization.
+     '-flifetime-dse=1',
+     '-Wno-unknown-pragmas',
++    '-fzero-init-padding-bits=unions',
+     # Clang
+     '-Wno-microsoft-enum-value',
+     '-fansi-escape-codes',
+

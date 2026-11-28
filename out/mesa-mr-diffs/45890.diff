@@ -1,0 +1,322 @@
+# agx/ra: bump memory register count
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45890 state=opened
+# "64K spill slots ought to be enough for anybody"
+--- src/asahi/compiler/test/test-lower-parallel-copy.cpp
++++ src/asahi/compiler/test/test-lower-parallel-copy.cpp
+@@ -14,7 +14,7 @@
+       agx_builder *A = agx_test_builder(mem_ctx);                              \
+       agx_builder *B = agx_test_builder(mem_ctx);                              \
+                                                                                \
+-      agx_emit_parallel_copies(A, copies, ARRAY_SIZE(copies));                 \
++      agx_emit_parallel_copies(A, copies, ARRAY_SIZE(copies), 1024);           \
+                                                                                \
+       {                                                                        \
+          agx_builder *b = B;                                                   \
+
+--- src/asahi/compiler/agx_compiler.h
++++ src/asahi/compiler/agx_compiler.h
+@@ -27,7 +27,7 @@ extern "C" {
+ #define AGX_NUM_UNIFORMS (512)
+ 
+ /* Semi-arbitrary limit for spill slot allocation */
+-#define AGX_NUM_MODELED_REGS_LOG2 (11)
++#define AGX_NUM_MODELED_REGS_LOG2 (16)
+ #define AGX_NUM_MODELED_REGS      (1 << AGX_NUM_MODELED_REGS_LOG2)
+ 
+ /* Limit on number of sources for non-phi instructions */
+@@ -93,7 +93,7 @@ typedef struct {
+     */
+    unsigned reg : AGX_NUM_MODELED_REGS_LOG2;
+    bool has_reg     : 1;
+-   unsigned padding : 6;
++   unsigned padding : 1;
+ } agx_index;
+ static_assert(sizeof(agx_index) == 8, "packed");
+ 
+@@ -547,6 +547,9 @@ typedef struct {
+    unsigned loop_count;
+    unsigned max_reg;
+ 
++   /* Max used registers, either physical registers or spill slots */
++   unsigned max_used_register_slots;
++
+    /* Promoted constants. These will be appended to the binary at the end. */
+    uint16_t rodata[512];
+ } agx_context;
+@@ -1087,7 +1090,7 @@ struct agx_copy {
+ };
+ 
+ void agx_emit_parallel_copies(agx_builder *b, struct agx_copy *copies,
+-                              unsigned n);
++                              unsigned n, unsigned num_regs);
+ 
+ void agx_compute_liveness(agx_context *ctx);
+ void agx_liveness_ins_update(struct u_sparse_bitset *live, agx_instr *I);
+
+--- src/asahi/compiler/agx_lower_parallel_copy.c
++++ src/asahi/compiler/agx_lower_parallel_copy.c
+@@ -101,12 +101,12 @@ struct copy_ctx {
+     * source. Once this drops to zero, then the physreg is unblocked and can
+     * be moved to.
+     */
+-   unsigned physreg_use_count[AGX_NUM_MODELED_REGS];
++   unsigned *physreg_use_count;
+ 
+    /* For each physreg, the pending copy_entry that uses it as a dest. */
+-   struct agx_copy *physreg_dest[AGX_NUM_MODELED_REGS];
++   struct agx_copy **physreg_dest;
+ 
+-   struct agx_copy entries[AGX_NUM_MODELED_REGS];
++   struct agx_copy *entries;
+ };
+ 
+ static bool
+@@ -148,7 +148,7 @@ split_32bit_copy(struct copy_ctx *ctx, struct agx_copy *entry)
+ 
+ static void
+ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
+-                                   unsigned num_copies, bool cls)
++                                   unsigned num_copies, unsigned num_regs, bool cls)
+ {
+    /* First, lower away 64-bit copies to smaller chunks, since we don't have
+     * 64-bit ALU so we always want to split.
+@@ -193,8 +193,9 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
+    struct copy_ctx _ctx = {.entry_count = num_copies};
+    struct copy_ctx *ctx = &_ctx;
+ 
+-   memset(ctx->physreg_dest, 0, sizeof(ctx->physreg_dest));
+-   memset(ctx->physreg_use_count, 0, sizeof(ctx->physreg_use_count));
++   ctx->physreg_dest = calloc(num_regs, sizeof(*ctx->physreg_dest));
++   ctx->physreg_use_count = calloc(num_regs, sizeof(*ctx->physreg_use_count));
++   ctx->entries = calloc(num_regs, sizeof(*ctx->entries));
+ 
+    for (unsigned i = 0; i < ctx->entry_count; i++) {
+       struct agx_copy *entry = &copies[i];
+@@ -225,7 +226,7 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
+          continue;
+ 
+       unsigned next_dest = entry->dest + 1;
+-      assert(next_dest < ARRAY_SIZE(ctx->physreg_dest) && "aligned reg");
++      assert(next_dest < num_regs && "aligned reg");
+ 
+       struct agx_copy *next_copy = ctx->physreg_dest[next_dest];
+       if (!next_copy)
+@@ -388,15 +389,18 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
+    }
+ 
+    free(copies2);
++   free(ctx->physreg_dest);
++   free(ctx->physreg_use_count);
++   free(ctx->entries);
+ }
+ 
+ void
+ agx_emit_parallel_copies(agx_builder *b, struct agx_copy *copies,
+-                         unsigned num_copies)
++                         unsigned num_copies, unsigned num_regs)
+ {
+    /* Emit copies fo reach register class separately because we don't have
+     * register class awareness in the parallel copy lowering data structure.
+     */
+-   agx_emit_parallel_copies_for_class(b, copies, num_copies, false);
+-   agx_emit_parallel_copies_for_class(b, copies, num_copies, true);
++   agx_emit_parallel_copies_for_class(b, copies, num_copies, num_regs, false);
++   agx_emit_parallel_copies_for_class(b, copies, num_copies, num_regs, true);
+ }
+
+--- src/asahi/compiler/agx_register_allocate.c
++++ src/asahi/compiler/agx_register_allocate.c
+@@ -632,7 +632,8 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
+          agx_builder b = agx_init_builder(rctx->shader, agx_before_instr(I));
+          agx_emit_parallel_copies(
+             &b, copies.data,
+-            util_dynarray_num_elements(&copies, struct agx_copy));
++            util_dynarray_num_elements(&copies, struct agx_copy),
++            rctx->shader->max_used_register_slots);
+       }
+ 
+       util_dynarray_fini(&copies);
+@@ -1052,7 +1053,7 @@ static void
+ agx_ra_assign_local(struct ra_ctx *rctx)
+ {
+    BITSET_DECLARE(used_regs_gpr, AGX_NUM_REGS) = {0};
+-   BITSET_DECLARE(used_regs_mem, AGX_NUM_MODELED_REGS) = {0};
++   uint32_t *used_regs_mem = BITSET_CALLOC(rctx->bound[RA_MEM]);
+    uint16_t *ssa_to_reg = calloc(rctx->shader->alloc, sizeof(uint16_t));
+ 
+    agx_block *block = rctx->block;
+@@ -1207,6 +1208,7 @@ agx_ra_assign_local(struct ra_ctx *rctx)
+    }
+ 
+    free(rctx->ssa_to_reg);
++   free(rctx->used_regs[RA_MEM]);
+ }
+ 
+ /*
+@@ -1283,7 +1285,7 @@ agx_insert_parallel_copies(agx_context *ctx, agx_block *block)
+          }
+       }
+ 
+-      agx_emit_parallel_copies(&b, copies, nr_phi);
++      agx_emit_parallel_copies(&b, copies, nr_phi, ctx->max_used_register_slots);
+ 
+       free(copies);
+    }
+@@ -1319,7 +1321,7 @@ lower_exports(agx_context *ctx)
+    }
+ 
+    agx_builder b = agx_init_builder(ctx, agx_after_block_logical(block));
+-   agx_emit_parallel_copies(&b, copies, nr);
++   agx_emit_parallel_copies(&b, copies, nr, ctx->max_used_register_slots);
+ }
+ 
+ void
+@@ -1417,6 +1419,9 @@ agx_ra(agx_context *ctx)
+       }
+    }
+ 
++   unsigned num_spill_slots = (spilling ? effective_demand : 0);
++   ctx->max_used_register_slots = MAX2(AGX_NUM_REGS, num_spill_slots);
++
+    if (spilling || remat) {
+       assert((remat || ctx->key->has_scratch) &&
+              "internal shaders are unspillable");
+@@ -1431,6 +1436,12 @@ agx_ra(agx_context *ctx)
+       assert(effective_demand <= max_possible_regs && "spiller post-condition");
+    }
+ 
++   if (num_spill_slots >= AGX_NUM_MODELED_REGS) {
++      fprintf(stderr, "needed %u spill slots (max demand), but can only represent %u slots",
++              num_spill_slots, AGX_NUM_MODELED_REGS);
++      UNREACHABLE("too many spill slots");
++   }
++
+    /* Record all phi webs. First initialize the union-find data structure with
+     * all SSA defs in their own singletons, then union together anything related
+     * by a phi. The resulting union-find structure will be the webs.
+@@ -1527,7 +1538,7 @@ agx_ra(agx_context *ctx)
+          .classes = classes,
+          .visited = visited,
+          .bound[RA_GPR] = max_regs,
+-         .bound[RA_MEM] = AGX_NUM_MODELED_REGS,
++         .bound[RA_MEM] = num_spill_slots,
+          .count[RA_GPR] = &reg_count,
+          .count[RA_MEM] = &mem_slot_count,
+       });
+@@ -1587,7 +1598,7 @@ agx_ra(agx_context *ctx)
+             };
+          }
+ 
+-         agx_emit_parallel_copies(&b, copies, n);
++         agx_emit_parallel_copies(&b, copies, n, ctx->max_used_register_slots);
+          agx_remove_instruction(ins);
+          continue;
+       } else if (ins->op == AGX_OPCODE_SPLIT) {
+@@ -1621,7 +1632,7 @@ agx_ra(agx_context *ctx)
+ 
+          /* Lower away */
+          agx_builder b = agx_init_builder(ctx, agx_after_instr(ins));
+-         agx_emit_parallel_copies(&b, copies, n);
++         agx_emit_parallel_copies(&b, copies, n, ctx->max_used_register_slots);
+          agx_remove_instruction(ins);
+          continue;
+       }
+
+--- src/asahi/compiler/agx_validate_ra.c
++++ src/asahi/compiler/agx_validate_ra.c
+@@ -44,7 +44,8 @@ vars_equal(struct var_offset x, struct var_offset y)
+ 
+ /* Represents the contents of a single register file */
+ struct regfile {
+-   struct var_offset r[RA_CLASSES][AGX_NUM_MODELED_REGS];
++   unsigned counts[RA_CLASSES];
++   struct var_offset *r[RA_CLASSES];
+ };
+ 
+ static void
+@@ -52,7 +53,7 @@ print_regfile(struct regfile *file, FILE *fp)
+ {
+    fprintf(fp, "regfile: \n");
+    for (enum ra_class cls = 0; cls < RA_CLASSES; ++cls) {
+-      for (unsigned r = 0; r < AGX_NUM_MODELED_REGS; ++r) {
++      for (unsigned r = 0; r < file->counts[cls]; ++r) {
+          struct var_offset v = file->r[cls][r];
+ 
+          if (v.defined) {
+@@ -83,7 +84,7 @@ copy_reg(struct regfile *file, agx_index dst, agx_index src)
+    enum ra_class src_cls = ra_class_for_index(src);
+ 
+    for (uint8_t offs = 0; offs < agx_index_size_16(dst); ++offs) {
+-      assert(dst.value + offs < ARRAY_SIZE(file->r[dst_cls]));
++      assert(dst.value + offs < file->counts[dst_cls]);
+       file->r[dst_cls][dst.value + offs] = file->r[src_cls][src.value + offs];
+    }
+ }
+@@ -101,8 +102,8 @@ swap_regs(struct regfile *file, agx_index a, agx_index b)
+    assert(size == agx_index_size_16(b));
+ 
+    for (uint8_t offs = 0; offs < size; ++offs) {
+-      assert(a.value + offs < ARRAY_SIZE(file->r[a_cls]));
+-      assert(b.value + offs < ARRAY_SIZE(file->r[b_cls]));
++      assert(a.value + offs < file->counts[a_cls]);
++      assert(b.value + offs < file->counts[b_cls]);
+ 
+       struct var_offset tmp = file->r[a_cls][a.value + offs];
+       file->r[a_cls][a.value + offs] = file->r[b_cls][b.value + offs];
+@@ -117,7 +118,7 @@ record_dest(struct regfile *file, agx_index idx)
+    enum ra_class cls = ra_class_for_index(idx);
+ 
+    for (uint8_t offs = 0; offs < agx_index_size_16(idx); ++offs) {
+-      assert(idx.reg + offs < ARRAY_SIZE(file->r[cls]));
++      assert(idx.reg + offs < file->counts[cls]);
+       file->r[cls][idx.reg + offs] = var_index(idx, offs);
+    }
+ }
+@@ -129,7 +130,7 @@ validate_src(agx_instr *I, unsigned s, struct regfile *file, agx_index idx)
+    enum ra_class cls = ra_class_for_index(idx);
+ 
+    for (uint8_t offs = 0; offs < agx_index_size_16(idx); ++offs) {
+-      assert(idx.reg + offs < ARRAY_SIZE(file->r[cls]));
++      assert(idx.reg + offs < file->counts[cls]);
+       struct var_offset actual = file->r[cls][idx.reg + offs];
+ 
+       agx_validate_assert(file, I, s, offs, actual.defined);
+@@ -165,7 +166,7 @@ validate_block(agx_context *ctx, agx_block *block, struct regfile *blocks)
+          struct regfile *pred_file = &blocks[(*pred)->index];
+ 
+          for (enum ra_class cls = 0; cls < RA_CLASSES; ++cls) {
+-            for (unsigned r = 0; r < AGX_NUM_MODELED_REGS; ++r) {
++            for (unsigned r = 0; r < file->counts[cls]; ++r) {
+                if (first_pred)
+                   file->r[cls][r] = pred_file->r[cls][r];
+                else if (!vars_equal(file->r[cls][r], pred_file->r[cls][r]))
+@@ -289,6 +290,15 @@ agx_validate_ra(agx_context *ctx)
+    bool succ = true;
+    struct regfile *blocks = calloc(ctx->num_blocks, sizeof(*blocks));
+ 
++   for (unsigned i = 0; i < ctx->num_blocks; ++i) {
++      struct regfile *block = &blocks[i];
++      block->counts[RA_GPR] = AGX_NUM_REGS;
++      block->counts[RA_MEM] = ctx->max_used_register_slots;
++      for (enum ra_class cls = 0; cls < RA_CLASSES; ++cls) {
++         block->r[cls] = calloc(block->counts[cls], sizeof(block->r[cls]));
++      }
++   }
++
+    agx_foreach_block(ctx, block) {
+       succ &= validate_block(ctx, block, blocks);
+    }
+@@ -298,6 +308,12 @@ agx_validate_ra(agx_context *ctx)
+       UNREACHABLE("invalid RA");
+    }
+ 
++   for (unsigned i = 0; i < ctx->num_blocks; ++i) {
++      for (enum ra_class cls = 0; cls < RA_CLASSES; ++cls) {
++         free(blocks[i].r[cls]);
++      }
++   }
++
+    free(blocks);
+ }
+ 
+

@@ -1,0 +1,849 @@
+# Add support for AF_UNIX sockets (followup)
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/7650 state=opened
+# Follow-up of !2786, which appears to have been abandoned.
+
+Depends on !8182, !8575, !8578, !8863, !9831, !9835
+
+# What is supported
+- basic socket operations (socket, listen, bind, connect, accept, getsockname, ioctlsocket, send, recv, sendto, recvfrom,  WSAIoctl(SIO_AF_UNIX_GETPEERPID))
+
+# Was is not supported 
+- abstract sockets
+- ConnectEx
+- DGRAM
+- WSAIoctl(SIO_AF_UNIX_SETBINDPARENTPATH)
+- WSAIoctl( SIO_AF_UNIX_SETCONNPARENTPATH)
+
+# Why was the chdir() design chosen?
+The path specified with the `bind()` function on Windows is converted to a Unix path within Wine. If this path is longer than the maximum path length allowed by the `bind()` call, a `chdir` command is executed to that path, and the filename in the current directory is used. Since this happens within `wineserver`, it has no effect on the calling Windows application.
+
+# Related issues
+- [Bug 60201](https://bugs.winehq.org/show_bug.cgi?id=60201) - Implement `SIO_AF_UNIX_GETPEERPID` ioctl 
+- [Bug 52568](https://bugs.winehq.org/show_bug.cgi?id=52568) - Support for `AF_UNIX` is missing
+- [DBus](https://gitlab.freedesktop.org/dbus/dbus/-/merge_requests/249) - Add Unix socket support on Windows 
+- [Bug 60887](https://bugs.winehq.org/show_bug.cgi?id=60887) - Opening files or AF_UNIX sockets via Volume GUID paths (\\?\Volume{GUID}\...) fails with ERROR_FILE_NOT_FOUND
+- [Bug 60888](https://bugs.winehq.org/show_bug.cgi?id=60888) - DefineDosDeviceW mapping a drive letter to a subdirectory succeeds, but accessing files via that drive letter fails with ERROR_FILE_NOT_FOUND
+# Related applications
+- [Kontakt 7](https://appdb.winehq.org/objectManager.php?sClass=application&iId=2123)
+
+# Execute minimal test case
+
+1. checkout wine
+```
+cd ~
+mkdir src
+git clone git@gitlab.winehq.org:rhabacker/wine.git
+cd wine
+```
+2. Optional: In dlls/ws2_32/tests/sock.c wrap all calls to test functions after `Init()` until `test_afunix()` and after with #if 0 ... #endif to reduce the number of unrelated messages
+
+3. Configure and compile
+--- dlls/ntdll/unix/file.c
++++ dlls/ntdll/unix/file.c
+@@ -1375,6 +1375,12 @@ static int fd_get_file_info( HANDLE handle, int fd, unsigned int options,
+     if (ret == -1) return ret;
+     *attr |= get_file_attributes( st );
+     if (reparse_tag) *reparse_tag = 0;
++    /* a bound AF_UNIX socket is a reparse point on Windows */
++    if (S_ISSOCK( st->st_mode ))
++    {
++        *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
++        if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_AF_UNIX;
++    }
+     /* consider mount points to be reparse points (IO_REPARSE_TAG_MOUNT_POINT) */
+     if (options & FILE_OPEN_REPARSE_POINT)
+     {
+@@ -1484,6 +1490,12 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG
+             if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_LX_SYMLINK;
+         }
+     }
++    /* a bound AF_UNIX socket is a reparse point on Windows */
++    else if (S_ISSOCK( st->st_mode ))
++    {
++        *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
++        if (reparse_tag) *reparse_tag = IO_REPARSE_TAG_AF_UNIX;
++    }
+     else if (S_ISDIR( st->st_mode ) && (parent_path = malloc( len + 4 )))
+     {
+         struct stat parent_st;
+@@ -4571,7 +4583,7 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
+ 
+         if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
+             status = errno_to_status( errno );
+-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
++        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
+             status = STATUS_INVALID_INFO_CLASS;
+         else
+             fill_file_info( &st, attributes, info, FileNetworkOpenInformation );
+@@ -4600,7 +4612,7 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
+ 
+         if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
+             status = errno_to_status( errno );
+-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
++        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
+             status = STATUS_INVALID_INFO_CLASS;
+         else
+             status = fill_file_info( &st, attributes, info, FileBasicInformation );
+@@ -4730,7 +4742,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+     case FileBasicInformation:
+         if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
+             status = errno_to_status( errno );
+-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
++        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
+             status = STATUS_INVALID_INFO_CLASS;
+         else
+             fill_file_info( &st, attr, ptr, class );
+@@ -4837,7 +4849,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+     case FileStatInformation:
+         if (fd_get_file_info( handle, fd, options, &st, &attr, &reparse_tag ) == -1)
+             status = errno_to_status( errno );
+-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
++        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISSOCK(st.st_mode))
+             status = STATUS_INVALID_INFO_CLASS;
+         else
+         {
+
+--- dlls/ntdll/unix/socket.c
++++ dlls/ntdll/unix/socket.c
+@@ -68,6 +68,8 @@
+ # define HAS_IRDA
+ #endif
+ 
++#include <sys/un.h>
++
+ #include "ntstatus.h"
+ #include "windef.h"
+ #include "winioctl.h"
+@@ -78,6 +80,7 @@
+ #include "ws2tcpip.h"
+ #include "wsipx.h"
+ #include "af_irda.h"
++#include "afunix.h"
+ #include "wine/afd.h"
+ 
+ #include "unix_private.h"
+@@ -106,6 +109,7 @@ union unix_sockaddr
+ #ifdef HAS_IRDA
+     struct sockaddr_irda irda;
+ #endif
++    struct sockaddr_un un;
+ };
+ 
+ struct async_recv_ioctl
+@@ -2074,6 +2078,12 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+             status = STATUS_BAD_DEVICE_TYPE;
+             break;
+ 
++        case IOCTL_AFD_WINE_GETPEERPID:
++            if (in_size) FIXME( "unexpected input size %u\n", in_size );
++
++            status = STATUS_BAD_DEVICE_TYPE;
++            break;
++
+         case IOCTL_AFD_WINE_GET_SO_BROADCAST:
+             return do_getsockopt( handle, io, SOL_SOCKET, SO_BROADCAST, out_buffer, out_size );
+ 
+
+--- dlls/ws2_32/tests/sock.c
++++ dlls/ws2_32/tests/sock.c
+@@ -14915,6 +14915,135 @@ static void test_afunix_path( const char *path )
+     winetest_pop_context();
+ }
+ 
++static void test_afunix_client( const char *path )
++{
++    SOCKADDR_UN addr;
++    SOCKET client;
++    DWORD peer_pid, bytes;
++    HANDLE output = GetStdHandle( STD_OUTPUT_HANDLE );
++
++    client = socket( AF_UNIX, SOCK_STREAM, 0 );
++    ok( client != INVALID_SOCKET, "socket failed: %u\n", WSAGetLastError() );
++
++    memset( &addr, 0, sizeof(addr) );
++    addr.sun_family = AF_UNIX;
++    strcpy( addr.sun_path, path );
++
++    ok( !connect(client, (SOCKADDR *)&addr, sizeof(addr)),
++        "connect failed: %u\n", WSAGetLastError() );
++
++    peer_pid = 0;
++    bytes = 0;
++    ok( !WSAIoctl(client, SIO_AF_UNIX_GETPEERPID, NULL, 0,
++                  &peer_pid, sizeof(peer_pid), &bytes, NULL, NULL),
++        "WSAIoctl failed: %u\n", WSAGetLastError() );
++    ok( bytes == sizeof(peer_pid), "unexpected result size %lu\n", bytes );
++
++    WriteFile( output, &peer_pid, sizeof(peer_pid), &bytes, NULL );
++    closesocket( client );
++}
++
++static void test_afunix_peerpid( const char *path, const char* client_path )
++{
++    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
++    STARTUPINFOA si = { sizeof(si) };
++    PROCESS_INFORMATION pi;
++    SOCKADDR_UN addr;
++    SOCKET listener = INVALID_SOCKET, accepted = INVALID_SOCKET;
++    HANDLE pipe_read = NULL, pipe_write = NULL;
++    DWORD server_pid, client_pid = 0, reported_server_pid = 0;
++    DWORD bytes;
++    char **argv, command[MAX_PATH * 2];
++
++    server_pid = GetCurrentProcessId();
++
++    /* Create listening socket. */
++    listener = socket(AF_UNIX, SOCK_STREAM, 0);
++    ok(listener != INVALID_SOCKET, "socket failed: %u\n", WSAGetLastError());
++    if (listener == INVALID_SOCKET) goto done;
++
++    /* TODO: initialize path using the existing AF_UNIX test infrastructure. */
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    strcpy(addr.sun_path, path);
++
++    ok(!bind(listener, (SOCKADDR *)&addr, sizeof(addr)),
++       "bind failed: %u\n", WSAGetLastError());
++    if (listen(listener, 1))
++    {
++        ok(0, "listen failed: %u\n", WSAGetLastError());
++        goto done;
++    }
++
++    /* Create pipe for receiving the client-side PID result. */
++    ok(CreatePipe(&pipe_read, &pipe_write, &sa, 0),
++       "CreatePipe failed: %lu\n", GetLastError());
++    if (!pipe_read || !pipe_write) goto done;
++
++    SetHandleInformation(pipe_read, HANDLE_FLAG_INHERIT, 0);
++
++    si.dwFlags = STARTF_USESTDHANDLES;
++    si.hStdOutput = pipe_write;
++    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
++    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
++
++    winetest_get_mainargs(&argv);
++    sprintf(command, "\"%s\" sock afunix client \"%s\"", argv[0], client_path);
++
++     if (!CreateProcessA(argv[0], command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
++    {
++        ok(FALSE, "CreateProcess failed: %lu\n", GetLastError());
++        goto done;
++    }
++
++    CloseHandle(pipe_write);
++    pipe_write = NULL;
++
++    if (!pi.hProcess) goto done;
++
++    /* Accept client connection. */
++    accepted = accept(listener, NULL, NULL);
++    ok(accepted != INVALID_SOCKET, "accept failed: %u\n", WSAGetLastError());
++    if (accepted == INVALID_SOCKET) goto wait_child;
++
++    /* Check PID of the client process. */
++    bytes = 0;
++    ok(!WSAIoctl(accepted, SIO_AF_UNIX_GETPEERPID, NULL, 0,
++                 &client_pid, sizeof(client_pid), &bytes, NULL, NULL),
++       "WSAIoctl failed: %u\n", WSAGetLastError());
++
++    ok(bytes == sizeof(client_pid), "unexpected result size %lu\n", bytes);
++    ok(client_pid == pi.dwProcessId,
++       "server returned peer PID %lu, expected client PID %lu\n",
++       client_pid, pi.dwProcessId);
++
++    /* Check PID reported by the client process. */
++    bytes = 0;
++    ok(ReadFile(pipe_read, &reported_server_pid,
++                sizeof(reported_server_pid), &bytes, NULL),
++       "ReadFile failed: %lu\n", GetLastError());
++
++    ok(bytes == sizeof(reported_server_pid),
++       "unexpected pipe result size %lu\n", bytes);
++
++    ok(reported_server_pid == server_pid,
++       "client returned peer PID %lu, expected server PID %lu\n",
++       reported_server_pid, server_pid);
++
++wait_child:
++    WaitForSingleObject(pi.hProcess, 5000);
++    CloseHandle(pi.hThread);
++    CloseHandle(pi.hProcess);
++
++done:
++    if (pipe_write) CloseHandle(pipe_write);
++    if (pipe_read) CloseHandle(pipe_read);
++    if (accepted != INVALID_SOCKET) closesocket(accepted);
++    if (listener != INVALID_SOCKET) closesocket(listener);
++
++    DeleteFileA(path);
++}
++
+ static void test_afunix(void)
+ {
+     SOCKET listener, client, server = 0;
+@@ -14930,6 +15059,9 @@ static void test_afunix(void)
+     ULONG zero = 0;
+     ULONG one = 1;
+     int ret;
++    DWORD pid;
++    DWORD bytesReturned;
++    BOOL enableGetPeerPidTests = TRUE;
+ 
+     /* Test connection and send/recv */
+     listener = socket(AF_UNIX, SOCK_STREAM, 0);
+@@ -15023,6 +15155,24 @@ static void test_afunix(void)
+     ok(ret == sizeof(serverBuf), "Incorrect return value from recvfrom: %d\n", ret);
+     ok(!memcmp(serverBuf, clientBuf, sizeof(clientBuf)), "Data mismatch over Unix socket\n");
+ 
++    /* test WSAIoctl(SIO_AF_UNIX_GETPEERPID) with peer in same process */
++    ret = WSAIoctl(listener, SIO_AF_UNIX_GETPEERPID, NULL, 0, &pid, sizeof(pid), &bytesReturned, NULL, NULL);
++    if (ret == SOCKET_ERROR && WSAGetLastError() == WSAEOPNOTSUPP)
++    {
++        win_skip("WSAIoctl(SIO_AF_UNIX_GETPEERPID) not supported on this platform\n");
++        enableGetPeerPidTests = FALSE;
++    }
++    if(enableGetPeerPidTests)
++    {
++        ok(ret == SOCKET_ERROR && WSAGetLastError() == WSAENOTCONN, "failed to call WSAioctl %u\n", WSAGetLastError());
++        ret = WSAIoctl(server, SIO_AF_UNIX_GETPEERPID, NULL, 0, &pid, sizeof(pid), &bytesReturned, NULL, NULL);
++        ok(!ret, "failed to get WSAioctl, error %u\n", WSAGetLastError());
++        ok(pid == GetCurrentProcessId(), "server returned peer PID %ld, expected client PID %ld\n", pid, GetCurrentProcessId());
++        ret = WSAIoctl(client,  SIO_AF_UNIX_GETPEERPID, NULL, 0, &pid, sizeof(pid), &bytesReturned, NULL, NULL);
++        ok(!ret, "failed to get WSAioctl, error %u\n", WSAGetLastError());
++        ok(pid == GetCurrentProcessId(), "client returned peer PID %ld, expected server PID %ld\n", pid, GetCurrentProcessId());
++    }
++
+     closesocket(listener);
+     closesocket(client);
+     closesocket(server);
+@@ -15063,11 +15213,36 @@ static void test_afunix(void)
+     RtlDosPathNameToNtPathName_U(pathW, &ntPath, NULL, NULL);
+     RtlUnicodeToMultiByteN(path, sizeof(addr.sun_path), NULL, ntPath.Buffer, ntPath.Length + sizeof(WCHAR));
+     test_afunix_path( path );
++    if(enableGetPeerPidTests)
++    {
++        char *unix_path;
++        char *alternative_path;
++
++        test_afunix_peerpid( path, path );
++
++        unix_path = wine_get_unix_file_name( pathW );
++        trace("unix_path %s\n", unix_path);
++        alternative_path = malloc( strlen(unix_path) + 3 );
++        if (!alternative_path)
++        {
++            ok(FALSE, "failed to alloc memory\n");
++            HeapFree( GetProcessHeap(), 0, unix_path );
++            return;
++        }
++        alternative_path[0] = 'Z';
++        alternative_path[1] = ':';
++        strcpy( alternative_path + 2, unix_path );
++        HeapFree( GetProcessHeap(), 0, unix_path );
++        test_afunix_peerpid( path, alternative_path );
++        free( alternative_path );
++    }
+ }
+ 
+ START_TEST( sock )
+ {
+     int i;
++    char **argv;
++    int argc;
+ 
+ /* Leave these tests at the beginning. They depend on WSAStartup not having been
+  * called, which is done by Init() below. */
+@@ -15076,6 +15251,18 @@ START_TEST( sock )
+ 
+     Init();
+ 
++    argc = winetest_get_mainargs( &argv );
++    if (argc >= 3 && !strcmp( argv[2], "afunix" ))
++    {
++        if (argc >= 5 && !strcmp( argv[3], "client" ))
++            test_afunix_client( argv[4] );
++        else
++            test_afunix();
++
++        Exit();
++        return;
++    }
++
+     test_set_getsockopt();
+     test_reuseaddr();
+     test_ip_pktinfo();
+
+--- dlls/ws2_32/socket.c
++++ dlls/ws2_32/socket.c
+@@ -182,6 +182,19 @@ static const WSAPROTOCOL_INFOW supported_protocols[] =
+         .iProtocol = BTHPROTO_RFCOMM,
+         .szProtocol = L"MSAFD RfComm [Bluetooth]",
+     },
++    {
++        .dwServiceFlags1 = XP1_GUARANTEED_DELIVERY | XP1_GUARANTEED_ORDER | XP1_IFS_HANDLES,
++        .dwProviderFlags = PFL_MATCHES_PROTOCOL_ZERO,
++        .ProviderId = {0xa00943d9, 0x9c2e, 0x4633, {0x9b, 0x59, 0x00, 0x57, 0xa3, 0x16, 0x09, 0x94}},
++        .dwCatalogEntryId = 1007,
++        .ProtocolChain.ChainLen = 1,
++        .iVersion = 2,
++        .iAddressFamily = AF_UNIX,
++        .iMaxSockAddr = sizeof(struct sockaddr_un),
++        .iMinSockAddr = offsetof(struct sockaddr_un, sun_path),
++        .iSocketType = SOCK_STREAM,
++        .szProtocol = L"AF_UNIX",
++    },
+ };
+ 
+ DECLARE_CRITICAL_SECTION(cs_socket_list);
+@@ -353,6 +366,11 @@ const char *debugstr_sockaddr( const struct sockaddr *a )
+                                  bth_addr.rgBytes[1], bth_addr.rgBytes[0], wine_dbgstr_guid( &addr->serviceClassId ),
+                                  addr->port );
+     }
++    case AF_UNIX:
++    {
++        return wine_dbg_sprintf("{ family AF_UNIX, path %s }",
++                                ((const SOCKADDR_UN *)a)->sun_path);
++    }
+     default:
+         return wine_dbg_sprintf("{ family %d }", a->sa_family);
+     }
+@@ -1251,6 +1269,13 @@ int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
+     IO_STATUS_BLOCK io;
+     HANDLE sync_event;
+     NTSTATUS status;
++    const struct sockaddr *req_addr = addr;
++    /* The corresponding unix path is appended to a buffer with
++     * the structure sockaddr_un and can have a length of <= PATH_MAX */
++    struct sockaddr_un sun = { 0 };
++    int req_len = len;
++    char *unix_path = NULL;
++    int unix_varargs_size = 0;
+ 
+     TRACE( "socket %#Ix, addr %s, len %d\n", s, debugstr_sockaddr(addr), len );
+ 
+@@ -1300,6 +1325,15 @@ int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
+                 return -1;
+             }
+             break;
++
++        case AF_UNIX:
++            if (len < offsetof(struct sockaddr_un, sun_path))
++            {
++                SetLastError( WSAEFAULT );
++                return -1;
++            }
++            break;
++
+         default:
+             FIXME( "unknown protocol %u\n", addr->sa_family );
+             SetLastError( WSAEAFNOSUPPORT );
+@@ -1308,7 +1342,62 @@ int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
+ 
+     if (!(sync_event = get_sync_event())) return -1;
+ 
+-    params = malloc( sizeof(int) + len );
++    if (addr->sa_family == AF_UNIX)
++    {
++        WCHAR *sun_pathW;
++
++        memcpy( &sun, addr, min( len, (int)sizeof(sun) ));
++
++        if (len <= offsetof(struct sockaddr_un, sun_path))
++        {
++            /* An address carrying only sun_family requests an autobind. Windows
++             * has no abstract sockets, so it assigns a path; do the same, or
++             * getsockname() would hand the caller an address it cannot connect to. */
++            static LONG autobind_seq;
++            WCHAR pathW[MAX_PATH];
++            DWORD dir_len = GetTempPathW( ARRAY_SIZE(pathW), pathW );
++
++            if (!dir_len || dir_len + 40 >= ARRAY_SIZE(pathW))
++            {
++                SetLastError( WSAEFAULT );
++                return -1;
++            }
++            swprintf( pathW + dir_len, ARRAY_SIZE(pathW) - dir_len, L"wine-autobind-%08x-%08x.sock",
++                      (unsigned int)GetCurrentProcessId(),
++                      (unsigned int)InterlockedIncrement( &autobind_seq ) );
++            /* Nothing removes the socket file when the socket goes away, and process
++             * ids are reused, so a previous run may have left this name behind. Since
++             * that run cannot still hold it - its id is ours now - drop the stale file
++             * instead of failing with WSAEADDRINUSE. This also bounds how many of them
++             * can accumulate. */
++            DeleteFileW( pathW );
++            if (!WideCharToMultiByte( CP_ACP, 0, pathW, -1, sun.sun_path, sizeof(sun.sun_path), NULL, NULL ))
++            {
++                SetLastError( WSAEFAULT );
++                return -1;
++            }
++            req_addr = (const struct sockaddr *)&sun;
++            req_len = offsetof(struct sockaddr_un, sun_path) + strlen( sun.sun_path ) + 1;
++        }
++
++        if (strlen( sun.sun_path ))
++        {
++            sun_pathW = strdupAtoW( sun.sun_path );
++            unix_path = wine_get_unix_file_name( sun_pathW );
++            free( sun_pathW );
++            if (!unix_path)
++                return SOCKET_ERROR;
++        }
++        else
++        {
++            unix_path = malloc(1);
++            *unix_path = '\0';
++        }
++        len = sizeof(sun);
++        unix_varargs_size = strlen( unix_path );
++    }
++
++    params = malloc( sizeof(int) + len + unix_varargs_size );
+     ret_addr = malloc( len );
+     if (!params || !ret_addr)
+     {
+@@ -1318,10 +1407,14 @@ int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
+         return -1;
+     }
+     params->unknown = 0;
+-    memcpy( &params->addr, addr, len );
++    if (addr->sa_family == AF_UNIX)
++        memset( &params->addr, 0, len );
++    memcpy( &params->addr, req_addr, req_len );
++    if (unix_path)
++        memcpy( (char *)&params->addr + len, unix_path, unix_varargs_size );
+ 
+     status = NtDeviceIoControlFile( (HANDLE)s, sync_event, NULL, NULL, &io, IOCTL_AFD_BIND,
+-                                    params, sizeof(int) + len, ret_addr, len );
++                                    params, sizeof(int) + len + unix_varargs_size, ret_addr, len );
+     if (status == STATUS_PENDING)
+     {
+         if (WaitForSingleObject( sync_event, INFINITE ) == WAIT_FAILED)
+@@ -1334,6 +1427,7 @@ int WINAPI bind( SOCKET s, const struct sockaddr *addr, int len )
+ 
+     free( params );
+     free( ret_addr );
++    free( unix_path );
+ 
+     SetLastError( NtStatusToWSAError( status ) );
+     return status ? -1 : 0;
+@@ -1374,11 +1468,24 @@ int WINAPI connect( SOCKET s, const struct sockaddr *addr, int len )
+     HANDLE sync_event;
+     NTSTATUS status;
+ 
++    char *unix_path = NULL;
++    int unix_varargs_size = 0;
++
+     TRACE( "socket %#Ix, addr %s, len %d\n", s, debugstr_sockaddr(addr), len );
+ 
+     if (!(sync_event = get_sync_event())) return -1;
+ 
+-    if (!(params = malloc( sizeof(*params) + len )))
++    if (addr->sa_family == AF_UNIX && *addr->sa_data)
++    {
++        WCHAR *sun_pathW = strdupAtoW(addr->sa_data);
++        unix_path = wine_get_unix_file_name(sun_pathW);
++        free(sun_pathW);
++        if (!unix_path)
++            return SOCKET_ERROR;
++        unix_varargs_size = strlen(unix_path);
++    }
++
++    if (!(params = malloc( sizeof(*params) + len + unix_varargs_size )))
+     {
+         SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+         return -1;
+@@ -1386,10 +1493,13 @@ int WINAPI connect( SOCKET s, const struct sockaddr *addr, int len )
+     params->addr_len = len;
+     params->synchronous = TRUE;
+     memcpy( params + 1, addr, len );
++    if (unix_path)
++        memcpy( (char *)(params + 1) + len, unix_path, unix_varargs_size );
+ 
+     status = NtDeviceIoControlFile( (HANDLE)s, sync_event, NULL, NULL, &io, IOCTL_AFD_WINE_CONNECT,
+-                                    params, sizeof(*params) + len, NULL, 0 );
++                                    params, sizeof(*params) + len + unix_varargs_size, NULL, 0 );
+     free( params );
++    free( unix_path );
+     if (status == STATUS_PENDING)
+     {
+         if (wait_event_alertable( sync_event ) == WAIT_FAILED) return -1;
+@@ -1424,6 +1534,8 @@ static BOOL WINAPI WS2_ConnectEx( SOCKET s, const struct sockaddr *name, int nam
+ {
+     struct afd_connect_params *params;
+     void *cvalue = NULL;
++    char *unix_path = NULL;
++    int unix_varargs_size = 0;
+     NTSTATUS status;
+ 
+     TRACE( "socket %#Ix, ptr %p %s, length %d, send_buffer %p, send_len %lu, overlapped %p\n",
+@@ -1435,24 +1547,50 @@ static BOOL WINAPI WS2_ConnectEx( SOCKET s, const struct sockaddr *name, int nam
+         return FALSE;
+     }
+ 
++    if (name->sa_family == AF_UNIX && *name->sa_data)
++    {
++        WCHAR *sun_pathW;
++
++        /* The server expects the translated Unix path appended to the address,
++         * which leaves no room for connect data on AF_UNIX sockets. */
++        if (send_len)
++        {
++            SetLastError( WSAEOPNOTSUPP );
++            return FALSE;
++        }
++
++        sun_pathW = strdupAtoW( name->sa_data );
++        unix_path = wine_get_unix_file_name( sun_pathW );
++        free( sun_pathW );
++        if (!unix_path)
++            return FALSE;
++        unix_varargs_size = strlen( unix_path );
++    }
++
+     if (!((ULONG_PTR)overlapped->hEvent & 1)) cvalue = overlapped;
+     overlapped->Internal = STATUS_PENDING;
+     overlapped->InternalHigh = 0;
+ 
+-    if (!(params = malloc( sizeof(*params) + namelen + send_len )))
++    if (!(params = malloc( sizeof(*params) + namelen + send_len + unix_varargs_size )))
+     {
++        free( unix_path );
+         SetLastError( ERROR_NOT_ENOUGH_MEMORY );
+         return SOCKET_ERROR;
+     }
+     params->addr_len = namelen;
+     params->synchronous = FALSE;
+     memcpy( params + 1, name, namelen );
+-    memcpy( (char *)(params + 1) + namelen, send_buffer, send_len );
++    if (unix_path)
++        memcpy( (char *)(params + 1) + namelen, unix_path, unix_varargs_size );
++    else
++        memcpy( (char *)(params + 1) + namelen, send_buffer, send_len );
+ 
+     status = NtDeviceIoControlFile( SOCKET2HANDLE(s), overlapped->hEvent, NULL, cvalue,
+                                     (IO_STATUS_BLOCK *)overlapped, IOCTL_AFD_WINE_CONNECT,
+-                                    params, sizeof(*params) + namelen + send_len, NULL, 0 );
++                                    params, sizeof(*params) + namelen + send_len + unix_varargs_size,
++                                    NULL, 0 );
+     free( params );
++    free( unix_path );
+     if (ret_len) *ret_len = overlapped->InternalHigh;
+     SetLastError( NtStatusToWSAError( status ) );
+     TRACE( "status %#lx.\n", status );
+@@ -2344,6 +2482,7 @@ static const char *debugstr_wsaioctl(DWORD code)
+         IOCTL_NAME(SIO_TRANSLATE_HANDLE);
+         IOCTL_NAME(SIO_UDP_CONNRESET);
+         IOCTL_NAME(SIO_UDP_NETRESET);
++        IOCTL_NAME(SIO_AF_UNIX_GETPEERPID);
+     }
+ #undef IOCTL_NAME
+ 
+@@ -2826,6 +2965,17 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID
+         return ret ? -1 : 0;
+     }
+ 
++    case SIO_AF_UNIX_GETPEERPID:
++    {
++        DWORD ret;
++
++        ret = server_ioctl_sock( s, IOCTL_AFD_WINE_GETPEERPID, NULL, 0,
++                                 out_buff, out_size, ret_size, overlapped, completion );
++        if (!ret) *ret_size = sizeof(DWORD);
++        SetLastError( ret );
++        return ret ? -1 : 0;
++    }
++
+     default:
+         FIXME( "unimplemented ioctl %s\n", debugstr_wsaioctl( code ) );
+         /* fall through */
+
+--- dlls/ws2_32/ws2_32_private.h
++++ dlls/ws2_32/ws2_32_private.h
+@@ -46,6 +46,7 @@
+ #include "mstcpip.h"
+ #include "af_irda.h"
+ #include "winnt.h"
++#include "afunix.h"
+ #define USE_WC_PREFIX   /* For CMSG_DATA */
+ #include "iphlpapi.h"
+ #include "ip2string.h"
+@@ -73,6 +74,18 @@ static inline char *strdupWtoA( const WCHAR *str )
+     return ret;
+ }
+ 
++static inline WCHAR *strdupAtoW( const char *str )
++{
++    WCHAR *ret = NULL;
++    if (str)
++    {
++        DWORD len = MultiByteToWideChar(CP_ACP, 0, str, -1, NULL, 0);
++        if ((ret = malloc( len * sizeof(WCHAR) )))
++            MultiByteToWideChar(CP_ACP, 0, str, -1, ret, len);
++    }
++    return ret;
++}
++
+ static const char magic_loopback_addr[] = {127, 12, 34, 56};
+ 
+ const char *debugstr_sockaddr( const struct sockaddr *addr );
+
+--- include/wine/afd.h
++++ include/wine/afd.h
+@@ -291,6 +291,7 @@ C_ASSERT( sizeof(struct afd_get_events_params) == 56 );
+ #define IOCTL_AFD_WINE_SET_TCP_KEEPCNT                  WINE_AFD_IOC(302)
+ #define IOCTL_AFD_WINE_GET_TCP_KEEPINTVL                WINE_AFD_IOC(303)
+ #define IOCTL_AFD_WINE_SET_TCP_KEEPINTVL                WINE_AFD_IOC(304)
++#define IOCTL_AFD_WINE_GETPEERPID                       WINE_AFD_IOC(305)
+ 
+ struct afd_iovec
+ {
+
+--- include/afunix.h
++++ include/afunix.h
+@@ -33,4 +33,10 @@ typedef struct WS(sockaddr_un)
+     char sun_path[UNIX_PATH_MAX];
+ } SOCKADDR_UN, *PSOCKADDR_UN;
+ 
++#ifdef USE_WS_PREFIX
++#define SIO_AF_UNIX_GETPEERPID _WSAIOR(WS_IOC_VENDOR, 256)
++#else
++#define SIO_AF_UNIX_GETPEERPID _WSAIOR(IOC_VENDOR, 256)
++#endif
++
+ #endif /* _WS2AFUNIX_ */
+
+--- server/fd.c
++++ server/fd.c
+@@ -1973,21 +1973,79 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
+ 
+     if (fd->unix_fd == -1)
+     {
++        int open_errno = errno;
++
+         /* check for trailing slash on file path */
+         if ((errno == ENOENT || (errno == ENOTDIR && !(options & FILE_DIRECTORY_FILE))) && name[strlen(name) - 1] == '/')
++        {
+             set_error( STATUS_OBJECT_NAME_INVALID );
++            goto error;
++        }
++
++        /* POSIX requires that open(2) throws EOPNOTSUPP when `path` is a Unix
++         * socket. BSD throws EOPNOTSUPP in this case and the additional case of
++         * O_SHLOCK or O_EXLOCK being passed when `path` resides on a filesystem
++         * without lock support. Contrary to POSIX, Linux returns ENXIO in this
++         * case, so we also check that error code here.
++         */
++        if (open_errno == EOPNOTSUPP || open_errno == ENXIO)
++        {
++            if (stat( name, &st ))
++            {
++                file_set_error();
++                goto error;
++            }
++
++            errno = open_errno;
++
++            if (S_ISSOCK(st.st_mode))
++            {
++                /* Windows exposes a bound AF_UNIX socket as a reparse point: opening it
++                 * without FILE_OPEN_REPARSE_POINT fails with STATUS_IO_REPARSE_TAG_NOT_HANDLED,
++                 * and with the flag it yields a handle that only carries metadata, which is
++                 * what O_PATH gives us here.
++                 */
++                if (options & FILE_DELETE_ON_CLOSE)
++                    ; /* no error, go to regular deletion code path */
++                else if (!(options & FILE_OPEN_REPARSE_POINT))
++                {
++                    set_error( STATUS_IO_REPARSE_TAG_NOT_HANDLED );
++                    goto error;
++                }
++                else
++                {
++#ifdef O_PATH
++                    fd->unix_fd = open( name, O_PATH );
++#endif
++                    if (fd->unix_fd == -1)
++                    {
++                        file_set_error();
++                        goto error;
++                    }
++                }
++            }
++            else
++            {
++                file_set_error();
++                goto error;
++            }
++        }
+         else
++        {
+             file_set_error();
+-        goto error;
++            goto error;
++        }
+     }
+ 
+     fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
+     fd->unix_name = NULL;
+-    fstat( fd->unix_fd, &st );
++    /* st was set from the file name if the file could not be opened */
++    if (fd->unix_fd != -1)
++        fstat( fd->unix_fd, &st );
+     *mode = st.st_mode;
+ 
+     /* only bother with an inode for normal files and directories */
+-    if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))
++    if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode) || S_ISSOCK(st.st_mode))
+     {
+         unsigned int err;
+         struct inode *inode = get_inode( st.st_dev, st.st_ino, fd->unix_fd );
+@@ -2050,7 +2108,8 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
+                 set_error( STATUS_OBJECT_NAME_COLLISION );
+                 goto error;
+             }
+-            ftruncate( fd->unix_fd, 0 );
++            if (fd->unix_fd != -1)
++                ftruncate( fd->unix_fd, 0 );
+         }
+     }
+     else  /* special file */
+@@ -2480,6 +2539,7 @@ static void get_reparse_point( struct fd *fd, struct async *async )
+     /* we can't just allocate get_reply_max_size() here;
+      * Linux won't return any data if the size is too small */
+     char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
++    struct stat st;
+     int ret;
+ 
+     if (!fd->unix_name)
+@@ -2494,6 +2554,26 @@ static void get_reparse_point( struct fd *fd, struct async *async )
+         return;
+     }
+ 
++    /* A bound AF_UNIX socket carries its reparse tag in the inode type, not in the
++     * name suffix and extended attribute the other reparse points use. Windows
++     * reports IO_REPARSE_TAG_AF_UNIX with no reparse data at all. */
++    if (fd->unix_fd != -1 && !fstat( fd->unix_fd, &st ) && S_ISSOCK( st.st_mode ))
++    {
++        REPARSE_DATA_BUFFER *data = (REPARSE_DATA_BUFFER *)buffer;
++        unsigned int size = sizeof(data->ReparseTag) + sizeof(data->ReparseDataLength)
++                            + sizeof(data->Reserved);
++
++        if (get_reply_max_size() < size)
++        {
++            set_error( STATUS_BUFFER_TOO_SMALL );
++            return;
++        }
++        memset( data, 0, size );
++        data->ReparseTag = IO_REPARSE_TAG_AF_UNIX;
++        set_reply_data( data, size );
++        return;
++    }
++
+     if (fd->unix_name[strlen( fd->unix_name ) - 1] != '?')
+     {
+         set_error( STATUS_NOT_A_REPARSE_POINT );
+
+--- server/sock.c
++++ server/sock.c
+

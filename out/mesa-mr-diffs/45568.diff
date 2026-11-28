@@ -1,0 +1,118 @@
+# kk: Stop WSI blits from stalling app submits (-7% frame time)
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45568 state=opened
+# `kk_queue_submit` encodes `waitForDrawable` before it commits the present blit. That wait holds back every later submit on the same queue until the display releases the drawable, so the app's next frame waits for the display.
+
+This creates an internal queue on first use by WSI and returns it from `get_blit_queue` and `get_mtl4_command_queue`. `wsi_common` already syncs the app queue and the blit queue with semaphores. The layer residency set is now only on the WSI queue, since only the blit touches the drawable.
+
+At a cost of one more MTL4CommandQueue and command pool per device that presents (about 50 KB). Devices that never create a swapchain do not create it.
+
+Tested with shadPS4 running Knowledge is Power (M1 Pro, macOS 27, x86_64 build under Rosetta). 60 s runs:
+
+| Run | Frames before | Frames after | Median before | Median after |
+|-----|---------------|--------------|---------------|--------------|
+| 1 | 2212 | 2315 | 31.5 ms | 29.6 ms |
+| 2 | 2013 | 2042 | 31.1 ms | 28.5 ms |
+| 3 | 2039 | 2050 | 31.0 ms | 28.5 ms |
+
+Median frame time 31.2 to 28.9 ms (-7%), lower in 3 of 3 pairs. Frames +2.3%.
+
+Metal HUD, same scene:
+
+![kk-mr-hud-before-after.png](/uploads/8ead26a04f5a189e9c5ef9030f99e841/kk-mr-hud-before-after.png){width="900" height="265"}
+--- src/kosmickrisp/vulkan/kk_device.c
++++ src/kosmickrisp/vulkan/kk_device.c
+@@ -306,6 +306,7 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (dev->residency_set.handle == NULL)
+       goto fail_compiler;
+ 
++   simple_mtx_init(&dev->blit_queue_mutex, mtx_plain);
+    if (pCreateInfo->queueCreateInfoCount > 0) {
+       result =
+          kk_queue_init(dev, &dev->queue, &pCreateInfo->pQueueCreateInfos[0], 0);
+@@ -353,6 +354,7 @@ fail_mem_cache:
+       dev->has_queue = false;
+    }
+ fail_vab_memory:
++   simple_mtx_destroy(&dev->blit_queue_mutex);
+    mtl_release(dev->residency_set.handle);
+    simple_mtx_destroy(&dev->residency_set.mutex);
+ fail_compiler:
+@@ -389,6 +391,11 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+    if (dev->heap)
+       kk_destroy_bo(dev, dev->heap);
+ 
++   if (dev->has_blit_queue) {
++      kk_queue_finish(dev, &dev->blit_queue);
++      dev->has_blit_queue = false;
++   }
++   simple_mtx_destroy(&dev->blit_queue_mutex);
+    if (dev->has_queue) {
+       kk_queue_finish(dev, &dev->queue);
+       dev->has_queue = false;
+
+--- src/kosmickrisp/vulkan/kk_device.h
++++ src/kosmickrisp/vulkan/kk_device.h
+@@ -97,6 +97,9 @@ struct kk_device {
+ 
+    bool has_queue;
+    struct kk_queue queue;
++   simple_mtx_t blit_queue_mutex;
++   bool has_blit_queue;
++   struct kk_queue blit_queue;
+ 
+    struct vk_meta_device meta;
+ 
+
+--- src/kosmickrisp/vulkan/kk_wsi.c
++++ src/kosmickrisp/vulkan/kk_wsi.c
+@@ -90,26 +90,42 @@ kk_encode_drawable_present(VkCommandBuffer vk_cmd, void *drawable)
+    cmd->drawable = drawable;
+ }
+ 
++static struct vk_queue *kk_get_blit_queue(VkDevice device);
++
+ static void *
+ kk_get_mtl4_command_queue(VkDevice device)
+ {
+-   VK_FROM_HANDLE(kk_device, dev, device);
+-   if (dev->has_queue) {
+-      return dev->queue.mtl_handle;
+-   }
++   struct vk_queue *vk_queue = kk_get_blit_queue(device);
++   if (!vk_queue)
++      return NULL;
+ 
+-   return NULL;
++   return container_of(vk_queue, struct kk_queue, vk)->mtl_handle;
+ }
+ 
+ static struct vk_queue *
+ kk_get_blit_queue(VkDevice device)
+ {
+-   /* We only have one queue, so just return that one. */
+    VK_FROM_HANDLE(kk_device, dev, device);
+    if (!dev->has_queue)
+       return NULL;
+ 
+-   return &dev->queue.vk;
++   /* WSI gets its own queue so waitForDrawable never stalls the app. */
++   simple_mtx_lock(&dev->blit_queue_mutex);
++   if (!dev->has_blit_queue) {
++      const VkDeviceQueueCreateInfo queue_info = {
++         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++         .queueFamilyIndex = 0,
++         .queueCount = 1,
++      };
++      VkResult result = kk_queue_init(dev, &dev->blit_queue, &queue_info, 0);
++      if (result == VK_SUCCESS)
++         dev->has_blit_queue = true;
++      else
++         mesa_logw("kk: failed to create the WSI queue");
++   }
++   simple_mtx_unlock(&dev->blit_queue_mutex);
++
++   return dev->has_blit_queue ? &dev->blit_queue.vk : &dev->queue.vk;
+ }
+ 
+ VkResult
+

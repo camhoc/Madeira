@@ -1,0 +1,66 @@
+# kk: Declare variables without initial value 0 in SSA temporaries
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45954 state=merged
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+
+The Apple compiler took more than 10 minutes on large shaders (66,019
+variables) and crashed. Now, by declaring variables without initial
+value 0, it takes 42 seconds.
+
+The variables are declared without initial 0. Removed the function
+msl_def_is_sampler from msl_type_inference.c and msl_private.h because
+it is no longer needed, since there is no need to give special
+treatment to samplers, which were declared without 0.
+
+* CTS: 56,319 subgroups, glsl, spirv and draw tests. No new failures
+  compared to main. The only differences are in 12 float16 *_geom
+  tests that are flaky: when repeated, all 12 pass, with and without
+  the change.
+* Hardware: M5 Pro, macOS 27.2.
+
+Assisted-by: LLM
+Original Language: ESP
+--- src/kosmickrisp/compiler/msl_private.h
++++ src/kosmickrisp/compiler/msl_private.h
+@@ -81,7 +81,6 @@ uint32_t msl_output_num_components(struct nir_to_msl_ctx *ctx,
+                                    uint32_t location);
+ 
+ bool msl_src_is_float(struct nir_to_msl_ctx *ctx, nir_src *src);
+-bool msl_def_is_sampler(struct nir_to_msl_ctx *ctx, nir_def *def);
+ bool msl_def_is_texture(struct nir_to_msl_ctx *ctx, nir_def *def);
+ 
+ void msl_nir_lower_subgroups(nir_shader *nir);
+
+--- src/kosmickrisp/compiler/msl_type_inference.c
++++ src/kosmickrisp/compiler/msl_type_inference.c
+@@ -888,12 +888,6 @@ msl_src_is_float(struct nir_to_msl_ctx *ctx, nir_src *src)
+    return get_type(ctx->types, src) == TYPE_FLOAT;
+ }
+ 
+-bool
+-msl_def_is_sampler(struct nir_to_msl_ctx *ctx, nir_def *def)
+-{
+-   return get_type(ctx->types, def) == TYPE_SAMPLER;
+-}
+-
+ bool
+ msl_def_is_texture(struct nir_to_msl_ctx *ctx, nir_def *def)
+ {
+
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -2463,10 +2463,7 @@ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
+             const char *type = msl_type_for_def(ctx->types, def);
+             if (!type)
+                continue;
+-            if (msl_def_is_sampler(ctx, def)) {
+-               P_IND(ctx, "%s t%u;\n", type, def->index);
+-            } else
+-               P_IND(ctx, "%s t%u = %s(0);\n", type, def->index, type);
++            P_IND(ctx, "%s t%u;\n", type, def->index);
+          }
+       }
+    }
+

@@ -1,0 +1,357 @@
+# winebus, hidclass, dinput: Add bus_num and port_path to device_desc and use them in instance_id.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/9687 state=opened
+# Use only real serial numbers, otherwise return error on IOCTL_HID_GET_STRING, similar to Windows.
+
+Generate consistent container_id (winebus) based on either serial number, uid (macos LocationID), bus_num/port_path (Linux bus_udev) or input/index.
+
+Generate consistent guidInstance (dinput) based on device_id/instance_id extracted from the device_path.
+--- dlls/dinput/tests/joystick8.c
++++ dlls/dinput/tests/joystick8.c
+@@ -6142,7 +6142,7 @@ static void test_joystick_instance_guid( DWORD version )
+ #undef MAKE_DESC
+ #undef MAKE_ATTR
+     };
+-    const GUID instance_uuid_init = {0x00000000, 0x0000, 0x1000, {0x80, 0x00, 0x00, 0x00, 'D', 'E', 'S', 'T'}};
++    const GUID instance_uuid_init = {0x00000000, 0x0000, 0x1000, {0x80, 0x00, 'D', 'E', 'S', 'T', 0x00, 0x00}};
+     struct dinput di = {.version = version}, di2 = {.version = version};
+     GUID expect_instances[4], instances[64], *instances_end;
+     IDirectInputDevice8W *device;
+
+--- dlls/dinput/joystick_hid.c
++++ dlls/dinput/joystick_hid.c
+@@ -65,7 +65,7 @@ DEFINE_GUID( device_path_guid, 0x00000000, 0x0000, 0x0000, 0x8d, 0x4a, 0x23, 0x9
+  */
+ #define UUID_TIME_TO_SYSTEM_TIME_DAYS ((ULONG64)((365 * 18) + 5 + 17 + 30 + 31))
+ #define UUID_TIME_TO_SYSTEM_TIME_NS_DIFFERENCE ((UUID_TIME_TO_SYSTEM_TIME_DAYS) * 24 * 60 * 60 * 10000000)
+-DEFINE_GUID( dinput_joystick_uuid_init, 0x00000000, 0x0000, 0x1000, 0x80, 0x00, 0x00, 0x00, 'D', 'E', 'S', 'T' );
++DEFINE_GUID( dinput_joystick_uuid_init, 0x00000000, 0x0000, 0x1000, 0x80, 0x00, 'D', 'E', 'S', 'T', 0x00, 0x00 );
+ 
+ static GUID create_instance_uuid(void)
+ {
+
+--- dlls/hidclass.sys/hid.h
++++ dlls/hidclass.sys/hid.h
+@@ -55,7 +55,6 @@ struct func_device
+     struct device base;
+     HID_DEVICE_ATTRIBUTES attrs;
+     HIDP_DEVICE_DESC device_desc;
+-    WCHAR serial[256];
+ 
+     ULONG poll_interval;
+     KEVENT halt_event;
+
+--- dlls/hidclass.sys/pnp.c
++++ dlls/hidclass.sys/pnp.c
+@@ -218,7 +218,6 @@ static NTSTATUS get_hid_device_desc( minidriver *minidriver, DEVICE_OBJECT *devi
+ static NTSTATUS initialize_device( minidriver *minidriver, DEVICE_OBJECT *device )
+ {
+     struct func_device *fdo = fdo_from_DEVICE_OBJECT( device );
+-    ULONG index = HID_STRING_ID_ISERIALNUMBER;
+     IO_STATUS_BLOCK io;
+     NTSTATUS status;
+ 
+@@ -230,14 +229,6 @@ static NTSTATUS initialize_device( minidriver *minidriver, DEVICE_OBJECT *device
+         return io.Status;
+     }
+ 
+-    call_minidriver( IOCTL_HID_GET_STRING, device, ULongToPtr(index), sizeof(index),
+-                     &fdo->serial, sizeof(fdo->serial), &io );
+-    if (io.Status != STATUS_SUCCESS)
+-    {
+-        ERR( "Minidriver failed to get serial number, status %#lx.\n", io.Status );
+-        return io.Status;
+-    }
+-
+     if ((status = get_hid_device_desc( minidriver, device, &fdo->device_desc )))
+     {
+         ERR( "Failed to get HID device description, status %#lx\n", status );
+@@ -288,8 +279,8 @@ static NTSTATUS create_child_pdos( minidriver *minidriver, DEVICE_OBJECT *device
+         {
+             swprintf( pdo->base.device_id, ARRAY_SIZE(pdo->base.device_id), L"%s&Col%02d",
+                       fdo->base.device_id, pdo->collection_desc->CollectionNumber );
+-            swprintf( pdo->base.instance_id, ARRAY_SIZE(pdo->base.instance_id), L"%u&%s&%x&%u&%04u",
+-                      fdo->attrs.VersionNumber, fdo->serial, 0, 0, i );
++            swprintf( pdo->base.instance_id, ARRAY_SIZE(pdo->base.instance_id), L"%s&%04u",
++                      fdo->base.instance_id, i );
+         }
+         else
+         {
+
+--- dlls/winebus.sys/bus_iohid.c
++++ dlls/winebus.sys/bus_iohid.c
+@@ -271,7 +271,6 @@ static void handle_DeviceMatchingCallback(void *context, IOReturn result, void *
+     struct device_desc desc =
+     {
+         .input = -1, .bus_id = -1, .is_hidraw = TRUE,
+-        .serialnumber = {'0','0','0','0',0},
+     };
+     struct iohid_device *impl;
+     USAGE_AND_PAGE usages;
+
+--- dlls/winebus.sys/bus_sdl.c
++++ dlls/winebus.sys/bus_sdl.c
+@@ -932,7 +932,6 @@ static void sdl_add_device(unsigned int index)
+         .input = -1,
+         .bus_id = -1,
+         .manufacturer = {'S','D','L',0},
+-        .serialnumber = {'0','0','0','0',0},
+     };
+     struct sdl_device *impl;
+ 
+@@ -941,7 +940,7 @@ static void sdl_add_device(unsigned int index)
+     SDL_JoystickType joystick_type;
+     SDL_GameController *controller = NULL;
+     const char *product, *sdl_serial;
+-    char buffer[ARRAY_SIZE(desc.product)];
++    char guid_str[33], buffer[ARRAY_SIZE(desc.product)];
+     int axis_count, axis_offset;
+ 
+     if ((joystick = pSDL_JoystickOpen(index)) == NULL)
+@@ -974,8 +973,20 @@ static void sdl_add_device(unsigned int index)
+         desc.version = 0;
+     }
+ 
+-    if (pSDL_JoystickGetSerial && (sdl_serial = pSDL_JoystickGetSerial(joystick)))
+-        ntdll_umbstowcs(sdl_serial, strlen(sdl_serial) + 1, desc.serialnumber, ARRAY_SIZE(desc.serialnumber));
++    if (pSDL_JoystickGetSerial)
++    {
++        if ((sdl_serial = pSDL_JoystickGetSerial(joystick)))
++            ntdll_umbstowcs(sdl_serial, strlen(sdl_serial) + 1, desc.serialnumber, ARRAY_SIZE(desc.serialnumber));
++    }
++    else
++    {
++        /* Overcooked! All You Can Eat only adds controllers with unique serial numbers
++         * Prefer keeping serial numbers unique over keeping them consistent across runs */
++        pSDL_JoystickGetGUIDString(pSDL_JoystickGetGUID(joystick), guid_str, sizeof(guid_str));
++        snprintf(buffer, sizeof(buffer), "%s.%d", guid_str, index);
++        TRACE("Making up serial number for %s: %s\n", product, buffer);
++        ntdll_umbstowcs(buffer, strlen(buffer) + 1, desc.serialnumber, ARRAY_SIZE(desc.serialnumber));
++    }
+ 
+     if (controller)
+     {
+
+--- dlls/winebus.sys/bus_udev.c
++++ dlls/winebus.sys/bus_udev.c
+@@ -1171,6 +1171,19 @@ static void get_device_subsystem_info(struct udev_device *dev, const char *subsy
+ 
+         if ((tmp = udev_device_get_sysattr_value(parent, "serial")))
+             ntdll_umbstowcs(tmp, strlen(tmp) + 1, desc->serialnumber, ARRAY_SIZE(desc->serialnumber));
++
++        if ((tmp = udev_device_get_sysattr_value(parent, "busnum")))
++            desc->bus_num = atoi(tmp);
++
++        if ((tmp = udev_device_get_sysattr_value(parent, "devpath")))
++        {
++            desc->port_path = 0;
++            sscanf(tmp, "%hhu.%hhu.%hhu.%hhu.%hhu.%hhu.%hhu.%hhu", (UINT8 *)&desc->port_path,
++                   (UINT8 *)&desc->port_path + 1, (UINT8 *)&desc->port_path + 2,
++                   (UINT8 *)&desc->port_path + 3, (UINT8 *)&desc->port_path + 4,
++                   (UINT8 *)&desc->port_path + 5, (UINT8 *)&desc->port_path + 6,
++                   (UINT8 *)&desc->port_path + 7);
++        }
+     }
+ }
+ 
+@@ -1191,7 +1204,6 @@ static NTSTATUS hidraw_device_create(struct udev_device *dev, int fd, const char
+ {
+ #ifdef HAVE_LINUX_HIDRAW_H
+     static const WCHAR hidraw[] = {'h','i','d','r','a','w',0};
+-    static const WCHAR zeros[] = {'0','0','0','0',0};
+     struct base_device *impl;
+     char buffer[MAX_PATH];
+ 
+@@ -1200,7 +1212,6 @@ static NTSTATUS hidraw_device_create(struct udev_device *dev, int fd, const char
+         ntdll_umbstowcs(buffer, strlen(buffer) + 1, desc.product, ARRAY_SIZE(desc.product));
+ 
+     if (!desc.manufacturer[0]) memcpy(desc.manufacturer, hidraw, sizeof(hidraw));
+-    if (!desc.serialnumber[0]) memcpy(desc.serialnumber, zeros, sizeof(zeros));
+ 
+     if (!(impl = raw_device_create(&hidraw_device_vtbl, sizeof(struct hidraw_device))))
+         return STATUS_NO_MEMORY;
+@@ -1222,7 +1233,6 @@ static NTSTATUS lnxev_device_create(struct udev_device *dev, int fd, const char
+ {
+ #ifdef HAS_PROPER_INPUT_HEADER
+     static const WCHAR evdev[] = {'e','v','d','e','v',0};
+-    static const WCHAR zeros[] = {'0','0','0','0',0};
+     int axis_count = 0, button_count = 0;
+     struct lnxev_info info = {0};
+     struct lnxev_device *impl;
+@@ -1241,7 +1251,6 @@ static NTSTATUS lnxev_device_create(struct udev_device *dev, int fd, const char
+     if (!desc.manufacturer[0]) memcpy(desc.manufacturer, evdev, sizeof(evdev));
+     if (!desc.product[0]) ntdll_umbstowcs(info.name, strlen(info.name) + 1, desc.product, ARRAY_SIZE(desc.product));
+     if (!desc.serialnumber[0]) ntdll_umbstowcs(info.uniq, strlen(info.uniq) + 1, desc.serialnumber, ARRAY_SIZE(desc.serialnumber));
+-    if (!desc.serialnumber[0]) memcpy(desc.serialnumber, zeros, sizeof(zeros));
+ 
+     if (!(impl = hid_device_create(&lnxev_device_vtbl, sizeof(struct lnxev_device))))
+         return STATUS_NO_MEMORY;
+
+--- dlls/winebus.sys/main.c
++++ dlls/winebus.sys/main.c
+@@ -171,7 +171,8 @@ static DWORD get_device_index(struct device_desc *desc, struct list **before)
+     /* The device list is sorted, so just increment the index until it doesn't match an index already in the list */
+     LIST_FOR_EACH_ENTRY(ext, &device_list, struct device_extension, entry)
+     {
+-        if (ext->desc.vid == desc->vid && ext->desc.pid == desc->pid && ext->desc.input == desc->input)
++        if (ext->desc.vid == desc->vid && ext->desc.pid == desc->pid && ext->desc.input == desc->input &&
++            !wcsicmp(ext->desc.serialnumber, desc->serialnumber))
+         {
+             if (ext->index != index)
+             {
+@@ -188,13 +189,24 @@ static DWORD get_device_index(struct device_desc *desc, struct list **before)
+ static WCHAR *get_instance_id(DEVICE_OBJECT *device)
+ {
+     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
+-    DWORD len = wcslen(ext->desc.serialnumber) + 33;
++    struct device_desc *desc = &ext->desc;
++    const DWORD sn_len = wcslen(desc->serialnumber);
++    DWORD len = (sn_len ? sn_len : sizeof(desc->port_path)*2) + 33;
+     WCHAR *dst;
+ 
+     if ((dst = ExAllocatePool(PagedPool, len * sizeof(WCHAR))))
+     {
+-        swprintf(dst, len, L"%u&%s&%x&%u&%u", ext->desc.version, ext->desc.serialnumber,
+-                 ext->desc.uid, ext->index, ext->desc.is_gamepad);
++        if (sn_len && !ext->index)
++        {
++            swprintf(dst, len, L"%u&%x&%u&%s&%u", desc->version, desc->uid, ext->index,
++                     desc->serialnumber, desc->is_gamepad);
++        }
++        else
++        {
++            swprintf(dst, len, L"%u&%x&%u&%llx&%u", desc->version, desc->uid,
++                     desc->bus_num ? desc->bus_num : ext->index, desc->port_path,
++                     desc->is_gamepad);
++        }
+     }
+ 
+     return dst;
+@@ -360,32 +372,40 @@ static void remove_pending_irps(DEVICE_OBJECT *device)
+     }
+ }
+ 
+-static void make_unique_serial(struct device_extension *device)
+-{
+-    struct device_extension *ext;
+-
+-    LIST_FOR_EACH_ENTRY(ext, &device_list, struct device_extension, entry)
+-        if (!wcscmp(device->desc.serialnumber, ext->desc.serialnumber)) break;
+-    if (&ext->entry == &device_list && *device->desc.serialnumber) return;
+-
+-    swprintf(device->desc.serialnumber, ARRAY_SIZE(device->desc.serialnumber), L"%04x%08x%04x%04x",
+-             device->index, device->desc.input, device->desc.pid, device->desc.vid);
+-}
+-
+ static void make_unique_container_id(struct device_extension *device)
+ {
+     struct device_extension *ext;
+-    LARGE_INTEGER ticks;
++    struct device_desc *desc = &device->desc;
++    const DWORD sn_len = wcslen(desc->serialnumber);
++    DWORD crc32;
+ 
+     LIST_FOR_EACH_ENTRY(ext, &device_list, struct device_extension, entry)
+         if (IsEqualGUID(&device->container_id, &ext->container_id)) break;
+     if (&ext->entry == &device_list && !IsEqualGUID(&device->container_id, &GUID_NULL)) return;
+ 
+-    device->container_id.Data1 = MAKELONG(device->desc.vid, device->desc.pid);
+-    device->container_id.Data2 = device->index;
+-    device->container_id.Data3 = device->desc.input;
+-    QueryPerformanceCounter(&ticks);
+-    memcpy(device->container_id.Data4, &ticks.QuadPart, sizeof(device->container_id.Data4));
++    device->container_id.Data1 = MAKELONG(desc->vid, desc->pid);
++    device->container_id.Data2 = desc->version;
++    if (sn_len && !device->index)
++    {
++        device->container_id.Data3 = 0;
++        crc32 = RtlComputeCrc32(0, (const BYTE *)desc->serialnumber, sn_len * sizeof(WCHAR));
++        *(UINT64 *)device->container_id.Data4 = crc32;
++    }
++    else if (desc->uid)
++    {
++        device->container_id.Data3 = 0;
++        *(UINT64 *)device->container_id.Data4 = desc->uid;
++    }
++    else if (desc->bus_num || desc->port_path)
++    {
++        device->container_id.Data3 = desc->bus_num;
++        *(UINT64 *)device->container_id.Data4 = desc->port_path;
++    }
++    else
++    {
++        device->container_id.Data3 = desc->input;
++        *(UINT64 *)device->container_id.Data4 = device->index;
++    }
+ }
+ 
+ static DEVICE_OBJECT *bus_create_hid_device(struct device_desc *desc, UINT64 unix_device)
+@@ -432,10 +452,6 @@ static DEVICE_OBJECT *bus_create_hid_device(struct device_desc *desc, UINT64 uni
+     InitializeCriticalSectionEx(&ext->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     ext->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": cs");
+ 
+-    /* Overcooked! All You Can Eat only adds controllers with unique serial numbers
+-     * Prefer keeping serial numbers unique over keeping them consistent across runs */
+-    make_unique_serial(ext);
+-
+     /*
+      * Some games use container ID to match the bus device to the HID
+      * device in order to get things like DEVPKEY_Device_BusReportedDeviceDesc.
+@@ -1480,6 +1496,7 @@ static NTSTATUS hid_get_device_string(DEVICE_OBJECT *device, DWORD index, WCHAR
+     case HID_STRING_ID_ISERIALNUMBER:
+         len = (wcslen(ext->desc.serialnumber) + 1) * sizeof(WCHAR);
+         if (len > buffer_len) return STATUS_BUFFER_TOO_SMALL;
++        else if (len == sizeof(WCHAR)) return STATUS_INVALID_PARAMETER;
+         else memcpy(buffer, ext->desc.serialnumber, len);
+         return STATUS_SUCCESS;
+     }
+
+--- dlls/winebus.sys/unixlib.c
++++ dlls/winebus.sys/unixlib.c
+@@ -110,7 +110,7 @@ static const struct device_desc mouse_device_desc =
+     .bus_id = -1,
+     .manufacturer = {'T','h','e',' ','W','i','n','e',' ','P','r','o','j','e','c','t',0},
+     .product = {'W','i','n','e',' ','H','I','D',' ','m','o','u','s','e',0},
+-    .serialnumber = {'0','0','0','0',0},
++    .serialnumber = {'8','4','5','E','0','0','0','1',0},
+ };
+ 
+ static NTSTATUS mouse_device_create(void *args)
+@@ -206,7 +206,7 @@ static const struct device_desc keyboard_device_desc =
+     .bus_id = -1,
+     .manufacturer = {'T','h','e',' ','W','i','n','e',' ','P','r','o','j','e','c','t',0},
+     .product = {'W','i','n','e',' ','H','I','D',' ','k','e','y','b','o','a','r','d',0},
+-    .serialnumber = {'0','0','0','0',0},
++    .serialnumber = {'8','4','5','E','0','0','0','2',0},
+ };
+ 
+ static NTSTATUS keyboard_device_create(void *args)
+
+--- dlls/winebus.sys/unixlib.h
++++ dlls/winebus.sys/unixlib.h
+@@ -40,6 +40,8 @@ struct device_desc
+     UINT uid;
+     UINT bus_type;
+     UINT bus_id; /* USB: class << 16 | subclass << 8 | protocol, -1 when unset */
++    UINT bus_num;
++    UINT64 port_path;
+     BOOL is_gamepad;
+     BOOL is_hidraw;
+ 
+@@ -160,9 +162,14 @@ enum unix_funcs
+ static inline const char *debugstr_device_desc(struct device_desc *desc)
+ {
+     if (!desc) return "(null)";
+-    return wine_dbg_sprintf("{vid %04x, pid %04x, version %04x, input %d, uid %08x, is_gamepad %u, is_hidraw %u, bus_type %u, bus_id %08x}",
++    return wine_dbg_sprintf("{vid %04x, pid %04x, version %04x, input %d, uid %08x, bus_type %u, bus_id %08x, bus_num %u, port_path %u.%u.%u.%u.%u.%u.%u.%u, is_gamepad %u, is_hidraw %u}",
+                             desc->vid, desc->pid, desc->version, desc->input, desc->uid,
+-                            desc->is_gamepad, desc->is_hidraw, desc->bus_type, desc->bus_id);
++                            desc->bus_type, desc->bus_id, desc->bus_num,
++                            *(UINT8 *)&desc->port_path, *((UINT8 *)&desc->port_path + 1),
++                            *((UINT8 *)&desc->port_path + 2), *((UINT8 *)&desc->port_path + 3),
++                            *((UINT8 *)&desc->port_path + 4), *((UINT8 *)&desc->port_path + 5),
++                            *((UINT8 *)&desc->port_path + 6), *((UINT8 *)&desc->port_path + 7),
++                            desc->is_gamepad, desc->is_hidraw);
+ }
+ 
+ static inline BOOL is_xbox_gamepad(WORD vid, WORD pid)
+

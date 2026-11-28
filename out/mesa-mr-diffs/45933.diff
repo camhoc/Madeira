@@ -1,0 +1,43 @@
+# kk: Make no Metal texture for an empty buffer view
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45933 state=opened
+# A texel buffer view with VK_WHOLE_SIZE and less than one texel past its
+offset aborts in Metal's texture descriptor validation.
+
+Tested with and without nullDescriptor, under Metal API and shader
+validation: texelFetch returns 0, textureSize and imageSize return 0,
+imageAtomicAdd returns 0, and stores and atomics leave the buffer
+unchanged. The 21,340 dEQP-VK texel buffer and buffer view cases:
+13,475 pass, 0 fail.
+--- src/kosmickrisp/vulkan/kk_buffer_view.c
++++ src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -63,6 +63,15 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+    if (!view)
+       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
++   /* With VK_WHOLE_SIZE, less than one texel past the offset is a valid view
++    * of zero elements. Metal aborts on a texture of width zero, so the view
++    * gets none: its descriptor is a null one, and every access to it is out
++    * of bounds anyway. */
++   if (view->vk.elements == 0) {
++      *pBufferView = kk_buffer_view_to_handle(view);
++      return VK_SUCCESS;
++   }
++
+    enum pipe_format p_format = vk_format_to_pipe_format(view->vk.format);
+    const struct kk_va_format *supported_format = kk_get_va_format(p_format);
+ 
+
+--- src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -233,8 +233,8 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
+    if (bufferView != VK_NULL_HANDLE) {
+       VK_FROM_HANDLE(kk_buffer_view, view, bufferView);
+ 
+-      assert(view->mtl_texel_buffer_handle);
+-      assert(view->texel_buffer_gpu_id);
++      /* A view of zero elements has no texture */
++      assert(view->texel_buffer_gpu_id || view->vk.elements == 0);
+ 
+       desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
+    }
+

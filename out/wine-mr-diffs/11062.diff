@@ -1,0 +1,217 @@
+# wined3d: Add Qualcomm vendor and Adreno 640 GPU info
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11062 state=opened
+# https://bugs.winehq.org/show_bug.cgi?id=59812
+
+Patch adds Qualcomm as new GPU vendor and uses Adreno 640 GPU as default/fallback placeholder for future entries based on existing vendor/gpu entries.
+
+Driver qdcmlib.ARM64.dll as default is a best guess and may need to change to something more accurate in future.  Unclear if wbemprox support is necessary but added it for consistency and to cover all cases.
+
+vidmem assigned to 5540 MB for gpu_description_table as reported by user's glxinfo:
+- https://bugs.winehq.org/attachment.cgi?id=81077
+
+videmem also boosted to 32768 MB for CARD_INTEL_UHD620_2 (recently added) to match that user's glxinfo instead of vidmem copied from CARD_INTEL_UHD620_1.  Unclear if CARD_INTEL_UHD620_1 should also be boosted to match CARD_INTEL_UHD620_2.  Figured this change is related/recent enough to be rolled into this MR.  I'll update that bug report about this change also:
+- https://bugs.winehq.org/show_bug.cgi?id=59186
+- https://bugs.winehq.org/attachment.cgi?id=80058
+--- dlls/wbemprox/builtin.c
++++ dlls/wbemprox/builtin.c
+@@ -4753,10 +4753,11 @@ done:
+     return ret;
+ }
+ 
+-#define HW_VENDOR_AMD    0x1002
+-#define HW_VENDOR_NVIDIA 0x10de
+-#define HW_VENDOR_INTEL  0x8086
+-#define HW_VENDOR_WINE   0x0000
++#define HW_VENDOR_AMD      0x1002
++#define HW_VENDOR_NVIDIA   0x10de
++#define HW_VENDOR_QUALCOMM 0x5143
++#define HW_VENDOR_INTEL    0x8086
++#define HW_VENDOR_WINE     0x0000
+ 
+ static DWORD get_adapter_vendor_id( const WCHAR *desc )
+ {
+@@ -4764,6 +4765,7 @@ static DWORD get_adapter_vendor_id( const WCHAR *desc )
+     if (wcsstr( desc, L"AMD" )) return HW_VENDOR_AMD;
+     if (wcsstr( desc, L"NVIDIA" )) return HW_VENDOR_NVIDIA;
+     if (wcsstr( desc, L"Intel" )) return HW_VENDOR_INTEL;
++    if (wcsstr( desc, L"Qualcomm" )) return HW_VENDOR_QUALCOMM;
+     return HW_VENDOR_WINE;
+ }
+ 
+@@ -4773,6 +4775,7 @@ static const WCHAR *get_videocontroller_installeddriver( const WCHAR *desc )
+     if (vendor_id == HW_VENDOR_AMD) return L"aticfx32.dll";
+     if (vendor_id == HW_VENDOR_NVIDIA) return L"nvd3dum.dll";
+     if (vendor_id == HW_VENDOR_INTEL) return L"igdudim32.dll";
++    if (vendor_id == HW_VENDOR_QUALCOMM) return L"qdcmlib.ARM64.dll";
+     return L"wine.dll";
+ }
+ 
+
+--- dlls/wined3d/adapter_gl.c
++++ dlls/wined3d/adapter_gl.c
+@@ -37,6 +37,7 @@ enum wined3d_gl_vendor
+     GL_VENDOR_FGLRX,
+     GL_VENDOR_MESA,
+     GL_VENDOR_NVIDIA,
++    GL_VENDOR_QUALCOMM,
+ };
+ 
+ struct wined3d_extension_map
+@@ -1228,6 +1229,9 @@ static enum wined3d_pci_vendor wined3d_guess_card_vendor(const char *gl_vendor_s
+     if (strstr(gl_renderer, "SVGA3D"))
+         return HW_VENDOR_VMWARE;
+ 
++    if (strstr(gl_renderer, "Adreno"))
++        return HW_VENDOR_QUALCOMM;
++
+     if (strstr(gl_vendor_string, "Mesa")
+             || strstr(gl_vendor_string, "Brian Paul")
+             || strstr(gl_vendor_string, "Tungsten Graphics, Inc")
+@@ -1838,6 +1842,10 @@ cards_nvidia_mesa[] =
+     {"nv04",                        CARD_NVIDIA_RIVA_TNT},
+     {"nv03",                        CARD_NVIDIA_RIVA_128},
+ },
++cards_qualcomm[] =
++{
++    {"adreno",                      CARD_QUALCOMM_ADRENO_640},      /* Adreno (TM) 640 */
++},
+ cards_redhat[] =
+ {
+     {"virgl",                       CARD_REDHAT_VIRGL},
+@@ -1866,6 +1874,11 @@ nvidia_gl_vendor_table[] =
+     {GL_VENDOR_MESA,    "Mesa Nouveau driver",              cards_nvidia_mesa,      ARRAY_SIZE(cards_nvidia_mesa)},
+     {GL_VENDOR_NVIDIA,  "NVIDIA binary driver",             cards_nvidia_binary,    ARRAY_SIZE(cards_nvidia_binary)},
+ },
++qualcomm_gl_vendor_table[] =
++{
++    {GL_VENDOR_QUALCOMM,"Qualcomm binary driver",           cards_qualcomm,         ARRAY_SIZE(cards_qualcomm)},
++    {GL_VENDOR_MESA,    "Mesa Qualcomm driver",             cards_qualcomm,         ARRAY_SIZE(cards_qualcomm)},
++},
+ redhat_gl_vendor_table[] =
+ {
+     {GL_VENDOR_MESA,    "Red Hat driver",                   cards_redhat,           ARRAY_SIZE(cards_redhat)},
+@@ -1914,11 +1927,12 @@ static const struct
+ }
+ card_vendor_table[] =
+ {
+-    {HW_VENDOR_AMD,    "AMD",    amd_gl_vendor_table,    ARRAY_SIZE(amd_gl_vendor_table)},
+-    {HW_VENDOR_NVIDIA, "NVIDIA", nvidia_gl_vendor_table, ARRAY_SIZE(nvidia_gl_vendor_table)},
+-    {HW_VENDOR_REDHAT, "Red Hat",redhat_gl_vendor_table, ARRAY_SIZE(redhat_gl_vendor_table)},
+-    {HW_VENDOR_VMWARE, "VMware", vmware_gl_vendor_table, ARRAY_SIZE(vmware_gl_vendor_table)},
+-    {HW_VENDOR_INTEL,  "Intel",  intel_gl_vendor_table,  ARRAY_SIZE(intel_gl_vendor_table)},
++    {HW_VENDOR_AMD,      "AMD",      amd_gl_vendor_table,      ARRAY_SIZE(amd_gl_vendor_table)},
++    {HW_VENDOR_NVIDIA,   "NVIDIA",   nvidia_gl_vendor_table,   ARRAY_SIZE(nvidia_gl_vendor_table)},
++    {HW_VENDOR_REDHAT,   "Red Hat",  redhat_gl_vendor_table,   ARRAY_SIZE(redhat_gl_vendor_table)},
++    {HW_VENDOR_VMWARE,   "VMware",   vmware_gl_vendor_table,   ARRAY_SIZE(vmware_gl_vendor_table)},
++    {HW_VENDOR_QUALCOMM, "Qualcomm", qualcomm_gl_vendor_table, ARRAY_SIZE(qualcomm_gl_vendor_table)},
++    {HW_VENDOR_INTEL,    "Intel",    intel_gl_vendor_table,    ARRAY_SIZE(intel_gl_vendor_table)},
+ };
+ 
+ static enum wined3d_pci_device wined3d_guess_card(enum wined3d_feature_level feature_level,
+
+--- dlls/wined3d/adapter_vk.c
++++ dlls/wined3d/adapter_vk.c
+@@ -2139,10 +2139,11 @@ static enum wined3d_display_driver guess_display_driver(enum wined3d_pci_vendor
+ {
+     switch (vendor)
+     {
+-        case HW_VENDOR_AMD:    return DRIVER_AMD_RX;
+-        case HW_VENDOR_INTEL:  return DRIVER_INTEL_HD4000;
+-        case HW_VENDOR_NVIDIA: return DRIVER_NVIDIA_GEFORCE8;
+-        default:               return DRIVER_WINE;
++        case HW_VENDOR_AMD:      return DRIVER_AMD_RX;
++        case HW_VENDOR_INTEL:    return DRIVER_INTEL_HD4000;
++        case HW_VENDOR_NVIDIA:   return DRIVER_NVIDIA_GEFORCE8;
++        case HW_VENDOR_QUALCOMM: return DRIVER_QUALCOMM_ADRENO;
++        default:                 return DRIVER_WINE;
+     }
+ }
+ 
+
+--- dlls/wined3d/directx.c
++++ dlls/wined3d/directx.c
+@@ -320,6 +320,9 @@ static const struct driver_version_information driver_version_table[] =
+     {DRIVER_NVIDIA_FERMI,       DRIVER_MODEL_NT6X,  "nvd3dum.dll",     13, 9135},
+     {DRIVER_NVIDIA_KEPLER,      DRIVER_MODEL_NT6X,  "nvd3dum.dll",     15, 3118}, /* 531.18 */
+ 
++    /* Qualcomm */
++    {DRIVER_QUALCOMM_ADRENO,    DRIVER_MODEL_GENERIC, "qdcmlib.ARM64.dll", 0,    0},
++
+     /* Red Hat */
+     {DRIVER_REDHAT_VIRGL,       DRIVER_MODEL_GENERIC, "virgl.dll",      0,    0},
+ 
+@@ -584,6 +587,9 @@ static const struct wined3d_gpu_description gpu_description_table[] =
+     /* VMware */
+     {HW_VENDOR_VMWARE,     CARD_VMWARE_SVGA3D,             "VMware SVGA 3D (Microsoft Corporation - WDDM)",             DRIVER_VMWARE,        1024},
+ 
++    /* Qualcomm cards */
++    {HW_VENDOR_QUALCOMM,   CARD_QUALCOMM_ADRENO_640,       "Turnip Adreno (TM) 640",                                    DRIVER_QUALCOMM_ADRENO,  5540 },
++
+     /* Intel cards */
+     {HW_VENDOR_INTEL,      CARD_INTEL_830M,                "Intel(R) 82830M Graphics Controller",                       DRIVER_INTEL_GMA800,  32 },
+     {HW_VENDOR_INTEL,      CARD_INTEL_855GM,               "Intel(R) 82852/82855 GM/GME Graphics Controller",           DRIVER_INTEL_GMA800,  32 },
+@@ -971,6 +977,19 @@ enum wined3d_pci_device wined3d_gpu_from_feature_level(enum wined3d_pci_vendor *
+         {WINED3D_FEATURE_LEVEL_10,    CARD_INTEL_G45},
+         {WINED3D_FEATURE_LEVEL_11,    CARD_INTEL_IVBD},
+         {WINED3D_FEATURE_LEVEL_NONE},
++    },
++    card_fallback_qualcomm[] =
++    {
++        {WINED3D_FEATURE_LEVEL_5,     CARD_QUALCOMM_ADRENO_640},
++        {WINED3D_FEATURE_LEVEL_6,     CARD_QUALCOMM_ADRENO_640},
++        {WINED3D_FEATURE_LEVEL_7,     CARD_QUALCOMM_ADRENO_640},
++        {WINED3D_FEATURE_LEVEL_8,     CARD_QUALCOMM_ADRENO_640},
++        {WINED3D_FEATURE_LEVEL_9_1,   CARD_QUALCOMM_ADRENO_640},
++        {WINED3D_FEATURE_LEVEL_9_2,   CARD_QUALCOMM_ADRENO_640},
++        {WINED3D_FEATURE_LEVEL_9_3,   CARD_QUALCOMM_ADRENO_640},
++        {WINED3D_FEATURE_LEVEL_10,    CARD_QUALCOMM_ADRENO_640},
++        {WINED3D_FEATURE_LEVEL_11,    CARD_QUALCOMM_ADRENO_640},
++        {WINED3D_FEATURE_LEVEL_NONE},
+     };
+ 
+     static const struct
+@@ -980,10 +999,11 @@ enum wined3d_pci_device wined3d_gpu_from_feature_level(enum wined3d_pci_vendor *
+     }
+     fallbacks[] =
+     {
+-        {HW_VENDOR_AMD,    card_fallback_amd},
+-        {HW_VENDOR_NVIDIA, card_fallback_nvidia},
+-        {HW_VENDOR_VMWARE, card_fallback_amd},
+-        {HW_VENDOR_INTEL,  card_fallback_intel},
++        {HW_VENDOR_AMD,       card_fallback_amd},
++        {HW_VENDOR_NVIDIA,    card_fallback_nvidia},
++        {HW_VENDOR_VMWARE,    card_fallback_amd},
++        {HW_VENDOR_INTEL,     card_fallback_intel},
++        {HW_VENDOR_QUALCOMM,  card_fallback_qualcomm},
+     };
+ 
+     const struct wined3d_fallback_card *cards;
+
+--- dlls/wined3d/wined3d_private.h
++++ dlls/wined3d/wined3d_private.h
+@@ -2083,6 +2083,7 @@ enum wined3d_pci_vendor
+     HW_VENDOR_NVIDIA                = 0x10de,
+     HW_VENDOR_VMWARE                = 0x15ad,
+     HW_VENDOR_REDHAT                = 0x1af4,
++    HW_VENDOR_QUALCOMM              = 0x5143,
+     HW_VENDOR_INTEL                 = 0x8086,
+ };
+ 
+@@ -2332,6 +2333,8 @@ enum wined3d_pci_device
+     CARD_NVIDIA_GEFORCE_RTX4080SUPER = 0x2702,
+     CARD_NVIDIA_GEFORCE_RTX4090     = 0x2684,
+ 
++    CARD_QUALCOMM_ADRENO_640        = 0x6040001,
++
+     CARD_REDHAT_VIRGL               = 0x1010,
+ 
+     CARD_VMWARE_SVGA3D              = 0x0405,
+@@ -2441,6 +2444,7 @@ enum wined3d_display_driver
+     DRIVER_NVIDIA_GEFORCE8,
+     DRIVER_NVIDIA_FERMI,
+     DRIVER_NVIDIA_KEPLER,
++    DRIVER_QUALCOMM_ADRENO,
+     DRIVER_REDHAT_VIRGL,
+     DRIVER_VMWARE,
+     DRIVER_WINE,
+

@@ -1,0 +1,324 @@
+# Draft: dstorage/dstoragecore: Add DirectStorage implementation
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11372 state=opened
+# ## Summary
+
+Wires dstoragecore.dll to call vkd3d-proton's GPU exports (PR #3160) for hardware-accelerated GDeflate decompression and fence signaling. This replaces the old `libds_gpu.so` dlopen stub with direct PE-to-PE calls into d3d12.dll.
+
+## Changes
+
+**dlls/dstoragecore/dstoragecore_main.c** — 300 insertions, 1255 deletions
+
+| Change | Description |
+|--------|-------------|
+| `load_vkd3d_exports()` | New. Resolves 7 `vkd3d_dstorage_*` functions from d3d12.dll at runtime via GetProcAddress |
+| `init_gpu_from_vkd3d()` | New. Called during queue creation when a D3D12 device is provided. Uses `vkd3d_dstorage_get_vk_device` + `vkd3d_dstorage_get_compute_queue` to set up the GPU context |
+| `struct ds_gpu_context` | Replaces the previous `ds_gpu_ctx` opaque pointer. Stores VkDevice, VkQueue, queue family index |
+| I/O completion | `vkd3d_dstorage_signal_fence` called instead of the old libds_gpu path. `vkd3d_dstorage_get_vk_buffer` / `vkd3d_dstorage_submit_compute` wired for future GPU dispatch |
+| Removed | `load_gpu_libraries()`, all `p_ds_gpu_*` function pointers, libds_gpu.so dlopen path, legacy GPU context |
+
+## Dependencies
+
+- **Wine MR !11371** (dstorage-core) — base dstorage/dstoragecore DLLs
+- **vkd3d-proton PR #3160** — must be merged first (provides the 7 exports this MR calls)
+
+  https://github.com/HansKristian-Work/vkd3d-proton/pull/3160
+
+## Testing
+
+Without vkd3d-proton PR #3160: gracefully degrades — GPU functions are no-ops, falls back to CPU decompression + synchronous I/O.
+
+With PR #3160: GPU context initializes on first `CreateQueue` with a D3D12 device. All 7 exports are validated at load time.
+--- dlls/d3d12core/Makefile.in
++++ dlls/d3d12core/Makefile.in
+@@ -1 +1,5 @@
+ MODULE = d3d12core.dll
++
++SOURCES = \
++	d3d12core_dstorage.c
++
+
+--- dlls/d3d12core/d3d12core.spec
++++ dlls/d3d12core/d3d12core.spec
+@@ -1,2 +1,2 @@
+-@ stub D3D12GetInterface
++@ stdcall D3D12GetInterface(ptr ptr)
+ @ stub D3D12SDKVersion
+
+--- dlls/d3d12core/d3d12core_dstorage.c
++++ dlls/d3d12core/d3d12core_dstorage.c
+@@ -0,0 +1,110 @@
++/*
++ * d3d12core_dstorage.c — DirectStorage D3D12 core integration for Wine
++ *
++ * Provides D3D12GetInterface which is REQUIRED by DirectStorage games.
++ * Without this function, Ratchet & Clank and other DS games crash at startup
++ * with "Call to unimplemented function d3d12core.dll.D3D12GetInterface".
++ *
++ * This function returns a factory interface that games use to enumerate
++ * D3D12 devices and check feature support before calling DStorageGetFactory.
++ *
++ * vkd3d-proton already handles all D3D12 device creation. This function
++ * bridges the gap by providing the Win32 entry point that games expect.
++ */
++#include <windows.h>
++#include <d3d12.h>
++#include <vulkan/vulkan.h>
++
++/*
++ * CLSID_D3D12DeviceFactory — the class identifier that games query via
++ * D3D12GetInterface. Defined in d3d12.h. Games typically call:
++ *
++ *   D3D12GetInterface(CLSID_D3D12DeviceFactory, IID_ID3D12DeviceFactory, &factory)
++ *   DStorageGetFactory(IID_IDStorageFactory, &dstorage)
++ *
++ * The factory returned here must match what vkd3d-proton's d3d12_device
++ * expects — specifically the ID3D12DeviceFactory interface layout.
++ */
++static const GUID CLSID_D3D12DeviceFactory = {
++    0x810B8C12, 0xEFFD, 0x4B67, {0x8A, 0x8C, 0xE0, 0x22, 0x4D, 0xCB, 0x3A, 0xEE}
++};
++static const GUID IID_ID3D12DeviceFactory = {
++    0x1C1E0DA6, 0xF260, 0x4B9E, {0x9A, 0x1A, 0x24, 0x53, 0xE3, 0x5A, 0xDE, 0xF5}
++};
++
++/* Minimal ID3D12DeviceFactory stub — returns E_NOTIMPL for all methods */
++struct d3d12_device_factory {
++    const struct ID3D12DeviceFactoryVtbl *lpVtbl;
++    LONG refcount;
++};
++
++static HRESULT STDMETHODCALLTYPE factory_QueryInterface(
++    ID3D12DeviceFactory *iface, REFIID riid, void **ppv)
++{
++    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_ID3D12DeviceFactory)) {
++        *ppv = iface; ID3D12DeviceFactory_AddRef(iface); return S_OK;
++    }
++    *ppv = NULL; return E_NOINTERFACE;
++}
++static ULONG STDMETHODCALLTYPE factory_AddRef(ID3D12DeviceFactory *iface)
++{ return InterlockedIncrement(&((struct d3d12_device_factory*)iface)->refcount); }
++static ULONG STDMETHODCALLTYPE factory_Release(ID3D12DeviceFactory *iface)
++{
++    ULONG ref = InterlockedDecrement(&((struct d3d12_device_factory*)iface)->refcount);
++    if (ref == 0) free(iface); return ref;
++}
++static HRESULT STDMETHODCALLTYPE factory_EnumAdapters(
++    ID3D12DeviceFactory *iface, UINT, ID3D12Adapter **ppv)
++{ *ppv = NULL; return DXGI_ERROR_NOT_FOUND; }
++static HRESULT STDMETHODCALLTYPE factory_EnumAdapters1(
++    ID3D12DeviceFactory *iface, UINT, ID3D12Adapter1 **ppv)
++{ *ppv = NULL; return DXGI_ERROR_NOT_FOUND; }
++static HRESULT STDMETHODCALLTYPE factory_CreateDevice(
++    ID3D12DeviceFactory *iface, ID3D12Adapter *, D3D_FEATURE_LEVEL, REFIID, void **ppv)
++{ *ppv = NULL; return E_NOTIMPL; }
++static HRESULT STDMETHODCALLTYPE factory_GetCreationAttributes(
++    ID3D12DeviceFactory *iface, UINT *pFlags)
++{ *pFlags = 0; return S_OK; }
++static HRESULT STDMETHODCALLTYPE factory_GetSupportedVersions(
++    ID3D12DeviceFactory *iface, UINT, D3D_FEATURE_LEVEL *)
++{ return E_NOTIMPL; }
++
++static const struct ID3D12DeviceFactoryVtbl factory_vtbl = {
++    factory_QueryInterface, factory_AddRef, factory_Release,
++    factory_EnumAdapters, factory_EnumAdapters1, factory_CreateDevice,
++    factory_GetCreationAttributes, factory_GetSupportedVersions
++};
++
++static struct d3d12_device_factory *g_factory = NULL;
++
++/*
++ * D3D12GetInterface — required by DirectStorage games (vkd3d-proton #1653)
++ *
++ * Called by games to get the D3D12 device factory. Games then use the factory
++ * to enumerate adapters, check feature support, and create D3D12 devices
++ * before initializing DirectStorage.
++ *
++ * This is exported by d3d12core.dll. In Wine, it must be added to the .spec
++ * file and linked into the PE build.
++ *
++ * The actual D3D12 device creation is handled by vkd3d-proton's D3D12CreateDevice.
++ * This function provides the factory entry point that games require for their
++ * DirectStorage initialization sequence.
++ */
++HRESULT WINAPI D3D12GetInterface(REFCLSID rclsid, REFIID riid, void **ppv)
++{
++    if (!ppv) return E_INVALIDARG;
++    *ppv = NULL;
++
++    if (!IsEqualCLSID(rclsid, &CLSID_D3D12DeviceFactory))
++        return CLASS_E_CLASSNOTAVAILABLE;
++
++    if (!g_factory) {
++        g_factory = calloc(1, sizeof(*g_factory));
++        if (!g_factory) return E_OUTOFMEMORY;
++        g_factory->lpVtbl = &factory_vtbl;
++        g_factory->refcount = 1;
++    }
++
++    return factory_QueryInterface((ID3D12DeviceFactory*)g_factory, riid, ppv);
++}
+
+--- dlls/dstorage/Makefile.in
++++ dlls/dstorage/Makefile.in
+@@ -0,0 +1,6 @@
++MODULE    = dstorage.dll
++IMPORTS   = kernel32
++
++SOURCES = \
++	dstorage_main.c
++
+
+--- dlls/dstorage/dstorage.spec
++++ dlls/dstorage/dstorage.spec
+@@ -0,0 +1,7 @@
++# Wine dstorage.dll module definition
++# This PE DLL shims the DirectStorage API for Wine/Proton.
++# It forwards calls to the native libdstorage.so via dlopen/dlsym.
++@ stdcall DStorageSetConfiguration(ptr)
++@ stdcall DStorageSetConfiguration1(ptr)
++@ stdcall DStorageGetFactory(ptr ptr)
++@ stdcall DStorageCreateCompressionCodec(long long ptr ptr)
+
+--- dlls/dstorage/dstorage_main.c
++++ dlls/dstorage/dstorage_main.c
+@@ -0,0 +1,86 @@
++/*
++ * dstorage_main.c — Wine dstorage.dll PE shim
++ *
++ * When compiled as a PE DLL with winegcc for Wine/Proton, this file
++ * uses LoadLibrary/GetProcAddress to resolve libdstorage.so functions.
++ * Wine maps these to the native Linux ELF loading layer automatically.
++ *
++ * Build for Wine:
++ *   winegcc -m64 -shared -o dstorage.dll dstorage_main.c
++ *
++ * Build for Linux (testing):
++ *   gcc -shared -o libdstorage_shim.so dstorage_main.c -ldl
++ */
++#include <windows.h>
++#include <stdio.h>
++#include <stdint.h>
++
++/* Type forward declarations matching dstorage_api.h but returning HRESULT (Windows ABI) */
++typedef struct DSTORAGE_CONFIGURATION { uint32_t a; int32_t b; int32_t c; int32_t d; int32_t e; int32_t f; int32_t g; } DSTORAGE_CONFIGURATION;
++typedef struct DSTORAGE_CONFIGURATION1 { uint32_t a; int32_t b; int32_t c; int32_t d; int32_t e; int32_t f; int32_t g; int32_t h; } DSTORAGE_CONFIGURATION1;
++
++/* Function pointer types for libdstorage.so APIs */
++typedef int32_t (*DStorageSetConfiguration_t)(const void*);
++typedef int32_t (*DStorageSetConfiguration1_t)(const void*);
++typedef int32_t (*DStorageGetFactory_t)(const void*, void**);
++typedef int32_t (*DStorageCreateCompressionCodec_t)(uint8_t, uint32_t, const void*, void**);
++
++static HMODULE g_lib = NULL;
++static int g_loaded = 0;
++
++static void ensure_lib(void) {
++    if (g_loaded) return;
++    g_loaded = 1;
++    /* In Wine: LoadLibrary maps to the native .so via Wine's ELF loader.
++     * Wine translates LoadLibrary("libdstorage.so") to dlopen("libdstorage.so"). */
++    const char* paths[] = {
++        "libdstorage.so",
++        "/usr/lib/libdstorage.so",
++        "/usr/local/lib/libdstorage.so",
++        NULL
++    };
++    for (int i = 0; paths[i]; i++) {
++        g_lib = LoadLibraryA(paths[i]);
++        if (g_lib) break;
++    }
++}
++
++static void* get_sym(const char* name) {
++    if (!g_lib) return NULL;
++    return (void*)GetProcAddress(g_lib, name);
++}
++
++/* ---- Exported API ---- */
++
++int32_t WINAPI DStorageSetConfiguration(const DSTORAGE_CONFIGURATION* cfg) {
++    ensure_lib();
++    DStorageSetConfiguration_t fn = (DStorageSetConfiguration_t)get_sym("DStorageSetConfiguration");
++    return fn ? (HRESULT)fn(cfg) : E_FAIL;
++}
++
++int32_t WINAPI DStorageSetConfiguration1(const DSTORAGE_CONFIGURATION1* cfg) {
++    ensure_lib();
++    DStorageSetConfiguration1_t fn = (DStorageSetConfiguration1_t)get_sym("DStorageSetConfiguration1");
++    return fn ? (int32_t)fn(cfg) : E_FAIL;
++}
++
++int32_t WINAPI DStorageGetFactory(REFIID riid, void** ppv) {
++    ensure_lib();
++    DStorageGetFactory_t fn = (DStorageGetFactory_t)get_sym("DStorageGetFactory");
++    return fn ? (int32_t)fn(riid, ppv) : E_FAIL;
++}
++
++int32_t WINAPI DStorageCreateCompressionCodec(
++    uint8_t format, uint32_t numThreads, REFIID riid, void** ppv) {
++    ensure_lib();
++    DStorageCreateCompressionCodec_t fn = (DStorageCreateCompressionCodec_t)get_sym("DStorageCreateCompressionCodec");
++    return fn ? (int32_t)fn(format, numThreads, riid, ppv) : E_FAIL;
++}
++
++BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
++    if (reason == DLL_PROCESS_DETACH && g_lib) {
++        FreeLibrary(g_lib);
++        g_lib = NULL;
++    }
++    return TRUE;
++}
+
+--- dlls/dstoragecore/Makefile.in
++++ dlls/dstoragecore/Makefile.in
+@@ -0,0 +1,7 @@
++MODULE    = dstoragecore.dll
++IMPORTS   = kernel32
++
++SOURCES = \
++	dstoragecore_main.c \
++	libds_uring.c
++
+
+--- dlls/dstoragecore/dstorage_api.h
++++ dlls/dstoragecore/dstorage_api.h
+
+--- dlls/dstoragecore/dstorage_com.h
++++ dlls/dstoragecore/dstorage_com.h
+
+--- dlls/dstoragecore/dstoragecore.spec
++++ dlls/dstoragecore/dstoragecore.spec
+@@ -0,0 +1,14 @@
++# Wine dstoragecore.dll module definition
++# This DLL implements the core DirectStorage runtime:
++# - Async I/O via io_uring (Linux native)
++# - GPU GDeflate decompression via Vulkan compute (vkd3d-proton)
++# - Fence completion signaling
++# - Status array tracking
++#
++# The DLL is a standard Wine builtin PE compiled with MinGW.
++# It calls into libds_uring.so (io_uring backend) and libds_gpu.so
++# (Vulkan GDeflate compute dispatch) via wine_unix_call.
++@ stdcall DStorageGetFactoryCore(ptr ptr)
++@ stdcall DStorageSetConfigurationCore(ptr)
++@ stdcall DStorageSetConfiguration1Core(ptr)
++@ stdcall DStorageCreateCompressionCodecCore(long long ptr ptr)
+
+--- dlls/dstoragecore/dstoragecore_main.c
++++ dlls/dstoragecore/dstoragecore_main.c
+
+--- dlls/dstoragecore/libds_uring.c
++++ dlls/dstoragecore/libds_uring.c
+
+--- configure.ac
++++ configure.ac
+@@ -2725,6 +2725,8 @@ WINE_CONFIG_MAKEFILE(dlls/dpwsockx)
+ WINE_CONFIG_MAKEFILE(dlls/drmclien)
+ WINE_CONFIG_MAKEFILE(dlls/dsdmo)
+ WINE_CONFIG_MAKEFILE(dlls/dsdmo/tests)
++WINE_CONFIG_MAKEFILE(dlls/dstorage)
++WINE_CONFIG_MAKEFILE(dlls/dstoragecore)
+ WINE_CONFIG_MAKEFILE(dlls/dsound)
+ WINE_CONFIG_MAKEFILE(dlls/dsound/tests)
+ WINE_CONFIG_MAKEFILE(dlls/dsquery)
+

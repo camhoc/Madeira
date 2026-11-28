@@ -1,0 +1,60 @@
+# win32u: Enable display mode emulation by default.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12806 state=closed
+# This is still fairly experimental, but that option will also enable Wayland cross-process rendering, which is a nice feature to have for Wine 12, and we need to make the switch at some point. It think it also generally helps with various use case on XWayland, as XWayland doesn't really allow applications to change the display mode anymore either.
+
+I was also thinking of coupling it with the UseEGL option, as many of the EmulateModeset features require it too, but it's simpler and perhaps more flexible not to. Also, there may be extra issues on macOS, which I have tested less (https://gitlab.winehq.org/wine/wine/-/merge_requests/12805 at the very least should probably be merged first), and I was thinking we could conditionally keep the option disabled by default with an `#ifdef __APPLE__` there if it ends up being too problematic.
+--- dlls/desk.cpl/desk.rc
++++ dlls/desk.cpl/desk.rc
+@@ -38,7 +38,7 @@ FONT 8, "Ms Shell Dlg"
+     COMBOBOX        IDC_DISPLAY_SETTINGS_LIST, 10, 136, 160, 60, CBS_DROPDOWNLIST | CBS_HASSTRINGS
+     PUSHBUTTON      "&Reset", IDC_DISPLAY_SETTINGS_RESET, 180, 135, 60, 15
+     PUSHBUTTON      "&Apply", IDC_DISPLAY_SETTINGS_APPLY, 250, 135, 60, 15
+-    AUTOCHECKBOX    "Emulate display mode changes (requires restart)", IDC_EMULATE_MODESET, 10, 155, 300, 10
++    AUTOCHECKBOX    "Disable display mode emulation (requires restart)", IDC_EMULATE_MODESET, 10, 155, 300, 10
+ }
+ 
+ LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
+
+--- dlls/desk.cpl/main.c
++++ dlls/desk.cpl/main.c
+@@ -251,8 +251,8 @@ static void handle_emulate_modeset_change( HWND hwnd )
+     if (!RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\Wine\\X11 Driver", 0, NULL, 0,
+                           KEY_SET_VALUE, NULL, &hkey, NULL ))
+     {
+-        if (IsDlgButtonChecked( hwnd, IDC_EMULATE_MODESET ) == BST_CHECKED) value = L"Y";
+-        RegSetValueExW( hkey, L"EmulateModeset", 0, REG_SZ, (BYTE *)value, (wcslen( value ) + 1) * sizeof(WCHAR) );
++        if (IsDlgButtonChecked( hwnd, IDC_EMULATE_MODESET ) != BST_CHECKED) RegDeleteValueW( hkey, L"EmulateModeset" );
++        else RegSetValueExW( hkey, L"EmulateModeset", 0, REG_SZ, (BYTE *)value, (wcslen( value ) + 1) * sizeof(WCHAR) );
+         RegCloseKey( hkey );
+     }
+ }
+@@ -458,7 +458,7 @@ static INT_PTR CALLBACK desktop_dialog_proc( HWND hwnd, UINT msg, WPARAM wparam,
+         refresh_device_list( hwnd );
+         create_desktop_view( hwnd );
+         SendMessageW( GetDlgItem( hwnd, IDC_EMULATE_MODESET ), BM_SETCHECK,
+-                      get_option( L"EmulateModeset", FALSE ), 0 );
++                      !get_option( L"EmulateModeset", TRUE ), 0 );
+         return TRUE;
+ 
+     case WM_COMMAND:
+
+--- dlls/win32u/sysparams.c
++++ dlls/win32u/sysparams.c
+@@ -165,7 +165,7 @@ static INT64 last_query_display_time;
+ static UINT64 monitor_update_serial;
+ static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+-BOOL emulate_modeset = FALSE;
++BOOL emulate_modeset = TRUE;
+ BOOL decorated_mode = TRUE;
+ BOOL use_egl = TRUE;
+ UINT64 thunk_lock_callback = 0;
+@@ -6092,6 +6092,7 @@ void sysparams_init(void)
+         use_egl = IS_OPTION_TRUE( buffer[0] );
+     if (!get_config_key( hkey, appkey, "EmulateModeset", buffer, sizeof(buffer) ))
+         emulate_modeset = IS_OPTION_TRUE( buffer[0] );
++    if (emulate_modeset) WARN( "Enabling experimental display mode emulation by default\n" );
+ 
+ #undef IS_OPTION_TRUE
+ 
+

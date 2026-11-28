@@ -1,0 +1,184 @@
+# shell32: Ignore an invalid BROWSEINFO.pidlRoot in SHBrowseForFolderW.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11477 state=closed
+# Some applications, in my case an internal CASE software development tool in my company, pass a plain CSIDL value instead of an item id list in BROWSEINFO.pidlRoot, CSIDL_DRIVES (0x11) for instance. Windows tolerates this and browses from the desktop, while Wine dereferences the value right away in InitializeTreeView and faults:
+
+Unhandled exception: page fault on read access to 0x00000011 =\>0 ILGetSize(pidl=00000011) \[dlls/shell32/pidl.c:778\] in shell32 1 ILClone(pidl=00000011) \[dlls/shell32/pidl.c:844\] in shell32 2 InitializeTreeView+0x65 \[dlls/shell32/brsfolder.c:212\] in shell32 3 BrsFolder_OnCreate+0x2ef \[dlls/shell32/brsfolder.c:750\] in shell32
+
+Validate the root pidl once when the dialog is created and treat an unreadable one like a NULL pidlRoot, that is, browse from the desktop.
+
+For more information please check this bug: https://bugs.winehq.org/show_bug.cgi?id=60063
+--- dlls/shell32/tests/brsfolder.c
++++ dlls/shell32/tests/brsfolder.c
+@@ -35,6 +35,12 @@ static const char new_folder_name[] = "foo";
+ static const WCHAR new_folder_name_w[] = L"foo";
+ static LPITEMIDLIST selected_folder_pidl;
+ 
++struct invalid_root_data
++{
++    BOOL initialized;
++    char windows_dir[MAX_PATH];
++};
++
+ /*
+  * Returns the number of folders in a folder.
+  */
+@@ -357,8 +363,77 @@ static void test_selection(void)
+     CoUninitialize();
+ }
+ 
++/*
++ * Callback used by test_invalid_root.
++ */
++static int CALLBACK invalid_root_callback(HWND hwnd, UINT uMsg, LPARAM lParam, LPARAM lpData)
++{
++    struct invalid_root_data *data = (struct invalid_root_data *)lpData;
++
++    switch (uMsg)
++    {
++    case BFFM_INITIALIZED:
++        data->initialized = TRUE;
++        /* An invalid root should be ignored, leaving the desktop as the root of
++         * the tree, so selecting an absolute path has to work. */
++        SendMessageA(hwnd, BFFM_SETSELECTIONA, TRUE, (LPARAM)data->windows_dir);
++        PostMessageA(hwnd, WM_COMMAND, IDOK, 0);
++        return 0;
++    default:
++        return 0;
++    }
++}
++
++/*
++ * Tests that an invalid BROWSEINFO.pidlRoot doesn't crash the dialog.  Some
++ * applications pass a CSIDL value instead of an item id list.
++ */
++static void test_invalid_root(void)
++{
++    struct invalid_root_data data;
++    char selected_folder[MAX_PATH];
++    char selected_path[MAX_PATH];
++    LPITEMIDLIST pidl;
++    HRESULT resCoInit;
++    BROWSEINFOA bi;
++
++    resCoInit = CoInitialize(NULL);
++    if (!(resCoInit == S_OK || resCoInit == S_FALSE))
++    {
++        skip("COM could not be initialized %lu\n", GetLastError());
++        return;
++    }
++
++    data.initialized = FALSE;
++    GetWindowsDirectoryA(data.windows_dir, MAX_PATH);
++
++    memset(&bi, 0, sizeof(bi));
++    bi.pszDisplayName = selected_folder;
++    bi.lpszTitle = "test_invalid_root";
++    bi.ulFlags = BIF_RETURNONLYFSDIRS;
++    bi.lpfn = invalid_root_callback;
++    bi.lParam = (LPARAM)&data;
++    /* not an item id list, but a CSIDL value */
++    bi.pidlRoot = (LPCITEMIDLIST)(ULONG_PTR)CSIDL_DRIVES;
++
++    pidl = SHBrowseForFolderA(&bi);
++    ok(data.initialized, "Dialog was not initialized.\n");
++    ok(pidl != NULL, "Expected a pidl.\n");
++
++    if (pidl)
++    {
++        ok(SHGetPathFromIDListA(pidl, selected_path), "SHGetPathFromIDList failed.\n");
++        ok(!lstrcmpiA(selected_path, data.windows_dir), "Expected %s, got %s.\n",
++           data.windows_dir, selected_path);
++        CoTaskMemFree(pidl);
++    }
++
++    CoUninitialize();
++}
++
+ START_TEST(brsfolder)
+ {
+     test_click_make_new_folder_button();
+     test_selection();
++    test_invalid_root();
+ }
+
+--- dlls/shell32/brsfolder.c
++++ dlls/shell32/brsfolder.c
+@@ -26,6 +26,7 @@
+ 
+ #define COBJMACROS
+ #include "wine/debug.h"
++#include "wine/exception.h"
+ #include "pidl.h"
+ #include "shell32_main.h"
+ #include "commoncontrols.h"
+@@ -49,6 +50,7 @@ typedef struct tagbrowse_info
+     HWND          hWnd;
+     HWND          hwndTreeView;
+     LPBROWSEINFOW lpBrowseInfo;
++    LPCITEMIDLIST root;    /* validated lpBrowseInfo->pidlRoot */
+     LPITEMIDLIST  pidlRet;
+     LAYOUT_DATA  *layout;  /* filled by LayoutInit, used by LayoutUpdate */
+     SIZE          szMin;
+@@ -100,6 +102,35 @@ static inline DWORD BrowseFlagsToSHCONTF(UINT ulFlags)
+     return SHCONTF_FOLDERS | (ulFlags & BIF_BROWSEINCLUDEFILES ? SHCONTF_NONFOLDERS : 0);
+ }
+ 
++/* Some applications pass garbage instead of a pidl as BROWSEINFO.pidlRoot
++ * (e.g. a plain CSIDL value).  Windows doesn't crash on those, so check that
++ * the pidl is readable and fall back to the desktop folder if it isn't. */
++static LPCITEMIDLIST get_root_pidl( LPCITEMIDLIST pidl )
++{
++    DWORD size = 0;
++
++    if (!pidl) return NULL;
++
++    __TRY
++    {
++        size = ILGetSize( pidl );
++    }
++    __EXCEPT_PAGE_FAULT
++    {
++        size = 0;
++    }
++    __ENDTRY
++
++    if (!size)
++    {
++        WARN( "ignoring invalid root pidl %p\n", pidl );
++        return NULL;
++    }
++
++    TRACE( "root pidl %p, size %lu\n", pidl, size );
++    return pidl;
++}
++
+ static void browsefolder_callback( LPBROWSEINFOW lpBrowseInfo, HWND hWnd,
+                                    UINT msg, LPARAM param )
+ {
+@@ -188,7 +219,7 @@ static void InitializeTreeView( browse_info *info )
+     IEnumIDList * pEnumChildren = NULL;
+     HTREEITEM item;
+     DWORD flags;
+-    LPCITEMIDLIST root = info->lpBrowseInfo->pidlRoot;
++    LPCITEMIDLIST root = info->root;
+ 
+     TRACE("%p\n", info );
+     
+@@ -925,7 +956,7 @@ static BOOL BrsFolder_OnSetExpanded(browse_info *info, LPVOID selection,
+ 
+     /* Move pidlCurrent behind the SHITEMIDs in pidlSelection, which are the root of
+      * the sub-tree currently displayed. */
+-    pidlRoot = info->lpBrowseInfo->pidlRoot;
++    pidlRoot = info->root;
+     pidlCurrent = pidlSelection;
+     while (!_ILIsEmpty(pidlRoot) && _ILIsEqualSimple(pidlRoot, pidlCurrent)) {
+         pidlRoot = ILGetNext(pidlRoot);
+@@ -1221,6 +1252,7 @@ LPITEMIDLIST WINAPI SHBrowseForFolderW (LPBROWSEINFOW lpbi)
+     info.hWnd = 0;
+     info.pidlRet = NULL;
+     info.lpBrowseInfo = lpbi;
++    info.root = get_root_pidl( lpbi->pidlRoot );
+     info.hwndTreeView = NULL;
+ 
+     icex.dwSize = sizeof( icex );
+

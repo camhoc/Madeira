@@ -1,0 +1,173 @@
+# Fix initialization of the handler_fd_ops
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/5503 state=closed
+# This lists all fields of the `struct fd_ops` when object of that type --
+`handler_fd_ops` in server/signal.c -- is being initialized.
+
+It looks like field list in initialization of the `handler_fd_ops` in
+server/signal.c was out-of-sync for a long time.  Take a look, for
+example, on patches ad1e0609a0f (server: Get rid of no loner used
+cancel_async from fd_ops., 2016-12-01) (which removed "reference" to the
+`cancel_async` field correctly, but did not add "references" to the `read`
+and `write` fields, for example), or 837b39b2028 (server: Add read and
+write fd member functions., 2015-05-05) (which updated `struct fd_ops`
+but did not change initialization of the `handler_fd_ops` at all).
+
+Because the main purpose of initialization of the `handler_fd_ops` made in
+server/signal.c is to assign address of the `handler_poll_event()`
+function to the `poll_event` field, while making all other fields `NULL`ed,
+lacking some fields in that initialization is not an error according to
+C standard:
+
+> 6.7.11 Initialization
+>
+> 11 ... If an object that has static or thread storage duration is not
+> initialized explicitly, or any object is initialized with an empty
+> initializer, then it is subject to default initialization, which
+> initializes an object as follows:
+>
+>   - if it has pointer type, it is initialized to a null pointer;
+>
+> ...
+>
+> 22 If there are fewer initializers in a brace-enclosed list than there
+> are elements or members of an aggregate, or fewer characters in a
+> string literal used to initialize an array of known size than there
+> are elements in the array, the remainder of the aggregate is subject
+> to default initialization.
+
+But to maintain code consistency I believe initialization of the
+`handler_fd_ops` object should enumerate all fields of the
+`struct fd_ops` type.
+
+No functional changes intended.
+
+```shell
+$ ./configure
+...
+$ make
+...
+$ ./wine --version
+wine-9.6-74-g6a1dab2af04
+```
+--- server/change.c
++++ server/change.c
+@@ -644,9 +644,14 @@ static const struct fd_ops inotify_fd_ops =
+ {
+     inotify_get_poll_events,     /* get_poll_events */
+     inotify_poll_event,          /* poll_event */
+-    NULL,                        /* flush */
+     NULL,                        /* get_fd_type */
++    NULL,                        /* read */
++    NULL,                        /* write */
++    NULL,                        /* flush */
++    NULL,                        /* get_file_info */
++    NULL,                        /* get_volume_info */
+     NULL,                        /* ioctl */
++    NULL,                        /* cancel_async */
+     NULL,                        /* queue_async */
+     NULL                         /* reselect_async */
+ };
+
+--- server/process.c
++++ server/process.c
+@@ -125,12 +125,16 @@ static const struct fd_ops process_fd_ops =
+ {
+     NULL,                        /* get_poll_events */
+     process_poll_event,          /* poll_event */
+-    NULL,                        /* flush */
+     NULL,                        /* get_fd_type */
++    NULL,                        /* read */
++    NULL,                        /* write */
++    NULL,                        /* flush */
++    NULL,                        /* get_file_info */
++    NULL,                        /* get_volume_info */
+     NULL,                        /* ioctl */
++    NULL,                        /* cancel_async */
+     NULL,                        /* queue_async */
+-    NULL,                        /* reselect_async */
+-    NULL                         /* cancel async */
++    NULL                         /* reselect_async */
+ };
+ 
+ /* process startup info */
+
+--- server/queue.c
++++ server/queue.c
+@@ -184,12 +184,16 @@ static const struct fd_ops msg_queue_fd_ops =
+ {
+     NULL,                        /* get_poll_events */
+     msg_queue_poll_event,        /* poll_event */
+-    NULL,                        /* flush */
+     NULL,                        /* get_fd_type */
++    NULL,                        /* read */
++    NULL,                        /* write */
++    NULL,                        /* flush */
++    NULL,                        /* get_file_info */
++    NULL,                        /* get_volume_info */
+     NULL,                        /* ioctl */
++    NULL,                        /* cancel_async */
+     NULL,                        /* queue_async */
+-    NULL,                        /* reselect_async */
+-    NULL                         /* cancel async */
++    NULL                         /* reselect_async */
+ };
+ 
+ 
+
+--- server/request.c
++++ server/request.c
+@@ -110,9 +110,14 @@ static const struct fd_ops master_socket_fd_ops =
+ {
+     NULL,                          /* get_poll_events */
+     master_socket_poll_event,      /* poll_event */
+-    NULL,                          /* flush */
+     NULL,                          /* get_fd_type */
++    NULL,                          /* read */
++    NULL,                          /* write */
++    NULL,                          /* flush */
++    NULL,                          /* get_file_info */
++    NULL,                          /* get_volume_info */
+     NULL,                          /* ioctl */
++    NULL,                          /* cancel_async */
+     NULL,                          /* queue_async */
+     NULL                           /* reselect_async */
+ };
+
+--- server/signal.c
++++ server/signal.c
+@@ -84,9 +84,14 @@ static const struct fd_ops handler_fd_ops =
+ {
+     NULL,                     /* get_poll_events */
+     handler_poll_event,       /* poll_event */
+-    NULL,                     /* flush */
+     NULL,                     /* get_fd_type */
++    NULL,                     /* read */
++    NULL,                     /* write */
++    NULL,                     /* flush */
++    NULL,                     /* get_file_info */
++    NULL,                     /* get_volume_info */
+     NULL,                     /* ioctl */
++    NULL,                     /* cancel_async */
+     NULL,                     /* queue_async */
+     NULL                      /* reselect_async */
+ };
+
+--- server/thread.c
++++ server/thread.c
+@@ -207,9 +207,14 @@ static const struct fd_ops thread_fd_ops =
+ {
+     NULL,                       /* get_poll_events */
+     thread_poll_event,          /* poll_event */
+-    NULL,                       /* flush */
+     NULL,                       /* get_fd_type */
++    NULL,                       /* read */
++    NULL,                       /* write */
++    NULL,                       /* flush */
++    NULL,                       /* get_file_info */
++    NULL,                       /* get_volume_info */
+     NULL,                       /* ioctl */
++    NULL,                       /* cancel_async */
+     NULL,                       /* queue_async */
+     NULL                        /* reselect_async */
+ };
+

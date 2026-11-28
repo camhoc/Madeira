@@ -1,0 +1,18 @@
+# Add .DS_Store file to gitignore
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11036 state=closed
+# The .DS_Store file is a file that gets used by MacOS's finder application for storing internal configuration data.
+
+There's no reason for that file to be part of the git tree.
+--- tools/makedep.c
++++ tools/makedep.c
+@@ -4571,6 +4571,9 @@ static void output_gitignore( const char *dest, struct strarray files )
+         output( "%s\n", file );
+     }
+ 
++    // Add Mac-specific files to .gitignore:
++    output(".DS_Store\n");
++
+     if (fclose( output_file )) fatal_perror( "write" );
+     output_file = NULL;
+     rename_temp_file( dest );
+

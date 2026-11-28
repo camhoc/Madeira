@@ -1,0 +1,203 @@
+# kk: Merge timestamp resolves at the end of the command buffer
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46472 state=opened
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+kk: Merge timestamp resolves at the end of the command buffer
+
+Each resolveCounterHeap runs as a separate encoder inside the command buffer and the GPU idles around it. KosmicKrisp resolved after every encoder that wrote a timestamp, so a command buffer paid one idle gap per such encoder.
+
+This keeps pending resolves until vkEndCommandBuffer, or until a query reset or copy needs them, then sorts them and merges runs of consecutive heap entries with contiguous reports into one resolve. Resetting or freeing a command buffer that is still recording drops its pending resolves without encoding them, so a query pool destroyed in the meantime is never touched.
+
+In Enshrouded (through Wine) the average frame rate goes from 30.4 to 31.9 FPS (+4.7% over three paired runs); the slowest frames did not improve in two of the three pairs.
+
+Testing (Apple M5 Pro, macOS 27.2): every timestamp case in the Vulkan mustpass (1,102 cases, 398 supported, all pass, also with Metal API validation, no messages) and a 79,312 case list, with no regressions against main.
+```
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -7,6 +7,8 @@
+ 
+ #include "kk_cmd_buffer.h"
+ 
++#include <stdlib.h>
++
+ #include "kk_buffer.h"
+ #include "kk_cmd_pool.h"
+ #include "kk_descriptor_set_layout.h"
+@@ -62,12 +64,16 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+ 
+ /* Ends Metal command buffer recording and returns allocator to pool for reuse */
+ static void
+-end_recording(struct kk_cmd_buffer *cmd)
++end_recording(struct kk_cmd_buffer *cmd, bool flush_ts_resolves)
+ {
+    if (cmd->vk.state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
+       return;
+ 
+    cs_end(cmd);
++   /* Timestamp resolves are encoded only from vkEndCommandBuffer, after the
++    * last encoder; a reset or freed command buffer drops them. */
++   if (flush_ts_resolves)
++      kk_cmd_flush_ts_resolves(cmd);
+    mtl_end_command_buffer(cmd->metal.cmd_buf);
+    kk_cmd_pool_return_allocator(kk_cmd_buffer_pool(cmd), cmd->metal.allocator);
+    cmd->metal.allocator = NULL;
+@@ -84,7 +90,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+       mtl_release(cmd->drawable);
+ 
+    /* Ensure closed command buffer for safe returns to pool */
+-   end_recording(cmd);
++   end_recording(cmd, false);
+    if (cmd->metal.cmd_buf)
+       kk_cmd_pool_return_cmd_buf(pool, cmd->metal.cmd_buf);
+    cmd->metal.cmd_buf = NULL;
+@@ -164,7 +170,7 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+ 
+    /* Ensure closed command buffer so we can start it again */
+-   end_recording(cmd);
++   end_recording(cmd, false);
+    kk_cmd_release_resources(dev, cmd);
+ 
+    cmd->uploader.bo = NULL;
+@@ -241,7 +247,7 @@ kk_EndCommandBuffer(VkCommandBuffer commandBuffer)
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+ 
+-   end_recording(cmd);
++   end_recording(cmd, true);
+ 
+    return vk_command_buffer_end(&cmd->vk);
+ }
+@@ -339,11 +345,55 @@ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
+    mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+    mtl_end_encoding(encoder);
+    mtl_release(encoder);
++}
++
++static int
++kk_ts_resolve_compare(const void *a, const void *b)
++{
++   const struct kk_ts_resolve *x = a, *y = b;
++   if (x->heap != y->heap)
++      return (uintptr_t)x->heap < (uintptr_t)y->heap ? -1 : 1;
++   if (x->index != y->index)
++      return x->index < y->index ? -1 : 1;
++   if (x->dst_addr != y->dst_addr)
++      return x->dst_addr < y->dst_addr ? -1 : 1;
++   return 0;
++}
++
++/* Each counter-heap resolve runs as a separate encoder that Metal inserts into
++ * the command buffer, and the GPU idles around each one. Pending resolves are
++ * therefore kept until the command buffer ends, or until a query reset or copy
++ * needs them, and runs of consecutive entries are merged into one resolve.
++ *
++ * Must be called with no encoder open, so that every timestamp write has passed
++ * its encoder's end barrier.
++ */
++void
++kk_cmd_flush_ts_resolves(struct kk_cmd_buffer *cmd)
++{
++   assert(!cmd->metal.render && !cmd->metal.compute);
+ 
+-   /* Fold the pending timestamp counter-heap resolves into `cmd_buf` */
+-   util_dynarray_foreach(&cmd->ts_resolves, struct kk_ts_resolve, r) {
+-      mtl_command_resolve_counter_heap(cmd->metal.cmd_buf, r->heap, r->index,
+-                                       1u, r->dst_addr);
++   const unsigned count =
++      util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve);
++   if (!count)
++      return;
++
++   struct kk_ts_resolve *r = cmd->ts_resolves.data;
++   qsort(r, count, sizeof(*r), kk_ts_resolve_compare);
++
++   /* A run of consecutive heap entries can be merged only if their reports are
++    * contiguous too. Both a timestamp heap entry and a query report are one
++    * uint64_t, and reports are laid out back to back.
++    */
++   for (unsigned i = 0; i < count;) {
++      unsigned n = 1;
++      while (i + n < count && r[i + n].heap == r[i].heap &&
++             r[i + n].index == r[i].index + n &&
++             r[i + n].dst_addr == r[i].dst_addr + n * sizeof(uint64_t))
++         n++;
++      mtl_command_resolve_counter_heap(cmd->metal.cmd_buf, r[i].heap,
++                                       r[i].index, n, r[i].dst_addr);
++      i += n;
+    }
+ 
+    util_dynarray_clear(&cmd->ts_resolves);
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -221,7 +221,8 @@ struct kk_uploader {
+ };
+ 
+ /* A pending resolve of one timestamp counter-heap entry into a query pool BO.
+- * Recorded by vkCmdWriteTimestamp2 and flushed on the GPU timeline at cs_end. */
++ * Recorded by vkCmdWriteTimestamp2 and flushed, merged, when the command buffer
++ * ends or before a query reset or copy. */
+ struct kk_ts_resolve {
+    mtl_counter_heap *heap;
+    uint32_t index;
+@@ -243,7 +244,7 @@ struct kk_cmd_buffer {
+       mtl_render_encoder *render;
+       mtl_compute_encoder *compute;
+    } metal;
+-   /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
++   /* Pending timestamp resolves (struct kk_ts_resolve). */
+    struct util_dynarray ts_resolves;
+    /* Timestamps already sampled by the current render encoder. (struct
+     * kk_ts_stage_entry). */
+@@ -315,6 +316,7 @@ kk_get_descriptors_state(struct kk_cmd_buffer *cmd,
+ void cs_start_render(struct kk_cmd_buffer *cmd);
+ mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
+ mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd);
++void kk_cmd_flush_ts_resolves(struct kk_cmd_buffer *cmd);
+ void cs_end(struct kk_cmd_buffer *cmd);
+ void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
+                                         uint64_t addr);
+
+--- src/kosmickrisp/vulkan/kk_query_pool.c
++++ src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -25,6 +25,11 @@ struct kk_query_report {
+    uint64_t value;
+ };
+ 
++/* Timestamp resolves are merged on the assumption that reports are one
++ * uint64_t each, back to back. */
++static_assert(sizeof(struct kk_query_report) == sizeof(uint64_t),
++              "query reports must be 64-bit");
++
+ uint16_t *
+ kk_pool_index_ptr(const struct kk_query_pool *pool)
+ {
+@@ -296,8 +301,10 @@ kk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+    /* A prior timestamp write may have a resolve still pending. Land it before
+     * the reset zeroes the pool BO, otherwise the deferred resolve would clobber
+     * the reset and leave the query spuriously available. */
+-   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) > 0)
++   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve)) {
+       cs_end(cmd);
++      kk_cmd_flush_ts_resolves(cmd);
++   }
+ 
+    emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
+ }
+@@ -585,8 +592,10 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
+    /* Timestamp results are resolved into the pool BO on a deferred command
+     * buffer; make sure any pending resolve lands before this copy reads it.
+     * This also gives VK_QUERY_RESULT_WAIT_BIT its meaning for timestamps. */
+-   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) > 0)
++   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve)) {
+       cs_end(cmd);
++      kk_cmd_flush_ts_resolves(cmd);
++   }
+ 
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+    /* The resolveCounterHeap runs on the blit stage and it needs to be available
+

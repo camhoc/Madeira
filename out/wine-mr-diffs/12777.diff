@@ -1,0 +1,36 @@
+# winemac: Fix fullscreen letterboxing position.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12777 state=opened
+# These are two commits made by Feifan in the past to fix the letterbox positioning and scaling.
+
+Also `BOOL fullscreen` was `0x80000000` (as truthy value) and assigned to the bitfield in the `macdrv_win_data`, which truncated it to `0`, so the letterbox wasn't removed properly when it should be.
+--- dlls/winemac.drv/cocoa_window.m
++++ dlls/winemac.drv/cocoa_window.m
+@@ -2508,10 +2508,14 @@ - (void) setMask:(CGRect)rect
+         CAShapeLayer *shapeLayer = [CAShapeLayer layer];
+         shapeLayer.bounds = self.contentView.layer.bounds;
+         shapeLayer.position = self.contentView.layer.position;
+-        shapeLayer.geometryFlipped = self.contentView.layer.geometryFlipped;
+         shapeLayer.anchorPoint = self.contentView.layer.anchorPoint;
+         shapeLayer.fillColor = CGColorGetConstantColor(kCGColorBlack);
+ 
++        rect.origin.x /= self.contentView.layer.contentsScale;
++        rect.origin.y /= self.contentView.layer.contentsScale;
++        rect.size.width /= self.contentView.layer.contentsScale;
++        rect.size.height /= self.contentView.layer.contentsScale;
++
+         CGMutablePathRef path = CGPathCreateMutable();
+         /* left/right */
+         if (rect.origin.x > 0.0)
+
+--- dlls/winemac.drv/window.c
++++ dlls/winemac.drv/window.c
+@@ -1652,7 +1652,7 @@ BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *styl
+ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                              const struct window_rects *new_rects, struct window_surface *surface)
+ {
+-    BOOL fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
++    const BOOL fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
+     struct macdrv_thread_data *thread_data;
+     struct macdrv_win_data *data;
+     unsigned int new_style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+

@@ -1,0 +1,112 @@
+# ntdll: Expose fewer cpsr bits to the user space.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12769 state=merged
+# Also fix exception tests on Windows 11 26H1.
+--- dlls/ntdll/tests/exception.c
++++ dlls/ntdll/tests/exception.c
+@@ -7877,8 +7877,8 @@ static void test_thread_context(void)
+     context.ContextFlags = CONTEXT_CONTROL;
+     status = pNtGetContextThread( thread, &context );
+     ok( !status, "NtGetContextThread failed %08lx\n", status );
+-    ok( (orig_context.Cpsr ^ context.Cpsr) == 0xf620fc30, "unexpected cpsr modification = %lx\n",
+-        orig_context.Cpsr ^ context.Cpsr );
++    ok( (orig_context.Cpsr ^ context.Cpsr) == 0xf0200000 || broken((orig_context.Cpsr ^ context.Cpsr) == 0xf620fc30),
++        "unexpected cpsr modification = %lx\n", orig_context.Cpsr ^ context.Cpsr );
+ 
+     status = pNtSetContextThread( thread, &orig_context );
+     ok( !status, "NtSetContextThread failed %08lx\n", status );
+@@ -8835,14 +8835,22 @@ static void rtlraiseexception_handler_( EXCEPTION_RECORD *rec, void *frame, CONT
+                                         void *dispatcher, BOOL unhandled_handler )
+ {
+     void *addr = rec->ExceptionAddress;
++    ULONG context_flags;
+ 
+     trace( "exception: %08lx flags:%lx addr:%p context: Pc:%p\n",
+            rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress, (void *)context->Pc );
+ 
+     ok( addr == (char *)code_mem + 0x0c,
+         "ExceptionAddress at %p instead of %p\n", addr, (char *)code_mem + 0x0c );
+-    ok( context->ContextFlags == (CONTEXT_FULL | CONTEXT_UNWOUND_TO_CALL) ||
+-        context->ContextFlags == (CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS),
++    context_flags = context->ContextFlags;
++    if (RtlGetEnabledExtendedFeatures( ~0ul ))
++        todo_wine
++        ok( (context_flags & CONTEXT_XSTATE) == CONTEXT_XSTATE, "missing CONTEXT_XSTATE flag\n" );
++    else
++        ok( (context_flags & CONTEXT_XSTATE) == CONTEXT_ARM64, "CONTEXT_XSTATE flag present\n" );
++    context_flags &= ~CONTEXT_XSTATE | CONTEXT_ARM64;
++    ok( context_flags == (CONTEXT_FULL | CONTEXT_UNWOUND_TO_CALL) ||
++        context_flags == (CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS),
+         "wrong context flags %lx\n", context->ContextFlags );
+     ok( context->Pc == (UINT_PTR)addr,
+         "%d: Pc at %Ix instead of %Ix\n", test_stage, context->Pc, (UINT_PTR)addr );
+@@ -13137,10 +13145,11 @@ START_TEST(exception)
+         test_stage = STAGE_BREAKPOINT_NOT_HANDLED;
+         test_breakpoint(1);
+         test_stage = STAGE_EXCEPTION_INVHANDLE_CONTINUE;
+-        test_closehandle(0, (HANDLE)0xdeadbeef);
+-#ifndef __aarch64__
+-        test_closehandle(0, (HANDLE)0x7fffffff);  /* apparently valid on arm64 */
+-#endif
++        if (!broken(is_arm64_native_machine))  /* apparently valid on arm64 */
++        {
++            test_closehandle(0, (HANDLE)0xdeadbeef);
++            test_closehandle(0, (HANDLE)0x7fffffff);
++        }
+         test_stage = STAGE_EXCEPTION_INVHANDLE_NOT_HANDLED;
+         test_closehandle(1, (HANDLE)0xdeadbeef);
+         test_closehandle(1, (HANDLE)~(ULONG_PTR)6);
+
+--- dlls/ntdll/unix/signal_arm64.c
++++ dlls/ntdll/unix/signal_arm64.c
+@@ -219,11 +219,6 @@ C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
+ #define ESR_ELx_ISS_DFSC(esr)           ((esr) & 0x3f)
+ #define ESR_ELx_ISS_DFSC_ALIGN_FAULT    0x21
+ 
+-/* Preserve all CPSR bits not covered by user context in signal handlers.
+- * Additionally, preserve the host SSBS bit, which is allowed to be set on
+- * Windows, but is volatile and restored on kernel transition anyway. */
+-static const ULONG cpsr_host_mask = ~cpsr_user_mask | 0x1000;
+-
+ /***********************************************************************
+  *           context_init_empty_xstate
+  *
+@@ -359,7 +354,7 @@ static void restore_context( struct thread_data *data, const CONTEXT *context, u
+ 
+     FP_sig(sigcontext)     = context->Fp;   /* Frame pointer */
+     LR_sig(sigcontext)     = context->Lr;   /* Link register */
+-    PSTATE_sig(sigcontext) = (PSTATE_sig(sigcontext) & cpsr_host_mask) | (context->Cpsr & ~cpsr_host_mask);
++    PSTATE_sig(sigcontext) = (PSTATE_sig(sigcontext) & ~cpsr_user_mask) | (context->Cpsr & cpsr_user_mask);
+     for (i = 0; i <= 28; i++) REGn_sig( i, sigcontext ) = context->X[i];
+     restore_fpu( context, sigcontext );
+ }
+@@ -648,7 +643,7 @@ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
+             wow_frame->Sp = context->Sp;
+             wow_frame->Lr = context->Lr;
+             wow_frame->Pc = context->Pc & ~1;
+-            wow_frame->Cpsr = context->Cpsr & cpsr_user_mask;
++            wow_frame->Cpsr = context->Cpsr;
+             if (context->Cpsr & 0x20) wow_frame->Pc |= 1; /* thumb */
+         }
+         if (flags & CONTEXT_FLOATING_POINT)
+@@ -1562,7 +1557,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     }
+     FP_sig(sigcontext)     = frame->fp;
+     LR_sig(sigcontext)     = frame->lr;
+-    PSTATE_sig(sigcontext) = (PSTATE_sig(sigcontext) & cpsr_host_mask) | frame->cpsr;
++    PSTATE_sig(sigcontext) = (PSTATE_sig(sigcontext) & ~cpsr_user_mask) | frame->cpsr;
+     for (i = 0; i <= 28; i++) REGn_sig( i, sigcontext ) = frame->x[i];
+ 
+ #ifdef linux
+
+--- dlls/ntdll/unix/unix_private.h
++++ dlls/ntdll/unix/unix_private.h
+@@ -641,7 +641,7 @@ static inline NTSTATUS map_section( HANDLE mapping, void **ptr, SIZE_T *size, UL
+                                0, NULL, size, ViewShare, 0, protect );
+ }
+ 
+-static const ULONG cpsr_user_mask = 0xf620fc30;
++static const ULONG cpsr_user_mask = 0xf0200000;
+ 
+ /* LDT definitions */
+ 
+

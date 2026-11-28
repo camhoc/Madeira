@@ -1,0 +1,174 @@
+# winemac: Update the clipboard asynchronously on app activation.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12658 state=merged
+# This fixes one of two possible hangs with Diablo 2 Resurrected (maybe there are more, at least these were the ones I could observe). The other one is related to window focus macdrv events (and an MR for it will follow shortly too, but it is a bit more complicated).
+
+The issue is that the games main thread has a SRW lock and wine code paths reenter D2R's window procedure try to acquire that same SRW lock shared (which makes this bug kind of random, since the clipboard event here gets delivered to exactly 1 thread that picks it up first).
+--- dlls/winemac.drv/clipboard.c
++++ dlls/winemac.drv/clipboard.c
+@@ -1417,9 +1417,9 @@ LRESULT macdrv_ClipboardWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ 
+ 
+ /**************************************************************************
+- *              macdrv_UpdateClipboard
++ *              request_clipboard_update
+  */
+-void macdrv_UpdateClipboard(void)
++static void request_clipboard_update(BOOL wait)
+ {
+     static ULONG last_update;
+     static HWND clipboard_manager;
+@@ -1428,7 +1428,7 @@ void macdrv_UpdateClipboard(void)
+ 
+     if (GetCurrentThreadId() == clipboard_thread_id) return;
+ 
+-    TRACE("\n");
++    TRACE("%s\n", wait ? "wait" : "post");
+ 
+     now = NtGetTickCount();
+     if (last_update && (int)(now - last_update) <= CLIPBOARD_UPDATE_DELAY) return;
+@@ -1444,9 +1444,24 @@ void macdrv_UpdateClipboard(void)
+         }
+     }
+ 
+-    send_message_timeout(clipboard_manager, WM_USER, 0, 0,
+-                         SMTO_ABORTIFHUNG, 5000, &ret);
+-    last_update = now;
++    if (wait)
++    {
++        send_message_timeout(clipboard_manager, WM_USER, 0, 0,
++                             SMTO_ABORTIFHUNG, 5000, &ret);
++        last_update = now;
++        return;
++    }
++
++    NtUserPostMessage(clipboard_manager, WM_USER, 0, 0);
++}
++
++
++/**************************************************************************
++ *              macdrv_UpdateClipboard
++ */
++void macdrv_UpdateClipboard(void)
++{
++    request_clipboard_update(TRUE);
+ }
+ 
+ 
+@@ -1455,6 +1470,15 @@ void macdrv_UpdateClipboard(void)
+  **************************************************************************/
+ 
+ 
++/**************************************************************************
++ *              macdrv_update_clipboard_async
++ */
++void macdrv_update_clipboard_async(void)
++{
++    request_clipboard_update(FALSE);
++}
++
++
+ /**************************************************************************
+  *              query_pasteboard_data
+  */
+
+--- dlls/winemac.drv/cocoa_app.m
++++ dlls/winemac.drv/cocoa_app.m
+@@ -2311,15 +2311,7 @@ - (NSApplicationTerminateReply) applicationShouldTerminate:(NSApplication *)send
+ 
+     - (void)applicationWillBecomeActive:(NSNotification *)notification
+     {
+-        macdrv_event* event = macdrv_create_event(APP_ACTIVATED, nil);
+-        event->deliver = 1;
+-
+-        [eventQueuesLock lock];
+-        for (WineEventQueue* queue in eventQueues)
+-            [queue postEvent:event];
+-        [eventQueuesLock unlock];
+-
+-        macdrv_release_event(event);
++        macdrv_update_clipboard_async();
+     }
+ 
+     - (void)applicationWillResignActive:(NSNotification *)notification
+
+--- dlls/winemac.drv/event.c
++++ dlls/winemac.drv/event.c
+@@ -35,7 +35,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(event);
+ static const char *dbgstr_event(int type)
+ {
+     static const char * const event_names[] = {
+-        "APP_ACTIVATED",
+         "APP_DEACTIVATED",
+         "APP_QUIT_REQUESTED",
+         "DISPLAYS_CHANGED",
+@@ -108,7 +107,6 @@ static macdrv_event_mask get_event_mask(DWORD mask)
+ 
+     if (mask & QS_POSTMESSAGE)
+     {
+-        event_mask |= event_mask_for_type(APP_ACTIVATED);
+         event_mask |= event_mask_for_type(APP_DEACTIVATED);
+         event_mask |= event_mask_for_type(APP_QUIT_REQUESTED);
+         event_mask |= event_mask_for_type(DISPLAYS_CHANGED);
+@@ -319,9 +317,6 @@ void macdrv_handle_event(const macdrv_event *event)
+ 
+     switch (event->type)
+     {
+-    case APP_ACTIVATED:
+-        macdrv_app_activated();
+-        break;
+     case APP_DEACTIVATED:
+         macdrv_app_deactivated();
+         break;
+
+--- dlls/winemac.drv/macdrv.h
++++ dlls/winemac.drv/macdrv.h
+@@ -267,7 +267,6 @@ extern void macdrv_ime_set_text(HWND hwnd, CFStringRef text, bool complete,
+ extern void macdrv_window_frame_changed(HWND hwnd, const macdrv_event *event);
+ extern void macdrv_window_got_focus(HWND hwnd, const macdrv_event *event);
+ extern void macdrv_window_lost_focus(HWND hwnd, const macdrv_event *event);
+-extern void macdrv_app_activated(void);
+ extern void macdrv_app_deactivated(void);
+ extern void macdrv_app_quit_requested(const macdrv_event *event);
+ extern void macdrv_window_maximize_requested(HWND hwnd);
+@@ -298,6 +297,7 @@ extern void macdrv_ime_set_text(HWND hwnd, CFStringRef text, bool complete,
+ extern void macdrv_displays_changed(const macdrv_event *event);
+ 
+ extern void macdrv_UpdateClipboard(void);
++extern void macdrv_update_clipboard_async(void);
+ extern bool query_pasteboard_data(HWND hwnd, CFStringRef type);
+ extern void macdrv_lost_pasteboard_ownership(HWND hwnd);
+ 
+
+--- dlls/winemac.drv/macdrv_cocoa.h
++++ dlls/winemac.drv/macdrv_cocoa.h
+@@ -255,7 +255,6 @@ static inline CGPoint cgpoint_win_from_mac(CGPoint point)
+ 
+ /* event */
+ enum {
+-    APP_ACTIVATED,
+     APP_DEACTIVATED,
+     APP_QUIT_REQUESTED,
+     DISPLAYS_CHANGED,
+
+--- dlls/winemac.drv/window.c
++++ dlls/winemac.drv/window.c
+@@ -1834,18 +1834,6 @@ void macdrv_window_lost_focus(HWND hwnd, const macdrv_event *event)
+ }
+ 
+ 
+-/***********************************************************************
+- *              macdrv_app_activated
+- *
+- * Handler for APP_ACTIVATED events.
+- */
+-void macdrv_app_activated(void)
+-{
+-    TRACE("\n");
+-    macdrv_UpdateClipboard();
+-}
+-
+-
+ /***********************************************************************
+  *              macdrv_app_deactivated
+  *
+

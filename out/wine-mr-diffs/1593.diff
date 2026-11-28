@@ -1,0 +1,376 @@
+# ntdll: More refactoring to separate large block and small block logics.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/1593 state=merged
+# 
+--- dlls/ntdll/heap.c
++++ dlls/ntdll/heap.c
+@@ -749,22 +749,33 @@ static void create_free_block( struct heap *heap, ULONG flags, SUBHEAP *subheap,
+ }
+ 
+ 
+-static void free_used_block( struct heap *heap, ULONG flags, struct block *block )
++static struct block *heap_delay_free( struct heap *heap, ULONG flags, struct block *block )
++{
++    struct block *tmp;
++
++    if (!heap->pending_free) return block;
++
++    block_set_type( block, BLOCK_TYPE_DEAD );
++    mark_block_free( block + 1, block_get_size( block ) - sizeof(*block), flags );
++
++    heap_lock( heap, flags );
++
++    tmp = heap->pending_free[heap->pending_pos];
++    heap->pending_free[heap->pending_pos] = block;
++    heap->pending_pos = (heap->pending_pos + 1) % MAX_FREE_PENDING;
++
++    heap_unlock( heap, flags );
++
++    return tmp;
++}
++
++
++static NTSTATUS heap_free_block( struct heap *heap, ULONG flags, struct block *block )
+ {
+     struct entry *entry;
+     SIZE_T block_size;
+     SUBHEAP *subheap;
+ 
+-    if (heap->pending_free)
+-    {
+-        struct block *tmp = heap->pending_free[heap->pending_pos];
+-        heap->pending_free[heap->pending_pos] = block;
+-        heap->pending_pos = (heap->pending_pos + 1) % MAX_FREE_PENDING;
+-        block_set_type( block, BLOCK_TYPE_DEAD );
+-        mark_block_free( block + 1, block_get_size( block ) - sizeof(*block), flags );
+-        if (!(block = tmp)) return;
+-    }
+-
+     block_size = block_get_size( block );
+     if (block_get_flags( block ) & BLOCK_FLAG_PREV_FREE)
+     {
+@@ -778,7 +789,7 @@ static void free_used_block( struct heap *heap, ULONG flags, struct block *block
+ 
+     subheap = block_get_subheap( heap, block );
+     create_free_block( heap, flags, subheap, block, block_size );
+-    if (next_block( subheap, block )) return;  /* not the last block */
++    if (next_block( subheap, block )) return STATUS_SUCCESS;  /* not the last block */
+ 
+     if (block == first_block( subheap ) && subheap != &heap->subheap)
+     {
+@@ -795,6 +806,8 @@ static void free_used_block( struct heap *heap, ULONG flags, struct block *block
+         /* keep room for a full committed block as hysteresis */
+         subheap_decommit( heap, subheap, (char *)(entry + 1) + REGION_ALIGN );
+     }
++
++    return STATUS_SUCCESS;
+ }
+ 
+ 
+@@ -819,23 +832,21 @@ static inline void shrink_used_block( struct heap *heap, ULONG flags, struct blo
+ }
+ 
+ 
+-/***********************************************************************
+- *           allocate_large_block
+- */
+-static struct block *allocate_large_block( struct heap *heap, DWORD flags, SIZE_T size )
++static NTSTATUS heap_allocate_large( struct heap *heap, ULONG flags, SIZE_T block_size,
++                                     SIZE_T size, void **ret )
+ {
+     ARENA_LARGE *arena;
+     SIZE_T total_size = ROUND_SIZE( sizeof(*arena) + size, REGION_ALIGN - 1 );
+     LPVOID address = NULL;
+     struct block *block;
+ 
+-    if (!(flags & HEAP_GROWABLE)) return NULL;
+-    if (total_size < size) return NULL;  /* overflow */
++    if (!(flags & HEAP_GROWABLE)) return STATUS_NO_MEMORY;
++    if (total_size < size) return STATUS_NO_MEMORY;  /* overflow */
+     if (NtAllocateVirtualMemory( NtCurrentProcess(), &address, 0, &total_size, MEM_COMMIT,
+                                  get_protection_type( heap->flags ) ))
+     {
+         WARN( "Could not allocate block for %#Ix bytes\n", size );
+-        return NULL;
++        return STATUS_NO_MEMORY;
+     }
+ 
+     arena = address;
+@@ -847,63 +858,30 @@ static struct block *allocate_large_block( struct heap *heap, DWORD flags, SIZE_
+     block_set_base( block, arena );
+     block_set_flags( block, ~0, BLOCK_FLAG_LARGE | BLOCK_USER_FLAGS( flags ) );
+     block_set_size( block, 0 );
++
++    heap_lock( heap, flags );
+     list_add_tail( &heap->large_list, &arena->entry );
++    heap_unlock( heap, flags );
++
+     valgrind_make_noaccess( (char *)block + sizeof(*block) + arena->data_size,
+                             arena->block_size - sizeof(*block) - arena->data_size );
+ 
+-    return block;
++    *ret = block + 1;
++    return STATUS_SUCCESS;
+ }
+ 
+ 
+-/***********************************************************************
+- *           free_large_block
+- */
+-static void free_large_block( struct heap *heap, struct block *block )
++static NTSTATUS heap_free_large( struct heap *heap, ULONG flags, struct block *block )
+ {
+     ARENA_LARGE *arena = CONTAINING_RECORD( block, ARENA_LARGE, block );
+     LPVOID address = arena;
+     SIZE_T size = 0;
+ 
++    heap_lock( heap, flags );
+     list_remove( &arena->entry );
+-    NtFreeVirtualMemory( NtCurrentProcess(), &address, &size, MEM_RELEASE );
+-}
+-
+-
+-/***********************************************************************
+- *           realloc_large_block
+- */
+-static struct block *realloc_large_block( struct heap *heap, DWORD flags, struct block *block, SIZE_T size )
+-{
+-    ARENA_LARGE *arena = CONTAINING_RECORD( block, ARENA_LARGE, block );
+-    SIZE_T old_size = arena->data_size;
+-    char *data = (char *)(block + 1);
+-
+-    if (arena->block_size - sizeof(*block) >= size)
+-    {
+-        /* FIXME: we could remap zero-pages instead */
+-        valgrind_notify_resize( data, old_size, size );
+-        initialize_block( block, old_size, size, flags );
+-
+-        arena->data_size = size;
+-        valgrind_make_noaccess( (char *)block + sizeof(*block) + arena->data_size,
+-                                arena->block_size - sizeof(*block) - arena->data_size );
+-
+-        return block;
+-    }
+-
+-    if (flags & HEAP_REALLOC_IN_PLACE_ONLY) return NULL;
+-    if (!(block = allocate_large_block( heap, flags, size )))
+-    {
+-        WARN( "Could not allocate block for %#Ix bytes\n", size );
+-        return NULL;
+-    }
+-
+-    valgrind_notify_alloc( block + 1, size, 0 );
+-    memcpy( block + 1, data, old_size );
+-    valgrind_notify_free( data );
+-    free_large_block( heap, &arena->block );
++    heap_unlock( heap, flags );
+ 
+-    return block;
++    return NtFreeVirtualMemory( NtCurrentProcess(), &address, &size, MEM_RELEASE );
+ }
+ 
+ 
+@@ -1482,7 +1460,7 @@ HANDLE WINAPI RtlDestroyHeap( HANDLE handle )
+     {
+         heap->pending_free = NULL;
+         for (tmp = pending; *tmp && tmp != pending + MAX_FREE_PENDING; ++tmp)
+-            free_used_block( heap, heap->flags, *tmp );
++            heap_free_block( heap, heap->flags, *tmp );
+         RtlFreeHeap( handle, 0, pending );
+     }
+ 
+@@ -1539,19 +1517,11 @@ static SIZE_T heap_get_block_size( const struct heap *heap, ULONG flags, SIZE_T
+     return block_size;
+ }
+ 
+-static NTSTATUS heap_allocate( struct heap *heap, ULONG flags, SIZE_T block_size, SIZE_T size, void **ret )
++static NTSTATUS heap_allocate_block( struct heap *heap, ULONG flags, SIZE_T block_size, SIZE_T size, void **ret )
+ {
+     SIZE_T old_block_size;
+     struct block *block;
+ 
+-    if (block_size >= HEAP_MIN_LARGE_BLOCK_SIZE)
+-    {
+-        if (!(block = allocate_large_block( heap, flags, size ))) return STATUS_NO_MEMORY;
+-
+-        *ret = block + 1;
+-        return STATUS_SUCCESS;
+-    }
+-
+     /* Locate a suitable free block */
+ 
+     if (!(block = find_free_block( heap, flags, block_size ))) return STATUS_NO_MEMORY;
+@@ -1583,10 +1553,12 @@ void *WINAPI DECLSPEC_HOTPATCH RtlAllocateHeap( HANDLE handle, ULONG flags, SIZE
+         status = STATUS_INVALID_HANDLE;
+     else if ((block_size = heap_get_block_size( heap, heap_flags, size )) == ~0U)
+         status = STATUS_NO_MEMORY;
++    else if (block_size >= HEAP_MIN_LARGE_BLOCK_SIZE)
++        status = heap_allocate_large( heap, heap_flags, block_size, size, &ptr );
+     else
+     {
+         heap_lock( heap, heap_flags );
+-        status = heap_allocate( heap, heap_flags, block_size, size, &ptr );
++        status = heap_allocate_block( heap, heap_flags, block_size, size, &ptr );
+         heap_unlock( heap, heap_flags );
+     }
+ 
+@@ -1598,13 +1570,6 @@ void *WINAPI DECLSPEC_HOTPATCH RtlAllocateHeap( HANDLE handle, ULONG flags, SIZE
+ }
+ 
+ 
+-static NTSTATUS heap_free( struct heap *heap, ULONG flags, struct block *block )
+-{
+-    if (block_get_flags( block ) & BLOCK_FLAG_LARGE) free_large_block( heap, block );
+-    else free_used_block( heap, flags, block );
+-    return STATUS_SUCCESS;
+-}
+-
+ /***********************************************************************
+  *           RtlFreeHeap   (NTDLL.@)
+  */
+@@ -1623,10 +1588,14 @@ BOOLEAN WINAPI DECLSPEC_HOTPATCH RtlFreeHeap( HANDLE handle, ULONG flags, void *
+         status = STATUS_INVALID_PARAMETER;
+     else if (!(block = unsafe_block_from_ptr( heap, heap_flags, ptr )))
+         status = STATUS_INVALID_PARAMETER;
++    else if (block_get_flags( block ) & BLOCK_FLAG_LARGE)
++        status = heap_free_large( heap, heap_flags, block );
++    else if (!(block = heap_delay_free( heap, heap_flags, block )))
++        status = STATUS_SUCCESS;
+     else
+     {
+         heap_lock( heap, heap_flags );
+-        status = heap_free( heap, heap_flags, block );
++        status = heap_free_block( heap, heap_flags, block );
+         heap_unlock( heap, heap_flags );
+     }
+ 
+@@ -1635,58 +1604,69 @@ BOOLEAN WINAPI DECLSPEC_HOTPATCH RtlFreeHeap( HANDLE handle, ULONG flags, void *
+     return !status;
+ }
+ 
+-
+-static NTSTATUS heap_reallocate( struct heap *heap, ULONG flags, struct block *block,
+-                                 SIZE_T block_size, SIZE_T size, void **ret )
++static NTSTATUS heap_resize_block( struct heap *heap, ULONG flags, struct block *block, SIZE_T block_size,
++                                   SIZE_T size, SIZE_T *old_size, void **ret )
+ {
+-    SIZE_T old_block_size, old_size;
+-    NTSTATUS status;
++    SUBHEAP *subheap = block_get_subheap( heap, block );
++    SIZE_T old_block_size;
++    struct entry *entry;
++    struct block *next;
+ 
+     if (block_get_flags( block ) & BLOCK_FLAG_LARGE)
+     {
+-        if (!(block = realloc_large_block( heap, flags, block, size ))) return STATUS_NO_MEMORY;
++        ARENA_LARGE *large = CONTAINING_RECORD( block, ARENA_LARGE, block );
++        old_block_size = large->block_size;
++        *old_size = large->data_size;
++
++        if (block_size < HEAP_MIN_LARGE_BLOCK_SIZE / 4) return STATUS_NO_MEMORY;  /* shrinking large block to small block */
++        if (old_block_size < block_size) return STATUS_NO_MEMORY;
++
++        /* FIXME: we could remap zero-pages instead */
++        valgrind_notify_resize( block + 1, *old_size, size );
++        initialize_block( block, *old_size, size, flags );
++
++        large->data_size = size;
++        valgrind_make_noaccess( (char *)block + sizeof(*block) + large->data_size,
++                                old_block_size - sizeof(*block) - large->data_size );
+ 
+         *ret = block + 1;
+         return STATUS_SUCCESS;
+     }
+ 
+-    /* Check if we need to grow the block */
+-
+     old_block_size = block_get_size( block );
+-    old_size = old_block_size - block_get_overhead( block );
++    *old_size = old_block_size - block_get_overhead( block );
++
++    if (block_size >= HEAP_MIN_LARGE_BLOCK_SIZE) return STATUS_NO_MEMORY;  /* growing small block to large block */
++
++    heap_lock( heap, flags );
++
+     if (block_size > old_block_size)
+     {
+-        SUBHEAP *subheap = block_get_subheap( heap, block );
+-        struct entry *entry;
+-        struct block *next;
+-
+         if (!(next = next_block( subheap, block )) || !(block_get_flags( next ) & BLOCK_FLAG_FREE) ||
+-            block_size >= HEAP_MIN_LARGE_BLOCK_SIZE ||
+             block_size > old_block_size + block_get_size( next ) || !subheap_commit( heap, subheap, block, block_size ))
+         {
+-            if (flags & HEAP_REALLOC_IN_PLACE_ONLY) return STATUS_NO_MEMORY;
+-            if ((status = heap_allocate( heap, flags & ~HEAP_ZERO_MEMORY, block_size, size, ret ))) return status;
+-            valgrind_notify_alloc( *ret, size, 0 );
+-            memcpy( *ret, block + 1, old_size );
+-            if (flags & HEAP_ZERO_MEMORY) memset( (char *)*ret + old_size, 0, size - old_size );
+-            valgrind_notify_free( block + 1 );
+-            free_used_block( heap, flags, block );
+-            return STATUS_SUCCESS;
++            heap_unlock( heap, flags );
++            return STATUS_NO_MEMORY;
+         }
++    }
+ 
+-        /* The next block is free and large enough */
++    if ((next = next_block( subheap, block )) && (block_get_flags( next ) & BLOCK_FLAG_FREE))
++    {
++        /* merge with next block if it is free */
+         entry = (struct entry *)next;
+         list_remove( &entry->entry );
+         old_block_size += block_get_size( next );
+     }
+ 
+-    valgrind_notify_resize( block + 1, old_size, size );
++    valgrind_notify_resize( block + 1, *old_size, size );
+     block_set_flags( block, BLOCK_FLAG_USER_MASK & ~BLOCK_FLAG_USER_INFO, BLOCK_USER_FLAGS( flags ) );
+     shrink_used_block( heap, flags, block, old_block_size, block_size, size );
+ 
+-    initialize_block( block, old_size, size, flags );
++    initialize_block( block, *old_size, size, flags );
+     mark_block_tail( block, flags );
+ 
++    heap_unlock( heap, flags );
++
+     *ret = block + 1;
+     return STATUS_SUCCESS;
+ }
+@@ -1696,9 +1676,9 @@ static NTSTATUS heap_reallocate( struct heap *heap, ULONG flags, struct block *b
+  */
+ void *WINAPI RtlReAllocateHeap( HANDLE handle, ULONG flags, void *ptr, SIZE_T size )
+ {
++    SIZE_T block_size, old_size;
+     struct block *block;
+     struct heap *heap;
+-    SIZE_T block_size;
+     ULONG heap_flags;
+     void *ret = NULL;
+     NTSTATUS status;
+@@ -1711,11 +1691,19 @@ void *WINAPI RtlReAllocateHeap( HANDLE handle, ULONG flags, void *ptr, SIZE_T si
+         status = STATUS_NO_MEMORY;
+     else if (!(block = unsafe_block_from_ptr( heap, heap_flags, ptr )))
+         status = STATUS_INVALID_PARAMETER;
+-    else
++    else if ((status = heap_resize_block( heap, heap_flags, block, block_size, size,
++                                          &old_size, &ret )))
+     {
+-        heap_lock( heap, heap_flags );
+-        status = heap_reallocate( heap, heap_flags, block, block_size, size, &ret );
+-        heap_unlock( heap, heap_flags );
++        if (flags & HEAP_REALLOC_IN_PLACE_ONLY)
++            status = STATUS_NO_MEMORY;
++        else if (!(ret = RtlAllocateHeap( heap, flags, size )))
++            status = STATUS_NO_MEMORY;
++        else
++        {
++            memcpy( ret, ptr, min( size, old_size ) );
++            RtlFreeHeap( heap, flags, ptr );
++            status = STATUS_SUCCESS;
++        }
+     }
+ 
+     TRACE( "handle %p, flags %#lx, ptr %p, size %#Ix, return %p, status %#lx.\n", handle, flags, ptr, size, ret, status );
+

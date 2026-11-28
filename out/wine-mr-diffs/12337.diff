@@ -1,0 +1,44 @@
+# win32u: Signal all waiters when releasing a d3dkmt keyed mutex.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12337 state=closed
+# It's possible that the waiter we wake will terminate before acquiring the mutex otherwise.
+--- server/d3dkmt.c
++++ server/d3dkmt.c
+@@ -441,13 +441,7 @@ static void mutex_release( struct d3dkmt_mutex *mutex, bool abandon )
+     struct keyed_wait *wait;
+ 
+     LIST_FOR_EACH_ENTRY( wait, &mutex->waits, struct keyed_wait, entry )
+-    {
+-        if (abandon || wait->key == mutex->key_value)
+-        {
+-            signal_sync( wait->sync );
+-            if (!abandon) break;
+-        }
+-    }
++        if (abandon || wait->key == mutex->key_value) signal_sync( wait->sync );
+     if (abandon) mutex->abandoned = true;
+ 
+     mutex->owner = NULL;
+@@ -673,7 +667,7 @@ DECL_HANDLER(d3dkmt_object_open_name)
+ DECL_HANDLER(d3dkmt_mutex_acquire)
+ {
+     struct d3dkmt_mutex *mutex;
+-    struct object *sync;
++    struct object *wait;
+ 
+     if (!(mutex = d3dkmt_object_open( req->mutex, D3DKMT_MUTEX ))) return;
+ 
+@@ -685,10 +679,10 @@ DECL_HANDLER(d3dkmt_mutex_acquire)
+         mutex_grab( mutex );
+     }
+     else if ((reply->wait_handle = req->wait_handle)) set_error( STATUS_PENDING );
+-    else if ((sync = keyed_wait_grab( mutex, req->key_value )))
++    else if ((wait = keyed_wait_grab( mutex, req->key_value )))
+     {
+-        if ((reply->wait_handle = alloc_handle( current->process, sync, SYNCHRONIZE, 0 ))) set_error( STATUS_PENDING );
+-        release_object( sync );
++        if ((reply->wait_handle = alloc_handle( current->process, wait, SYNCHRONIZE, 0 ))) set_error( STATUS_PENDING );
++        release_object( wait );
+     }
+ 
+     release_object( mutex );
+

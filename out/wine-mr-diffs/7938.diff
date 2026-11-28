@@ -1,0 +1,538 @@
+# winemac: Use IOSurface to update native window layers instead of CGImage.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/7938 state=merged
+# This consolidates the two separate `CGImage`s (`colorImage` and `shapeImage`) previously used in `WineContentView` into a single `IOSurface` that also holds the window mask information in its alpha channel now.
+
+The alpha channel is now being updated in `macdrv_surface_flush`, whenever the shape changes (and stores that change for the next update, to also keep the front buffer in sync).
+
+This reduces the delay from setting a `CGImage` to a layer from 50ms to about 1.5ms in the `IOSurface` case (also accounting for `vImageSelectChannels_ARGB8888` operation).
+
+Based on a patch by @bshanks.
+
+I am already putting it out for feedback, but I will so some more testing to see how the performance impact of this is and do more exhaustive testing with shaped windows.
+
+Ideally the double buffer solution can be avoided as well... Also the `HBITMAP` for the windows is currently backed by a `CGDataProviderRef` and could also become an `IOSurface` I believe.
+--- dlls/winemac.drv/Makefile.in
++++ dlls/winemac.drv/Makefile.in
+@@ -4,10 +4,12 @@ IMPORTS   = uuid rpcrt4 user32 gdi32 win32u
+ DELAYIMPORTS = ole32 shell32 imm32
+ UNIX_LIBS    = \
+ 	-lwin32u \
++	-framework Accelerate \
+ 	-framework AppKit \
+ 	-framework Carbon \
+ 	-framework Foundation \
+ 	-framework IOKit \
++	-framework IOSurface \
+ 	-framework Metal \
+ 	-framework OpenGL \
+ 	-framework QuartzCore \
+
+--- dlls/winemac.drv/cocoa_window.m
++++ dlls/winemac.drv/cocoa_window.m
+@@ -22,6 +22,7 @@
+ #import "macdrv.h"
+ 
+ #define GL_SILENCE_DEPRECATION
++#import <IOSurface/IOSurfaceObjC.h>
+ #import <Metal/Metal.h>
+ #import <QuartzCore/QuartzCore.h>
+ #include <dlfcn.h>
+@@ -227,8 +228,8 @@ - (id) initWithFrame:(NSRect)frame device:(id<MTLDevice>)device;
+ @interface WineContentView : WineBaseView <NSTextInput, NSViewLayerContentScaleDelegate>
+ {
+     CGRect surfaceRect;
+-    CGImageRef colorImage;
+-    CGImageRef shapeImage;
++    IOSurface* _ioSurface;
++    BOOL _hasShape;
+ 
+     NSMutableArray* glContexts;
+     NSMutableArray* pendingGlContexts;
+@@ -368,8 +369,7 @@ - (void) dealloc
+         [glContexts release];
+         [pendingGlContexts release];
+         [_caLayerHosts release];
+-        CGImageRelease(colorImage);
+-        CGImageRelease(shapeImage);
++        [_ioSurface release];
+         [super dealloc];
+     }
+ 
+@@ -386,8 +386,6 @@ - (BOOL) wantsUpdateLayer
+     - (void) updateLayer
+     {
+         WineWindow* window = (WineWindow*)[self window];
+-        CGImageRef image, maskedImage;
+-        CGRect imageRect;
+         CALayer* layer = [self layer];
+ 
+         if ([window contentView] != self)
+@@ -396,32 +394,17 @@ - (void) updateLayer
+         if (window.closing)
+             return;
+ 
+-        imageRect = layer.bounds;
+-        imageRect.origin.x *= layer.contentsScale;
+-        imageRect.origin.y *= layer.contentsScale;
+-        imageRect.size.width *= layer.contentsScale;
+-        imageRect.size.height *= layer.contentsScale;
++        layer.position = surfaceRect.origin;
++        layer.contents = _ioSurface;
++        [window windowDidDrawContent];
+ 
+-        maskedImage = shapeImage ? CGImageCreateWithMask(colorImage, shapeImage)
+-                                 : CGImageRetain(colorImage);
+-        image = CGImageCreateWithImageInRect(maskedImage, imageRect);
+-        CGImageRelease(maskedImage);
+-
+-        if (image)
++        // If the window may be transparent, then we have to invalidate the
++        // shadow every time we draw.  Also, if this is the first time we've
++        // drawn since changing from transparent to opaque.
++        if (_hasShape || window.usePerPixelAlpha || window.shapeChangedSinceLastDraw)
+         {
+-            layer.position = surfaceRect.origin;
+-            layer.contents = (id)image;
+-            CFRelease(image);
+-            [window windowDidDrawContent];
+-
+-            // If the window may be transparent, then we have to invalidate the
+-            // shadow every time we draw.  Also, if this is the first time we've
+-            // drawn since changing from transparent to opaque.
+-            if (shapeImage || window.usePerPixelAlpha || window.shapeChangedSinceLastDraw)
+-            {
+-                window.shapeChangedSinceLastDraw = FALSE;
+-                [window invalidateShadow];
+-            }
++            window.shapeChangedSinceLastDraw = NO;
++            [window invalidateShadow];
+         }
+     }
+ 
+@@ -430,21 +413,21 @@ - (void) setSurfaceRect:(CGRect)rect
+         surfaceRect = rect;
+     }
+ 
+-    - (void) setColorImage:(CGImageRef)image
++    - (void) setIOSurface:(IOSurface*)surface
+     {
+-        CGImageRelease(colorImage);
+-        colorImage = CGImageRetain(image);
++        [surface retain];
++        [_ioSurface release];
++        _ioSurface = surface;
+     }
+ 
+-    - (void) setShapeImage:(CGImageRef)image
++    - (void) setHasShape:(BOOL)has_shape
+     {
+-        CGImageRelease(shapeImage);
+-        shapeImage = CGImageRetain(image);
++        _hasShape = has_shape;
+     }
+ 
+-    - (BOOL) hasShapeImage
++    - (BOOL) hasShape
+     {
+-        return !!shapeImage;
++        return _hasShape;
+     }
+ 
+     - (void) viewWillDraw
+@@ -1908,7 +1891,7 @@ - (void) setDisabled:(BOOL)newValue
+     - (BOOL) needsTransparency
+     {
+         WineContentView *view = self.contentView;
+-        return self.contentView.layer.mask || [view hasShapeImage] || self.usePerPixelAlpha ||
++        return self.contentView.layer.mask || [view hasShape] || self.usePerPixelAlpha ||
+                 (gl_surface_mode == GL_SURFACE_BEHIND && [view hasGLDescendant]);
+     }
+ 
+@@ -3260,47 +3243,45 @@ void macdrv_set_cocoa_parent_window(WineWindow *window, WineWindow *parent)
+ 
+ 
+ /***********************************************************************
+- *              macdrv_window_set_color_image
++ *              macdrv_window_set_io_surface
+  *
+  * Push a window surface color pixel update in a specified rect (in non-client
+  * area coordinates).
+  */
+-void macdrv_window_set_color_image(WineWindow *window, CGImageRef image, CGRect rect, CGRect dirty)
++void macdrv_window_set_io_surface(WineWindow *window, IOSurfaceRef s, CGRect rect, CGRect dirty)
+ {
+ @autoreleasepool
+ {
+-    CGImageRetain(image);
++    IOSurface* surface = (IOSurface*)s;
++
++    [surface retain];
+ 
+     OnMainThreadAsync(^{
+         WineContentView *view = [window contentView];
+ 
+-        [view setColorImage:image];
++        [view setIOSurface:surface];
+         [view setSurfaceRect:cgrect_mac_from_win(rect)];
+         [view setNeedsDisplayInRect:NSRectFromCGRect(cgrect_mac_from_win(dirty))];
+ 
+-        CGImageRelease(image);
++        [surface release];
+     });
+ }
+ }
+ 
+ 
+ /***********************************************************************
+- *              macdrv_window_set_shape_image
++ *              macdrv_window_shape_changed
+  */
+-void macdrv_window_set_shape_image(WineWindow *window, CGImageRef image)
++void macdrv_window_shape_changed(WineWindow *window, bool has_shape)
+ {
+ @autoreleasepool
+ {
+-    CGImageRetain(image);
+-
+     OnMainThreadAsync(^{
+         WineContentView *view = [window contentView];
+ 
+-        [view setShapeImage:image];
+-        [view setNeedsDisplay:true];
++        [view setHasShape:has_shape];
++        [view setNeedsDisplay:YES];
+         [window checkTransparency];
+-
+-        CGImageRelease(image);
+     });
+ }
+ }
+@@ -3853,7 +3834,7 @@ void macdrv_set_view_backing_size(WineContentView *view, const int backing_size[
+  *              macdrv_window_background_color
+  *
+  * Returns the standard Mac window background color as a 32-bit value of
+- * the form 0x00rrggbb.
++ * the form 0xaarrggbb.
+  */
+ uint32_t macdrv_window_background_color(void)
+ {
+@@ -3865,14 +3846,14 @@ uint32_t macdrv_window_background_color(void)
+     // of it is to draw with it.
+     dispatch_once(&once, ^{
+         OnMainThread(^{
+-            unsigned char rgbx[4];
+-            unsigned char *planes = rgbx;
++            unsigned char rgba[4];
++            unsigned char *planes = rgba;
+             NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:&planes
+                                                                                pixelsWide:1
+                                                                                pixelsHigh:1
+                                                                             bitsPerSample:8
+-                                                                          samplesPerPixel:3
+-                                                                                 hasAlpha:NO
++                                                                          samplesPerPixel:4
++                                                                                 hasAlpha:YES
+                                                                                  isPlanar:NO
+                                                                            colorSpaceName:NSCalibratedRGBColorSpace
+                                                                              bitmapFormat:0
+@@ -3884,7 +3865,7 @@ uint32_t macdrv_window_background_color(void)
+             NSRectFill(NSMakeRect(0, 0, 1, 1));
+             [NSGraphicsContext restoreGraphicsState];
+             [bitmap release];
+-            result = rgbx[0] << 16 | rgbx[1] << 8 | rgbx[2];
++            result = rgba[0] << 16 | rgba[1] << 8 | rgba[2] | rgba[3] << 24;
+         });
+     });
+ 
+
+--- dlls/winemac.drv/macdrv_cocoa.h
++++ dlls/winemac.drv/macdrv_cocoa.h
+@@ -34,8 +34,10 @@
+ #define LoadResource MacLoadResource
+ #define Polygon MacPolygon
+ 
++#include <Accelerate/Accelerate.h>
+ #include <ApplicationServices/ApplicationServices.h>
+ #include <Carbon/Carbon.h>
++#include <IOSurface/IOSurface.h>
+ 
+ #undef GetCurrentProcess
+ #undef GetCurrentThread
+@@ -483,8 +485,8 @@ extern void macdrv_order_cocoa_window(WineWindow *window, WineWindow *prev,
+ extern void macdrv_set_cocoa_window_frame(WineWindow *window, const CGRect* new_frame);
+ extern void macdrv_get_cocoa_window_frame(WineWindow *window, CGRect* out_frame);
+ extern void macdrv_set_cocoa_parent_window(WineWindow *window, WineWindow *parent);
+-extern void macdrv_window_set_color_image(WineWindow *window, CGImageRef image, CGRect rect, CGRect dirty);
+-extern void macdrv_window_set_shape_image(WineWindow *window, CGImageRef image);
++extern void macdrv_window_set_io_surface(WineWindow *window, IOSurfaceRef s, CGRect rect, CGRect dirty);
++extern void macdrv_window_shape_changed(WineWindow *window, bool has_shape);
+ extern void macdrv_set_window_shape(WineWindow *window, const CGRect *rects, int count);
+ extern void macdrv_set_window_alpha(WineWindow *window, CGFloat alpha);
+ extern void macdrv_window_use_per_pixel_alpha(WineWindow *window, bool use_per_pixel_alpha);
+
+--- dlls/winemac.drv/surface.c
++++ dlls/winemac.drv/surface.c
+@@ -45,24 +45,49 @@ struct macdrv_window_surface
+ {
+     struct window_surface   header;
+     WineWindow             *window;
+-    CGDataProviderRef       provider;
++    IOSurfaceRef            front_buffer;
++    IOSurfaceRef            back_buffer;
++    vImage_Buffer           shape_mask;
+ };
+ 
+ static struct macdrv_window_surface *get_mac_surface(struct window_surface *surface);
+ 
+-static CGDataProviderRef data_provider_create(size_t size, void **bits)
++static IOSurfaceRef create_io_surface(int width, int height)
+ {
+-    CGDataProviderRef provider;
+-    CFMutableDataRef data;
+-
+-    if (!(data = CFDataCreateMutable(kCFAllocatorDefault, size))) return NULL;
+-    CFDataSetLength(data, size);
+-
+-    if ((provider = CGDataProviderCreateWithCFData(data)))
+-        *bits = CFDataGetMutableBytePtr(data);
+-    CFRelease(data);
++    CFStringRef keys[] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfacePixelFormat };
++    CFNumberRef values[4];
++    CFDictionaryRef properties;
++    IOSurfaceRef surface;
++    uint32_t surface_width = width, surface_height = height;
++    uint32_t bytes_per_element = 4, pixel_format = 'BGRA';
++
++    values[0] = CFNumberCreate(NULL, kCFNumberSInt32Type, &surface_width);
++    values[1] = CFNumberCreate(NULL, kCFNumberSInt32Type, &surface_height);
++    values[2] = CFNumberCreate(NULL, kCFNumberSInt32Type, &bytes_per_element);
++    values[3] = CFNumberCreate(NULL, kCFNumberSInt32Type, &pixel_format);
++    properties = CFDictionaryCreate(NULL, (const void **)keys, (const void **)values, ARRAY_SIZE(keys),
++                                    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++    surface = IOSurfaceCreate(properties);
++    CFRelease(properties);
++    CFRelease(values[0]);
++    CFRelease(values[1]);
++    CFRelease(values[2]);
++    CFRelease(values[3]);
++    return surface;
++}
+ 
+-    return provider;
++static void fill_io_surface(IOSurfaceRef surface, DWORD color)
++{
++    BYTE *base;
++    size_t row_bytes, y, height;
++
++    IOSurfaceLock(surface, 0, NULL);
++    base = IOSurfaceGetBaseAddress(surface);
++    row_bytes = IOSurfaceGetBytesPerRow(surface);
++    height = IOSurfaceGetHeight(surface);
++    for (y = 0; y < height; y++)
++        memset_pattern4(base + y * row_bytes, &color, IOSurfaceGetWidth(surface) * 4);
++    IOSurfaceUnlock(surface, 0, NULL);
+ }
+ 
+ /***********************************************************************
+@@ -72,6 +97,24 @@ static void macdrv_surface_set_clip(struct window_surface *window_surface, const
+ {
+ }
+ 
++static void update_shape(vImage_Buffer *shape_mask, const BITMAPINFO *shape_info,
++                         const void *shape_bits)
++{
++    const BYTE *src = shape_bits;
++    UINT width = shape_mask->width, height = shape_mask->height;
++    UINT src_row_bytes = shape_info->bmiHeader.biSizeImage / abs(shape_info->bmiHeader.biHeight);
++    UINT x, y;
++
++    for (y = 0; y < height; y++)
++    {
++        const BYTE *src_row = src + y * src_row_bytes;
++        DWORD *dst_row = (DWORD *)((BYTE *)shape_mask->data + y * shape_mask->rowBytes);
++
++        for (x = 0; x < width; x++)
++            dst_row[x] = ((src_row[x / 8] >> (7 - x % 8)) & 1) ? 0xffffffff : 0;
++    }
++}
++
+ /***********************************************************************
+  *              macdrv_surface_flush
+  */
+@@ -80,44 +123,55 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
+                                  const BITMAPINFO *shape_info, const void *shape_bits)
+ {
+     struct macdrv_window_surface *surface = get_mac_surface(window_surface);
+-    CGImageAlphaInfo alpha_info = (window_surface->alpha_mask ? kCGImageAlphaPremultipliedFirst : kCGImageAlphaNoneSkipFirst);
+-    CGColorSpaceRef colorspace;
+-    CGImageRef image;
++    IOSurfaceRef io_surface = surface->back_buffer;
++    bool use_alpha = !!window_surface->alpha_mask;
+     struct macdrv_win_data *data;
+-
+-    colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+-    image = CGImageCreate(color_info->bmiHeader.biWidth, abs(color_info->bmiHeader.biHeight), 8, 32,
+-                          color_info->bmiHeader.biSizeImage / abs(color_info->bmiHeader.biHeight), colorspace,
+-                          alpha_info | kCGBitmapByteOrder32Little, surface->provider, NULL, retina_on, kCGRenderingIntentDefault);
+-    CGColorSpaceRelease(colorspace);
+-
+-    macdrv_window_set_color_image(surface->window, image, cgrect_from_rect(*rect), cgrect_from_rect(*dirty));
+-    CGImageRelease(image);
+-
+-    if (shape_changed)
++    vImage_Buffer src = {
++        .data = (void *)color_bits,
++        .height = IOSurfaceGetHeight(io_surface),
++        .width = IOSurfaceGetWidth(io_surface),
++        .rowBytes = color_info->bmiHeader.biSizeImage / abs(color_info->bmiHeader.biHeight),
++    };
++    vImage_Buffer dst = {
++        .data = IOSurfaceGetBaseAddress(io_surface),
++        .height = src.height,
++        .width = src.width,
++        .rowBytes = IOSurfaceGetBytesPerRow(io_surface),
++    };
++
++    if (shape_changed && shape_bits) update_shape(&surface->shape_mask, shape_info, shape_bits);
++
++    IOSurfaceLock(io_surface, 0, NULL);
++    if (use_alpha)
+     {
+-        if (!shape_bits)
+-            macdrv_window_set_shape_image(surface->window, NULL);
+-        else
++        vImageClipToAlpha_BGRA8888(&src, &dst, kvImageNoFlags);
++        if (shape_bits &&
++            (window_surface->shape_region || window_surface->color_key != CLR_INVALID))
+         {
+-            const BYTE *src = shape_bits;
+-            CGDataProviderRef provider;
+-            CGImageRef image;
+-            BYTE *dst;
+-            UINT i;
+-
+-            if (!(provider = data_provider_create(shape_info->bmiHeader.biSizeImage, (void **)&dst))) return TRUE;
+-            for (i = 0; i < shape_info->bmiHeader.biSizeImage; i++) dst[i] = ~src[i]; /* CGImage mask bits are inverted */
+-
+-            image = CGImageMaskCreate(shape_info->bmiHeader.biWidth, abs(shape_info->bmiHeader.biHeight), 1, 1,
+-                                      shape_info->bmiHeader.biSizeImage / abs(shape_info->bmiHeader.biHeight),
+-                                      provider, NULL, retina_on);
+-            CGDataProviderRelease(provider);
+-
+-            macdrv_window_set_shape_image(surface->window, image);
+-            CGImageRelease(image);
++            vImage_Buffer bytes = dst, mask = surface->shape_mask;
++
++            /* The mask repeats 0 or 255 across BGRA, so bytewise clipping clears whole pixels. */
++            bytes.width *= 4;
++            mask.width *= 4;
++            vImageClipToAlpha_Planar8(&bytes, &mask, &bytes, kvImageNoFlags);
+         }
+     }
++    else if (!shape_bits)
++    {
++        vImageOverwriteChannelsWithScalar_ARGB8888(255, &src, &dst, 0x1, kvImageNoFlags);
++    }
++    else
++    {
++        vImageSelectChannels_ARGB8888(&surface->shape_mask, &src, &dst, 0x1, kvImageNoFlags);
++        vImageClipToAlpha_BGRA8888(&dst, &dst, kvImageNoFlags);
++    }
++    IOSurfaceUnlock(io_surface, 0, NULL);
++
++    surface->back_buffer = surface->front_buffer;
++    surface->front_buffer = io_surface;
++    macdrv_window_set_io_surface(surface->window, io_surface, cgrect_from_rect(*rect), cgrect_from_rect(*dirty));
++
++    if (shape_changed) macdrv_window_shape_changed(surface->window, !!shape_bits);
+ 
+     /* The window may have been previously drawn with client_surface, for example, when the window
+      * had been a target for a D3D swapchain. Hide the client_view so that it doesn't occlude the
+@@ -143,7 +197,9 @@ static void macdrv_surface_destroy(struct window_surface *window_surface)
+     struct macdrv_window_surface *surface = get_mac_surface(window_surface);
+ 
+     TRACE("freeing %p\n", surface);
+-    CGDataProviderRelease(surface->provider);
++    free(surface->shape_mask.data);
++    if (surface->back_buffer) CFRelease(surface->back_buffer);
++    if (surface->front_buffer) CFRelease(surface->front_buffer);
+ }
+ 
+ static const struct window_surface_funcs macdrv_surface_funcs =
+@@ -168,13 +224,11 @@ static struct window_surface *create_surface(HWND hwnd, WineWindow *window, cons
+     struct macdrv_window_surface *surface;
+     int width = rect->right - rect->left, height = rect->bottom - rect->top;
+     DWORD window_background;
+-    D3DKMT_CREATEDCFROMMEMORY desc = {.Format = D3DDDIFMT_A8R8G8B8};
+     char buffer[FIELD_OFFSET(BITMAPINFO, bmiColors[256])];
+     BITMAPINFO *info = (BITMAPINFO *)buffer;
+     struct window_surface *window_surface;
+-    CGDataProviderRef provider;
+-    HBITMAP bitmap = 0;
+-    UINT status;
++    IOSurfaceRef io_surface1 = NULL, io_surface2 = NULL;
++    HBITMAP bitmap;
+     void *bits;
+ 
+     memset(info, 0, sizeof(*info));
+@@ -186,35 +240,41 @@ static struct window_surface *create_surface(HWND hwnd, WineWindow *window, cons
+     info->bmiHeader.biSizeImage   = get_dib_image_size(info);
+     info->bmiHeader.biCompression = BI_RGB;
+ 
+-    if (!(provider = data_provider_create(info->bmiHeader.biSizeImage, &bits))) return NULL;
++    if (!(bitmap = NtGdiCreateDIBSection(0, NULL, 0, info, DIB_RGB_COLORS, 0, 0, 0, &bits)))
++        return NULL;
++
+     window_background = macdrv_window_background_color();
+-    memset_pattern4(bits, &window_background, info->bmiHeader.biSizeImage);
+-
+-    /* wrap the data in a HBITMAP so we can write to the surface pixels directly */
+-    desc.Width = info->bmiHeader.biWidth;
+-    desc.Height = abs(info->bmiHeader.biHeight);
+-    desc.Pitch = info->bmiHeader.biSizeImage / abs(info->bmiHeader.biHeight);
+-    desc.pMemory = bits;
+-    desc.hDeviceDc = NtUserGetDCEx(hwnd, 0, DCX_CACHE | DCX_WINDOW);
+-    if ((status = NtGdiDdDDICreateDCFromMemory(&desc)))
+-        ERR("Failed to create HBITMAP, status %#x\n", status);
+-    else
++
++    if (!(io_surface1 = create_io_surface(width, height)) ||
++        !(io_surface2 = create_io_surface(width, height)))
+     {
+-        bitmap = desc.hBitmap;
+-        NtGdiDeleteObjectApp(desc.hDc);
++        if (io_surface1) CFRelease(io_surface1);
++        NtGdiDeleteObjectApp(bitmap);
++        return NULL;
+     }
+-    if (desc.hDeviceDc) NtUserReleaseDC(hwnd, desc.hDeviceDc);
++
++    fill_io_surface(io_surface1, window_background);
++    fill_io_surface(io_surface2, window_background);
+ 
+     if (!(window_surface = window_surface_create(&macdrv_surface_funcs, hwnd, rect, info, bitmap)))
+     {
+-        if (bitmap) NtGdiDeleteObjectApp(bitmap);
+-        CGDataProviderRelease(provider);
++        NtGdiDeleteObjectApp(bitmap);
++        CFRelease(io_surface1);
++        CFRelease(io_surface2);
+     }
+     else
+     {
+         surface = get_mac_surface(window_surface);
+         surface->window = window;
+-        surface->provider = provider;
++        surface->front_buffer = io_surface1;
++        surface->back_buffer = io_surface2;
++        if (vImageBuffer_Init(&surface->shape_mask, height, width, 32, kvImageNoFlags))
++        {
++            window_surface_release(window_surface);
++            return NULL;
++        }
++        window_background &= 0x00ffffff;
++        memset_pattern4(bits, &window_background, info->bmiHeader.biSizeImage);
+     }
+ 
+     return window_surface;
+

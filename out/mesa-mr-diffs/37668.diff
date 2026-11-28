@@ -1,0 +1,471 @@
+# asahi: support SVM and cl_ext_buffer_device_address
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/37668 state=opened
+# 
+--- docs/features.txt
++++ docs/features.txt
+@@ -792,7 +792,7 @@ Rusticl Optional Core Features:
+ 
+ Rusticl Optional OpenCL 2.x Features:
+   Shared virtual memory                                 in progress
+-  - Coarse Grain Buffer                                 DONE (iris, radeonsi, llvmpipe)
++  - Coarse Grain Buffer                                 DONE (asahi, iris, radeonsi, llvmpipe)
+   - Fine Grain Buffer                                   in progress
+   - System                                              DONE (nvc0, llvmpipe)
+   - clEnqueueSVMMigrateMem                              DONE
+@@ -881,7 +881,7 @@ Rusticl extensions:
+   cl_khr_terminate_context                              not started
+   cl_khr_throttle_hints                                 not started
+   cl_khr_work_group_uniform_arithmetic                  not started
+-  cl_ext_buffer_device_address                          DONE (iris, llvmpipe, radeonsi, zink)
++  cl_ext_buffer_device_address                          DONE (asahi, iris, llvmpipe, radeonsi, zink)
+   cl_ext_cxx_for_opencl                                 not started
+   cl_ext_device_fission                                 not started
+   cl_ext_float_atomics                                  not started
+
+--- src/asahi/lib/agx_bo.h
++++ src/asahi/lib/agx_bo.h
+@@ -37,6 +37,10 @@ enum agx_bo_flags {
+    /* BO is read-only from the GPU side
+     */
+    AGX_BO_READONLY = 1 << 5,
++
++   /* BO's VMA is externally managed
++    */
++   AGX_BO_NO_VMA = 1 << 6,
+ };
+ 
+ enum agx_va_flags {
+
+--- src/asahi/lib/agx_device.c
++++ src/asahi/lib/agx_device.c
+@@ -205,23 +205,25 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
+    bo->handle = bo->uapi_handle = handle;
+    bo->prime_fd = -1;
+ 
+-   enum agx_va_flags va_flags = flags & AGX_BO_LOW_VA ? AGX_VA_USC : 0;
+-   bo->va = agx_va_alloc(dev, size, bo->align, va_flags, 0);
+-   if (!bo->va) {
+-      fprintf(stderr, "Failed to allocate BO VMA\n");
+-      agx_bo_free(dev, bo);
+-      return NULL;
+-   }
++   if (!(flags & AGX_BO_NO_VMA)) {
++      enum agx_va_flags va_flags = flags & AGX_BO_LOW_VA ? AGX_VA_USC : 0;
++      bo->va = agx_va_alloc(dev, size, bo->align, va_flags, 0);
++      if (!bo->va) {
++         fprintf(stderr, "Failed to allocate BO VMA\n");
++         agx_bo_free(dev, bo);
++         return NULL;
++      }
+ 
+-   uint32_t bind = DRM_ASAHI_BIND_READ;
+-   if (!(flags & AGX_BO_READONLY)) {
+-      bind |= DRM_ASAHI_BIND_WRITE;
+-   }
++      uint32_t bind = DRM_ASAHI_BIND_READ;
++      if (!(flags & AGX_BO_READONLY)) {
++         bind |= DRM_ASAHI_BIND_WRITE;
++      }
+ 
+-   ret = agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0, bind);
+-   if (ret) {
+-      agx_bo_free(dev, bo);
+-      return NULL;
++      ret = agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0, bind);
++      if (ret) {
++         agx_bo_free(dev, bo);
++         return NULL;
++      }
+    }
+ 
+    return bo;
+@@ -592,10 +594,10 @@ agx_open_device(void *memctx, struct agx_device *dev)
+ 
+    uint64_t shader_size = 0x100000000ull;
+    // Put the user heap after the USC heap
+-   uint64_t user_start = dev->shader_base + shader_size;
++   dev->main_heap_start = dev->shader_base + shader_size;
+ 
+    assert(dev->shader_base >= dev->params.vm_start);
+-   assert(user_start < dev->params.vm_end);
++   assert(dev->main_heap_start < dev->params.vm_end);
+ 
+    dev->agxdecode = agxdecode_new_context(dev->shader_base);
+ 
+@@ -619,7 +621,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
+       .kernel_end = dev->params.vm_end,
+    };
+ 
+-   uint64_t user_size = vm_create.kernel_start - user_start;
++   uint64_t user_size = vm_create.kernel_start - dev->main_heap_start;
+ 
+    int ret = asahi_simple_ioctl(dev, DRM_IOCTL_ASAHI_VM_CREATE, &vm_create);
+    if (ret) {
+@@ -629,24 +631,25 @@ agx_open_device(void *memctx, struct agx_device *dev)
+    }
+ 
+    /* Round the user VA window to powers-of-two... */
+-   user_start = util_next_power_of_two64(user_start);
++   dev->main_heap_start = util_next_power_of_two64(dev->main_heap_start);
+    user_size = util_next_power_of_two64(user_size + 1) >> 1;
+ 
+    /* ...so when we cut user size in half to emulate sparse buffers... */
+    user_size /= 2;
+ 
+    /* ...or maybe in quarters if necessary to disambiguate */
+-   if (user_size == user_start) {
++   if (user_size == dev->main_heap_start) {
+       user_size /= 2;
+    }
+ 
+    /* ...we can distinguish the top/bottom half by an address bit */
+    dev->sparse_ro_offset = user_size;
+-   assert((user_start & dev->sparse_ro_offset) == 0);
+-   assert(((user_start + (user_size - 1)) & dev->sparse_ro_offset) == 0);
++   assert((dev->main_heap_start & dev->sparse_ro_offset) == 0);
++   assert(((dev->main_heap_start + (user_size - 1)) & dev->sparse_ro_offset) == 0);
+ 
+    simple_mtx_init(&dev->vma_lock, mtx_plain);
+-   util_vma_heap_init(&dev->main_heap, user_start, user_size);
++   util_vma_heap_init(&dev->main_heap, dev->main_heap_start, user_size);
++   dev->main_heap_size = user_size;
+    util_vma_heap_init(&dev->usc_heap, dev->shader_base, shader_size);
+ 
+    dev->vm_id = vm_create.vm_id;
+
+--- src/asahi/lib/agx_device.h
++++ src/asahi/lib/agx_device.h
+@@ -118,6 +118,8 @@ struct agx_device {
+    /* VMA heaps */
+    simple_mtx_t vma_lock;
+    uint64_t shader_base;
++   uint64_t main_heap_start;
++   uint64_t main_heap_size;
+    struct util_vma_heap main_heap;
+    struct util_vma_heap usc_heap;
+    uint64_t guard_size;
+
+--- src/gallium/auxiliary/util/u_screen.c
++++ src/gallium/auxiliary/util/u_screen.c
+@@ -187,6 +187,7 @@ u_init_pipe_screen_caps(struct pipe_screen *pscreen, int accel)
+ 
+    caps->min_vma =
+    caps->max_vma = 0;
++   caps->vma_alignment = 0x1000;
+ }
+ 
+ uint64_t u_default_get_timestamp(UNUSED struct pipe_screen *screen)
+
+--- src/gallium/drivers/asahi/agx_pipe.c
++++ src/gallium/drivers/asahi/agx_pipe.c
+@@ -577,6 +577,9 @@ agx_resource_create_with_modifiers(struct pipe_screen *screen,
+    if (bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SHARED))
+       create_flags |= AGX_BO_SHAREABLE;
+ 
++   if (nresource->base.flags & PIPE_RESOURCE_FLAG_FRONTEND_VM)
++      create_flags |= AGX_BO_NO_VMA;
++
+    nresource->bo =
+       agx_bo_create(dev, nresource->layout.size_B, 0, create_flags, label);
+ 
+@@ -1133,6 +1136,7 @@ transition_resource(struct pipe_context *pctx, struct agx_resource *rsrc,
+    struct agx_resource *new_res =
+       agx_resource(pctx->screen->resource_create(pctx->screen, templ));
+ 
++   assert(!(rsrc->base.flags & PIPE_RESOURCE_FLAG_FIXED_ADDRESS));
+    assert(new_res);
+    assert(!(rsrc->base.bind & PIPE_BIND_SHARED) && "cannot swap BOs if shared");
+ 
+@@ -1966,6 +1970,7 @@ agx_init_compute_caps(struct pipe_screen *pscreen)
+ static void
+ agx_init_screen_caps(struct pipe_screen *pscreen)
+ {
++   struct agx_device *dev = agx_device(pscreen);
+    struct pipe_caps *caps = (struct pipe_caps *)&pscreen->caps;
+ 
+    u_init_pipe_screen_caps(pscreen, 1);
+@@ -2002,7 +2007,7 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
+    caps->texture_barrier = true;
+ 
+    /* Timer resolution is the length of a single tick in nanos */
+-   caps->timer_resolution = agx_gpu_timestamp_to_ns(agx_device(pscreen), 1);
++   caps->timer_resolution = agx_gpu_timestamp_to_ns(dev, 1);
+ 
+    caps->shader_subgroup_size = 32;
+    caps->shader_subgroup_supported_stages = BITFIELD_MASK(MESA_SHADER_STAGES);
+@@ -2171,6 +2176,9 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
+    caps->max_texture_anisotropy = 16.0;
+ 
+    caps->max_texture_lod_bias = 16.0; /* arbitrary */
++
++   caps->min_vma = dev->main_heap_start;
++   caps->max_vma = dev->main_heap_start + dev->main_heap_size - 1;
+ }
+ 
+ static bool
+@@ -2380,6 +2388,74 @@ agx_get_cl_cts_version(struct pipe_screen *pscreen)
+    return NULL;
+ }
+ 
++static struct pipe_vm_allocation *
++agx_alloc_vm(struct pipe_screen *pscreen, uint64_t start, uint64_t size)
++{
++   struct agx_device *dev = agx_device(pscreen);
++   struct pipe_vm_allocation *res = CALLOC_STRUCT(pipe_vm_allocation);
++   if (!res)
++      return NULL;
++
++   simple_mtx_lock(&dev->vma_lock);
++   bool err = util_vma_heap_alloc_addr(&dev->main_heap, start, size);
++   simple_mtx_unlock(&dev->vma_lock);
++   if (!err) {
++      FREE(res);
++      return NULL;
++   }
++
++   res->start = start;
++   res->size = size;
++
++   return res;
++}
++
++static void
++agx_free_vm(struct pipe_screen *pscreen, struct pipe_vm_allocation *alloc)
++{
++   struct agx_device *dev = agx_device(pscreen);
++   simple_mtx_lock(&dev->vma_lock);
++   util_vma_heap_free(&dev->main_heap, alloc->start, alloc->size);
++   simple_mtx_unlock(&dev->vma_lock);
++   FREE(alloc);
++}
++
++static bool
++agx_resource_assign_vma(struct pipe_screen *pscreen,
++                        struct pipe_resource *presource,
++                        uint64_t address)
++{
++   struct agx_resource *res = agx_resource(presource);
++   struct agx_device *dev = agx_device(pscreen);
++
++   if (res->bo->va) {
++      if (agx_bo_bind(dev, NULL, res->bo->va->addr, res->bo->va->size_B, 0, DRM_ASAHI_BIND_UNBIND))
++         return false;
++      FREE(res->bo->va);
++   }
++
++   if (address) {
++      res->bo->va = CALLOC_STRUCT(agx_va);
++      res->bo->va->addr = address;
++      res->bo->va->size_B = res->bo->size;
++      res->bo->va->flags = AGX_VA_FIXED;
++      if (agx_bo_bind(dev, res->bo, res->bo->va->addr, res->bo->va->size_B, 0, DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE))
++         return false;
++   } else {
++      res->bo->va = NULL;
++   }
++   return true;
++}
++
++static uint64_t
++agx_resource_get_address(struct pipe_screen *screen,
++                         struct pipe_resource *resource)
++{
++   assert(resource->flags & PIPE_RESOURCE_FLAG_FIXED_ADDRESS);
++   struct agx_resource *res = agx_resource(resource);
++   return res->bo->va->addr;
++}
++
+ struct pipe_screen *
+ agx_screen_create(int fd, struct renderonly *ro,
+                   const struct pipe_screen_config *config)
+@@ -2441,6 +2517,10 @@ agx_screen_create(int fd, struct renderonly *ro,
+    screen->fence_get_fd = agx_fence_get_fd;
+    screen->get_disk_shader_cache = agx_get_disk_shader_cache;
+    screen->get_cl_cts_version = agx_get_cl_cts_version;
++   screen->alloc_vm = agx_alloc_vm;
++   screen->free_vm = agx_free_vm;
++   screen->resource_assign_vma = agx_resource_assign_vma;
++   screen->resource_get_address = agx_resource_get_address;
+ 
+    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
+       screen->nir_options[i] = &agx_nir_options;
+
+--- src/gallium/drivers/asahi/agx_state.c
++++ src/gallium/drivers/asahi/agx_state.c
+@@ -5444,6 +5444,12 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
+       }
+    }
+ 
++   for (uint32_t i = 0; i < info->num_globals; i++) {
++      struct agx_resource *buffer = agx_resource(info->globals[i]);
++      agx_batch_writes(batch, buffer, 0);
++      batch->incoherent_writes = true;
++   }
++
+    agx_launch(batch, grid, wg, cs, NULL, MESA_SHADER_COMPUTE,
+               info->variable_shared_mem);
+ 
+
+--- src/gallium/frontends/rusticl/core/context.rs
++++ src/gallium/frontends/rusticl/core/context.rs
+@@ -294,7 +294,14 @@ impl Context {
+         mut alignment: NonZeroU64,
+     ) -> CLResult<*mut c_void> {
+         // TODO: choose better alignment in regards to huge pages
+-        alignment = cmp::max(alignment, NonZeroU64::new(0x1000).unwrap());
++        alignment = cmp::max(
++            alignment,
++            Platform::get()
++                .vm
++                .as_ref()
++                .map(|vm| vm.vm_alignment)
++                .unwrap_or(NonZeroU64::new(Platform::get().page_size).unwrap()),
++        );
+ 
+         // clSVMAlloc will fail if alignment is not a power of two.
+         // `from_size_align()` verifies this condition is met.
+
+--- src/gallium/frontends/rusticl/core/device.rs
++++ src/gallium/frontends/rusticl/core/device.rs
+@@ -1206,6 +1206,10 @@ impl DeviceBase {
+         Some((NonZeroU64::new(min)?, NonZeroU64::new(max)?))
+     }
+ 
++    pub fn vm_alignment(&self) -> u32 {
++        self.screen.caps().vma_alignment
++    }
++
+     pub fn unified_memory(&self) -> bool {
+         self.screen.caps().uma
+     }
+
+--- src/gallium/frontends/rusticl/core/platform.rs
++++ src/gallium/frontends/rusticl/core/platform.rs
+@@ -28,6 +28,7 @@ pub const MAX_PIXEL_SIZE_BYTES: u64 = 4 * 4;
+ 
+ pub struct PlatformVM<'a> {
+     vm: Mutex<VM>,
++    pub vm_alignment: NonZeroU64,
+     // we make use of the drop to automatically free the reserved VM
+     _dev_allocs: Vec<ScreenVMAllocation<'a>>,
+ }
+@@ -49,6 +50,7 @@ pub struct Platform {
+     pub extensions: Vec<cl_name_version>,
+     // lifetime has to match the one of devs
+     pub vm: Option<PlatformVM<'static>>,
++    pub page_size: u64,
+ }
+ 
+ pub enum PerfDebugLevel {
+@@ -86,6 +88,7 @@ static mut PLATFORM: Platform = Platform {
+     extension_string: String::new(),
+     extensions: Vec::new(),
+     vm: None,
++    page_size: 0,
+ };
+ static mut PLATFORM_DBG: PlatformDebug = PlatformDebug {
+     allow_invalid_spirv: false,
+@@ -177,7 +180,7 @@ impl Platform {
+         unsafe { &*addr_of!(PLATFORM_FEATURES) }
+     }
+ 
+-    fn alloc_vm(devs: &[Device]) -> Option<PlatformVM<'_>> {
++    fn alloc_vm(devs: &[Device], page_size: u64) -> Option<PlatformVM<'_>> {
+         // We support buffer SVM only on 64 bit platforms
+         if cfg!(not(target_pointer_width = "64")) {
+             return None;
+@@ -186,24 +189,38 @@ impl Platform {
+         // No need to check system SVM devices
+         let devs = devs.iter().filter(|dev| !dev.system_svm_supported());
+ 
+-        let (start, end) = devs.clone().filter_map(|dev| dev.vm_alloc_range()).reduce(
+-            |(min_a, max_a), (min_b, max_b)| (cmp::max(min_a, min_b), cmp::min(max_a, max_b)),
+-        )?;
++        let (start, end, alignment) = devs
++            .clone()
++            .filter_map(|dev| {
++                let (min, max) = dev.vm_alloc_range()?;
++                let alignment = dev.vm_alignment();
++                Some((min, max, alignment))
++            })
++            .reduce(|(min_a, max_a, alignment_a), (min_b, max_b, alignment_b)| {
++                (
++                    cmp::max(min_a, min_b),
++                    cmp::min(max_a, max_b),
++                    cmp::max(alignment_a, alignment_b),
++                )
++            })?;
+ 
+         // Allocate 1/8 of the available VM. No specific reason for this limit. Might have to bump
+         // this later, but it's probably fine as there is plenty of VM available.
+-        let size = NonZeroU64::new((end.get() / 8).next_power_of_two())?;
+-        if start > size {
++        let size =
++            NonZeroU64::new(((end.get() - start.get()) / 8).next_multiple_of(alignment.into()))?;
++        if start.saturating_add(size.get()) >= end {
+             return None;
+         }
+ 
+         let mut allocs = Vec::new();
+         for dev in devs {
+-            allocs.push(dev.screen().alloc_vm(size, size)?);
++            allocs.push(dev.screen().alloc_vm(start, size)?);
+         }
+ 
++        let alignment = cmp::max(alignment.into(), page_size);
+         Some(PlatformVM {
+-            vm: Mutex::new(VM::new(size, size)),
++            vm: Mutex::new(VM::new(start, size)),
++            vm_alignment: NonZeroU64::new(alignment)?,
+             _dev_allocs: allocs,
+         })
+     }
+@@ -215,7 +232,13 @@ impl Platform {
+ 
+         self.devs = Device::all();
+ 
+-        self.vm = Self::alloc_vm(&self.devs);
++        unsafe {
++            os_get_page_size(&mut self.page_size);
++        }
++
++        if self.page_size != 0 {
++            self.vm = Self::alloc_vm(&self.devs, self.page_size);
++        }
+ 
+         if self
+             .devs
+
+--- src/gallium/frontends/rusticl/meson.build
++++ src/gallium/frontends/rusticl/meson.build
+@@ -272,6 +272,7 @@ rusticl_mesa_bindings = rust.bindgen(
+     '--allowlist-function',     'rz?alloc_.*',
+     '--allowlist-function',     'SHA1.*',
+     '--allowlist-var',          'SHA1_.*',
++    '--allowlist-function',     'os_.*',
+     '--allowlist-function',     'u_.*',
+     '--allowlist-function',     'util_format_.*',
+     '--allowlist-function',     'util_queue_.*',
+
+--- src/gallium/frontends/rusticl/rusticl_mesa_bindings.h
++++ src/gallium/frontends/rusticl/rusticl_mesa_bindings.h
+@@ -24,6 +24,7 @@
+ #include "util/blob.h"
+ #include "util/disk_cache.h"
+ #include "util/hex.h"
++#include "util/os_misc.h"
+ #include "util/os_time.h"
+ #include "util/sha1/sha1.h"
+ #include "util/u_cpu_detect.h"
+
+--- src/gallium/include/pipe/p_defines.h
++++ src/gallium/include/pipe/p_defines.h
+@@ -1131,6 +1131,7 @@ struct pipe_caps {
+    /** for CL SVM */
+    uint64_t min_vma;
+    uint64_t max_vma;
++   uint32_t vma_alignment;
+ 
+    enum pipe_vertex_input_alignment vertex_input_alignment;
+    enum pipe_endian endianness;
+

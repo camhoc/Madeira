@@ -1,0 +1,1437 @@
+# kk: Encode indirect count draws into an ICB inside the render pass
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46361 state=opened
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+vkCmdDraw*IndirectCount currently ends the render pass and unrolls the
+draws in a compute pass. This MR encodes them into an indirect command
+buffer from a vertex dispatch and executes it in the same render pass,
+as planned in 0126f4388a5 ("kk: One MTL4CommandBuffer per
+VkCommandBuffer").
+
+* The first commit folds the sample ID and position in single-sample
+  fragment shaders, so they no longer run per sample. The ICB path
+  excludes fragment shaders that read the sample ID, so this also lets
+  more draws use it.
+* The second commit adds the ICB path. The previous path is kept for the
+  cases listed in the commit message.
+* The third commit Adds visibility argument to barrier.
+
+Tested on an Apple M5 Pro with macOS 27.2. Vulkan CTS: no regressions
+against main on 79,312 cases, and no failures or Metal API validation
+messages on the indirect count groups. Other GPUs and macOS 26 were not
+tested.
+
+Enshrouded under Wine, average FPS over three A/B runs against main:
+* Barrier and ICB commits only: 30.5 to 37.4, +22.7%
+* All three commits: 30.3 to 38.9, +28.5%
+```
+--- src/kosmickrisp/bridge/stubs/mtl_compiler.c
++++ src/kosmickrisp/bridge/stubs/mtl_compiler.c
+@@ -99,3 +99,9 @@ mtl_new_render_pipeline(mtl_compiler *compiler,
+ {
+    return NULL;
+ }
++
++void
++mtl_render_pipeline_descriptor_set_support_icb(
++   mtl_render_pipeline_descriptor *descriptor, bool support)
++{
++}
+
+--- src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -14,20 +14,23 @@ mtl_end_encoding(void *encoder)
+ 
+ void
+ mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+-                         enum mtl_stages before_queue_stages)
++                         enum mtl_stages before_queue_stages,
++                         enum mtl_visibility_options visibility)
+ {
+ }
+ 
+ void
+ mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
+-                                 enum mtl_stages before_queue_stages)
++                                 enum mtl_stages before_stages,
++                                 enum mtl_visibility_options visibility)
+ {
+ }
+ 
+ void
+ mtl_barrier_after_queue_stages(void *encoder,
+                                enum mtl_stages after_queue_stages,
+-                               enum mtl_stages before_stages)
++                               enum mtl_stages before_stages,
++                               enum mtl_visibility_options visibility)
+ {
+ }
+ 
+@@ -136,6 +139,12 @@ mtl_dispatch_threads_with_indirect_buffer(mtl_compute_encoder *encoder,
+ {
+ }
+ 
++enum mtl_stages
++mtl_compute_used_stages(mtl_compute_encoder *encoder)
++{
++   return 0u;
++}
++
+ /* MTLRenderEncoder */
+ mtl_render_encoder *
+ mtl_new_render_command_encoder_with_descriptor(
+
+--- src/kosmickrisp/bridge/stubs/mtl_icb.c
++++ src/kosmickrisp/bridge/stubs/mtl_icb.c
+@@ -0,0 +1,25 @@
++/*
++ * Copyright 2026 Sercan Firat, Nivogli
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "mtl_icb.h"
++
++mtl_indirect_command_buffer *
++mtl_new_icb(mtl_device *device, uint32_t max_count)
++{
++   return NULL;
++}
++
++uint64_t
++mtl_icb_resource_id(mtl_indirect_command_buffer *icb)
++{
++   return 0u;
++}
++
++void
++mtl_render_execute_icb_indirect(mtl_render_encoder *encoder,
++                                mtl_indirect_command_buffer *icb,
++                                uint64_t range_addr)
++{
++}
+
+--- src/kosmickrisp/bridge/meson.build
++++ src/kosmickrisp/bridge/meson.build
+@@ -19,6 +19,7 @@ if host_machine.system() == 'darwin'
+     'mtl_device.m',
+     'mtl_encoder.m',
+     'mtl_heap.m',
++    'mtl_icb.m',
+     'mtl_render_state.m',
+     'mtl_residency_set.m',
+     'mtl_sampler.m',
+@@ -37,6 +38,7 @@ else
+     'stubs/mtl_device.c',
+     'stubs/mtl_encoder.c',
+     'stubs/mtl_heap.c',
++    'stubs/mtl_icb.c',
+     'stubs/mtl_render_state.c',
+     'stubs/mtl_residency_set.c',
+     'stubs/mtl_sampler.c',
+
+--- src/kosmickrisp/bridge/mtl_bridge.h
++++ src/kosmickrisp/bridge/mtl_bridge.h
+@@ -30,6 +30,7 @@
+ #include "mtl_encoder.h"
+ #include "mtl_format.h"
+ #include "mtl_heap.h"
++#include "mtl_icb.h"
+ #include "mtl_render_state.h"
+ #include "mtl_residency_set.h"
+ #include "mtl_sampler.h"
+
+--- src/kosmickrisp/bridge/mtl_compiler.h
++++ src/kosmickrisp/bridge/mtl_compiler.h
+@@ -37,6 +37,10 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
+ /* Render pipeline descriptor */
+ mtl_render_pipeline_descriptor *mtl_new_render_pipeline_descriptor(void);
+ 
++/* Lets indirect command buffers inherit the pipeline */
++void mtl_render_pipeline_descriptor_set_support_icb(
++   mtl_render_pipeline_descriptor *descriptor, bool support);
++
+ void mtl_render_pipeline_descriptor_set_vertex_shader(
+    mtl_render_pipeline_descriptor *descriptor, mtl_function_descriptor *shader);
+ 
+
+--- src/kosmickrisp/bridge/mtl_compiler.m
++++ src/kosmickrisp/bridge/mtl_compiler.m
+@@ -112,6 +112,19 @@ mtl_new_render_pipeline_descriptor()
+    }
+ }
+ 
++void
++mtl_render_pipeline_descriptor_set_support_icb(
++   mtl_render_pipeline_descriptor *descriptor, bool support)
++{
++   @autoreleasepool {
++      MTL4RenderPipelineDescriptor *desc =
++         (MTL4RenderPipelineDescriptor *)descriptor;
++      desc.supportIndirectCommandBuffers =
++         support ? MTL4IndirectCommandBufferSupportStateEnabled
++                 : MTL4IndirectCommandBufferSupportStateDisabled;
++   }
++}
++
+ void
+ mtl_render_pipeline_descriptor_set_vertex_shader(mtl_render_pipeline_descriptor *descriptor,
+                                                  mtl_function_descriptor *shader)
+
+--- src/kosmickrisp/bridge/mtl_encoder.h
++++ src/kosmickrisp/bridge/mtl_encoder.h
+@@ -14,14 +14,17 @@
+ /* Common encoder utils */
+ void mtl_end_encoding(void *encoder);
+ void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+-                              enum mtl_stages before_queue_stages);
++                              enum mtl_stages before_queue_stages,
++                              enum mtl_visibility_options visibility);
+ void mtl_barrier_after_encoder_stages(void *encoder,
+                                       enum mtl_stages after_stages,
+-                                      enum mtl_stages before_queue_stages);
++                                      enum mtl_stages before_stages,
++                                      enum mtl_visibility_options visibility);
+ 
+ void mtl_barrier_after_queue_stages(void *encoder,
+                                     enum mtl_stages after_queue_stages,
+-                                    enum mtl_stages before_stages);
++                                    enum mtl_stages before_stages,
++                                    enum mtl_visibility_options visibility);
+ 
+ void mtl_update_fence(void *encoder, mtl_fence *fence,
+                       enum mtl_stages after_stages);
+@@ -77,6 +80,8 @@ void mtl_dispatch_threadgroups_with_indirect_buffer(
+ void mtl_dispatch_threads_with_indirect_buffer(mtl_compute_encoder *encoder,
+                                                uint64_t addr);
+ 
++enum mtl_stages mtl_compute_used_stages(mtl_compute_encoder *encoder);
++
+ /* MTLRenderEncoder */
+ mtl_render_encoder *mtl_new_render_command_encoder_with_descriptor(
+    mtl_command_buffer *command_buffer, mtl_render_pass_descriptor *descriptor);
+
+--- src/kosmickrisp/bridge/mtl_encoder.m
++++ src/kosmickrisp/bridge/mtl_encoder.m
+@@ -24,38 +24,41 @@ mtl_end_encoding(void *encoder)
+ 
+ void
+ mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+-                         enum mtl_stages before_queue_stages)
++                         enum mtl_stages before_queue_stages,
++                         enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+       /* TODO_KOSMICKRISP Expose visibility option since resource alias should only be required
+        * if occlusion queries are used */
+       [enc barrierAfterStages:(MTLStages)after_stages beforeQueueStages:(MTLStages)before_queue_stages
+-           visibilityOptions:MTL4VisibilityOptionResourceAlias];
++           visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
+ void
+ mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
+-                                 enum mtl_stages before_queue_stages)
++                                 enum mtl_stages before_stages,
++                                 enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+-      [enc barrierAfterEncoderStages:(MTLStages)after_stages beforeEncoderStages:(MTLStages)before_queue_stages
+-           visibilityOptions:MTL4VisibilityOptionResourceAlias];
++      [enc barrierAfterEncoderStages:(MTLStages)after_stages beforeEncoderStages:(MTLStages)before_stages
++           visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
+ void
+ mtl_barrier_after_queue_stages(void *encoder,
+                                enum mtl_stages after_queue_stages,
+-                               enum mtl_stages before_stages)
++                               enum mtl_stages before_stages,
++                               enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+       [enc barrierAfterQueueStages:(MTLStages)after_queue_stages
+                       beforeStages:(MTLStages)before_stages
+-                 visibilityOptions:MTL4VisibilityOptionResourceAlias];
++                 visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
+@@ -284,6 +287,15 @@ mtl_dispatch_threads_with_indirect_buffer(mtl_compute_encoder *encoder,
+    }
+ }
+ 
++enum mtl_stages
++mtl_compute_used_stages(mtl_compute_encoder *encoder)
++{
++   @autoreleasepool {
++      id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
++      return [enc stages];
++   }
++}
++
+ /* MTLRenderEncoder */
+ 
+ /* Encoder commands */
+
+--- src/kosmickrisp/bridge/mtl_icb.h
++++ src/kosmickrisp/bridge/mtl_icb.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright 2026 Sercan Firat, Nivogli
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef MTL_ICB_H
++#define MTL_ICB_H 1
++
++#include "mtl_types.h"
++
++#include <inttypes.h>
++
++
++/* Draw and indexed-draw commands that inherit the pipeline and render state
++ * but set their own buffers (root, samplers and per-draw data at 0..2). */
++mtl_indirect_command_buffer *mtl_new_icb(mtl_device *device,
++                                         uint32_t max_count);
++
++uint64_t mtl_icb_resource_id(mtl_indirect_command_buffer *icb);
++
++/* Runs the range of commands that the MTLIndirectCommandBufferExecutionRange
++ * at range_addr describes */
++void mtl_render_execute_icb_indirect(mtl_render_encoder *encoder,
++                                     mtl_indirect_command_buffer *icb,
++                                     uint64_t range_addr);
++
++#endif /* MTL_ICB_H */
+
+--- src/kosmickrisp/bridge/mtl_icb.m
++++ src/kosmickrisp/bridge/mtl_icb.m
+@@ -0,0 +1,49 @@
++/*
++ * Copyright 2026 Sercan Firat, Nivogli
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "mtl_icb.h"
++
++#include <Metal/MTLIndirectCommandBuffer.h>
++#include <Metal/MTL4RenderCommandEncoder.h>
++
++mtl_indirect_command_buffer *
++mtl_new_icb(mtl_device *device, uint32_t max_count)
++{
++   @autoreleasepool {
++      id<MTLDevice> dev = (id<MTLDevice>)device;
++      MTLIndirectCommandBufferDescriptor *desc =
++         [[MTLIndirectCommandBufferDescriptor new] autorelease];
++      desc.commandTypes =
++         MTLIndirectCommandTypeDraw | MTLIndirectCommandTypeDrawIndexed;
++      desc.inheritPipelineState = YES;
++      desc.inheritBuffers = NO;
++      desc.maxVertexBufferBindCount = 3;
++      desc.maxFragmentBufferBindCount = 3;
++      return [dev newIndirectCommandBufferWithDescriptor:desc
++                                         maxCommandCount:max_count
++                                                 options:MTLResourceStorageModePrivate];
++   }
++}
++
++uint64_t
++mtl_icb_resource_id(mtl_indirect_command_buffer *icb)
++{
++   @autoreleasepool {
++      id<MTLIndirectCommandBuffer> i = (id<MTLIndirectCommandBuffer>)icb;
++      return i.gpuResourceID._impl;
++   }
++}
++
++void
++mtl_render_execute_icb_indirect(mtl_render_encoder *encoder,
++                                mtl_indirect_command_buffer *icb,
++                                uint64_t range_addr)
++{
++   @autoreleasepool {
++      id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
++      [enc executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)icb
++                    indirectBuffer:range_addr];
++   }
++}
+
+--- src/kosmickrisp/bridge/mtl_types.h
++++ src/kosmickrisp/bridge/mtl_types.h
+@@ -43,6 +43,7 @@ typedef void mtl_render_pass_attachment_descriptor;
+ typedef void mtl_residency_set;
+ typedef void mtl_allocation;
+ typedef void mtl_compiler;
++typedef void mtl_indirect_command_buffer;
+ typedef void mtl_argument_table_descriptor;
+ typedef void mtl_argument_table;
+ typedef void mtl_commit_options;
+@@ -235,6 +236,12 @@ enum mtl_cull_mode {
+    MTL_CULL_MODE_BACK = 2,
+ };
+ 
++enum mtl_visibility_options {
++   MTL_VISIBILITY_OPTION_NONE = 0,
++   MTL_VISIBILITY_OPTION_DEVICE = 1 << 0,
++   MTL_VISIBILITY_OPTION_RESOURCE_ALIAS = 1 << 1,
++};
++
+ enum mtl_visibility_result_mode {
+    MTL_VISIBILITY_RESULT_MODE_DISABLED = 0,
+    MTL_VISIBILITY_RESULT_MODE_BOOLEAN = 1,
+
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -2414,7 +2414,8 @@ msl_gather_info(struct nir_to_msl_ctx *ctx, struct nir_to_msl_options *options)
+          /* Metal's sample mask has all the bits when we only care about the bit
+           * the fragment was generated for. This is why we need to compute it
+           * using sample id. */
+-         if (BITSET_TEST(ctx->shader->info.system_values_read,
++         if (!options->single_sample &&
++             BITSET_TEST(ctx->shader->info.system_values_read,
+                          SYSTEM_VALUE_SAMPLE_MASK_IN))
+             BITSET_SET(ctx->shader->info.system_values_read,
+                        SYSTEM_VALUE_SAMPLE_ID);
+
+--- src/kosmickrisp/compiler/nir_to_msl.h
++++ src/kosmickrisp/compiler/nir_to_msl.h
+@@ -23,6 +23,10 @@ struct nir_to_msl_options {
+     * the render target has. This leads to an incorrect calculation of the
+     * component count for the render target formats. */
+    uint8_t rts_component_count[MAX_DRAW_BUFFERS];
++
++   /* Fragment shader of a single-sample pipeline: the input sample mask has
++    * only one bit, so it does not need the sample ID. */
++   bool single_sample;
+ };
+ 
+ /* Assumes nir_shader_gather_info has been called beforehand. */
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -55,6 +55,11 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+       kk_destroy_bo(dev, *bo);
+    }
+    util_dynarray_clear(&cmd->large_bos);
++
++   util_dynarray_foreach(&cmd->icbs, struct kk_cmd_icb, icb)
++      kk_cmd_pool_return_icb(pool, icb->cls, icb->icb);
++   util_dynarray_clear(&cmd->icbs);
++
+    util_dynarray_clear(&cmd->post_render_writes);
+    util_dynarray_clear(&cmd->ts_resolves);
+    util_dynarray_clear(&cmd->ts_stage_map);
+@@ -96,6 +101,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+ 
+    kk_cmd_release_resources(dev, cmd);
+    util_dynarray_fini(&cmd->large_bos);
++   util_dynarray_fini(&cmd->icbs);
+    util_dynarray_fini(&cmd->post_render_writes);
+    util_dynarray_fini(&cmd->ts_resolves);
+    util_dynarray_fini(&cmd->ts_stage_map);
+@@ -131,6 +137,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+    cmd->ts_resolves = UTIL_DYNARRAY_INIT;
+    cmd->ts_stage_map = UTIL_DYNARRAY_INIT;
+    cmd->post_render_writes = UTIL_DYNARRAY_INIT;
++   cmd->icbs = UTIL_DYNARRAY_INIT;
+ 
+    {
+       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
+@@ -259,6 +266,26 @@ kk_encoder_update_debug(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
+       mtl_encoder_push_debug_group(encoder, label->pLabelName);
+ }
+ 
++/* Returns an indirect command buffer of at least max_count commands from the
++ * command pool, or NULL if max_count is too large.  It goes back to the pool
++ * when the command buffer is reset or destroyed. */
++mtl_indirect_command_buffer *
++kk_cmd_get_icb(struct kk_cmd_buffer *cmd, uint32_t max_count)
++{
++   uint32_t log2 = MAX2(util_logbase2_ceil(max_count), KK_ICB_MIN_LOG2);
++   uint32_t cls = log2 - KK_ICB_MIN_LOG2;
++   if (cls >= KK_ICB_CLASSES)
++      return NULL;
++
++   mtl_indirect_command_buffer *icb =
++      kk_cmd_pool_get_icb(kk_cmd_buffer_pool(cmd), cls);
++   if (icb) {
++      struct kk_cmd_icb entry = {.icb = icb, .cls = cls};
++      util_dynarray_append(&cmd->icbs, entry);
++   }
++   return icb;
++}
++
+ void
+ cs_start_render(struct kk_cmd_buffer *cmd)
+ {
+@@ -336,7 +363,8 @@ static void
+ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
+ {
+    /* TODO_KOSMICKRISP This is probably overkill */
+-   mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL,
++                            MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+    mtl_end_encoding(encoder);
+    mtl_release(encoder);
+ 
+@@ -457,6 +485,25 @@ kk_barrier_requires_encoder_split(struct kk_cmd_buffer *cmd,
+           (dst & VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
+ }
+ 
++static bool
++kk_barrier_has_indirect_dst(const VkDependencyInfo *dep)
++{
++   const VkPipelineStageFlags2 indirect_stages =
++      VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
++      VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT |
++      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++   VkPipelineStageFlags2 dst = 0;
++
++   for (uint32_t i = 0; i < dep->memoryBarrierCount; i++)
++      dst |= dep->pMemoryBarriers[i].dstStageMask;
++   for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount; i++)
++      dst |= dep->pBufferMemoryBarriers[i].dstStageMask;
++   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++)
++      dst |= dep->pImageMemoryBarriers[i].dstStageMask;
++
++   return dst & indirect_stages;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+                        const VkDependencyInfo *pDependencyInfo)
+@@ -476,16 +523,29 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+          kk_apply_attachment_store_ops(cmd, true);
+          cs_end(cmd);
+          cs_start_render(cmd);
+-      } else
++      } else if (kk_cmd_buffer_device(cmd)->icb.enabled &&
++                 kk_barrier_has_indirect_dst(pDependencyInfo)) {
++         /* kk_draw_icb reads the count and indirect commands from a vertex
++          * shader in this encoder.  Only pre-rasterization stages can write
++          * them inside a render pass (VUID-vkCmdPipelineBarrier2-None-07890).
++          */
++         mtl_barrier_after_encoder_stages(
++            cmd->metal.render, MTL_STAGE_VERTEX,
++            MTL_STAGE_VERTEX | MTL_STAGE_FRAGMENT,
++            MTL_VISIBILITY_OPTION_DEVICE | MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++      } else {
+          mtl_barrier_after_encoder_stages(cmd->metal.render, MTL_STAGE_VERTEX,
+-                                          MTL_STAGE_FRAGMENT);
++                                          MTL_STAGE_FRAGMENT,
++                                          MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++      }
+    } else if (cmd->metal.compute) {
+       /* We chain encoders, so an intra-encoder barrier is enough here:
+        * no need to tear down and recreate the encoder.
+        */
+       mtl_barrier_after_encoder_stages(cmd->metal.compute,
+                                        MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
+-                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
++                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
++                                       MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+    }
+ }
+ 
+@@ -813,7 +873,8 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
+ 
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+    mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
+-                                    MTL_STAGE_DISPATCH);
++                                    MTL_STAGE_DISPATCH,
++                                    MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+ 
+    struct kk_ptr data_gpu = kk_pool_upload(cmd, data, data_size, 8u);
+    if (unlikely(!data_gpu.gpu))
+@@ -834,7 +895,8 @@ kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
+       mtl_dispatch_threadgroups_with_indirect_buffer(encoder, grid.addr,
+                                                      local_size);
+    mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
+-                                    MTL_STAGE_DISPATCH);
++                                    MTL_STAGE_DISPATCH,
++                                    MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+ 
+    /* Rebind the existing root. */
+    mtl_set_address(cmd->argument_table, cmd->state.root_addr, 0u);
+@@ -1062,7 +1124,8 @@ kk_CmdWriteMarkerToMemoryAMD(VkCommandBuffer commandBuffer,
+    if (cmd_buffer->metal.compute) {
+       mtl_barrier_after_encoder_stages(cmd_buffer->metal.compute,
+                                        MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
+-                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
++                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
++                                       MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+    }
+ 
+    write.value = pInfo->marker;
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -228,6 +228,11 @@ struct kk_ts_resolve {
+    uint64_t dst_addr;
+ };
+ 
++struct kk_cmd_icb {
++   mtl_indirect_command_buffer *icb;
++   uint32_t cls;
++};
++
+ struct kk_ts_stage_entry {
+    mtl_counter_heap *heap;
+    enum mtl_render_stages stage;
+@@ -243,6 +248,10 @@ struct kk_cmd_buffer {
+       mtl_render_encoder *render;
+       mtl_compute_encoder *compute;
+    } metal;
++
++   /* Indirect command buffers taken from the command pool (struct
++    * kk_cmd_icb) */
++   struct util_dynarray icbs;
+    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
+    struct util_dynarray ts_resolves;
+    /* Timestamps already sampled by the current render encoder. (struct
+@@ -316,6 +325,8 @@ void cs_start_render(struct kk_cmd_buffer *cmd);
+ mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
+ mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd);
+ void cs_end(struct kk_cmd_buffer *cmd);
++mtl_indirect_command_buffer *kk_cmd_get_icb(struct kk_cmd_buffer *cmd,
++                                            uint32_t max_count);
+ void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
+                                         uint64_t addr);
+ 
+
+--- src/kosmickrisp/vulkan/kk_cmd_copy.c
++++ src/kosmickrisp/vulkan/kk_cmd_copy.c
+@@ -245,7 +245,8 @@ copy_through_buffer(struct kk_cmd_buffer *cmd, struct kk_image *src,
+       info.mtl_data.options = src_options;
+       mtl_copy_from_texture_to_buffer(encoder, &info.mtl_data);
+ 
+-      mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_BLIT);
++      mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_BLIT,
++                                       MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+ 
+       info.mtl_data.image = dst_plane->mtl_handle;
+       info.mtl_data.image_size = dst_size;
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1064,7 +1064,8 @@ kk_heap(struct kk_cmd_buffer *cmd)
+ 
+       /* Ensure heap is set to 0 before we allocate anything. */
+       mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
+-                                       MTL_STAGE_DISPATCH);
++                                       MTL_STAGE_DISPATCH,
++                                       MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+ 
+       cmd->uses_heap = true;
+    }
+@@ -2138,7 +2139,8 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+       mtl_compute_pipeline_state *pipeline = vs->pipeline.gfx.pre_render[0];
+       struct mtl_size local_size = {KK_POLY_WG_SIZE, 1, 1};
+       mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+-                                       MTL_STAGE_DISPATCH);
++                                       MTL_STAGE_DISPATCH,
++                                       MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+       mtl_compute_set_pipeline_state(enc, pipeline);
+       kk_dispatch_compute(enc, grid_vs, local_size);
+    }
+@@ -2150,7 +2152,8 @@ kk_launch_tess(struct kk_cmd_buffer *cmd, struct kk_draw_data draw)
+       if (grid_tcs.mode == KK_GRID_DIRECT && grid_tcs.size.x == 0u)
+          return (struct kk_draw_data){.grid = kk_grid_1d(0u)};
+       mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+-                                       MTL_STAGE_DISPATCH);
++                                       MTL_STAGE_DISPATCH,
++                                       MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+       mtl_compute_set_pipeline_state(enc, pipeline);
+       kk_dispatch_compute(enc, grid_tcs, local_size);
+    }
+@@ -2271,14 +2274,15 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
+    if (!(pdev->settings.disabled_workarounds & BITFIELD64_BIT(19)))
+       mtl_set_threadgroup_memory_length(enc, 16u, 0u);
+ 
+-   mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+-                                    MTL_STAGE_DISPATCH);
++   mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH, MTL_STAGE_DISPATCH,
++                                    MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++
+    mtl_compute_set_pipeline_state(
+       enc, vs->pipeline.gfx.pre_render[pre_render_count - 2u]);
+    kk_dispatch_compute(enc, grid_vs, local_size);
+ 
+-   mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH,
+-                                    MTL_STAGE_DISPATCH);
++   mtl_barrier_after_encoder_stages(enc, MTL_STAGE_DISPATCH, MTL_STAGE_DISPATCH,
++                                    MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+    mtl_compute_set_pipeline_state(
+       enc, vs->pipeline.gfx.pre_render[pre_render_count - 1u]);
+    kk_dispatch_compute(enc, grid_gs, local_size);
+@@ -2345,6 +2349,175 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+    return draw;
+ }
+ 
++/* Whether an indirect-count draw can run from an indirect command buffer */
++static bool
++kk_draw_can_use_icb(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
++{
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++
++   /* The ICB is executed from the primary command buffer's render encoder */
++   if (!dev->icb.enabled || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
++      return false;
++
++   /* The generator evaluates the draw count and conditional rendering only */
++   if ((data->predicate_count != 1 && data->predicate_count != 2) ||
++       data->predicate_op[0] != KK_PREDICATE_GT_DRAW_ID)
++      return false;
++
++   /* Tessellation and geometry shaders run as compute passes */
++   if (cmd->state.shaders[MESA_SHADER_TESS_EVAL] ||
++       cmd->state.shaders[MESA_SHADER_GEOMETRY])
++      return false;
++
++   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++   if (!vs || vs->pipeline.gfx.icb_support != KK_ICB_SUPPORTED)
++      return false;
++
++   /* An ICB draw takes the index buffer as a pointer without a length, so
++    * nothing bounds its index reads.  Reading past the index buffer is only
++    * valid with robustBufferAccess2
++    * (VUID-VkDrawIndexedIndirectCommand-robustBufferAccess2-08798).  Also keep
++    * the existing path for pipelines that ask for that behavior for their
++    * vertex inputs. */
++   if (data->indexed && (dev->vk.enabled_features.robustBufferAccess2 ||
++                         vs->info.vs.robust2_vertex_inputs))
++      return false;
++
++   if (requires_unroll(cmd, data) || mesa_prim_has_adjacency(data->prim))
++      return false;
++
++   if (data->indexed) {
++      if (data->index_buffer_el_size_B != 2 &&
++          data->index_buffer_el_size_B != 4)
++         return false;
++
++      /* A null index buffer has no address to give the ICB */
++      if (data->index_buffer.addr == 0u || data->index_buffer.range == 0u)
++         return false;
++   }
++
++   return true;
++}
++
++/* Indirect-count draw without CPU work per draw and without ending the
++ * render encoder.  A rasterizer-disabled vertex shader (dev->icb.gen_vs)
++ * runs in the render encoder, encodes the first min(count, draw_count) draws
++ * into an ICB and writes its execution range, then a barrier orders it
++ * before executeCommandsInBuffer.  Returns false if the draw has to take the
++ * existing path.
++ *
++ * A shader write that feeds the count or indirect buffer inside the same
++ * render pass is only legal from a pre-rasterization stage in a VkRenderPass
++ * self-dependency (VUID-vkCmdPipelineBarrier2-None-07890 and
++ * VUID-vkCmdPipelineBarrier2-srcStageMask-09556).  kk_CmdPipelineBarrier2
++ * orders such writes before later vertex shaders in the encoder, which
++ * include the generator.
++ */
++static bool
++kk_draw_icb(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
++{
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   struct kk_graphics_state *gfx = &cmd->state.gfx;
++
++   if (unlikely(data->draw_count == 0))
++      return true;
++
++   if (!kk_draw_can_use_icb(cmd, data))
++      return false;
++
++   assert(data->predicate_addr[0] != 0u);
++
++   if (gfx->need_to_start_render_pass)
++      kk_flush_gfx_state(cmd);
++
++   /* kk_pool_alloc and kk_pool_upload set the command buffer error */
++   struct kk_ptr range = kk_pool_alloc(cmd, 2 * sizeof(uint32_t), 8u);
++   if (unlikely(!range.gpu))
++      return false;
++
++   /* The generator writes draw_id per draw.  The other fields are only used
++    * with tessellation and geometry shaders, which don't take this path. */
++   struct kk_per_draw_data tmpl_data = gfx->per_draw_data;
++   tmpl_data.draw_id = 0u;
++   uint32_t pd_size = sizeof(tmpl_data);
++   struct kk_ptr tmpl = kk_pool_upload(cmd, &tmpl_data, pd_size, 8u);
++
++   struct kk_ptr per_draw =
++      data->upload_mask
++         ? kk_pool_alloc(cmd, (uint64_t)pd_size * data->draw_count, 8u)
++         : (struct kk_ptr){0};
++
++   if (unlikely(!tmpl.gpu || (data->upload_mask && !per_draw.gpu)))
++      return false;
++
++   /* Last, so that no failure above leaves an unused ICB with the command
++    * buffer */
++   mtl_indirect_command_buffer *icb = kk_cmd_get_icb(cmd, data->draw_count);
++   if (unlikely(!icb))
++      return false;
++
++   struct kk_addr_range index = data->index_buffer;
++   struct kk_icb_gen_args args = {
++      .icb_id = mtl_icb_resource_id(icb),
++      .count_addr = data->predicate_addr[0],
++      .indirect_addr = data->indirect_command.addr,
++      .range_addr = range.gpu,
++      .index_addr = data->indexed ? index.addr : 0u,
++      .root_addr = cmd->state.root_addr,
++      .sampler_addr = dev->samplers.table.bo->gpu,
++      .per_draw_static = tmpl.gpu,
++      .per_draw_out = per_draw.gpu,
++      .per_draw_tmpl = tmpl.gpu,
++      .cond_addr = data->predicate_count == 2 ? data->predicate_addr[1] : 0u,
++      .max_draws = data->draw_count,
++      .in_stride_el = data->indirect_command.stride / sizeof(uint32_t),
++      .index_el_size_B = data->indexed ? data->index_buffer_el_size_B : 0u,
++      .prim_type = mesa_prim_to_mtl_primitive_type(data->prim),
++      .per_draw_size_el = data->upload_mask ? pd_size / sizeof(uint32_t) : 0u,
++      .cond_inverted = data->predicate_count == 2 &&
++                       data->predicate_op[1] == KK_PREDICATE_EQ_ZERO,
++   };
++
++   struct kk_ptr args_gpu = kk_pool_upload(cmd, &args, sizeof(args), 8u);
++   if (unlikely(!args_gpu.gpu))
++      return false;
++
++   mtl_render_encoder *enc = cs_get_render(cmd);
++   uint32_t view_mask = gfx->render.view_mask;
++   bool multiview = util_bitcount(view_mask) > 1u;
++   if (multiview) {
++      uint32_t zero_layer = 0u;
++      mtl_set_vertex_amplification_count(enc, &zero_layer, 1u);
++   }
++
++   mtl_set_address(cmd->argument_table, args_gpu.gpu, 0u);
++   mtl_render_set_pipeline_state(enc, dev->icb.gen_vs);
++   mtl_draw_primitives(enc, MTL_PRIMITIVE_TYPE_POINT, 0u, data->draw_count,
++                       1u, 0u);
++
++   /* Metal documents no stage for the ICB and execution range reads of
++    * executeCommandsInBuffer.  Vertex to vertex with device visibility was
++    * verified on Apple M5 Pro by a probe and by dEQP-VK. */
++   mtl_barrier_after_encoder_stages(
++      enc, MTL_STAGE_VERTEX, MTL_STAGE_VERTEX, MTL_VISIBILITY_OPTION_DEVICE);
++
++   if (multiview) {
++      uint32_t layer_ids[KK_MAX_MULTIVIEW_VIEW_COUNT] = {};
++      uint32_t count = 0u;
++      u_foreach_bit(id, view_mask)
++         layer_ids[count++] = id;
++      mtl_set_vertex_amplification_count(enc, layer_ids, count);
++   }
++
++   /* Restore the application's pipeline and root table */
++   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
++   mtl_render_set_pipeline_state(enc, vs->pipeline.gfx.render);
++   mtl_set_address(cmd->argument_table, cmd->state.root_addr, 0u);
++
++   mtl_render_execute_icb_indirect(enc, icb, range.gpu);
++   return true;
++}
++
+ static void
+ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ {
+@@ -2357,6 +2530,11 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    data->flatshade_first =
+       dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
+ 
++   if (data->indirect && data->predicate_count > 0 &&
++       data->predicate_op[0] == KK_PREDICATE_GT_DRAW_ID &&
++       kk_draw_icb(cmd, data))
++      return;
++
+    /* Convert to indirect and process predicates. Skip draw if we fail. */
+    if (data->predicate_count > 0 && !kk_predicate_draws(cmd, data))
+       return;
+
+--- src/kosmickrisp/vulkan/kk_cmd_pool.c
++++ src/kosmickrisp/vulkan/kk_cmd_pool.c
+@@ -123,6 +123,31 @@ kk_cmd_pool_return_cmd_buf(struct kk_cmd_pool *pool,
+    util_dynarray_append(&pool->metal.free_cmd_bufs, cmd_buf);
+ }
+ 
++/* Returns a free ICB of class cls, or a new one */
++mtl_indirect_command_buffer *
++kk_cmd_pool_get_icb(struct kk_cmd_pool *pool, uint32_t cls)
++{
++   struct util_dynarray *free_icbs = &pool->metal.free_icbs[cls];
++   if (util_dynarray_num_elements(free_icbs, mtl_indirect_command_buffer *) >
++       0u)
++      return util_dynarray_pop(free_icbs, mtl_indirect_command_buffer *);
++
++   struct kk_device *dev = kk_cmd_pool_device(pool);
++   mtl_indirect_command_buffer *icb =
++      mtl_new_icb(dev->mtl_handle, 1u << (cls + KK_ICB_MIN_LOG2));
++   /* Resident until the pool releases it */
++   if (icb)
++      kk_device_add_buffer_to_residency_set(dev, icb);
++   return icb;
++}
++
++void
++kk_cmd_pool_return_icb(struct kk_cmd_pool *pool, uint32_t cls,
++                       mtl_indirect_command_buffer *icb)
++{
++   util_dynarray_append(&pool->metal.free_icbs[cls], icb);
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ kk_CreateCommandPool(VkDevice _device,
+                      const VkCommandPoolCreateInfo *pCreateInfo,
+@@ -146,6 +171,8 @@ kk_CreateCommandPool(VkDevice _device,
+ 
+    pool->metal.free_allocators = UTIL_DYNARRAY_INIT;
+    pool->metal.free_cmd_bufs = UTIL_DYNARRAY_INIT;
++   for (uint32_t i = 0; i < KK_ICB_CLASSES; i++)
++      pool->metal.free_icbs[i] = UTIL_DYNARRAY_INIT;
+ 
+    list_inithead(&pool->free_bos);
+ 
+@@ -154,9 +181,26 @@ kk_CreateCommandPool(VkDevice _device,
+    return VK_SUCCESS;
+ }
+ 
++static void
++kk_cmd_pool_release_icbs(struct kk_cmd_pool *pool)
++{
++   struct kk_device *dev = kk_cmd_pool_device(pool);
++
++   for (uint32_t i = 0; i < KK_ICB_CLASSES; i++) {
++      util_dynarray_foreach(&pool->metal.free_icbs[i],
++                            mtl_indirect_command_buffer *, icb) {
++         kk_device_remove_buffer_from_residency_set(dev, *icb);
++         mtl_release(*icb);
++      }
++      util_dynarray_clear(&pool->metal.free_icbs[i]);
++   }
++}
++
+ static void
+ kk_cmd_pool_release_mtl_objects(struct kk_cmd_pool *pool)
+ {
++   kk_cmd_pool_release_icbs(pool);
++
+    util_dynarray_foreach(&pool->metal.free_allocators, mtl_command_allocator *,
+                          allocator) {
+       mtl_release(*allocator);
+@@ -185,6 +229,8 @@ kk_DestroyCommandPool(VkDevice _device, VkCommandPool commandPool,
+    kk_cmd_pool_release_mtl_objects(pool);
+    util_dynarray_fini(&pool->metal.free_allocators);
+    util_dynarray_fini(&pool->metal.free_cmd_bufs);
++   for (uint32_t i = 0; i < KK_ICB_CLASSES; i++)
++      util_dynarray_fini(&pool->metal.free_icbs[i]);
+    vk_free2(&device->vk.alloc, pAllocator, pool);
+ }
+ 
+@@ -213,6 +259,7 @@ kk_TrimCommandPool(VkDevice device, VkCommandPool commandPool,
+ 
+    vk_command_pool_trim(&pool->vk, flags);
+    kk_cmd_pool_destroy_bos(pool);
++   kk_cmd_pool_release_icbs(pool);
+ }
+ 
+ void
+
+--- src/kosmickrisp/vulkan/kk_cmd_pool.h
++++ src/kosmickrisp/vulkan/kk_cmd_pool.h
+@@ -17,6 +17,10 @@
+ #define KK_CMD_BO_SIZE     (1024 * 128)
+ #define KK_CMD_POOL_BO_MAX 32
+ 
++/* Indirect command buffer (ICB) classes: class c holds 64 << c commands */
++#define KK_ICB_CLASSES  15u
++#define KK_ICB_MIN_LOG2 6u
++
+ /* Recyclable command buffer BO, used for both push buffers and upload */
+ struct kk_cmd_bo {
+    struct kk_bo *bo;
+@@ -35,6 +39,8 @@ struct kk_cmd_pool {
+    struct {
+       struct util_dynarray free_allocators;
+       struct util_dynarray free_cmd_bufs;
++      /* Free ICBs (mtl_indirect_command_buffer *) by class */
++      struct util_dynarray free_icbs[KK_ICB_CLASSES];
+    } metal;
+ };
+ 
+@@ -58,6 +64,10 @@ void kk_cmd_pool_return_allocator(struct kk_cmd_pool *pool,
+ mtl_command_buffer *kk_cmd_pool_get_cmd_buf(struct kk_cmd_pool *pool);
+ void kk_cmd_pool_return_cmd_buf(struct kk_cmd_pool *pool,
+                                 mtl_command_buffer *cmd_buf);
++mtl_indirect_command_buffer *kk_cmd_pool_get_icb(struct kk_cmd_pool *pool,
++                                                 uint32_t cls);
++void kk_cmd_pool_return_icb(struct kk_cmd_pool *pool, uint32_t cls,
++                            mtl_indirect_command_buffer *icb);
+ 
+ void kk_cmd_pool_set_label(struct kk_cmd_pool *pool, const char *label);
+ 
+
+--- src/kosmickrisp/vulkan/kk_debug.c
++++ src/kosmickrisp/vulkan/kk_debug.c
+@@ -11,6 +11,7 @@ const struct debug_named_value debug_flags[] = {
+    {"nir", KK_DEBUG_NIR},
+    {"msl", KK_DEBUG_MSL},
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
++   {"no_icb", KK_DEBUG_NO_ICB},
+    {NULL, 0},
+ };
+ 
+
+--- src/kosmickrisp/vulkan/kk_debug.h
++++ src/kosmickrisp/vulkan/kk_debug.h
+@@ -12,6 +12,8 @@ enum kk_debug {
+    KK_DEBUG_MSL = 1ull << 1,
+    /* Forces robustness for all shaders */
+    KK_DEBUG_FORCE_ROBUSTNESS = 1ull << 2,
++   /* Never run indirect-count draws from indirect command buffers */
++   KK_DEBUG_NO_ICB = 1ull << 3,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
+
+--- src/kosmickrisp/vulkan/kk_device.h
++++ src/kosmickrisp/vulkan/kk_device.h
+@@ -106,8 +106,43 @@ struct kk_device {
+    util_once_flag heap_init_once;
+ 
+    bool gpu_capture_active;
++
++   /* Indirect-count draws run from indirect command buffers (ICBs) that a
++    * rasterizer-disabled vertex shader fills inside the render pass, see
++    * kk_draw_icb() */
++   struct {
++      bool enabled;
++      mtl_render_pipeline_state *gen_vs;
++   } icb;
++};
++
++/* Arguments of the ICB generator.  The layout must match
++ * kk_icb_gen_args_msl in kk_device_lib.c, which nothing checks. */
++struct kk_icb_gen_args {
++   uint64_t icb_id;          /* MTLResourceID of the ICB */
++   uint64_t count_addr;      /* draw count */
++   uint64_t indirect_addr;   /* indirect draw commands */
++   uint64_t range_addr;      /* MTLIndirectCommandBufferExecutionRange out */
++   uint64_t index_addr;      /* index buffer, or 0 if not indexed */
++   uint64_t root_addr;       /* root argument table */
++   uint64_t sampler_addr;    /* sampler argument table */
++   uint64_t per_draw_static; /* per-draw data if it doesn't vary by draw */
++   uint64_t per_draw_out;    /* per-draw data array, one per draw */
++   uint64_t per_draw_tmpl;   /* per-draw data the array is built from */
++   uint64_t cond_addr;       /* conditional rendering predicate, or 0 */
++   uint32_t max_draws;
++   uint32_t in_stride_el;     /* indirect command stride in uint32s */
++   uint32_t index_el_size_B;  /* 2, 4, or 0 if not indexed */
++   uint32_t prim_type;        /* MTLPrimitiveType */
++   uint32_t per_draw_size_el; /* per-draw data size in uint32s, or 0 */
++   uint32_t cond_inverted;
+ };
+ 
++static_assert(sizeof(struct kk_icb_gen_args) == 112,
++              "kk_icb_gen_args must match kk_icb_gen_args_msl");
++static_assert(offsetof(struct kk_icb_gen_args, max_draws) == 88,
++              "kk_icb_gen_args must match kk_icb_gen_args_msl");
++
+ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+ 
+ static inline struct kk_physical_device *
+
+--- src/kosmickrisp/vulkan/kk_device_lib.c
++++ src/kosmickrisp/vulkan/kk_device_lib.c
+@@ -17,6 +17,8 @@
+ #include "nir/nir.h"
+ #include "nir/nir_builder.h"
+ 
++#include "kk_debug.h"
++
+ static VkResult
+ build_precompiled_shaders(struct kk_device *dev)
+ {
+@@ -61,10 +63,131 @@ fail:
+    return vk_error(dev, VK_ERROR_INVALID_SHADER_NV);
+ }
+ 
++/* Fills an indirect command buffer from indirect draw commands inside the
++ * render pass.  It runs as a rasterizer-disabled vertex shader with one
++ * vertex per draw slot.  Vertex 0 writes the execution range: the draw count,
++ * clamped to max_draws, or 0 if conditional rendering discards the draws.
++ * Every vertex below the draw count encodes its draw, or resets its command
++ * if the draw is empty.  kk_icb_gen_args_msl must match struct
++ * kk_icb_gen_args in kk_device.h, which nothing checks.
++ */
++static const char kk_icb_gen_msl[] =
++   "#include <metal_stdlib>\n"
++   "using namespace metal;\n"
++   "struct kk_icb_gen_args_msl {\n"
++   "   command_buffer icb;\n"
++   "   device const uint *count_ptr;\n"
++   "   device const uint *indirect_data;\n"
++   "   device uint2 *range_out;\n"
++   "   device const void *index_buffer;\n"
++   "   device const ulong *root_table;\n"
++   "   device const ulong *sampler_table;\n"
++   "   device const uchar *per_draw_static;\n"
++   "   device uchar *per_draw_out;\n"
++   "   device const uint *per_draw_tmpl;\n"
++   "   device const uint *cond_ptr;\n"
++   "   uint max_draws;\n"
++   "   uint in_stride_el;\n"
++   "   uint index_el_size_B;\n"
++   "   uint prim_type;\n"
++   "   uint per_draw_size_el;\n"
++   "   uint cond_inverted;\n"
++   "};\n"
++   "static inline uint eval_draw_count(device const kk_icb_gen_args_msl &a)\n"
++   "{\n"
++   "   if (a.cond_ptr) {\n"
++   "      bool cond_val = (*a.cond_ptr != 0u);\n"
++   "      if (a.cond_inverted) cond_val = !cond_val;\n"
++   "      if (!cond_val) return 0u;\n"
++   "   }\n"
++   "   return min(*a.count_ptr, a.max_draws);\n"
++   "}\n"
++   "vertex void kk_icb_gen_vs(uint i [[vertex_id]],\n"
++   "                          device const kk_icb_gen_args_msl &a [[buffer(0)]])\n"
++   "{\n"
++   "   uint actual_count = eval_draw_count(a);\n"
++   "   if (i == 0u) {\n"
++   "      *a.range_out = uint2(0u, actual_count);\n"
++   "   }\n"
++   "   if (i >= actual_count)\n"
++   "      return;\n"
++   "   render_command cmd(a.icb, i);\n"
++   "   device const uint *d = a.indirect_data + (uint64_t)i * a.in_stride_el;\n"
++   "   uint count        = d[0];\n"
++   "   uint instance_cnt = d[1];\n"
++   "   uint first_val    = d[2];\n"
++   "   if (instance_cnt == 0u || count == 0u) {\n"
++   "      cmd.reset();\n"
++   "      return;\n"
++   "   }\n"
++   "   device const uchar *pd = a.per_draw_static;\n"
++   "   if (a.per_draw_size_el) {\n"
++   "      device uint *o = (device uint *)(a.per_draw_out + (uint64_t)i * a.per_draw_size_el * 4u);\n"
++   "      device const uint *tmpl = a.per_draw_tmpl;\n"
++   "      for (uint k = 1u; k < a.per_draw_size_el; k++)\n"
++   "         o[k] = tmpl[k];\n"
++   "      o[0] = i;\n"
++   "      pd = (device const uchar *)o;\n"
++   "   }\n"
++   "   cmd.set_vertex_buffer(a.root_table, 0);\n"
++   "   cmd.set_vertex_buffer(a.sampler_table, 1);\n"
++   "   cmd.set_vertex_buffer(pd, 2);\n"
++   "   cmd.set_fragment_buffer(a.root_table, 0);\n"
++   "   cmd.set_fragment_buffer(a.sampler_table, 1);\n"
++   "   cmd.set_fragment_buffer(pd, 2);\n"
++   "   primitive_type prim = static_cast<primitive_type>(a.prim_type);\n"
++   "   if (a.index_el_size_B == 2) {\n"
++   "      cmd.draw_indexed_primitives(prim, count,\n"
++   "         (device const ushort *)a.index_buffer + first_val,\n"
++   "         instance_cnt, as_type<int>(d[3]), d[4]);\n"
++   "   } else if (a.index_el_size_B == 4) {\n"
++   "      cmd.draw_indexed_primitives(prim, count,\n"
++   "         (device const uint *)a.index_buffer + first_val,\n"
++   "         instance_cnt, as_type<int>(d[3]), d[4]);\n"
++   "   } else {\n"
++   "      cmd.draw_primitives(prim, first_val, count, instance_cnt, d[3]);\n"
++   "   }\n"
++   "}\n";
++
++static VkResult
++build_icb_generator(struct kk_device *dev)
++{
++   struct kk_physical_device *pdev = kk_device_physical(dev);
++
++   dev->icb.enabled = false;
++   if (KK_DEBUG(NO_ICB))
++      return VK_SUCCESS;
++
++   /* Without the generator, draws take the existing indirect-count path */
++   mtl_library *library = mtl_new_library(
++      dev->mtl_compiler_handle, kk_icb_gen_msl, pdev->info.msl_version,
++      MTL_MATH_MODE_SAFE, MTL_MATH_FLOATING_POINT_FUNCTIONS_PRECISE);
++   if (library == NULL)
++      return VK_SUCCESS;
++
++   mtl_function_descriptor *fn_main =
++      mtl_new_library_function_descriptor(library, "kk_icb_gen_vs");
++   mtl_render_pipeline_descriptor *pdesc =
++      mtl_new_render_pipeline_descriptor();
++   mtl_render_pipeline_descriptor_set_vertex_shader(pdesc, fn_main);
++   mtl_render_pipeline_descriptor_set_rasterization_enabled(pdesc, false);
++   dev->icb.gen_vs = mtl_new_render_pipeline(dev->mtl_compiler_handle, pdesc);
++   mtl_release(pdesc);
++   mtl_release(fn_main);
++   mtl_release(library);
++
++   dev->icb.enabled = dev->icb.gen_vs != NULL;
++   return VK_SUCCESS;
++}
++
+ VkResult
+ kk_device_init_lib(struct kk_device *dev)
+ {
+-   return build_precompiled_shaders(dev);
++   VkResult result = build_precompiled_shaders(dev);
++   if (result != VK_SUCCESS)
++      return result;
++
++   return build_icb_generator(dev);
+ }
+ 
+ void
+@@ -72,4 +195,7 @@ kk_device_finish_lib(struct kk_device *dev)
+ {
+    for (uint32_t i = 0; i < LIBKK_NUM_PROGRAMS; ++i)
+       mtl_release(dev->precompiled_cache.shaders[i].pipeline);
++
++   if (dev->icb.gen_vs)
++      mtl_release(dev->icb.gen_vs);
+ }
+
+--- src/kosmickrisp/vulkan/kk_query_pool.c
++++ src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -591,7 +591,7 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
+    mtl_compute_encoder *encoder = cs_get_compute(cmd);
+    /* The resolveCounterHeap runs on the blit stage and it needs to be available
+     * for the compute job to copy results to the bo. */
+-   mtl_barrier_after_queue_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH);
++   mtl_barrier_after_queue_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH, MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+ 
+    struct kk_bo *results_bo =
+       kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -991,20 +991,94 @@ kk_nir_lower_vertex_id_zero_base(struct nir_shader *nir)
+    return progress;
+ }
+ 
+-/* Consumes nir */
++static bool
++lower_single_sample(nir_builder *b, nir_intrinsic_instr *intr,
++                    UNUSED void *data)
++{
++   b->cursor = nir_before_instr(&intr->instr);
++   nir_def *value;
++   switch (intr->intrinsic) {
++   case nir_intrinsic_load_sample_id:
++      value = nir_imm_int(b, 0);
++      break;
++   case nir_intrinsic_load_sample_pos:
++   case nir_intrinsic_load_sample_pos_from_id:
++      value = nir_imm_vec2(b, 0.5f, 0.5f);
++      break;
++   default:
++      return false;
++   }
++   nir_def_replace(&intr->def, value);
++   return true;
++}
++
++/* With a single sample, the sample ID is always 0 and the sample position is
++ * the pixel center.  Folding them avoids declaring Metal's [[sample_id]]
++ * input, which makes the fragment shader run per sample.  The
++ * system_values_read bits are recomputed by modify_nir_info. */
++static bool
++kk_nir_lower_single_sample(nir_shader *nir)
++{
++   return nir_shader_intrinsics_pass(nir, lower_single_sample,
++                                     nir_metadata_control_flow, NULL);
++}
++
++/* Returns why render pipelines with this fragment shader can't support
++ * indirect command buffers, see enum kk_icb_support.  Must run after
++ * nir_to_msl, which adds the sample ID when the shader reads the sample
++ * position or the input sample mask. */
++static enum kk_icb_support
++kk_fs_icb_support(nir_shader *nir)
++{
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic != nir_intrinsic_load_interpolated_input)
++               continue;
++            nir_intrinsic_instr *bary = nir_src_as_intrinsic(intr->src[0]);
++            if (bary &&
++                nir_intrinsic_interp_mode(bary) == INTERP_MODE_NOPERSPECTIVE)
++               return KK_ICB_NO_NOPERSPECTIVE;
++         }
++      }
++   }
++
++   if (BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_SAMPLE_ID))
++      return KK_ICB_NO_SAMPLE_ID;
++
++   return KK_ICB_SUPPORTED;
++}
++
++/* Consumes nir.  For a fragment shader, icb_support gets its enum
++ * kk_icb_support if not NULL. */
+ static void
+ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+                const struct vk_graphics_pipeline_state *state,
+-               struct msl_compile_data *data, const bool apply_wa19)
++               struct msl_compile_data *data, const bool apply_wa19,
++               uint8_t *icb_support)
+ {
+    NIR_PASS(_, nir, kk_nir_lower_poly);
+ 
++   const bool single_sample = nir->info.stage == MESA_SHADER_FRAGMENT &&
++                              state && state->ms &&
++                              state->ms->rasterization_samples == 1u;
++   if (single_sample)
++      NIR_PASS(_, nir, kk_nir_lower_single_sample);
++
+    msl_optimize_nir(nir);
+    modify_nir_info(nir);
+ 
++   /* No later pass may bring the sample ID back. */
++   assert(!single_sample ||
++          !BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_SAMPLE_ID));
++
+    struct nir_to_msl_options translate_options = {
+       .mem_ctx = NULL,
+       .disabled_workarounds = pdev->settings.disabled_workarounds,
++      .single_sample = single_sample,
+    };
+ 
+    if (!apply_wa19)
+@@ -1031,6 +1105,8 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+    }
+ 
+    data->code = nir_to_msl(nir, &translate_options);
++   if (icb_support && nir->info.stage == MESA_SHADER_FRAGMENT)
++      *icb_support = kk_fs_icb_support(nir);
+    const char *entrypoint_name = nir_shader_get_entrypoint(nir)->function->name;
+ 
+    /* We need to steal so it doesn't get destroyed with the nir. Needs to happen
+@@ -1162,7 +1238,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       nir->info.stage = MESA_SHADER_COMPUTE;
+       memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+       nir->xfb_info = NULL;
+-      kk_compile_msl(pdev, nir, state, &shader->gs_main, apply_wa19);
++      kk_compile_msl(pdev, nir, state, &shader->gs_main, apply_wa19, NULL);
+ 
+       /* From here on, nir is the rasterization VS of the GS */
+       nir = rast;
+@@ -1181,7 +1257,9 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+    /* KK_WORKAROUND_19 Only the stage that feeds geometry will be dispatched
+     * through the buggy Metal entry point. */
+    apply_wa19 &= next_stage == MESA_SHADER_GEOMETRY;
+-   kk_compile_msl(pdev, nir, state, &shader->msl_data[stage], apply_wa19);
++   kk_compile_msl(pdev, nir, state, &shader->msl_data[stage], apply_wa19,
++                  stage == MESA_SHADER_FRAGMENT ? &shader->info.fs.icb_support
++                                                : NULL);
+ 
+    *shader_out = shader;
+ 
+@@ -1477,6 +1555,9 @@ gather_graphics_pipeline_create_info(
+ 
+       info->vs.additional_stages_bits |= BITFIELD_BIT(stage);
+ 
++      if (stage == MESA_SHADER_FRAGMENT)
++         info->vs.fs_icb_support = s->info.fs.icb_support;
++
+       if (s->info.stage == MESA_SHADER_TESS_CTRL)
+          info->vs.tess_local_thread_size = s->info.tess.tcs_output_patch_size;
+ 
+@@ -1618,6 +1699,13 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
+          pipeline_descriptor, vs->info.vs.sample_count);
+    }
+ 
++   /* Only single-sample pipelines support ICBs, see enum kk_icb_support */
++   pipe->gfx.icb_support = vs->info.vs.has_ms && vs->info.vs.sample_count == 1u
++                              ? vs->info.vs.fs_icb_support
++                              : KK_ICB_NO_MULTISAMPLE;
++   if (device->icb.enabled && pipe->gfx.icb_support == KK_ICB_SUPPORTED)
++      mtl_render_pipeline_descriptor_set_support_icb(pipeline_descriptor, true);
++
+    pipe->gfx.render =
+       mtl_new_render_pipeline(device->mtl_compiler_handle, pipeline_descriptor);
+    if (pipe->gfx.render == NULL)
+@@ -1800,6 +1888,9 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+                                      local_size_threads, &s->pipeline.cs);
+    } else {
+       gather_graphics_pipeline_create_info(state, shaders, total_shaders);
++      shaders[0]->info.vs.robust2_vertex_inputs =
++         vertex_robustness->vertex_inputs ==
++         VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2;
+       result = kk_compile_graphics_pipeline(dev, shaders[0]);
+ 
+       /* Free generated fragment shader */
+
+--- src/kosmickrisp/vulkan/kk_shader.h
++++ src/kosmickrisp/vulkan/kk_shader.h
+@@ -47,6 +47,18 @@ kk_tess_info_merge(struct kk_tess_info a, struct kk_tess_info b)
+    return out;
+ }
+ 
++/* Whether a render pipeline also supports indirect command buffers (ICBs),
++ * else why not.  With ICB support, macOS 27.2 fails dEQP-VK multisample,
++ * input attachment and custom resolve cases for multisampled pipelines,
++ * linear interpolation cases for no-perspective inputs, and a custom resolve
++ * case for fragment shaders that read the sample ID. */
++enum kk_icb_support {
++   KK_ICB_SUPPORTED = 0,
++   KK_ICB_NO_MULTISAMPLE,
++   KK_ICB_NO_NOPERSPECTIVE,
++   KK_ICB_NO_SAMPLE_ID,
++};
++
+ struct kk_shader_info {
+    mesa_shader_stage stage;
+    bool uses_per_draw_data;
+@@ -90,6 +102,12 @@ struct kk_shader_info {
+          bool has_ds;
+          bool has_depth_write;
+          bool has_stencil_test;
++
++         /* enum kk_icb_support of the fragment shader */
++         uint8_t fs_icb_support;
++
++         /* Vertex inputs use robustBufferAccess2 behavior */
++         bool robust2_vertex_inputs;
+       } vs;
+ 
+       struct {
+@@ -105,6 +123,8 @@ struct kk_shader_info {
+ 
+       struct {
+          bool uses_flat_varyings;
++         /* enum kk_icb_support */
++         uint8_t icb_support;
+       } fs;
+ 
+       struct {
+@@ -127,6 +147,8 @@ struct kk_pipeline_handles {
+          mtl_compute_pipeline_state *pre_render[4];
+          mtl_depth_stencil_state *ds_handle;
+          uint32_t pre_render_count;
++         /* enum kk_icb_support of render */
++         uint8_t icb_support;
+       } gfx;
+       mtl_compute_pipeline_state *cs;
+    };
+

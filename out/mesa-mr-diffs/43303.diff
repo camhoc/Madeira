@@ -1,0 +1,4864 @@
+# Draft: kk: Experimental support VK_KHR_acceleration_structure VK_KHR_ray_query VK_KHR_ray_tracing
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/43303 state=opened
+# Support for the various extensions.
+
+Mostly for discussion and testing currently. Just wanted to quickly get this up before my flight back home--I'll add the appropriate stuff from the contribution guidelines later.
+
+Tested with Khronos' and Sascha Willem's relevant samples--also with an experimental Ray-tracing support in our company's app "PyMOL" which exercises triangle-based geometry and AABBs for sphere and cylinder/capsule procedural geometry.
+--- docs/drivers/kosmickrisp/workarounds.rst
++++ docs/drivers/kosmickrisp/workarounds.rst
+@@ -49,6 +49,74 @@ info on what was updated.
+ Workarounds
+ ===========
+ 
++KK_WORKAROUND_18
++----------------
++| macOS version: 26.x
++| Metal ticket: Unreported
++| Metal ticket status:
++| CTS test failure: N/A
++| Comments:
++
++``MTL4Compiler``'s ``newLibraryWithDescriptor:error:`` can fail to compile MSL
++source that the device compiler accepts. On top of that, some Metal versions
++write a non-object pointer into the returned ``NSError`` out parameter, so
++dereferencing it to print the failure reason crashes instead of reporting the
++error.
++
++The workaround has two parts. The error is only printed after checking with
++``isKindOfClass:[NSError class]`` that the returned pointer really is an
++``NSError``, and the compilation is retried through
++``compiler.device newLibraryWithSource:options:error:``. Libraries produced by
++the device compiler are accepted by MTL4 pipeline descriptors, so the retry is
++transparent to the rest of the driver. Only if that retry also fails is the
++library reported as unavailable.
++
++| Log:
++| 2026-07-18: Workaround implemented; it came in with the ported ray tracing code, so the exact macOS version it was first hit on was not recorded
++
++KK_WORKAROUND_17
++----------------
++| macOS version: 26.x
++| Metal ticket: Unreported
++| Metal ticket status:
++| CTS test crash: ``dEQP-VK.ray_tracing_pipeline.*``
++| Comments:
++
++The MSL compiler hits an internal compiler error when a multi-component store
++to device memory is emitted as a single dereference-and-assign statement, which
++is what ``nir_intrinsic_store_scratch`` lowers to for ray tracing stages. The
++crash reproduces with ``(*(device uint3*)&scratch[offset]) = value;``.
++
++The workaround is to split the store into two statements, binding the
++dereference to a reference first:
++``device uint3 &ptr = *(device uint3*)&scratch[offset]; ptr = value;``.
++The pair is wrapped in a block scope so the generated reference name cannot
++collide with anything else in the enclosing scope.
++
++| Log:
++| 2026-07-25: Workaround implemented; it came in with the ported ray tracing code, so the exact macOS version it was first hit on was not recorded
++
++KK_WORKAROUND_16
++----------------
++| macOS version: 26.x
++| Metal ticket: FB20945046 (reporter handle not recorded)
++| Metal ticket status: Waiting resolution
++| CTS test crash: ``dEQP-VK.ray_tracing_pipeline.*``
++| Comments:
++
++The MSL compiler hits an internal compiler error when it inlines the functions
++generated for a ray tracing pipeline. A whole pipeline is compiled into a single
++MSL compute kernel, so every miss, closest hit, any hit and intersection shader,
++the recursive traversal helper, the triangle and AABB intersection handlers and
++the ``OpReportIntersectionKHR`` helper end up as plain MSL functions calling
++each other. Letting the compiler inline them crashes it.
++
++The workaround is to emit ``__attribute__((noinline))`` on every one of those
++generated functions so the MSL compiler never inlines them.
++
++| Log:
++| 2026-07-18: Workaround implemented; the ticket number came in with the ported ray tracing code
++
+ KK_WORKAROUND_15
+ ----------------
+ | macOS version: 27.0 beta (26A5353q)
+
+--- docs/drivers/kosmickrisp.rst
++++ docs/drivers/kosmickrisp.rst
+@@ -75,11 +75,104 @@ Environment variables
+ 
+ KosmicKrisp specific environment variables:
+ 
+-- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders.
++- ``MESA_KK_DEBUG``: ``msl`` to log all generated Metal Shading Language (MSL) shaders. ``force_robustness`` to force robustness on all shaders. ``nir`` is also accepted but currently has no effect.
+ - ``MESA_KK_GPU_CAPTURE``: Starts Metal capture at device create and ends it at device destroy. Set to ``1`` to activate.
+ - ``MESA_KK_GPU_CAPTURE_DIRECTORY``: Metal capture will be saved to the specified directory. Defaults to Xcode if no path is provided.
+ - ``MESA_KK_DISABLE_WORKAROUNDS``: Provide ``all`` to disable all workarounds. Otherwise, provide a comma separated list to disable wanted workarounds e.g. ``1,3,4`` to disable workaround 1, 3 and 4.
+ 
++Ray tracing
++***********
++
++KosmicKrisp exposes ``VK_KHR_acceleration_structure``, ``VK_KHR_ray_query``,
++``VK_KHR_ray_tracing_pipeline``, ``VK_KHR_ray_tracing_maintenance1``,
++``VK_KHR_pipeline_library`` and ``VK_KHR_deferred_host_operations``. These are
++built on top of Metal ray tracing: acceleration structures are
++``MTLAccelerationStructure`` objects, and a ray tracing pipeline is compiled
++into a single MSL compute kernel holding every shader group of that pipeline,
++plus an intersection function linked into a Metal intersection function table
++to handle procedural (AABB) geometry.
++
++Because Vulkan exposes state that Metal acceleration structures do not carry
++(per-geometry and per-instance flags, shader binding table record offsets,
++BLAS handles), KosmicKrisp keeps that data in side buffers referenced from a
++driver-owned acceleration structure header.
++
++Ray tracing pipelines keep their call stack, ray payloads and hit attributes in
++a driver-owned device scratch buffer, so giving every ray in a launch its own
++frame would make that buffer grow with the launch size. KosmicKrisp instead
++dispatches only as many workers as fit in a 16 MiB scratch budget, and the
++raygen kernel loops over the launch so each worker handles several logical
++rays in turn. At least one worker always runs, so the allocation can exceed the
++budget when a single frame is larger than 16 MiB. Pipelines that declare
++``VK_DYNAMIC_STATE_RAY_TRACING_PIPELINE_STACK_SIZE_KHR`` additionally shrink
++the per-worker frame to the size passed to
++``vkCmdSetRayTracingPipelineStackSizeKHR``, plus room for the hit attribute
++prefix the traversal loop writes at the deepest frame, and never past the
++compiled layout. That lets more workers share the same budget.
++
++The following parts of the ray tracing extensions are not supported:
++
++- Host-side acceleration structure builds
++  (``accelerationStructureHostCommands``). All builds, copies and queries must
++  be recorded into a command buffer.
++- Indirect acceleration structure builds
++  (``accelerationStructureIndirectBuild``), i.e.
++  ``vkCmdBuildAccelerationStructuresIndirectKHR``. Ray tracing dispatch
++  itself is indirect-capable: both ``vkCmdTraceRaysIndirectKHR`` and
++  ``vkCmdTraceRaysIndirect2KHR`` are supported.
++- Acceleration structure and shader group handle capture/replay
++  (``accelerationStructureCaptureReplay`` and
++  ``rayTracingPipelineShaderGroupHandleCaptureReplay``);
++  ``shaderGroupHandleCaptureReplaySize`` is therefore reported as 0.
++- Update-after-bind acceleration structure descriptors
++  (``descriptorBindingAccelerationStructureUpdateAfterBind``), even though
++  every other descriptor type KosmicKrisp exposes supports update-after-bind
++  and the matching
++  ``maxPerStageDescriptorUpdateAfterBindAccelerationStructures`` and
++  ``maxDescriptorSetUpdateAfterBindAccelerationStructures`` limits are
++  non-zero.
++- ``VK_KHR_ray_tracing_position_fetch``.
++
++In addition, Metal has no notion of a portable serialized acceleration
++structure. ``vkCmdCopyAccelerationStructureToMemoryKHR`` writes a blob holding
++the Vulkan-side data only - the spec header, the per-instance BLAS handles and
++the per-geometry flags - and zeroes the region that would hold the Metal
++acceleration structure itself, since that format is opaque to the driver.
++``vkCmdCopyMemoryToAccelerationStructureKHR`` restores the BLAS handles and the
++geometry flags from the blob, and clones the remaining side tables and the
++Metal acceleration structure itself from the source, which it finds in a
++per-device table keyed on the blob's device address. The table entry is dropped
++once either the source acceleration structure or the buffer the blob was
++written into is destroyed.
++Serialized data can therefore only be deserialized from the buffer it was
++written into, while the acceleration structure it came from is still alive in
++the same process; deserializing anything else logs a warning and leaves the
++destination untouched.
++
++Known issues
++============
++
++Triangles are intersected by Metal's fixed-function intersector, which decides
++on its own what a ray passing exactly through an edge or a vertex shared by
++adjacent triangles hits. KosmicKrisp does not intersect triangles in software,
++so it cannot enforce the watertightness rules the Vulkan specification
++requires.
++
++Ray queries and ray tracing pipelines traverse through that same intersector,
++so the limitation applies to both paths: the
++``dEQP-VK.ray_query.watertightness.*`` and
++``dEQP-VK.ray_tracing_pipeline.watertightness.*`` groups are both affected.
++On the ray query side, every
++``dEQP-VK.ray_query.watertightness.singlehit.*.triangles`` case that runs on
++KosmicKrisp fails: 11 of the 12 cases, the twelfth being skipped because
++``geometryShader`` is not exposed.
++
++The only ray tracing pipeline cases exercised so far are the ten
++``dEQP-VK.ray_tracing_pipeline.watertightness.{0..9}.4096`` cases, which all
++pass. Their ``16384`` and ``65536`` counterparts are deliberately left out of
++routine runs because of their runtime, so no pass or fail count is claimed for
++the ``dEQP-VK.ray_tracing_pipeline.watertightness.*`` group as a whole.
++
+ Metal workarounds
+ *****************
+ 
+
+--- docs/relnotes/new_features.txt
++++ docs/relnotes/new_features.txt
+@@ -15,3 +15,9 @@ shaderCoreBuiltins on panvk/v6-7
+ schedulingControls on panvk/v6-7
+ VK_KHR_synchronization2 on pvr
+ VK_KHR_copy_memory_indirect on panvk
++VK_KHR_acceleration_structure on kk
++VK_KHR_deferred_host_operations on kk
++VK_KHR_pipeline_library on kk
++VK_KHR_ray_query on kk
++VK_KHR_ray_tracing_maintenance1 on kk
++VK_KHR_ray_tracing_pipeline on kk
+
+--- docs/features.txt
++++ docs/features.txt
+@@ -538,12 +538,12 @@ Vulkan 1.4 -- all DONE: anv, hk, lvp, nvk, panvk/v10+, radv/gfx8+, tu/a7xx+, vn
+ 
+ Khronos extensions that are not part of any Vulkan version:
+ 
+-  VK_KHR_acceleration_structure                         DONE (anv/gfx12.5+, lvp, radv/gfx10.3+, tu/a740+, vn)
++  VK_KHR_acceleration_structure                         DONE (anv/gfx12.5+, kk, lvp, radv/gfx10.3+, tu/a740+, vn)
+   VK_KHR_calibrated_timestamps                          DONE (anv, hasvk, hk, kk, nvk, panvk/v10+, radv, tu/a750+, vn)
+   VK_KHR_compute_shader_derivatives                     DONE (anv, lvp, nvk, panvk/v9+, radv, tu, vn)
+   VK_KHR_cooperative_matrix                             DONE (anv, lvp, nvk/Turing+, radv/gfx11+, vn)
+   VK_KHR_copy_memory_indirect                           DONE (anv, lvp, nvk, panvk/v10+, radv/gfx8+)
+-  VK_KHR_deferred_host_operations                       DONE (anv, hasvk, lvp, radv, tu, vn)
++  VK_KHR_deferred_host_operations                       DONE (anv, hasvk, kk, lvp, radv, tu, vn)
+   VK_KHR_depth_clamp_zero_one                           DONE (anv, nvk, panvk, radv, tu, vn)
+   VK_KHR_device_address_commands                        DONE (anv, lvp, radv)
+   VK_KHR_device_fault                                   DONE (radv)
+@@ -570,14 +570,14 @@ Khronos extensions that are not part of any Vulkan version:
+   VK_KHR_performance_query                              DONE (anv, radv/gfx10.3, radv/gfx11, tu, v3dv)
+   VK_KHR_pipeline_binary                                DONE (anv, hk, nvk, panvk, radv)
+   VK_KHR_pipeline_executable_properties                 DONE (anv, hasvk, hk, nvk, panvk, pvr, radv, tu, v3dv)
+-  VK_KHR_pipeline_library                               DONE (anv, hk, lvp, nvk, panvk, radv, tu, vn)
++  VK_KHR_pipeline_library                               DONE (anv, hk, kk, lvp, nvk, panvk, radv, tu, vn)
+   VK_KHR_present_id                                     DONE (anv, hasvk, hk, nvk, panvk, pvr, radv, tu, v3dv, vn)
+   VK_KHR_present_id2                                    DONE (anv, hasvk, hk, nvk, panvk, pvr, radv, tu, v3dv, vn)
+   VK_KHR_present_wait                                   DONE (anv, hasvk, hk, nvk, panvk, pvr, radv, tu, v3dv, vn)
+   VK_KHR_present_wait2                                  DONE (anv, hasvk, hk, nvk, panvk, pvr, radv, tu, v3dv, vn)
+-  VK_KHR_ray_query                                      DONE (anv/gfx12.5+, lvp, radv/gfx10.3+, tu/a740+, vn)
+-  VK_KHR_ray_tracing_maintenance1                       DONE (anv/gfx12.5+, lvp, radv/gfx10.3+, tu/a740+, vn)
+-  VK_KHR_ray_tracing_pipeline                           DONE (anv/gfx12.5+, lvp, radv/gfx10.3+, vn)
++  VK_KHR_ray_query                                      DONE (anv/gfx12.5+, kk (*), lvp, radv/gfx10.3+, tu/a740+, vn)
++  VK_KHR_ray_tracing_maintenance1                       DONE (anv/gfx12.5+, kk, lvp, radv/gfx10.3+, tu/a740+, vn)
++  VK_KHR_ray_tracing_pipeline                           DONE (anv/gfx12.5+, kk (*), lvp, radv/gfx10.3+, vn)
+   VK_KHR_ray_tracing_position_fetch                     DONE (anv, lvp, radv/gfx10.3+, vn)
+   VK_KHR_robustness2                                    DONE (anv, hasvk, hk, kk, lvp, nvk, panvk/v10+, pvr, radv, tu, v3dv, vn)
+   VK_KHR_shader_abort                                   DONE (radv)
+@@ -754,6 +754,16 @@ Khronos extensions that are not part of any Vulkan version:
+   VK_VALVE_shader_mixed_float_dot_product               DONE (radv/{vega20,navi14,gfx10.3+})
+   VK_VALVE_video_encode_rgb_conversion                  DONE (radv)
+ 
++(*) kk relies on Metal's fixed-function triangle intersector and cannot enforce
++    the watertightness rules the Vulkan specification requires. Both traversal
++    paths use that intersector, so the dEQP-VK.ray_query.watertightness.* and
++    dEQP-VK.ray_tracing_pipeline.watertightness.* cases are affected. The ray
++    query single-hit triangle cases are known to fail. On the pipeline side
++    only dEQP-VK.ray_tracing_pipeline.watertightness.{0..9}.4096 has been run,
++    where all 10 cases pass; the 16384 and 65536 variants stay excluded from
++    routine runs because of their runtime, so no result is claimed for the
++    group as a whole. See docs/drivers/kosmickrisp.rst for details.
++
+ Rusticl OpenCL 1.0 -- all DONE:
+   Image support                                         DONE
+ 
+
+--- src/compiler/nir/nir_intrinsics.py
++++ src/compiler/nir/nir_intrinsics.py
+@@ -1042,6 +1042,17 @@ system_value("view_index", 1)
+ system_value("subgroup_size", 1)
+ system_value("subgroup_invocation", 1)
+ system_value("amplification_id_kk", 1)
++# KosmicKrisp: Runtime offset for shader_call_data (ray payloads/callable data)
++# Formula: shader_call_data_offset = payload_location - stack_size
++# (See lavapipe lvp_ray_tracing_pipeline.c:746, 459)
++system_value("shader_call_data_offset_kk", 1)
++
++# KosmicKrisp: Base offset of the current ray tracing shader's own scratch
++# frame, relative to the recursion level's stack pointer. Non-zero for any-hit
++# shaders, which share a stack level with the intersection shader that
++# dispatched them. Baked into local-variable scratch offsets at lowering time
++# so payload and hit attribute accesses are never shifted by it.
++system_value("shader_base_offset_kk", 1)
+ 
+ # These intrinsics provide a bitmask for all invocations, with one bit per
+ # invocation starting with the least significant bit, according to the
+
+--- src/kosmickrisp/bridge/stubs/mtl_acceleration_structure.c
++++ src/kosmickrisp/bridge/stubs/mtl_acceleration_structure.c
+@@ -0,0 +1,63 @@
++/*
++ * Copyright 2025 Schrödinger, Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "mtl_acceleration_structure.h"
++
++struct mtl_acceleration_structure_triangle_geometry_descriptor *
++mtl_new_acceleration_structure_triangle_geometry_descriptor(
++   uint32_t triangle_count, enum mtl_index_type index_type,
++   mtl_buffer *index_buffer, uint64_t index_buffer_offset,
++   enum mtl_attribute_format vertex_format, mtl_buffer *vertex_buffer,
++   uint64_t vertex_buffer_offset, uint64_t vertex_stride, bool is_opaque,
++   mtl_buffer *transform_buffer, uint64_t transform_buffer_offset)
++{
++   return NULL;
++}
++
++struct mtl_acceleration_structure_bounding_box_geometry_descriptor *
++mtl_new_acceleration_structure_bounding_box_geometry_descriptor(
++   uint32_t bounding_box_count, mtl_buffer *bounding_box_buffer,
++   uint64_t bounding_box_buffer_offset, uint64_t bounding_box_stride,
++   bool is_opaque)
++{
++   return NULL;
++}
++
++struct mtl_primitive_acceleration_structure_descriptor *
++mtl_new_primitive_acceleration_structure_descriptor(
++   mtl_acceleration_structure_geometry_descriptor **geometries,
++   uint32_t geometry_count, bool allow_refit)
++{
++   return NULL;
++}
++
++struct mtl_instance_acceleration_structure_descriptor *
++mtl_new_instance_acceleration_structure_descriptor(
++   uint32_t instance_count, mtl_buffer *instance_descriptor_buffer,
++   bool allow_refit)
++{
++   return NULL;
++}
++
++struct mtl_acceleration_structure_sizes
++mtl_calculate_acceleration_structure_sizes(
++   mtl_device *device, mtl_acceleration_structure_descriptor *descriptor)
++{
++   struct mtl_acceleration_structure_sizes sizes = {0};
++   return sizes;
++}
++
++size_t
++mtl_sizeof_mtl_acceleration_structure_instance_descriptor(void)
++{
++   return 0u;
++}
++
++uint64_t
++mtl_acceleration_structure_get_gpu_resource_id(
++   mtl_acceleration_structure *accel_struct)
++{
++   return 0u;
++}
+
+--- src/kosmickrisp/bridge/stubs/mtl_argument_table.c
++++ src/kosmickrisp/bridge/stubs/mtl_argument_table.c
+@@ -30,3 +30,9 @@ void
+ mtl_set_address(mtl_argument_table *table, uint64_t address, uint32_t binding)
+ {
+ }
++
++void
++mtl_set_resource(mtl_argument_table *table, uint64_t resource_id,
++                 uint32_t binding)
++{
++}
+
+--- src/kosmickrisp/bridge/stubs/mtl_buffer.c
++++ src/kosmickrisp/bridge/stubs/mtl_buffer.c
+@@ -6,6 +6,13 @@
+ 
+ #include "mtl_buffer.h"
+ 
++mtl_buffer *
++mtl_new_buffer_with_length_on_device(mtl_device *device, size_t size_B,
++                                     enum mtl_resource_options storage_mode)
++{
++   return NULL;
++}
++
+ uint64_t
+ mtl_buffer_get_length(mtl_buffer *buffer)
+ {
+
+--- src/kosmickrisp/bridge/stubs/mtl_compiler.c
++++ src/kosmickrisp/bridge/stubs/mtl_compiler.c
+@@ -31,15 +31,59 @@ mtl_new_library_function_descriptor(mtl_library *library,
+    return NULL;
+ }
+ 
++mtl_function *
++mtl_new_function_with_name(mtl_library *library, const char *entry_point)
++{
++   return NULL;
++}
++
+ /* Compute pipeline */
+ mtl_compute_pipeline_state *
+ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
+                                mtl_function_descriptor *function,
+-                               uint64_t max_total_threads_per_threadgroup)
++                               uint64_t max_total_threads_per_threadgroup,
++                               uint64_t max_call_stack_depth)
++{
++   return NULL;
++}
++
++mtl_compute_pipeline_state *
++mtl_new_compute_pipeline_state_with_linked_function(
++   mtl_compiler *compiler, mtl_function_descriptor *function,
++   mtl_function_descriptor *linked_function,
++   uint64_t max_total_threads_per_threadgroup, uint64_t max_call_stack_depth)
++{
++   return NULL;
++}
++
++mtl_intersection_function_table *
++mtl_new_intersection_function_table(mtl_compute_pipeline_state *pipeline,
++                                    uint32_t function_count)
++{
++   return NULL;
++}
++
++mtl_function_handle *
++mtl_compute_state_function_handle_with_function(
++   mtl_compute_pipeline_state *pipeline, mtl_function *function)
+ {
+    return NULL;
+ }
+ 
++void
++mtl_intersection_function_table_set_function(
++   mtl_intersection_function_table *table, mtl_function_handle *function,
++   uint32_t index)
++{
++}
++
++uint64_t
++mtl_intersection_function_table_get_gpu_resource_id(
++   mtl_intersection_function_table *table)
++{
++   return 0u;
++}
++
+ /* Render pipeline descriptor */
+ mtl_render_pipeline_descriptor *
+ mtl_new_render_pipeline_descriptor(void)
+
+--- src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -57,6 +57,12 @@ mtl_copy_from_buffer_to_buffer(mtl_compute_encoder *encoder,
+ {
+ }
+ 
++void
++mtl_fill_buffer(mtl_compute_encoder *encoder, mtl_buffer *buffer, size_t offset,
++                size_t size, uint8_t value)
++{
++}
++
+ void
+ mtl_copy_from_buffer_to_texture(mtl_compute_encoder *encoder,
+                                 struct mtl_buffer_image_copy *data)
+@@ -249,3 +255,43 @@ void mtl_render_set_stencil_store_action(mtl_render_encoder *encoder,
+                                        enum mtl_store_action action)
+ {
+ }
++
++void
++mtl_build_acceleration_structure(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *dst_as,
++   mtl_acceleration_structure_descriptor *descriptor,
++   mtl_buffer *scratch_buffer, uint64_t scratch_buffer_offset)
++{
++}
++
++void
++mtl_refit_acceleration_structure(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *src_as, mtl_acceleration_structure *dst_as,
++   mtl_acceleration_structure_descriptor *descriptor,
++   mtl_buffer *scratch_buffer, uint64_t scratch_buffer_offset)
++{
++}
++
++void
++mtl_acceleration_structure_copy(mtl_acceleration_structure_encoder *encoder,
++                                mtl_acceleration_structure *src_as,
++                                mtl_acceleration_structure *dst_as)
++{
++}
++
++void
++mtl_acceleration_structure_copy_and_compact(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *src_as, mtl_acceleration_structure *dst_as)
++{
++}
++
++void
++mtl_acceleration_structure_write_compacted_size(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *src_as, mtl_buffer *dst_buffer,
++   size_t dst_offset)
++{
++}
+
+--- src/kosmickrisp/bridge/stubs/mtl_heap.c
++++ src/kosmickrisp/bridge/stubs/mtl_heap.c
+@@ -35,3 +35,9 @@ mtl_new_texture_with_descriptor(mtl_heap *heap,
+ {
+    return NULL;
+ }
++
++mtl_acceleration_structure *
++mtl_new_acceleration_structure(mtl_heap *heap, uint64_t size, uint64_t offset)
++{
++   return NULL;
++}
+
+--- src/kosmickrisp/bridge/meson.build
++++ src/kosmickrisp/bridge/meson.build
+@@ -10,6 +10,7 @@ mtl_bridge_files = files(
+ 
+ if host_machine.system() == 'darwin'
+   mtl_bridge_files += files(
++    'mtl_acceleration_structure.m',
+     'mtl_argument_table.m',
+     'mtl_bridge.m',
+     'mtl_buffer.m',
+@@ -28,6 +29,7 @@ if host_machine.system() == 'darwin'
+   )
+ else
+   mtl_bridge_files += files(
++    'stubs/mtl_acceleration_structure.c',
+     'stubs/mtl_argument_table.c',
+     'stubs/mtl_bridge.c',
+     'stubs/mtl_buffer.c',
+
+--- src/kosmickrisp/bridge/mtl_acceleration_structure.h
++++ src/kosmickrisp/bridge/mtl_acceleration_structure.h
+@@ -0,0 +1,48 @@
++/*
++ * Copyright 2025 Schrödinger, Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef MTL_ACCELERATION_STRUCTURE_H
++#define MTL_ACCELERATION_STRUCTURE_H 1
++
++#include "mtl_format.h"
++#include "mtl_types.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++
++struct mtl_acceleration_structure_triangle_geometry_descriptor *
++mtl_new_acceleration_structure_triangle_geometry_descriptor(
++   uint32_t triangle_count, enum mtl_index_type index_type,
++   mtl_buffer *index_buffer, uint64_t index_buffer_offset,
++   enum mtl_attribute_format vertex_format, mtl_buffer *vertex_buffer,
++   uint64_t vertex_buffer_offset, uint64_t vertex_stride, bool is_opaque,
++   mtl_buffer *transform_buffer, uint64_t transform_buffer_offset);
++
++struct mtl_acceleration_structure_bounding_box_geometry_descriptor *
++mtl_new_acceleration_structure_bounding_box_geometry_descriptor(
++   uint32_t bounding_box_count, mtl_buffer *bounding_box_buffer,
++   uint64_t bounding_box_buffer_offset, uint64_t bounding_box_stride,
++   bool is_opaque);
++
++struct mtl_primitive_acceleration_structure_descriptor *
++mtl_new_primitive_acceleration_structure_descriptor(
++   mtl_acceleration_structure_geometry_descriptor **geometries,
++   uint32_t geometry_count, bool allow_refit);
++
++struct mtl_instance_acceleration_structure_descriptor *
++mtl_new_instance_acceleration_structure_descriptor(
++   uint32_t instance_count, mtl_buffer *instance_descriptor_buffer,
++   bool allow_refit);
++
++struct mtl_acceleration_structure_sizes
++mtl_calculate_acceleration_structure_sizes(
++   mtl_device *device, mtl_acceleration_structure_descriptor *descriptor);
++
++size_t mtl_sizeof_mtl_acceleration_structure_instance_descriptor(void);
++
++uint64_t mtl_acceleration_structure_get_gpu_resource_id(
++   mtl_acceleration_structure *accel_struct);
++
++#endif /* MTL_ACCELERATION_STRUCTURE_H */
+
+--- src/kosmickrisp/bridge/mtl_acceleration_structure.m
++++ src/kosmickrisp/bridge/mtl_acceleration_structure.m
+@@ -0,0 +1,154 @@
++/*
++ * Copyright 2025 Schrödinger, Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "mtl_acceleration_structure.h"
++#include "mtl_buffer.h"
++
++#include <Metal/MTL4AccelerationStructure.h>
++#include <Metal/MTLAccelerationStructure.h>
++#include <Metal/MTLDevice.h>
++
++static MTL4BufferRange
++mtl4_buffer_range(mtl_buffer *buffer, uint64_t offset)
++{
++   if (!buffer)
++      return MTL4BufferRangeMake(0, 0);
++
++   /* Offsets are accumulated from several independent sources, so an
++    * out-of-range one must resolve to an empty range rather than wrap the
++    * subtraction into a near-2^64 length. */
++   uint64_t length = mtl_buffer_get_length(buffer);
++   uint64_t remaining = offset < length ? length - offset : 0;
++
++   return MTL4BufferRangeMake(mtl_buffer_get_gpu_address(buffer) + offset,
++                              remaining);
++}
++
++struct mtl_acceleration_structure_triangle_geometry_descriptor *
++mtl_new_acceleration_structure_triangle_geometry_descriptor(
++   uint32_t triangle_count, enum mtl_index_type index_type,
++   mtl_buffer *index_buffer, uint64_t index_buffer_offset,
++   enum mtl_attribute_format vertex_format, mtl_buffer *vertex_buffer,
++   uint64_t vertex_buffer_offset, uint64_t vertex_stride, bool is_opaque,
++   mtl_buffer *transform_buffer, uint64_t transform_buffer_offset)
++{
++   @autoreleasepool {
++      MTL4AccelerationStructureTriangleGeometryDescriptor *descriptor =
++         [MTL4AccelerationStructureTriangleGeometryDescriptor new];
++      descriptor.triangleCount = triangle_count;
++      descriptor.indexType = (MTLIndexType)index_type;
++      descriptor.indexBuffer =
++         mtl4_buffer_range(index_buffer, index_buffer_offset);
++      descriptor.vertexFormat = (MTLAttributeFormat)vertex_format;
++      descriptor.vertexBuffer =
++         mtl4_buffer_range(vertex_buffer, vertex_buffer_offset);
++      descriptor.vertexStride = vertex_stride;
++      descriptor.transformationMatrixBuffer =
++         mtl4_buffer_range(transform_buffer, transform_buffer_offset);
++      /* VkTransformMatrixKHR is a row-major float[3][4]. Metal defaults to
++       * reading the same 12 floats as a column-major float4x3, so tell it the
++       * matrix is row-major. */
++      descriptor.transformationMatrixLayout = MTLMatrixLayoutRowMajor;
++      descriptor.opaque = is_opaque;
++      return (
++         mtl_acceleration_structure_triangle_geometry_descriptor *)descriptor;
++   }
++}
++
++struct mtl_acceleration_structure_bounding_box_geometry_descriptor *
++mtl_new_acceleration_structure_bounding_box_geometry_descriptor(
++   uint32_t bounding_box_count, mtl_buffer *bounding_box_buffer,
++   uint64_t bounding_box_buffer_offset, uint64_t bounding_box_stride,
++   bool is_opaque)
++{
++   @autoreleasepool {
++      MTL4AccelerationStructureBoundingBoxGeometryDescriptor *descriptor =
++         [MTL4AccelerationStructureBoundingBoxGeometryDescriptor new];
++      descriptor.boundingBoxCount = bounding_box_count;
++      descriptor.boundingBoxBuffer =
++         mtl4_buffer_range(bounding_box_buffer, bounding_box_buffer_offset);
++      descriptor.boundingBoxStride = bounding_box_stride;
++      descriptor.opaque = is_opaque;
++      return (mtl_acceleration_structure_bounding_box_geometry_descriptor *)
++         descriptor;
++   }
++}
++
++struct mtl_primitive_acceleration_structure_descriptor *
++mtl_new_primitive_acceleration_structure_descriptor(
++   mtl_acceleration_structure_geometry_descriptor **geometries,
++   uint32_t geometry_count, bool allow_refit)
++{
++   @autoreleasepool {
++      MTL4PrimitiveAccelerationStructureDescriptor *descriptor =
++         [MTL4PrimitiveAccelerationStructureDescriptor new];
++      descriptor.usage = allow_refit ? MTLAccelerationStructureUsageRefit
++                                     : MTLAccelerationStructureUsageNone;
++      NSMutableArray<MTL4AccelerationStructureGeometryDescriptor *>
++         *mtl_geometries = [NSMutableArray arrayWithCapacity:geometry_count];
++      for (uint32_t i = 0; i < geometry_count; i++) {
++         [mtl_geometries
++            addObject:(MTL4AccelerationStructureGeometryDescriptor *)
++                         geometries[i]];
++      }
++      descriptor.geometryDescriptors = mtl_geometries;
++      return (mtl_primitive_acceleration_structure_descriptor *)descriptor;
++   }
++}
++
++struct mtl_instance_acceleration_structure_descriptor *
++mtl_new_instance_acceleration_structure_descriptor(
++   uint32_t instance_count, mtl_buffer *instance_descriptor_buffer,
++   bool allow_refit)
++{
++   @autoreleasepool {
++      MTL4InstanceAccelerationStructureDescriptor *descriptor =
++         [MTL4InstanceAccelerationStructureDescriptor new];
++      descriptor.usage = allow_refit ? MTLAccelerationStructureUsageRefit
++                                     : MTLAccelerationStructureUsageNone;
++      descriptor.instanceCount = instance_count;
++      descriptor.instanceDescriptorType =
++         MTLAccelerationStructureInstanceDescriptorTypeIndirect;
++      descriptor.instanceDescriptorBuffer =
++         mtl4_buffer_range(instance_descriptor_buffer, 0);
++      return (mtl_instance_acceleration_structure_descriptor *)descriptor;
++   }
++}
++
++struct mtl_acceleration_structure_sizes
++mtl_calculate_acceleration_structure_sizes(
++   mtl_device *device, mtl_acceleration_structure_descriptor *descriptor)
++{
++   struct mtl_acceleration_structure_sizes return_sizes;
++   @autoreleasepool {
++      id<MTLDevice> dev = (id<MTLDevice>)device;
++      MTLAccelerationStructureDescriptor *desc =
++         (MTLAccelerationStructureDescriptor *)descriptor;
++      MTLAccelerationStructureSizes sizes =
++         [dev accelerationStructureSizesWithDescriptor:desc];
++      return_sizes.acceleration_structure_size =
++         sizes.accelerationStructureSize;
++      return_sizes.build_scratch_buffer_size = sizes.buildScratchBufferSize;
++      return_sizes.refit_scratch_buffer_size = sizes.refitScratchBufferSize;
++      return return_sizes;
++   }
++}
++
++size_t
++mtl_sizeof_mtl_acceleration_structure_instance_descriptor(void)
++{
++   return sizeof(MTLIndirectAccelerationStructureInstanceDescriptor);
++}
++
++uint64_t
++mtl_acceleration_structure_get_gpu_resource_id(
++   mtl_acceleration_structure *accel_struct)
++{
++   @autoreleasepool {
++      id<MTLAccelerationStructure> accel =
++         (id<MTLAccelerationStructure>)accel_struct;
++      return (uint64_t)[accel gpuResourceID]._impl;
++   }
++}
+
+--- src/kosmickrisp/bridge/mtl_argument_table.h
++++ src/kosmickrisp/bridge/mtl_argument_table.h
+@@ -22,5 +22,7 @@ mtl_new_argument_table(mtl_device *dev,
+                        mtl_argument_table_descriptor *descriptor);
+ void mtl_set_address(mtl_argument_table *table, uint64_t address,
+                      uint32_t binding);
++void mtl_set_resource(mtl_argument_table *table, uint64_t resource_id,
++                      uint32_t binding);
+ 
+-#endif /* KK_ARGUMENT_TABLE_H */
+\ No newline at end of file
++#endif /* KK_ARGUMENT_TABLE_H */
+
+--- src/kosmickrisp/bridge/mtl_argument_table.m
++++ src/kosmickrisp/bridge/mtl_argument_table.m
+@@ -47,3 +47,14 @@ mtl_set_address(mtl_argument_table *table, uint64_t address, uint32_t binding)
+       [t setAddress:address atIndex:binding];
+    }
+ }
++
++void
++mtl_set_resource(mtl_argument_table *table, uint64_t resource_id,
++                 uint32_t binding)
++{
++   @autoreleasepool {
++      id<MTL4ArgumentTable> t = (id<MTL4ArgumentTable>)table;
++      MTLResourceID resource = {._impl = resource_id};
++      [t setResource:resource atBufferIndex:binding];
++   }
++}
+
+--- src/kosmickrisp/bridge/mtl_buffer.h
++++ src/kosmickrisp/bridge/mtl_buffer.h
+@@ -13,6 +13,10 @@
+ 
+ struct kk_image_layout;
+ 
++mtl_buffer *
++mtl_new_buffer_with_length_on_device(mtl_device *device, size_t size_B,
++                                     enum mtl_resource_options storage_mode);
++
+ /* Utils */
+ uint64_t mtl_buffer_get_length(mtl_buffer *buffer);
+ uint64_t mtl_buffer_get_gpu_address(mtl_buffer *buffer);
+@@ -23,4 +27,4 @@ void *mtl_get_contents(mtl_buffer *buffer);
+ mtl_texture *mtl_new_texture_with_descriptor_linear(
+    mtl_buffer *buffer, const struct kk_image_layout *layout, uint64_t offset);
+ 
+-#endif /* MTL_BUFFER_H */
+\ No newline at end of file
++#endif /* MTL_BUFFER_H */
+
+--- src/kosmickrisp/bridge/mtl_buffer.m
++++ src/kosmickrisp/bridge/mtl_buffer.m
+@@ -10,8 +10,21 @@
+ #include "kk_image_layout.h"
+ 
+ #include <Metal/MTLBuffer.h>
++#include <Metal/MTLDevice.h>
+ #include <Metal/MTLTexture.h>
+ 
++mtl_buffer *
++mtl_new_buffer_with_length_on_device(mtl_device *device, size_t size_B,
++                                     enum mtl_resource_options storage_mode)
++{
++   @autoreleasepool {
++      id<MTLDevice> dev = (id<MTLDevice>)device;
++      return (mtl_buffer *)[dev
++         newBufferWithLength:size_B
++                     options:(MTLResourceOptions)storage_mode];
++   }
++}
++
+ uint64_t
+ mtl_buffer_get_length(mtl_buffer *buffer)
+ {
+
+--- src/kosmickrisp/bridge/mtl_compiler.h
++++ src/kosmickrisp/bridge/mtl_compiler.h
+@@ -26,12 +26,28 @@ mtl_new_library(mtl_compiler *compiler, const char *src,
+ mtl_function_descriptor *
+ mtl_new_library_function_descriptor(mtl_library *library,
+                                     const char *entry_point);
++mtl_function *mtl_new_function_with_name(mtl_library *library,
++                                         const char *entry_point);
+ 
+ /* Compute pipeline */
+-mtl_compute_pipeline_state *
+-mtl_new_compute_pipeline_state(mtl_compiler *compiler,
+-                               mtl_function_descriptor *function,
+-                               uint64_t max_total_threads_per_threadgroup);
++mtl_compute_pipeline_state *mtl_new_compute_pipeline_state(
++   mtl_compiler *compiler, mtl_function_descriptor *function,
++   uint64_t max_total_threads_per_threadgroup, uint64_t max_call_stack_depth);
++mtl_compute_pipeline_state *mtl_new_compute_pipeline_state_with_linked_function(
++   mtl_compiler *compiler, mtl_function_descriptor *function,
++   mtl_function_descriptor *linked_function,
++   uint64_t max_total_threads_per_threadgroup, uint64_t max_call_stack_depth);
++
++mtl_intersection_function_table *
++mtl_new_intersection_function_table(mtl_compute_pipeline_state *pipeline,
++                                    uint32_t function_count);
++mtl_function_handle *mtl_compute_state_function_handle_with_function(
++   mtl_compute_pipeline_state *pipeline, mtl_function *function);
++void mtl_intersection_function_table_set_function(
++   mtl_intersection_function_table *table, mtl_function_handle *function,
++   uint32_t index);
++uint64_t mtl_intersection_function_table_get_gpu_resource_id(
++   mtl_intersection_function_table *table);
+ 
+ /* Render pipeline descriptor */
+ mtl_render_pipeline_descriptor *mtl_new_render_pipeline_descriptor(void);
+
+--- src/kosmickrisp/bridge/mtl_compiler.m
++++ src/kosmickrisp/bridge/mtl_compiler.m
+@@ -10,8 +10,10 @@
+ #include <Metal/MTL4ComputePipeline.h>
+ #include <Metal/MTL4LibraryDescriptor.h>
+ #include <Metal/MTL4LibraryFunctionDescriptor.h>
++#include <Metal/MTL4LinkingDescriptor.h>
+ #include <Metal/MTL4RenderPipeline.h>
+ #include <Metal/MTLDevice.h>
++#include <Metal/MTLIntersectionFunctionTable.h>
+ 
+ /* Compiler */
+ mtl_compiler *
+@@ -22,11 +24,13 @@ mtl_new_compiler(mtl_device *device)
+ 
+       MTL4CompilerDescriptor *desc = [[MTL4CompilerDescriptor new] autorelease];
+ 
+-      NSError *error;
++      NSError *error = nil;
+       id<MTL4Compiler> compiler = [dev newCompilerWithDescriptor:desc error:&error];
+ 
+       if (compiler == nil) {
+-         fprintf(stderr, "Failed to create MTL4Compiler: %s\n", [error.localizedDescription UTF8String]);
++         const char *message =
++            error ? error.localizedDescription.UTF8String : "unknown error";
++         fprintf(stderr, "Failed to create MTL4Compiler: %s\n", message);
+       }
+ 
+       return compiler;
+@@ -55,11 +59,26 @@ mtl_new_library(mtl_compiler *compiler, const char *src,
+       desc.source = ns_src;
+       desc.options = opts;
+ 
+-      NSError *error;
++      NSError *error = nil;
+       id<MTLLibrary> lib = [comp newLibraryWithDescriptor:desc error:&error];
+ 
+       if (lib == nil) {
+-         fprintf(stderr, "Failed to create MTLLibrary: %s\n", [error.localizedDescription UTF8String]);
++         /* KK_WORKAROUND_18 */
++         if (error != nil && [(id)error isKindOfClass:[NSError class]]) {
++            fprintf(stderr, "MTL4 library compilation failed: %s\n",
++                    error.localizedDescription.UTF8String);
++         }
++
++         NSError *fallback_error = nil;
++         lib = [comp.device newLibraryWithSource:ns_src
++                                         options:opts
++                                           error:&fallback_error];
++         if (lib == nil) {
++            const char *message =
++               fallback_error ? fallback_error.localizedDescription.UTF8String
++                              : "unknown error";
++            fprintf(stderr, "Failed to create MTLLibrary: %s\n", message);
++         }
+       }
+ 
+       return lib;
+@@ -80,11 +99,23 @@ mtl_new_library_function_descriptor(mtl_library *library, const char *entry_poin
+    }
+ }
+ 
++mtl_function *
++mtl_new_function_with_name(mtl_library *library, const char *entry_point)
++{
++   @autoreleasepool {
++      id<MTLLibrary> lib = (id<MTLLibrary>)library;
++      NSString *name = [NSString stringWithCString:entry_point
++                                          encoding:NSASCIIStringEncoding];
++      return (mtl_function *)[lib newFunctionWithName:name];
++   }
++}
++
+ /* Compute pipeline */
+ mtl_compute_pipeline_state *
+ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
+                                mtl_function_descriptor *function,
+-                               uint64_t max_total_threads_per_threadgroup)
++                               uint64_t max_total_threads_per_threadgroup,
++                               uint64_t max_call_stack_depth)
+ {
+    @autoreleasepool {
+       id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
+@@ -93,18 +124,125 @@ mtl_new_compute_pipeline_state(mtl_compiler *compiler,
+       desc.computeFunctionDescriptor = (MTL4FunctionDescriptor *)function;
+       desc.maxTotalThreadsPerThreadgroup = max_total_threads_per_threadgroup;
+ 
+-      NSError *error;
+-      id<MTLComputePipelineState> pipeline = [comp newComputePipelineStateWithDescriptor:desc compilerTaskOptions:nil
+-                                                                                   error:&error];
++      MTL4PipelineStageDynamicLinkingDescriptor *dynamic_linking = nil;
++      if (max_call_stack_depth > 0) {
++         dynamic_linking =
++            [[MTL4PipelineStageDynamicLinkingDescriptor new] autorelease];
++         dynamic_linking.maxCallStackDepth = max_call_stack_depth;
++      }
++
++      NSError *error = nil;
++      id<MTLComputePipelineState> pipeline =
++         [comp newComputePipelineStateWithDescriptor:desc
++                            dynamicLinkingDescriptor:dynamic_linking
++                                 compilerTaskOptions:nil
++                                               error:&error];
+ 
+       if (pipeline == nil) {
+-         fprintf(stderr, "Failed to create MTLComputePipelineState: %s\n", [error.localizedDescription UTF8String]);
++         const char *message =
++            error ? error.localizedDescription.UTF8String : "unknown error";
++         fprintf(stderr, "Failed to create MTLComputePipelineState: %s\n",
++                 message);
+       }
+ 
+       return pipeline;
+    }
+ }
+ 
++mtl_compute_pipeline_state *
++mtl_new_compute_pipeline_state_with_linked_function(
++   mtl_compiler *compiler, mtl_function_descriptor *function,
++   mtl_function_descriptor *linked_function,
++   uint64_t max_total_threads_per_threadgroup, uint64_t max_call_stack_depth)
++{
++   @autoreleasepool {
++      id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
++      MTL4ComputePipelineDescriptor *desc =
++         [[MTL4ComputePipelineDescriptor new] autorelease];
++      desc.computeFunctionDescriptor = (MTL4FunctionDescriptor *)function;
++      desc.maxTotalThreadsPerThreadgroup = max_total_threads_per_threadgroup;
++
++      MTL4StaticLinkingDescriptor *linking =
++         [[MTL4StaticLinkingDescriptor new] autorelease];
++      linking.functionDescriptors =
++         @[(MTL4FunctionDescriptor *)linked_function];
++      desc.staticLinkingDescriptor = linking;
++
++      MTL4PipelineStageDynamicLinkingDescriptor *dynamic_linking = nil;
++      if (max_call_stack_depth > 0) {
++         dynamic_linking =
++            [[MTL4PipelineStageDynamicLinkingDescriptor new] autorelease];
++         dynamic_linking.maxCallStackDepth = max_call_stack_depth;
++      }
++
++      NSError *error = nil;
++      id<MTLComputePipelineState> pipeline =
++         [comp newComputePipelineStateWithDescriptor:desc
++                            dynamicLinkingDescriptor:dynamic_linking
++                                 compilerTaskOptions:nil
++                                               error:&error];
++      if (pipeline == nil) {
++         const char *message =
++            error ? error.localizedDescription.UTF8String : "unknown error";
++         fprintf(stderr,
++                 "Failed to create linked MTLComputePipelineState: %s\n",
++                 message);
++      }
++
++      return pipeline;
++   }
++}
++
++mtl_intersection_function_table *
++mtl_new_intersection_function_table(mtl_compute_pipeline_state *pipeline,
++                                    uint32_t function_count)
++{
++   @autoreleasepool {
++      id<MTLComputePipelineState> state = (id<MTLComputePipelineState>)pipeline;
++      MTLIntersectionFunctionTableDescriptor *desc =
++         [MTLIntersectionFunctionTableDescriptor
++            intersectionFunctionTableDescriptor];
++      desc.functionCount = function_count;
++      return (mtl_intersection_function_table *)[state
++         newIntersectionFunctionTableWithDescriptor:desc];
++   }
++}
++
++mtl_function_handle *
++mtl_compute_state_function_handle_with_function(
++   mtl_compute_pipeline_state *pipeline, mtl_function *function)
++{
++   @autoreleasepool {
++      id<MTLComputePipelineState> state = (id<MTLComputePipelineState>)pipeline;
++      id<MTLFunction> fn = (id<MTLFunction>)function;
++      return (mtl_function_handle *)[[state functionHandleWithFunction:fn]
++         retain];
++   }
++}
++
++void
++mtl_intersection_function_table_set_function(
++   mtl_intersection_function_table *table, mtl_function_handle *function,
++   uint32_t index)
++{
++   @autoreleasepool {
++      id<MTLIntersectionFunctionTable> t =
++         (id<MTLIntersectionFunctionTable>)table;
++      [t setFunction:(id<MTLFunctionHandle>)function atIndex:index];
++   }
++}
++
++uint64_t
++mtl_intersection_function_table_get_gpu_resource_id(
++   mtl_intersection_function_table *table)
++{
++   @autoreleasepool {
++      id<MTLIntersectionFunctionTable> t =
++         (id<MTLIntersectionFunctionTable>)table;
++      return t.gpuResourceID._impl;
++   }
++}
++
+ /* Render pipeline descriptor */
+ mtl_render_pipeline_descriptor *
+ mtl_new_render_pipeline_descriptor()
+
+--- src/kosmickrisp/bridge/mtl_encoder.h
++++ src/kosmickrisp/bridge/mtl_encoder.h
+@@ -38,6 +38,9 @@ void mtl_copy_from_buffer_to_buffer(mtl_compute_encoder *encoder,
+                                     mtl_buffer *dst_buf, size_t dst_offset,
+                                     size_t size);
+ 
++void mtl_fill_buffer(mtl_compute_encoder *encoder, mtl_buffer *buffer,
++                     size_t offset, size_t size, uint8_t value);
++
+ void mtl_copy_from_buffer_to_texture(mtl_compute_encoder *encoder,
+                                      struct mtl_buffer_image_copy *data);
+ 
+@@ -144,4 +147,31 @@ void mtl_render_set_depth_store_action(mtl_render_encoder *encoder,
+ void mtl_render_set_stencil_store_action(mtl_render_encoder *encoder,
+                                        enum mtl_store_action action);
+ 
++/* MTLAccelerationStructureEncoder */
++void mtl_build_acceleration_structure(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *dst_as,
++   mtl_acceleration_structure_descriptor *descriptor,
++   mtl_buffer *scratch_buffer, uint64_t scratch_buffer_offset);
++
++void mtl_refit_acceleration_structure(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *src_as, mtl_acceleration_structure *dst_as,
++   mtl_acceleration_structure_descriptor *descriptor,
++   mtl_buffer *scratch_buffer, uint64_t scratch_buffer_offset);
++
++void
++mtl_acceleration_structure_copy(mtl_acceleration_structure_encoder *encoder,
++                                mtl_acceleration_structure *src_as,
++                                mtl_acceleration_structure *dst_as);
++
++void mtl_acceleration_structure_copy_and_compact(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *src_as, mtl_acceleration_structure *dst_as);
++
++void mtl_acceleration_structure_write_compacted_size(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *src_as, mtl_buffer *dst_buffer,
++   size_t dst_offset);
++
+ #endif /* MTL_ENCODER_H */
+
+--- src/kosmickrisp/bridge/mtl_encoder.m
++++ src/kosmickrisp/bridge/mtl_encoder.m
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "mtl_encoder.h"
++#include "mtl_buffer.h"
+ 
+ #include <Metal/MTL4CommandBuffer.h>
+ #include <Metal/MTL4ComputeCommandEncoder.h>
+@@ -104,6 +105,18 @@ mtl_copy_from_buffer_to_buffer(mtl_compute_encoder *encoder,
+    }
+ }
+ 
++void
++mtl_fill_buffer(mtl_compute_encoder *encoder, mtl_buffer *buffer, size_t offset,
++                size_t size, uint8_t value)
++{
++   @autoreleasepool {
++      id<MTL4ComputeCommandEncoder> enc =
++         (id<MTL4ComputeCommandEncoder>)encoder;
++      id<MTLBuffer> mtl_buf = (id<MTLBuffer>)buffer;
++      [enc fillBuffer:mtl_buf range:NSMakeRange(offset, size) value:value];
++   }
++}
++
+ void
+ mtl_copy_from_buffer_to_texture(mtl_compute_encoder *encoder,
+                                 struct mtl_buffer_image_copy *data)
+@@ -500,3 +513,105 @@ void mtl_render_set_stencil_store_action(mtl_render_encoder *encoder,
+         [enc setStencilStoreAction:(MTLStoreAction)action];
+     }
+ }
++
++/* Resolves a buffer plus offset into the range Metal should see.  An offset
++ * past the end of the buffer yields an empty range instead of wrapping the
++ * length subtraction around to a near-2^64 value. */
++static MTL4BufferRange
++mtl4_scratch_range(mtl_buffer *buffer, uint64_t offset)
++{
++   if (!buffer)
++      return MTL4BufferRangeMake(0, 0);
++
++   uint64_t length = mtl_buffer_get_length(buffer);
++   uint64_t remaining = offset < length ? length - offset : 0;
++
++   return MTL4BufferRangeMake(mtl_buffer_get_gpu_address(buffer) + offset,
++                              remaining);
++}
++
++void
++mtl_build_acceleration_structure(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *dst_as,
++   mtl_acceleration_structure_descriptor *descriptor,
++   mtl_buffer *scratch_buffer, uint64_t scratch_buffer_offset)
++{
++   @autoreleasepool {
++      id<MTL4ComputeCommandEncoder> enc =
++         (id<MTL4ComputeCommandEncoder>)encoder;
++      id<MTLAccelerationStructure> dst = (id<MTLAccelerationStructure>)dst_as;
++      MTL4BufferRange scratch =
++         mtl4_scratch_range(scratch_buffer, scratch_buffer_offset);
++      [enc buildAccelerationStructure:dst
++                           descriptor:(MTL4AccelerationStructureDescriptor *)
++                                         descriptor
++                        scratchBuffer:scratch];
++   }
++}
++
++void
++mtl_refit_acceleration_structure(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *src_as, mtl_acceleration_structure *dst_as,
++   mtl_acceleration_structure_descriptor *descriptor,
++   mtl_buffer *scratch_buffer, uint64_t scratch_buffer_offset)
++{
++   @autoreleasepool {
++      id<MTL4ComputeCommandEncoder> enc =
++         (id<MTL4ComputeCommandEncoder>)encoder;
++      id<MTLAccelerationStructure> src = (id<MTLAccelerationStructure>)src_as;
++      id<MTLAccelerationStructure> dst = (id<MTLAccelerationStructure>)dst_as;
++      MTL4BufferRange scratch =
++         mtl4_scratch_range(scratch_buffer, scratch_buffer_offset);
++      [enc refitAccelerationStructure:src
++                           descriptor:(MTL4AccelerationStructureDescriptor *)
++                                         descriptor
++                          destination:dst
++                        scratchBuffer:scratch];
++   }
++}
++
++void
++mtl_acceleration_structure_copy(mtl_acceleration_structure_encoder *encoder,
++                                mtl_acceleration_structure *src_as,
++                                mtl_acceleration_structure *dst_as)
++{
++   @autoreleasepool {
++      id<MTL4ComputeCommandEncoder> enc =
++         (id<MTL4ComputeCommandEncoder>)encoder;
++      id<MTLAccelerationStructure> dst = (id<MTLAccelerationStructure>)dst_as;
++      id<MTLAccelerationStructure> src = (id<MTLAccelerationStructure>)src_as;
++      [enc copyAccelerationStructure:src toAccelerationStructure:dst];
++   }
++}
++
++void
++mtl_acceleration_structure_copy_and_compact(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *src_as, mtl_acceleration_structure *dst_as)
++{
++   @autoreleasepool {
++      id<MTL4ComputeCommandEncoder> enc =
++         (id<MTL4ComputeCommandEncoder>)encoder;
++      id<MTLAccelerationStructure> dst = (id<MTLAccelerationStructure>)dst_as;
++      id<MTLAccelerationStructure> src = (id<MTLAccelerationStructure>)src_as;
++      [enc copyAndCompactAccelerationStructure:src toAccelerationStructure:dst];
++   }
++}
++
++void
++mtl_acceleration_structure_write_compacted_size(
++   mtl_acceleration_structure_encoder *encoder,
++   mtl_acceleration_structure *src_as, mtl_buffer *dst_buffer,
++   size_t dst_offset)
++{
++   @autoreleasepool {
++      id<MTL4ComputeCommandEncoder> enc =
++         (id<MTL4ComputeCommandEncoder>)encoder;
++      id<MTLAccelerationStructure> src = (id<MTLAccelerationStructure>)src_as;
++      MTL4BufferRange dst = MTL4BufferRangeMake(
++         mtl_buffer_get_gpu_address(dst_buffer) + dst_offset, sizeof(uint64_t));
++      [enc writeCompactedAccelerationStructureSize:src toBuffer:dst];
++   }
++}
+
+--- src/kosmickrisp/bridge/mtl_format.h
++++ src/kosmickrisp/bridge/mtl_format.h
+@@ -202,4 +202,79 @@ enum mtl_pixel_format {
+    MTL_PIXEL_FORMAT_X24_S8_UINT = 262,
+ };
+ 
++enum mtl_attribute_format {
++   MTL_ATTRIBUTE_FORMAT_INVALID = 0,
++
++   MTL_ATTRIBUTE_FORMAT_UCHAR2 = 1,
++   MTL_ATTRIBUTE_FORMAT_UCHAR3 = 2,
++   MTL_ATTRIBUTE_FORMAT_UCHAR4 = 3,
++
++   MTL_ATTRIBUTE_FORMAT_CHAR2 = 4,
++   MTL_ATTRIBUTE_FORMAT_CHAR3 = 5,
++   MTL_ATTRIBUTE_FORMAT_CHAR4 = 6,
++
++   MTL_ATTRIBUTE_FORMAT_UCHAR2_NORMALIZED = 7,
++   MTL_ATTRIBUTE_FORMAT_UCHAR3_NORMALIZED = 8,
++   MTL_ATTRIBUTE_FORMAT_UCHAR4_NORMALIZED = 9,
++
++   MTL_ATTRIBUTE_FORMAT_CHAR2_NORMALIZED = 10,
++   MTL_ATTRIBUTE_FORMAT_CHAR3_NORMALIZED = 11,
++   MTL_ATTRIBUTE_FORMAT_CHAR4_NORMALIZED = 12,
++
++   MTL_ATTRIBUTE_FORMAT_USHORT2 = 13,
++   MTL_ATTRIBUTE_FORMAT_USHORT3 = 14,
++   MTL_ATTRIBUTE_FORMAT_USHORT4 = 15,
++
++   MTL_ATTRIBUTE_FORMAT_SHORT2 = 16,
++   MTL_ATTRIBUTE_FORMAT_SHORT3 = 17,
++   MTL_ATTRIBUTE_FORMAT_SHORT4 = 18,
++
++   MTL_ATTRIBUTE_FORMAT_USHORT2_NORMALIZED = 19,
++   MTL_ATTRIBUTE_FORMAT_USHORT3_NORMALIZED = 20,
++   MTL_ATTRIBUTE_FORMAT_USHORT4_NORMALIZED = 21,
++
++   MTL_ATTRIBUTE_FORMAT_SHORT2_NORMALIZED = 22,
++   MTL_ATTRIBUTE_FORMAT_SHORT3_NORMALIZED = 23,
++   MTL_ATTRIBUTE_FORMAT_SHORT4_NORMALIZED = 24,
++
++   MTL_ATTRIBUTE_FORMAT_HALF2 = 25,
++   MTL_ATTRIBUTE_FORMAT_HALF3 = 26,
++   MTL_ATTRIBUTE_FORMAT_HALF4 = 27,
++
++   MTL_ATTRIBUTE_FORMAT_FLOAT = 28,
++   MTL_ATTRIBUTE_FORMAT_FLOAT2 = 29,
++   MTL_ATTRIBUTE_FORMAT_FLOAT3 = 30,
++   MTL_ATTRIBUTE_FORMAT_FLOAT4 = 31,
++
++   MTL_ATTRIBUTE_FORMAT_INT = 32,
++   MTL_ATTRIBUTE_FORMAT_INT2 = 33,
++   MTL_ATTRIBUTE_FORMAT_INT3 = 34,
++   MTL_ATTRIBUTE_FORMAT_INT4 = 35,
++
++   MTL_ATTRIBUTE_FORMAT_UINT = 36,
++   MTL_ATTRIBUTE_FORMAT_UINT2 = 37,
++   MTL_ATTRIBUTE_FORMAT_UINT3 = 38,
++   MTL_ATTRIBUTE_FORMAT_UINT4 = 39,
++
++   MTL_ATTRIBUTE_FORMAT_INT1010102_NORMALIZED = 40,
++   MTL_ATTRIBUTE_FORMAT_UINT1010102_NORMALIZED = 41,
++
++   MTL_ATTRIBUTE_FORMAT_UCHAR4_NORMALIZED_BGRA = 42,
++
++   MTL_ATTRIBUTE_FORMAT_UCHAR = 45,
++   MTL_ATTRIBUTE_FORMAT_CHAR = 46,
++   MTL_ATTRIBUTE_FORMAT_UCHAR_NORMALIZED = 47,
++   MTL_ATTRIBUTE_FORMAT_CHAR_NORMALIZED = 48,
++
++   MTL_ATTRIBUTE_FORMAT_USHORT = 49,
++   MTL_ATTRIBUTE_FORMAT_SHORT = 50,
++   MTL_ATTRIBUTE_FORMAT_USHORT_NORMALIZED = 51,
++   MTL_ATTRIBUTE_FORMAT_SHORT_NORMALIZED = 52,
++
++   MTL_ATTRIBUTE_FORMAT_HALF = 53,
++
++   MTL_ATTRIBUTE_FORMAT_FLOAT_RG11B10 = 54,
++   MTL_ATTRIBUTE_FORMAT_FLOAT_RGB9E5 = 55,
++};
++
+ #endif /* MTL_FORMAT_H */
+
+--- src/kosmickrisp/bridge/mtl_heap.h
++++ src/kosmickrisp/bridge/mtl_heap.h
+@@ -27,4 +27,7 @@ mtl_buffer *mtl_new_buffer_with_length(mtl_heap *heap, uint64_t size_B,
+ mtl_texture *mtl_new_texture_with_descriptor(
+    mtl_heap *heap, const struct kk_image_layout *layout, uint64_t offset);
+ 
+-#endif /* MTL_HEAP_H */
+\ No newline at end of file
++mtl_acceleration_structure *
++mtl_new_acceleration_structure(mtl_heap *heap, uint64_t size, uint64_t offset);
++
++#endif /* MTL_HEAP_H */
+
+--- src/kosmickrisp/bridge/mtl_heap.m
++++ src/kosmickrisp/bridge/mtl_heap.m
+@@ -81,3 +81,14 @@ mtl_new_texture_with_descriptor(mtl_heap *heap,
+       return [hp newTextureWithDescriptor:descriptor offset:offset];
+    }
+ }
++
++mtl_acceleration_structure *
++mtl_new_acceleration_structure(mtl_heap *heap, uint64_t size, uint64_t offset)
++{
++   @autoreleasepool {
++      id<MTLHeap> hp = (id<MTLHeap>)heap;
++      return (mtl_acceleration_structure *)[hp
++         newAccelerationStructureWithSize:size
++                                   offset:offset];
++   }
++}
+
+--- src/kosmickrisp/bridge/mtl_types.h
++++ src/kosmickrisp/bridge/mtl_types.h
+@@ -24,6 +24,7 @@ typedef void mtl_command_encoder;
+ typedef void mtl_blit_encoder;
+ typedef void mtl_compute_encoder;
+ typedef void mtl_render_encoder;
++typedef void mtl_acceleration_structure_encoder;
+ typedef void mtl_event;
+ typedef void mtl_shared_event;
+ typedef void mtl_sampler_descriptor;
+@@ -32,6 +33,8 @@ typedef void mtl_compute_pipeline_state;
+ typedef void mtl_library;
+ typedef void mtl_render_pipeline_state;
+ typedef void mtl_function_descriptor;
++typedef void mtl_function;
++typedef void mtl_function_handle;
+ typedef void mtl_resource;
+ typedef void mtl_render_pass_descriptor;
+ typedef void mtl_render_pipeline_descriptor;
+@@ -40,6 +43,15 @@ typedef void mtl_stencil_descriptor;
+ typedef void mtl_depth_stencil_descriptor;
+ typedef void mtl_depth_stencil_state;
+ typedef void mtl_render_pass_attachment_descriptor;
++typedef void mtl_acceleration_structure_triangle_geometry_descriptor;
++typedef void mtl_acceleration_structure_bounding_box_geometry_descriptor;
++typedef void mtl_acceleration_structure_geometry_descriptor;
++typedef void mtl_primitive_acceleration_structure_descriptor;
++typedef void mtl_instance_acceleration_structure_descriptor;
++typedef void mtl_acceleration_structure_descriptor;
++typedef void mtl_acceleration_structure_instance_descriptor;
++typedef void mtl_acceleration_structure;
++typedef void mtl_intersection_function_table;
+ typedef void mtl_residency_set;
+ typedef void mtl_allocation;
+ typedef void mtl_compiler;
+@@ -374,4 +386,10 @@ struct mtl_feedback_data {
+    enum mtl_command_queue_error error;
+ };
+ 
++struct mtl_acceleration_structure_sizes {
++   size_t acceleration_structure_size;
++   size_t build_scratch_buffer_size;
++   size_t refit_scratch_buffer_size;
++};
++
+ #endif /* KK_MTL_TYPES_H */
+
+--- src/kosmickrisp/bridge/vk_to_mtl_map.c
++++ src/kosmickrisp/bridge/vk_to_mtl_map.c
+@@ -6,6 +6,7 @@
+ 
+ #include "vk_to_mtl_map.h"
+ 
++#include "kosmickrisp/bridge/mtl_format.h"
+ #include "kosmickrisp/bridge/mtl_types.h"
+ 
+ #include "util/format/u_format.h"
+@@ -284,3 +285,67 @@ mtl_command_queue_error_to_string(enum mtl_command_queue_error error)
+       UNREACHABLE("Unsupported error value");
+    }
+ }
++
++enum mtl_index_type
++vk_index_type_to_mtl_index_type(enum VkIndexType index_type)
++{
++   switch (index_type) {
++   case VK_INDEX_TYPE_UINT16:
++      return MTL_INDEX_TYPE_UINT16;
++   case VK_INDEX_TYPE_UINT32:
++      return MTL_INDEX_TYPE_UINT32;
++   default:
++      UNREACHABLE("Unsupported VkIndexType");
++   }
++}
++
++enum mtl_attribute_format
++vk_acceleration_structure_vertex_format_to_mtl_attribute_format(
++   enum VkFormat format)
++{
++   /* Only 2-, 3- and 4-component formats can express a triangle vertex
++    * position, and those are the ones
++    * MTLAccelerationStructureTriangleGeometryDescriptor.vertexFormat accepts.
++    */
++   switch (format) {
++   case VK_FORMAT_R32G32B32A32_SFLOAT:
++      return MTL_ATTRIBUTE_FORMAT_FLOAT4;
++   case VK_FORMAT_R32G32B32_SFLOAT:
++      return MTL_ATTRIBUTE_FORMAT_FLOAT3;
++   case VK_FORMAT_R32G32_SFLOAT:
++      return MTL_ATTRIBUTE_FORMAT_FLOAT2;
++   case VK_FORMAT_R16G16B16A16_SFLOAT:
++      return MTL_ATTRIBUTE_FORMAT_HALF4;
++   case VK_FORMAT_R16G16B16_SFLOAT:
++      return MTL_ATTRIBUTE_FORMAT_HALF3;
++   case VK_FORMAT_R16G16_SFLOAT:
++      return MTL_ATTRIBUTE_FORMAT_HALF2;
++   case VK_FORMAT_R16G16_SNORM:
++      return MTL_ATTRIBUTE_FORMAT_SHORT2_NORMALIZED;
++   case VK_FORMAT_R16G16B16_SNORM:
++      return MTL_ATTRIBUTE_FORMAT_SHORT3_NORMALIZED;
++   case VK_FORMAT_R16G16B16A16_SNORM:
++      return MTL_ATTRIBUTE_FORMAT_SHORT4_NORMALIZED;
++   case VK_FORMAT_R16G16_UNORM:
++      return MTL_ATTRIBUTE_FORMAT_USHORT2_NORMALIZED;
++   case VK_FORMAT_R16G16B16_UNORM:
++      return MTL_ATTRIBUTE_FORMAT_USHORT3_NORMALIZED;
++   case VK_FORMAT_R16G16B16A16_UNORM:
++      return MTL_ATTRIBUTE_FORMAT_USHORT4_NORMALIZED;
++   case VK_FORMAT_R8G8B8A8_SNORM:
++      return MTL_ATTRIBUTE_FORMAT_CHAR4_NORMALIZED;
++   case VK_FORMAT_R8G8B8_SNORM:
++      return MTL_ATTRIBUTE_FORMAT_CHAR3_NORMALIZED;
++   case VK_FORMAT_R8G8_SNORM:
++      return MTL_ATTRIBUTE_FORMAT_CHAR2_NORMALIZED;
++   default:
++      return MTL_ATTRIBUTE_FORMAT_INVALID;
++   }
++}
++
++bool
++vk_acceleration_structure_vertex_format_supported(enum VkFormat format)
++{
++   return vk_acceleration_structure_vertex_format_to_mtl_attribute_format(
++             format) != MTL_ATTRIBUTE_FORMAT_INVALID;
++}
+
+--- src/kosmickrisp/bridge/vk_to_mtl_map.h
++++ src/kosmickrisp/bridge/vk_to_mtl_map.h
+@@ -6,6 +6,8 @@
+ #ifndef KK_MTL_TO_VK_MAP_H
+ #define KK_MTL_TO_VK_MAP_H 1
+ 
++#include <stdbool.h>
++
+ struct mtl_origin;
+ struct mtl_size;
+ enum mtl_primitive_type;
+@@ -21,6 +23,7 @@ enum mtl_winding;
+ enum mtl_cull_mode;
+ enum mtl_index_type;
+ enum mtl_command_queue_error;
++enum mtl_attribute_format;
+ 
+ struct VkOffset3D;
+ struct VkExtent3D;
+@@ -35,6 +38,8 @@ enum VkSamplerMipmapMode;
+ enum VkCompareOp;
+ enum VkFrontFace;
+ enum VkCullModeFlagBits;
++enum VkIndexType;
++enum VkFormat;
+ 
+ /* STRUCTS */
+ struct mtl_origin vk_offset_3d_to_mtl_origin(const struct VkOffset3D *offset);
+@@ -82,4 +87,13 @@ unsigned mtl_index_type_to_size_B(enum mtl_index_type type);
+ const char *
+ mtl_command_queue_error_to_string(enum mtl_command_queue_error error);
+ 
++enum mtl_index_type
++vk_index_type_to_mtl_index_type(enum VkIndexType index_type);
++
++enum mtl_attribute_format
++vk_acceleration_structure_vertex_format_to_mtl_attribute_format(
++   enum VkFormat format);
++
++bool vk_acceleration_structure_vertex_format_supported(enum VkFormat format);
++
+ #endif /* KK_MTL_TO_VK_MAP_H */
+
+--- src/kosmickrisp/compiler/meson.build
++++ src/kosmickrisp/compiler/meson.build
+@@ -4,6 +4,7 @@
+ 
+ libmsl_compiler_files = files(
+     'nir_to_msl.c',
++    'nir_to_msl_rt.c',
+     'msl_type_inference.c',
+     'msl_iomap.c',
+     'msl_nir_gather_common.c',
+
+--- src/kosmickrisp/compiler/msl_iomap.c
++++ src/kosmickrisp/compiler/msl_iomap.c
+@@ -317,6 +317,19 @@ fs_output_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
+    P_IND(ctx, "};\n")
+ }
+ 
++static void
++rayintersection_input_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
++{
++   P(ctx, "struct BoundingBoxIntersection {\n");
++   ctx->indentlevel++;
++   P_IND(ctx, "float hit_t [[distance]];\n");
++   P_IND(ctx, "/* uint kind; */\n");
++   P_IND(ctx, "bool accept [[accept_intersection]];\n");
++   P_IND(ctx, "/* bool continue_search [[continue_search]]; */\n");
++   ctx->indentlevel--;
++   P(ctx, "};\n");
++}
++
+ struct gather_ctx {
+    struct io_slot_info *input;
+    struct io_slot_info *output;
+@@ -442,6 +455,14 @@ msl_emit_io_blocks(struct nir_to_msl_ctx *ctx, nir_shader *shader)
+    case MESA_SHADER_COMPUTE:
+    case MESA_SHADER_TESS_CTRL:
+       break;
++   case MESA_SHADER_RAYGEN:
++   case MESA_SHADER_ANY_HIT:
++   case MESA_SHADER_INTERSECTION:
++   case MESA_SHADER_CLOSEST_HIT:
++   case MESA_SHADER_MISS:
++   case MESA_SHADER_CALLABLE:
++      rayintersection_input_block(shader, ctx);
++      break;
+    default:
+       assert(0);
+    }
+
+--- src/kosmickrisp/compiler/msl_private.h
++++ src/kosmickrisp/compiler/msl_private.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include "kosmickrisp/kk_ray_tracing_common.h"
+ #include "util/string_buffer.h"
+ #include "nir.h"
+ 
+@@ -18,6 +19,52 @@ struct io_slot_info {
+    bool uses_interpolant;
+ };
+ 
++struct shader_binding_table_info {
++   /* Buffer binding where SBT info is stored */
++   uint32_t sbt_buffer_binding;
++
++   /* Offsets within the SBT buffer to find base addresses */
++   uint32_t raygen_addr_offset;
++   uint32_t miss_addr_offset;
++   uint32_t hit_addr_offset;
++   uint32_t callable_addr_offset;
++
++   /* Offsets to find stride values */
++   uint32_t raygen_stride_offset;
++   uint32_t miss_stride_offset;
++   uint32_t hit_stride_offset;
++   uint32_t callable_stride_offset;
++
++   /* Offset to ray_launch_size_addr (pointer to a four word buffer: the three
++    * launch dimensions followed by the worker count the raygen grid-stride
++    * loop strides by) */
++   uint32_t ray_launch_size_addr_offset;
++
++   /* Offsets to the first logical ray and ray count handled by the current
++    * direct-dispatch chunk.  A zero count selects the full-launch grid-stride
++    * path used by indirect dispatches. */
++   uint32_t ray_launch_base_offset;
++   uint32_t ray_launch_count_offset;
++
++   /* Offset to scratch_buffer_addr (pointer to device scratch buffer) */
++   uint32_t scratch_buffer_addr_offset;
++
++   /* Offset to the per-worker scratch stride */
++   uint32_t scratch_buffer_stride_offset;
++};
++
++struct kk_rt_scratch_layout {
++   size_t total_size; // Total scratch size including local vars and payload
++
++   // Per-shader-type scratch sizes (for stack_ptr management)
++   uint32_t raygen_size;
++   uint32_t ahit_size;
++   uint32_t chit_size;
++   uint32_t miss_size;
++   uint32_t isec_size;
++   uint32_t callable_size;
++};
++
+ struct nir_to_msl_ctx {
+    FILE *output;
+    struct hash_table *types;
+@@ -28,6 +75,14 @@ struct nir_to_msl_ctx {
+    unsigned short indentlevel;
+    struct io_slot_info inputs_info[NUM_TOTAL_VARYING_SLOTS];
+    struct io_slot_info outputs_info[NUM_TOTAL_VARYING_SLOTS];
++   struct hash_table *ray_query_vars; // Maps nir_variable* -> unique ID
++   unsigned ray_query_counter;
++   struct kk_rt_scratch_layout scratch_layout; // For ray tracing payload offsets
++   struct kk_rt_group *groups;                 // Ray tracing shader groups
++   uint32_t group_count;                       // Number of groups
++   uint64_t rt_pipeline_flags;
++
++   struct shader_binding_table_info sbt;
+ };
+ 
+ #define P_IND(ctx, ...)                                                        \
+
+--- src/kosmickrisp/compiler/msl_type_inference.c
++++ src/kosmickrisp/compiler/msl_type_inference.c
+@@ -24,6 +24,7 @@ typedef enum ti_type {
+    TYPE_FLOAT,
+    TYPE_SAMPLER,
+    TYPE_TEXTURE,
++   TYPE_MATRIX_FLOAT4X3, /* Ray query transform matrices */
+ } ti_type;
+ 
+ static ti_type
+@@ -271,8 +272,17 @@ infer_types_from_alu(struct hash_table *types, nir_alu_instr *alu)
+ }
+ 
+ static void
+-infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
++infer_types_from_intrinsic(struct hash_table *types, nir_shader *shader,
++                           nir_intrinsic_instr *instr)
+ {
++   /* Only ray tracing stages rebase scratch accesses by a runtime
++    * shader_call_data_offset / shader_base_offset, which the RT lowering can
++    * make negative.  Everywhere else scratch offsets are plain byte counts and
++    * must stay unsigned so the backward propagation through iadd/ishl/... does
++    * not turn ordinary spill address math signed. */
++   const ti_type scratch_offset_type =
++      mesa_shader_stage_is_rt(shader->info.stage) ? TYPE_INT : TYPE_UINT;
++
+    switch (instr->intrinsic) {
+    case nir_intrinsic_load_input:
+    case nir_intrinsic_load_interpolated_input:
+@@ -341,16 +351,22 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
+       set_type(types, &instr->src[0], TYPE_NONE);
+       set_type(types, &instr->def, TYPE_NONE);
+       break;
+-   case nir_intrinsic_load_scratch:
+    case nir_intrinsic_load_shared:
+       set_type(types, &instr->def, TYPE_UINT);
+       set_type(types, &instr->src[0], TYPE_UINT);
+       break;
+-   case nir_intrinsic_store_scratch:
+    case nir_intrinsic_store_shared:
+       set_type(types, &instr->src[0], TYPE_UINT);
+       set_type(types, &instr->src[1], TYPE_UINT);
+       break;
++   case nir_intrinsic_load_scratch:
++      set_type(types, &instr->def, TYPE_UINT);
++      set_type(types, &instr->src[0], scratch_offset_type);
++      break;
++   case nir_intrinsic_store_scratch:
++      set_type(types, &instr->src[0], TYPE_UINT);
++      set_type(types, &instr->src[1], scratch_offset_type);
++      break;
+    case nir_intrinsic_load_first_vertex:
+    case nir_intrinsic_load_base_instance:
+    case nir_intrinsic_load_vertex_id:
+@@ -371,6 +387,10 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
+    case nir_intrinsic_load_amplification_id_kk:
+       set_type(types, &instr->def, TYPE_UINT);
+       break;
++   case nir_intrinsic_load_shader_call_data_offset_kk:
++   case nir_intrinsic_load_shader_base_offset_kk:
++      set_type(types, &instr->def, TYPE_INT);
++      break;
+    case nir_intrinsic_load_vulkan_descriptor:
+    case nir_intrinsic_load_barycentric_at_sample:
+       set_type(types, &instr->src[0], TYPE_UINT);
+@@ -505,6 +525,143 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
+          break;
+       }
+       break;
++   case nir_intrinsic_rq_initialize:
++      /* src 0: ray query (pass) */
++      /* src 1: acceleration structure (pass) */
++      set_type(types, &instr->src[2], TYPE_UINT);  /* ray flags */
++      set_type(types, &instr->src[3], TYPE_UINT);  /* cull mask */
++      set_type(types, &instr->src[4], TYPE_FLOAT); /* origin */
++      set_type(types, &instr->src[5], TYPE_FLOAT); /* tmin */
++      set_type(types, &instr->src[6], TYPE_FLOAT); /* direction */
++      set_type(types, &instr->src[7], TYPE_FLOAT); /* tmax */
++      break;
++   case nir_intrinsic_rq_proceed:
++      set_type(types, &instr->def, TYPE_BOOL);
++      break;
++   case nir_intrinsic_rq_generate_intersection:
++      set_type(types, &instr->src[1], TYPE_FLOAT); /* t */
++      break;
++   case nir_intrinsic_rq_load:
++      /* src 0: ray query (pass) */
++      if (nir_intrinsic_has_ray_query_value(instr)) {
++         nir_ray_query_value value = nir_intrinsic_ray_query_value(instr);
++         switch (value) {
++         /* Float vector types (float3) */
++         case nir_ray_query_value_intersection_object_ray_direction:
++         case nir_ray_query_value_intersection_object_ray_origin:
++         case nir_ray_query_value_world_ray_direction:
++         case nir_ray_query_value_world_ray_origin:
++            set_type(types, &instr->def, TYPE_FLOAT);
++            break;
++         /* Float scalar types */
++         case nir_ray_query_value_intersection_t:
++         case nir_ray_query_value_tmin:
++            set_type(types, &instr->def, TYPE_FLOAT);
++            break;
++         /* Float2 types (barycentrics) */
++         case nir_ray_query_value_intersection_barycentrics:
++            set_type(types, &instr->def, TYPE_FLOAT);
++            break;
++         /* Matrix types (float4x3) or their columns (float3) */
++         case nir_ray_query_value_intersection_object_to_world:
++         case nir_ray_query_value_intersection_world_to_object:
++            if (nir_intrinsic_has_column(instr)) {
++               /* Accessing a column of the matrix - returns float3 */
++               set_type(types, &instr->def, TYPE_FLOAT);
++            } else {
++               /* Returning the entire matrix - returns float4x3 */
++               set_type(types, &instr->def, TYPE_MATRIX_FLOAT4X3);
++            }
++            break;
++         /* Bool types */
++         case nir_ray_query_value_intersection_front_face:
++         case nir_ray_query_value_intersection_candidate_aabb_opaque:
++            set_type(types, &instr->def, TYPE_BOOL);
++            break;
++         /* Everything else is uint (intersection type, IDs, indices, etc.) */
++         default:
++            set_type(types, &instr->def, TYPE_UINT);
++            break;
++         }
++      } else if (nir_intrinsic_has_column(instr)) {
++         /* Accessing a column of a transform matrix - returns float3 */
++         set_type(types, &instr->def, TYPE_FLOAT);
++      } else if (nir_intrinsic_has_committed(instr)) {
++         set_type(types, &instr->def, TYPE_UINT);
++      }
++      break;
++   case nir_intrinsic_load_ray_launch_id:
++   case nir_intrinsic_load_ray_launch_size:
++      set_type(types, &instr->def, TYPE_UINT);
++      break;
++   case nir_intrinsic_trace_ray:
++      /* src 0: acceleration structure (pass) */
++      set_type(types, &instr->src[1], TYPE_UINT);          /* ray flags */
++      set_type(types, &instr->src[2], TYPE_UINT);          /* cull mask */
++      set_type(types, &instr->src[3], TYPE_UINT);          /* sbt offset */
++      set_type(types, &instr->src[4], TYPE_UINT);          /* sbt stride */
++      set_type(types, &instr->src[5], TYPE_UINT);          /* miss shader idx */
++      set_type(types, &instr->src[6], TYPE_FLOAT);         /* ray origin */
++      set_type(types, &instr->src[7], TYPE_FLOAT);         /* ray tmin */
++      set_type(types, &instr->src[8], TYPE_FLOAT);         /* ray direction */
++      set_type(types, &instr->src[9], TYPE_FLOAT);         /* ray tmax */
++      set_type(types, &instr->src[10], TYPE_GENERIC_DATA); /* payload */
++      break;
++   case nir_intrinsic_report_ray_intersection:
++      set_type(types, &instr->src[0], TYPE_FLOAT); /* hit_t */
++      set_type(types, &instr->src[1], TYPE_UINT);  /* hit_kind */
++      set_type(types, &instr->def, TYPE_BOOL);
++      break;
++   case nir_intrinsic_load_ray_t_min:
++      set_type(types, &instr->def, TYPE_FLOAT);
++      break;
++   case nir_intrinsic_load_ray_t_max:
++      set_type(types, &instr->def, TYPE_FLOAT);
++      break;
++   case nir_intrinsic_load_ray_instance_custom_index:
++      set_type(types, &instr->def, TYPE_UINT);
++      break;
++   case nir_intrinsic_load_ray_world_direction:
++      set_type(types, &instr->def, TYPE_FLOAT);
++      break;
++   case nir_intrinsic_load_ray_world_origin:
++      set_type(types, &instr->def, TYPE_FLOAT);
++      break;
++   case nir_intrinsic_load_ray_object_direction:
++      set_type(types, &instr->def, TYPE_FLOAT);
++      break;
++   case nir_intrinsic_load_ray_object_origin:
++      set_type(types, &instr->def, TYPE_FLOAT);
++      break;
++   case nir_intrinsic_load_ray_world_to_object:
++      if (nir_intrinsic_has_column(instr)) {
++         /* Accessing a column of the matrix - returns float3 */
++         set_type(types, &instr->def, TYPE_FLOAT);
++      } else {
++         /* Returning the entire matrix - returns float4x3 */
++         set_type(types, &instr->def, TYPE_MATRIX_FLOAT4X3);
++      }
++      break;
++   case nir_intrinsic_load_ray_object_to_world:
++      if (nir_intrinsic_has_column(instr)) {
++         /* Accessing a column of the matrix - returns float3 */
++         set_type(types, &instr->def, TYPE_FLOAT);
++      } else {
++         /* Returning the entire matrix - returns float4x3 */
++         set_type(types, &instr->def, TYPE_MATRIX_FLOAT4X3);
++      }
++      break;
++   case nir_intrinsic_load_ray_flags:
++      set_type(types, &instr->def, TYPE_UINT);
++      break;
++   case nir_intrinsic_load_ray_hit_kind:
++      set_type(types, &instr->def, TYPE_UINT);
++      break;
++   case nir_intrinsic_execute_callable:
++      set_type(types, &instr->src[0], TYPE_UINT); /* sbt offset */
++      set_type(types, &instr->src[1],
++               TYPE_UINT); /* scratch offset (after deref lowering) */
++      break;
+    default:
+       break;
+    }
+@@ -556,14 +713,15 @@ infer_types_from_tex(struct hash_table *types, nir_tex_instr *tex)
+ }
+ 
+ static void
+-infer_types_from_instr(struct hash_table *types, nir_instr *instr)
++infer_types_from_instr(struct hash_table *types, nir_shader *shader,
++                       nir_instr *instr)
+ {
+    switch (instr->type) {
+    case nir_instr_type_alu:
+       infer_types_from_alu(types, nir_instr_as_alu(instr));
+       return;
+    case nir_instr_type_intrinsic:
+-      infer_types_from_intrinsic(types, nir_instr_as_intrinsic(instr));
++      infer_types_from_intrinsic(types, shader, nir_instr_as_intrinsic(instr));
+       return;
+    case nir_instr_type_tex:
+       infer_types_from_tex(types, nir_instr_as_tex(instr));
+@@ -696,6 +854,8 @@ ti_type_to_msl_type(ti_type type, uint8_t bit_width, uint8_t num_components)
+       break;
+    case TYPE_SAMPLER:
+       return "sampler";
++   case TYPE_MATRIX_FLOAT4X3:
++      return "float4x3";
+    default:
+       return NULL;
+    }
+@@ -858,7 +1018,7 @@ msl_infer_types(nir_shader *shader)
+    nir_foreach_function_impl(impl, shader) {
+       nir_foreach_block(block, impl) {
+          nir_foreach_instr(instr, block) {
+-            infer_types_from_instr(types, instr);
++            infer_types_from_instr(types, shader, instr);
+          }
+       }
+    }
+
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+
+--- src/kosmickrisp/compiler/nir_to_msl.h
++++ src/kosmickrisp/compiler/nir_to_msl.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include "msl_private.h"
+ #include "nir.h"
+ 
+ #define MSL_MAX_SAMPLERS 4096
+@@ -121,3 +122,40 @@ static const nir_shader_compiler_options kk_nir_options = {
+    .lower_int64_options = nir_lower_ufind_msb64 | nir_lower_subgroup_shuffle64,
+    .io_options = nir_io_mediump_is_32bit,
+ };
++
++/* Combines all NIR shaders of a ray tracing pipeline into a single MSL
++ * compute shader.
++ *
++ * - shaders: NIR shader per pipeline stage, one of which must be the raygen
++ *   shader
++ * - shader_count: number of entries in shaders
++ * - scratch_layout: per-stage scratch frame sizes and total scratch size
++ * - groups: kk_rt_group array with shader group information
++ * - group_count: number of groups
++ * - rt_pipeline_flags: VkPipelineCreateFlags2 the pipeline was created with
++ * - sbt_options: SBT offset configuration for reading from root descriptor
++ *   table
++ * - mem_ctx: ralloc context the returned MSL string is allocated from
++ */
++char *rt_nir_to_msl(nir_shader **shaders, uint32_t shader_count,
++                    struct kk_rt_scratch_layout *scratch_layout,
++                    struct kk_rt_group *groups, uint32_t group_count,
++                    uint64_t rt_pipeline_flags,
++                    const struct shader_binding_table_info *sbt_options,
++                    void *mem_ctx);
++
++/* Shared with nir_to_msl_rt.c */
++
++const char *output_type(nir_shader *shader);
++void predeclare_ray_queries(struct nir_to_msl_ctx *ctx,
++                            nir_function_impl *impl);
++void predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl);
++void cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node);
++void emit_output_return(struct nir_to_msl_ctx *ctx, nir_shader *shader);
++void emit_local_vars(struct nir_to_msl_ctx *ctx, nir_shader *shader);
++const char *get_stage_string(mesa_shader_stage stage);
++const char *get_entrypoint_name(nir_shader *shader);
++void emit_inputs(struct nir_to_msl_ctx *ctx, nir_shader *shader);
++void rename_main_entrypoint(struct nir_shader *nir);
++void msl_gather_info(struct nir_to_msl_ctx *ctx,
++                     struct nir_to_msl_options *options);
+
+--- src/kosmickrisp/compiler/nir_to_msl_rt.c
++++ src/kosmickrisp/compiler/nir_to_msl_rt.c
+
+--- src/kosmickrisp/vulkan/kk_acceleration_structure.c
++++ src/kosmickrisp/vulkan/kk_acceleration_structure.c
+@@ -0,0 +1,247 @@
++/*
++ * Copyright 2025 Schrödinger, Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "kk_acceleration_structure.h"
++#include "kk_buffer.h"
++#include "kk_cmd_buffer.h"
++#include "kk_device.h"
++#include "kk_entrypoints.h"
++#include "kk_instance.h"
++
++#include "kosmickrisp/bridge/mtl_bridge.h"
++#include "kosmickrisp/bridge/mtl_buffer.h"
++#include "kosmickrisp/bridge/mtl_heap.h"
++
++#include "kosmickrisp/bridge/vk_to_mtl_map.h"
++#include "vulkan/vulkan_core.h"
++#include "vk_physical_device.h"
++
++void
++kk_acceleration_structure_track_metadata_buffer(
++   struct kk_acceleration_structure *accel, mtl_buffer *buffer)
++{
++   if (buffer)
++      util_dynarray_append(&accel->metadata_buffers, buffer);
++}
++
++void
++kk_acceleration_structure_retire_metadata_buffers(
++   struct kk_cmd_buffer *cmd, struct kk_acceleration_structure *accel)
++{
++   util_dynarray_foreach(&accel->metadata_buffers, mtl_buffer *, buffer) {
++      kk_cmd_buffer_retire_buffer(cmd, *buffer);
++   }
++   util_dynarray_clear(&accel->metadata_buffers);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++kk_CreateAccelerationStructureKHR(
++   VkDevice device, const VkAccelerationStructureCreateInfoKHR *pCreateInfo,
++   const VkAllocationCallbacks *pAllocator,
++   VkAccelerationStructureKHR *pAccelerationStructure)
++{
++   VK_FROM_HANDLE(kk_device, dev, device);
++   VkResult result;
++
++   struct kk_acceleration_structure *acceleration_structure =
++      vk_object_zalloc(&dev->vk, pAllocator, sizeof(*acceleration_structure),
++                       VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR);
++
++   if (!acceleration_structure)
++      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++
++   util_dynarray_init(&acceleration_structure->metadata_buffers, NULL);
++
++   VK_FROM_HANDLE(vk_buffer, buffer, pCreateInfo->buffer);
++   acceleration_structure->vk.buffer = buffer;
++   acceleration_structure->vk.offset = pCreateInfo->offset;
++   acceleration_structure->vk.size = pCreateInfo->size;
++
++   acceleration_structure->heap = mtl_new_heap(
++      dev->mtl_handle, pCreateInfo->size, MTL_RESOURCE_STORAGE_MODE_PRIVATE);
++   if (!acceleration_structure->heap) {
++      result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      goto fail;
++   }
++
++   /* Add heap to residency set for GPU access */
++   kk_device_add_allocation_to_residency_set(dev, acceleration_structure->heap);
++
++   acceleration_structure->mtl_handle = mtl_new_acceleration_structure(
++      acceleration_structure->heap, pCreateInfo->size, 0u);
++   if (!acceleration_structure->mtl_handle) {
++      result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      goto fail_heap;
++   }
++
++   acceleration_structure->gpu_resource_id =
++      mtl_acceleration_structure_get_gpu_resource_id(
++         acceleration_structure->mtl_handle);
++
++   /* IRRuntimeAccelerationStructureGPUHeader + bespoke data for Vulkan */
++   struct acceleration_structure_header header = {
++      .acceleration_structure_resource_id =
++         acceleration_structure->gpu_resource_id,
++      .address_of_instance_contributions = 0, // NULL for now
++      .pad0 = {0},
++      .dispatch_thread_groups_indirect_arguments = {0},
++      .padding_for_alignment = 0,
++      .sbt_offsets_buffer_address = 0,
++      .instance_count = 0,
++      .geometry_count = 0,
++      .geometry_flags_buffer_address = 0,
++      .instance_geom_flags_buffers_address = 0,
++      .instance_flags_address = 0,
++   };
++
++   acceleration_structure->header_buffer = mtl_new_buffer_with_length_on_device(
++      dev->mtl_handle, sizeof(header), MTL_RESOURCE_STORAGE_MODE_SHARED);
++   if (!acceleration_structure->header_buffer) {
++      result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      goto fail_acceleration_structure;
++   }
++
++   /* Add header buffer to residency set for GPU access */
++   kk_device_add_allocation_to_residency_set(
++      dev, acceleration_structure->header_buffer);
++
++   void *header_data = mtl_get_contents(acceleration_structure->header_buffer);
++   if (!header_data) {
++      result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      goto fail_header;
++   }
++   memcpy(header_data, &header, sizeof(header));
++
++   acceleration_structure->header_address =
++      mtl_buffer_get_gpu_address(acceleration_structure->header_buffer);
++
++   /* Only bottom-level structures are ever named by an instance descriptor,
++    * so keeping top-level ones out of the registry keeps the lookup table the
++    * instance-conversion shader searches as small as it can be. */
++   if (pCreateInfo->type != VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR)
++      kk_blas_registry_add(dev, acceleration_structure);
++
++   *pAccelerationStructure =
++      kk_acceleration_structure_to_handle(acceleration_structure);
++   return VK_SUCCESS;
++
++fail_header:
++   kk_device_remove_allocation_from_residency_set(
++      dev, acceleration_structure->header_buffer);
++   mtl_release(acceleration_structure->header_buffer);
++fail_acceleration_structure:
++   mtl_release(acceleration_structure->mtl_handle);
++fail_heap:
++   kk_device_remove_allocation_from_residency_set(dev,
++                                                  acceleration_structure->heap);
++   mtl_release(acceleration_structure->heap);
++fail:
++   util_dynarray_fini(&acceleration_structure->metadata_buffers);
++   vk_object_free(&dev->vk, pAllocator, acceleration_structure);
++   return result;
++}
++
++VKAPI_ATTR void VKAPI_CALL
++kk_DestroyAccelerationStructureKHR(
++   VkDevice device, VkAccelerationStructureKHR accelerationStructure,
++   const VkAllocationCallbacks *pAllocator)
++{
++   VK_FROM_HANDLE(kk_device, dev, device);
++   struct kk_acceleration_structure *accel =
++      kk_acceleration_structure_from_handle(accelerationStructure);
++   if (!accel)
++      return;
++
++   kk_blas_registry_remove(dev, accel);
++
++   /* Lock to prevent concurrent access during destruction */
++   simple_mtx_lock(&dev->as_serialization_lock);
++
++   /* Serialization registers this AS both under its header address and under
++    * the device address of every blob it was serialized into, so drop every
++    * entry that points at it rather than just the header key. Otherwise a
++    * later deserialize from one of those blobs dereferences freed memory. */
++   hash_table_u64_foreach(dev->as_serialization_map, entry) {
++      if (entry.data == accel)
++         _mesa_hash_table_u64_remove(dev->as_serialization_map, entry.key);
++   }
++
++   if (accel->header_buffer) {
++      kk_device_remove_allocation_from_residency_set(dev, accel->header_buffer);
++      mtl_release(accel->header_buffer);
++      accel->header_buffer = NULL;
++   }
++
++   util_dynarray_foreach(&accel->metadata_buffers, mtl_buffer *, buffer) {
++      kk_device_remove_allocation_from_residency_set(dev, *buffer);
++      mtl_release(*buffer);
++   }
++   util_dynarray_fini(&accel->metadata_buffers);
++
++   /* Release Metal acceleration structure */
++   if (accel->mtl_handle) {
++      mtl_release(accel->mtl_handle);
++      accel->mtl_handle = NULL;
++   }
++
++   /* Remove heap from residency set and release */
++   if (accel->heap) {
++      kk_device_remove_allocation_from_residency_set(dev, accel->heap);
++      mtl_release(accel->heap);
++      accel->heap = NULL;
++   }
++
++   simple_mtx_unlock(&dev->as_serialization_lock);
++
++   vk_object_free(&dev->vk, pAllocator, accel);
++}
++
++VKAPI_ATTR VkDeviceAddress VKAPI_CALL
++kk_GetAccelerationStructureDeviceAddressKHR(
++   VkDevice device, const VkAccelerationStructureDeviceAddressInfoKHR *pInfo)
++{
++   VK_FROM_HANDLE(kk_acceleration_structure, as, pInfo->accelerationStructure);
++
++   /* Header address rather than device address since this can be placed
++    * in a buffer for dynamic indexing.
++    */
++   return as->header_address;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++kk_BuildAccelerationStructuresKHR(
++   VkDevice _device, VkDeferredOperationKHR deferredOperation,
++   uint32_t infoCount,
++   const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
++   const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
++{
++   UNREACHABLE("Unimplemented");
++   return VK_ERROR_FEATURE_NOT_PRESENT;
++}
++
++VKAPI_ATTR void VKAPI_CALL
++kk_GetDeviceAccelerationStructureCompatibilityKHR(
++   VkDevice device, const VkAccelerationStructureVersionInfoKHR *pVersionInfo,
++   VkAccelerationStructureCompatibilityKHR *pCompatibility)
++{
++   VK_FROM_HANDLE(kk_device, dev, device);
++   struct kk_instance *instance =
++      (struct kk_instance *)dev->vk.physical->instance;
++   const struct {
++      uint64_t registry_id;
++      uint64_t pad;
++   } accel_struct_compat = {
++      .registry_id = mtl_device_get_registry_id(dev->mtl_handle),
++   };
++   STATIC_ASSERT(sizeof(accel_struct_compat) == VK_UUID_SIZE);
++
++   bool compat = memcmp(pVersionInfo->pVersionData, instance->driver_build_sha,
++                        VK_UUID_SIZE) == 0 &&
++                 memcmp(pVersionInfo->pVersionData + VK_UUID_SIZE,
++                        &accel_struct_compat, VK_UUID_SIZE) == 0;
++   *pCompatibility =
++      compat ? VK_ACCELERATION_STRUCTURE_COMPATIBILITY_COMPATIBLE_KHR
++             : VK_ACCELERATION_STRUCTURE_COMPATIBILITY_INCOMPATIBLE_KHR;
++}
+
+--- src/kosmickrisp/vulkan/kk_acceleration_structure.h
++++ src/kosmickrisp/vulkan/kk_acceleration_structure.h
+@@ -0,0 +1,110 @@
++/*
++ * Copyright 2025 Schrödinger, Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef KK_ACCELERATION_STRUCTURE
++#define KK_ACCELERATION_STRUCTURE 1
++
++#include "kosmickrisp/bridge/mtl_acceleration_structure.h"
++#include "kosmickrisp/bridge/mtl_format.h"
++#include "kosmickrisp/bridge/mtl_types.h"
++
++#include "kk_private.h"
++
++#include "util/u_dynarray.h"
++#include "vk_acceleration_structure.h"
++
++struct kk_cmd_buffer;
++
++struct acceleration_structure_header {
++   /* Metal runtime fields - do not modify */
++   uint64_t acceleration_structure_resource_id;
++   uint64_t address_of_instance_contributions;
++   uint64_t pad0[4]; /* Reserved by Metal */
++   uint32_t dispatch_thread_groups_indirect_arguments[3];
++
++   /* Extra data for Vulkan features not in Metal */
++   uint32_t padding_for_alignment; /* Just in case -- padding to next 64 bits */
++   uint64_t sbt_offsets_buffer_address; /* GPU address of SBT offsets buffer
++                                           (uint32_t array) - TLAS only */
++   uint32_t instance_count;             /* Number of instances in TLAS */
++   uint32_t geometry_count;             /* Number of geometries in BLAS */
++   uint64_t
++      geometry_flags_buffer_address; /* GPU address of geometry flags buffer
++                                        (uint8_t array) - BLAS only */
++   uint64_t
++      instance_geom_flags_buffers_address; /* GPU address of per-instance
++                                              geometry flags buffers (uint64_t
++                                              array) - TLAS only */
++   uint64_t instance_flags_address; /* GPU address of instance opacity flags
++                                       (uint8_t array: bit0=FORCE_OPAQUE,
++                                       bit1=FORCE_NON_OPAQUE) - TLAS only */
++};
++
++struct kk_acceleration_structure {
++   struct vk_acceleration_structure vk;
++
++   /* MTL handle for AS */
++   mtl_acceleration_structure *mtl_handle;
++
++   /* Heap where AS is backed */
++   mtl_heap *heap;
++
++   /* GPU Resource ID of the Acceleration Structure */
++   uint64_t gpu_resource_id;
++
++   /* Side-buffer for SBT offsets (indexed by instance_id) */
++   /* Content: maps instance_id -> sbt_offset (uint32_t) */
++   mtl_buffer *instance_sbt_offsets_buffer;
++
++   /* [TLAS] Content: maps instance_id -> geometry_flags_buffer_address
++    * (uint64_t) */
++   mtl_buffer *instance_geom_flags_buffers;
++
++   /* Content: maps instance_id -> opacity flags (uint8_t) */
++   /* bit0: FORCE_OPAQUE */
++   /* bit1: FORCE_NON_OPAQUE */
++   mtl_buffer *instance_flags;
++
++   uint32_t instance_count; /* Number of instances in TLAS */
++
++   /* Content: maps instance_id -> BLAS device address (uint64_t).  This is
++    * produced by the instance-conversion shader so GPU-written instance data
++    * is observed at execution time. */
++   mtl_buffer *instance_blas_handles_buffer;
++
++   /* Side-buffer for geometry flags (indexed by geometry_id) - BLAS only */
++   /* Content: maps geometry_id -> flags (uint8_t) */
++   /* bit0: VK_GEOEMTRY_OPAQUE_BIT_KHR */
++   mtl_buffer *geometry_flags_buffer;
++
++   /* Number of geometries in BLAS */
++   uint32_t geometry_count;
++
++   /* Header buffer for bindless access */
++   mtl_buffer *header_buffer;      /* Buffer containing encoded AS descriptor */
++   VkDeviceAddress header_address; /* GPU Address of the header buffer */
++
++   /* Metadata buffers may be replaced by rebuild, copy, or deserialize
++    * commands while earlier recorded work can still reference them. A
++    * superseded generation is handed to the command buffer that replaces it
++    * and released from that submission's Metal feedback callback. Whatever is
++    * still current is released when the acceleration structure is destroyed. */
++   struct util_dynarray metadata_buffers;
++};
++
++void kk_acceleration_structure_track_metadata_buffer(
++   struct kk_acceleration_structure *accel, mtl_buffer *buffer);
++
++/* Hands every metadata buffer generation currently owned by accel to cmd.
++ * Call before recording a command that replaces accel's side tables so the
++ * old generations stop accumulating on the acceleration structure. */
++void kk_acceleration_structure_retire_metadata_buffers(
++   struct kk_cmd_buffer *cmd, struct kk_acceleration_structure *accel);
++
++VK_DEFINE_NONDISP_HANDLE_CASTS(kk_acceleration_structure, vk.base,
++                               VkAccelerationStructureKHR,
++                               VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR)
++
++#endif /* KK_ACCELERATION_STRUCTURE */
+
+--- src/kosmickrisp/vulkan/kk_bo.c
++++ src/kosmickrisp/vulkan/kk_bo.c
+@@ -58,7 +58,7 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
+    bo->gpu = mtl_buffer_get_gpu_address(map);
+    bo->cpu = mtl_get_contents(map);
+ 
+-   kk_device_add_heap_to_residency_set(dev, handle);
++   kk_device_add_allocation_to_residency_set(dev, handle);
+ 
+    *bo_out = bo;
+    return result;
+@@ -77,9 +77,9 @@ kk_destroy_bo(struct kk_device *dev, struct kk_bo *bo)
+    /* We may only have a mapped buffer, for example if the memory was imported
+     * from a host pointer */
+    if (bo->mtl_handle)
+-      kk_device_remove_heap_from_residency_set(dev, bo->mtl_handle);
++      kk_device_remove_allocation_from_residency_set(dev, bo->mtl_handle);
+    else
+-      kk_device_remove_buffer_from_residency_set(dev, bo->map);
++      kk_device_remove_allocation_from_residency_set(dev, bo->map);
+ 
+    mtl_release(bo->map);
+ 
+
+--- src/kosmickrisp/vulkan/kk_buffer.c
++++ src/kosmickrisp/vulkan/kk_buffer.c
+@@ -61,6 +61,20 @@ kk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
+    if (!buffer)
+       return;
+ 
++   /* Drop the address mapping before releasing the Metal buffer so a
++    * concurrent device-address lookup cannot hand out a released handle. */
++   if (buffer->vk.device_address) {
++      simple_mtx_lock(&dev->buffer_addr_lock);
++      u64interval_tree_remove(&dev->buffer_addr_tree, &buffer->interval_node);
++      simple_mtx_unlock(&dev->buffer_addr_lock);
++
++      if (buffer->holds_serialized_as) {
++         kk_as_serialization_purge_range(dev,
++                                         buffer->interval_node.interval.start,
++                                         buffer->interval_node.interval.end);
++      }
++   }
++
+    if (buffer->mtl_handle)
+       mtl_release(buffer->mtl_handle);
+ 
+@@ -148,6 +162,35 @@ unsupported:
+       };
+ }
+ 
++void
++kk_buffer_add_to_addr_tree(struct kk_device *dev, struct kk_buffer *buffer)
++{
++   struct u64interval interval = {
++      .start = buffer->vk.device_address,
++      .end = buffer->vk.device_address + buffer->vk.size - 1,
++   };
++   buffer->interval_node.interval = interval;
++   simple_mtx_lock(&dev->buffer_addr_lock);
++   u64interval_tree_insert(&dev->buffer_addr_tree, &buffer->interval_node);
++   simple_mtx_unlock(&dev->buffer_addr_lock);
++}
++
++struct kk_buffer *
++kk_buffer_get_buffer_from_device_address_no_lock(struct kk_device *dev,
++                                                 VkDeviceAddress address)
++{
++   struct u64interval node = {
++      .start = address,
++      .end = address,
++   };
++   struct u64interval_node *found_node =
++      u64interval_tree_first(&dev->buffer_addr_tree, node);
++   if (!found_node) {
++      return NULL;
++   }
++   return rb_node_data(struct kk_buffer, found_node, interval_node);
++}
++
+ static VkResult
+ kk_bind_buffer_memory(struct kk_device *dev, const VkBindBufferMemoryInfo *info)
+ {
+@@ -166,6 +209,9 @@ kk_bind_buffer_memory(struct kk_device *dev, const VkBindBufferMemoryInfo *info)
+    }
+ 
+    buffer->vk.device_address = mtl_buffer_get_gpu_address(buffer->mtl_handle);
++
++   kk_buffer_add_to_addr_tree(dev, buffer);
++
+    /* We need Metal to give us a CPU mapping so it correctly captures the
+     * data in the GPU debugger... */
+    mtl_get_contents(buffer->mtl_handle);
+
+--- src/kosmickrisp/vulkan/kk_buffer.h
++++ src/kosmickrisp/vulkan/kk_buffer.h
+@@ -13,11 +13,24 @@
+ 
+ #include "kosmickrisp/bridge/mtl_types.h"
+ 
++#include "util/rb_tree.h"
++
+ #include "vk_buffer.h"
+ 
+ struct kk_buffer {
+    struct vk_buffer vk;
+    mtl_buffer *mtl_handle;
++   /* Offset of vk.device_address inside mtl_handle. Zero for buffers bound to
++    * device memory, non-zero when mtl_handle is a pool buffer the VkBuffer is
++    * only a sub-allocation of (vk_meta bind-map buffers). */
++   uint64_t mtl_handle_offset;
++   struct u64interval_node interval_node; // BDA -> kk_buffer
++
++   /* Set once an acceleration structure has been serialized into this buffer.
++    * Those map entries are keyed on a device address this buffer owns, so
++    * they have to be dropped before the address can be handed to a different
++    * allocation. */
++   bool holds_serialized_as;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer, vk.base, VkBuffer,
+@@ -45,4 +58,11 @@ kk_buffer_to_mtl_resource(const struct kk_buffer *buffer)
+    return NULL;
+ }
+ 
++struct kk_buffer *
++kk_buffer_get_buffer_from_device_address_no_lock(struct kk_device *dev,
++                                                 VkDeviceAddress address);
++
++void kk_buffer_add_to_addr_tree(struct kk_device *dev,
++                                struct kk_buffer *buffer);
++
+ #endif // KK_BUFFER_H
+
+--- src/kosmickrisp/vulkan/kk_buffer_view.c
++++ src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -17,6 +17,7 @@
+ 
+ #include "kosmickrisp/bridge/mtl_bridge.h"
+ #include "kosmickrisp/bridge/mtl_format.h"
++#include "kosmickrisp/bridge/vk_to_mtl_map.h"
+ 
+ #include "vk_format.h"
+ 
+@@ -49,6 +50,10 @@ kk_get_buffer_format_features(struct kk_physical_device *pdev,
+    if (kk_vbo_supports_format(p_format))
+       features |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+ 
++   if (vk_acceleration_structure_vertex_format_supported(vk_format))
++      features |=
++         VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR;
++
+    return features;
+ }
+ 
+
+--- src/kosmickrisp/vulkan/kk_cmd_acceleration_structure.c
++++ src/kosmickrisp/vulkan/kk_cmd_acceleration_structure.c
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -7,6 +7,7 @@
+ 
+ #include "kk_cmd_buffer.h"
+ 
++#include "kk_acceleration_structure.h"
+ #include "kk_buffer.h"
+ #include "kk_cmd_pool.h"
+ #include "kk_descriptor_set_layout.h"
+@@ -39,6 +40,7 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+    struct kk_cmd_pool *pool = kk_cmd_buffer_pool(cmd);
+ 
+    kk_cmd_release_dynamic_ds_state(cmd);
++   kk_descriptor_state_fini(cmd, &cmd->state.rt.descriptors);
+    kk_descriptor_state_fini(cmd, &cmd->state.gfx.descriptors);
+    kk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
+ 
+@@ -55,6 +57,25 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+       kk_destroy_bo(dev, *bo);
+    }
+    util_dynarray_clear(&cmd->large_bos);
++
++   /* A submitted command buffer may only be reset or freed after its work has
++    * completed, so any buffers left here are safe to release. An unsubmitted
++    * command buffer has no such ordering guarantee relative to earlier work:
++    * defer its retired buffers until a later queue completion instead. */
++   if (cmd->submitted)
++      kk_device_release_retired_buffers(dev, &cmd->retired_buffers);
++   else
++      kk_device_defer_retired_buffers(dev, &cmd->retired_buffers);
++
++   /* Release the ray tracing scratch buffer. It is only reused while the
++    * command buffer keeps recording; a reset clears the state that points at
++    * it, so holding on to it would leak the allocation and its residency set
++    * entry. */
++   if (cmd->state.rt.scratch_bo) {
++      kk_destroy_bo(dev, cmd->state.rt.scratch_bo);
++      cmd->state.rt.scratch_bo = NULL;
++      cmd->state.rt.scratch_bo_size = 0;
++   }
+ }
+ 
+ static void
+@@ -87,6 +108,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+    kk_cmd_release_resources(dev, cmd);
+    util_dynarray_fini(&cmd->submit_cmd_bufs);
+    util_dynarray_fini(&cmd->large_bos);
++   util_dynarray_fini(&cmd->retired_buffers);
+ 
+    vk_free(&pool->vk.alloc, cmd);
+ }
+@@ -137,8 +159,9 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+ 
+    {
+       mtl_argument_table_descriptor *desc = mtl_new_argument_table_descriptor();
+-      /* Root at 0, samplers at 1 and per draw data at 2 */
+-      mtl_set_max_buffer_binding_count(desc, 3u);
++      /* Root at 0, samplers at 1, per-draw/IFT at 2. RT helper kernels use
++       * temporary bindings through index 8. */
++      mtl_set_max_buffer_binding_count(desc, 9u);
+       cmd->argument_table = mtl_new_argument_table(dev->mtl_handle, desc);
+       mtl_set_address(cmd->argument_table, dev->samplers.table.bo->gpu, 1u);
+       mtl_release(desc);
+@@ -146,6 +169,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+ 
+    cmd->submit_cmd_bufs = UTIL_DYNARRAY_INIT;
+    cmd->large_bos = UTIL_DYNARRAY_INIT;
++   cmd->retired_buffers = UTIL_DYNARRAY_INIT;
+ 
+    cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
+    cmd->vk.dynamic_graphics_state.ms.sample_locations =
+@@ -195,6 +219,7 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+ 
+    memset(&cmd->state, 0, sizeof(cmd->state));
+    cmd->uses_heap = false;
++   cmd->submitted = false;
+ }
+ 
+ static void
+@@ -206,7 +231,6 @@ kk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+ 
+    vk_command_buffer_reset(&cmd->vk);
+    kk_reset_cmd_buffer_internal(cmd);
+-   cmd->submitted = false;
+    cmd->one_time_submit = false;
+ }
+ 
+@@ -410,9 +434,11 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+       /* We chain encoders, so an intra-encoder barrier is enough here:
+        * no need to tear down and recreate the encoder.
+        */
+-      mtl_barrier_after_encoder_stages(cmd->pre_gfx->encoder,
+-                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
+-                                       MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
++      mtl_barrier_after_encoder_stages(
++         cmd->pre_gfx->encoder,
++         MTL_STAGE_DISPATCH | MTL_STAGE_BLIT | MTL_STAGE_ACCELERATION_STRUCTURE,
++         MTL_STAGE_DISPATCH | MTL_STAGE_BLIT |
++            MTL_STAGE_ACCELERATION_STRUCTURE);
+    }
+ }
+ 
+@@ -483,6 +509,17 @@ kk_bind_descriptor_sets(struct kk_descriptor_state *desc,
+    desc->root_dirty = true;
+ }
+ 
++static bool
++kk_is_ray_tracing_stage(VkShaderStageFlags stageFlags)
++{
++   const VkShaderStageFlags rt_stages =
++      VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
++      VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
++      VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR;
++
++   return !!(stageFlags & rt_stages);
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdBindDescriptorSets2KHR(
+    VkCommandBuffer commandBuffer,
+@@ -499,6 +536,11 @@ kk_CmdBindDescriptorSets2KHR(
+       kk_bind_descriptor_sets(&cmd->state.cs.descriptors,
+                               pBindDescriptorSetsInfo);
+    }
++
++   if (kk_is_ray_tracing_stage(pBindDescriptorSetsInfo->stageFlags)) {
++      kk_bind_descriptor_sets(&cmd->state.rt.descriptors,
++                              pBindDescriptorSetsInfo);
++   }
+ }
+ 
+ static struct kk_push_descriptor_set *
+@@ -561,6 +603,11 @@ kk_CmdPushDescriptorSet2KHR(
+       kk_push_descriptor_set(cmd, &cmd->state.cs.descriptors,
+                              pPushDescriptorSetInfo);
+    }
++
++   if (kk_is_ray_tracing_stage(pPushDescriptorSetInfo->stageFlags)) {
++      kk_push_descriptor_set(cmd, &cmd->state.rt.descriptors,
++                             pPushDescriptorSetInfo);
++   }
+ }
+ 
+ static void
+@@ -583,6 +630,10 @@ kk_CmdPushConstants2KHR(VkCommandBuffer commandBuffer,
+ 
+    if (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+       kk_push_constants(cmd, &cmd->state.cs.descriptors, pPushConstantsInfo);
++
++   if (kk_is_ray_tracing_stage(pPushConstantsInfo->stageFlags)) {
++      kk_push_constants(cmd, &cmd->state.rt.descriptors, pPushConstantsInfo);
++   }
+ }
+ 
+ void
+@@ -605,6 +656,13 @@ kk_cmd_buffer_alloc_bo(struct kk_cmd_buffer *cmd, struct kk_cmd_bo **bo_out)
+    return VK_SUCCESS;
+ }
+ 
++void
++kk_cmd_buffer_retire_buffer(struct kk_cmd_buffer *cmd, mtl_buffer *buffer)
++{
++   if (buffer)
++      util_dynarray_append(&cmd->retired_buffers, buffer);
++}
++
+ struct kk_ptr
+ kk_pool_alloc(struct kk_cmd_buffer *cmd, uint32_t size_B, uint32_t alignment_B)
+ {
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -43,6 +43,29 @@ struct kk_root_descriptor_table {
+       struct {
+          uint32_t base_group[3];
+       } cs;
++      struct {
++         /* TODO: Can/should these be in the root buffer?
++          */
++         uint64_t sbt_raygen_addr;
++         uint64_t sbt_miss_addr;
++         uint64_t sbt_hit_addr;
++         uint64_t sbt_callable_addr;
++         uint32_t sbt_raygen_rec_stride;
++         uint32_t sbt_miss_rec_stride;
++         uint32_t sbt_hit_rec_stride;
++         uint32_t sbt_callable_rec_stride;
++         /* Direct traces split the launch into bounded Metal dispatches.
++          * Indirect traces leave count at zero and use the raygen grid-stride
++          * loop over the full launch. */
++         uint64_t ray_launch_base;
++         uint64_t ray_launch_count;
++         /* Bytes between the scratch frames of two ray tracing workers */
++         uint64_t scratch_buffer_stride;
++         /* Address of the four word buffer holding the ray launch size and
++          * the worker count */
++         uint64_t ray_launch_size_addr;
++         uint64_t scratch_buffer_addr; // Address of device scratch buffer
++      } rt;
+    };
+ 
+    /* Client push constants */
+@@ -187,6 +210,36 @@ struct kk_conditional_rendering_state {
+    bool enabled;
+ };
+ 
++struct kk_ray_tracing_state {
++   struct kk_descriptor_state descriptors;
++   mtl_compute_pipeline_state *pipeline_state;
++   mtl_intersection_function_table *intersection_table;
++   struct mtl_size local_size;
++   enum kk_dirty dirty;
++   struct kk_rt_pipeline
++      *pipeline; /* Reference to bound RT pipeline for scratch size */
++
++   /* vkCmdSetRayTracingPipelineStackSizeKHR state.  It persists across
++    * pipeline binds and is only consulted by pipelines that declared the
++    * dynamic state, so it must never hold a pipeline's compiled size. */
++   VkDeviceSize stack_size;
++   bool stack_size_set;
++
++   /* Persistent scratch buffer reused across dispatches.
++    * Metal retains it via useResource, so it's safe to reuse even if GPU is
++    * still using it from a previous submit. Freed when the command buffer is
++    * reset or destroyed. */
++   struct kk_bo *scratch_bo;
++   size_t scratch_bo_size;
++
++   /* Set once a recorded dispatch has written the current scratch buffer.
++    * The scratch is indexed by thread id alone, so it aliases between any two
++    * ray tracing dispatches. Metal 4 runs dispatches in one encoder
++    * concurrently, and the aliasing is invisible to the application's
++    * barriers, so the driver must order the reuse itself. */
++   bool scratch_hazard;
++};
++
+ struct kk_encoder;
+ 
+ struct kk_uploader {
+@@ -237,6 +290,7 @@ struct kk_cmd_buffer {
+       uint64_t root_addr;
+       /* Only tracks graphics shaders since compute is always bound for now. */
+       uint32_t dirty_shaders;
++      struct kk_ray_tracing_state rt;
+    } state;
+ 
+    struct kk_uploader uploader;
+@@ -246,6 +300,12 @@ struct kk_cmd_buffer {
+    /* Owned large BOs */
+    struct util_dynarray large_bos;
+ 
++   /* Metal buffers superseded during recording (mtl_buffer *). Submission
++    * transfers them to a Metal completion callback. Resetting an unsubmitted
++    * command buffer moves them to the device's deferred list so earlier
++    * submissions cannot lose residency or their final reference. */
++   struct util_dynarray retired_buffers;
++
+    /* Does the command buffer use the geometry heap? */
+    bool uses_heap;
+    /* Set at vkBeginCommandBuffer. One-time-submit buffers skip command
+@@ -259,6 +319,10 @@ struct kk_cmd_buffer {
+ VK_DEFINE_HANDLE_CASTS(kk_cmd_buffer, vk.base, VkCommandBuffer,
+                        VK_OBJECT_TYPE_COMMAND_BUFFER)
+ 
++/* Hands ownership of a device-allocated Metal buffer to the command buffer so
++ * that it outlives any work already encoded against it. */
++void kk_cmd_buffer_retire_buffer(struct kk_cmd_buffer *cmd, mtl_buffer *buffer);
++
+ extern const struct vk_command_buffer_ops kk_cmd_buffer_ops;
+ 
+ static inline struct kk_device *
+@@ -282,6 +346,8 @@ kk_get_descriptors_state(struct kk_cmd_buffer *cmd,
+       return &cmd->state.gfx.descriptors;
+    case VK_PIPELINE_BIND_POINT_COMPUTE:
+       return &cmd->state.cs.descriptors;
++   case VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR:
++      return &cmd->state.rt.descriptors;
+    default:
+       UNREACHABLE("Unhandled bind point");
+    }
+
+--- src/kosmickrisp/vulkan/kk_cmd_dispatch.c
++++ src/kosmickrisp/vulkan/kk_cmd_dispatch.c
+@@ -6,7 +6,6 @@
+ 
+ #include "vulkan/vulkan_core.h"
+ 
+-#include "kk_buffer.h"
+ #include "kk_cmd_buffer.h"
+ #include "kk_descriptor_set_layout.h"
+ #include "kk_device.h"
+@@ -17,6 +16,16 @@
+ 
+ #include "vk_common_entrypoints.h"
+ 
++/* Target upper bound for a ray tracing dispatch's scratch allocation.  A
++ * launch can be far larger than the number of frames that fit here, so the
++ * worker count is clamped to the budget.  One frame is still allocated when it
++ * alone exceeds the budget. */
++#define KK_RT_SCRATCH_BUDGET (16ull * 1024ull * 1024ull)
++
++/* The generated MSL dereferences the per-worker frame as uint64_t, float2 and
++ * float4, so every frame has to start naturally aligned. */
++#define KK_RT_SCRATCH_STRIDE_ALIGN 16ull
++
+ static void
+ kk_flush_compute_state(struct kk_cmd_buffer *cmd)
+ {
+@@ -57,6 +66,194 @@ kk_predicate_compute(struct kk_cmd_buffer *cmd, uint64_t indirect_addr_out,
+    }
+ }
+ 
++static void
++kk_flush_rt_state(struct kk_cmd_buffer *cmd)
++{
++   mtl_compute_encoder *enc = cs_get_compute(cmd, true);
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++
++   // Fill Metal argument buffer with descriptor set addresses
++   struct kk_descriptor_state *desc = &cmd->state.rt.descriptors;
++
++   if (desc->push_dirty)
++      kk_cmd_buffer_flush_push_descriptors(cmd, desc);
++   if (desc->root_dirty)
++      kk_upload_descriptor_root(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
++
++   if (desc->root.addr)
++      mtl_set_address(cmd->argument_table, desc->root.addr, 0u);
++
++   mtl_set_address(cmd->argument_table, dev->samplers.table.bo->gpu, 1u);
++
++   mtl_compute_set_pipeline_state(enc, cmd->state.rt.pipeline_state);
++
++   /* Bind the IFT as a Metal 4 resource at buffer index 2. */
++   if (cmd->state.rt.intersection_table) {
++      uint64_t resource_id =
++         mtl_intersection_function_table_get_gpu_resource_id(
++            cmd->state.rt.intersection_table);
++      mtl_set_resource(cmd->argument_table, resource_id, 2u);
++   }
++
++   cmd->state.rt.dirty = 0u;
++}
++
++static bool
++kk_ensure_rt_scratch(struct kk_cmd_buffer *cmd, size_t size)
++{
++   if (size == 0)
++      return true;
++
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   struct kk_bo *scratch_bo = cmd->state.rt.scratch_bo;
++   if (!scratch_bo || cmd->state.rt.scratch_bo_size < size) {
++      /* The GPU may still use the old buffer for an earlier dispatch recorded
++       * in this command buffer.
++       */
++      if (scratch_bo) {
++         util_dynarray_append(&cmd->large_bos, scratch_bo);
++         cmd->state.rt.scratch_bo = NULL;
++         cmd->state.rt.scratch_bo_size = 0;
++      }
++
++      VkResult result =
++         kk_alloc_bo(dev, &cmd->vk.base, size, 256u, &scratch_bo);
++      if (result != VK_SUCCESS) {
++         vk_command_buffer_set_error(&cmd->vk, result);
++         return false;
++      }
++
++      cmd->state.rt.scratch_bo = scratch_bo;
++      cmd->state.rt.scratch_bo_size = size;
++
++      /* Nothing recorded so far can be using this allocation. */
++      cmd->state.rt.scratch_hazard = false;
++   }
++
++   struct kk_descriptor_state *desc = &cmd->state.rt.descriptors;
++   desc->root.rt.scratch_buffer_addr = scratch_bo->gpu;
++   desc->root_dirty = true;
++   return true;
++}
++
++/* Orders a dispatch that is about to consume the ray tracing scratch buffer
++ * against every earlier dispatch that already wrote it. */
++static void
++kk_rt_scratch_acquire(struct kk_cmd_buffer *cmd, mtl_compute_encoder *encoder)
++{
++   if (!cmd->state.rt.scratch_hazard)
++      return;
++
++   mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
++                                    MTL_STAGE_DISPATCH);
++   cmd->state.rt.scratch_hazard = false;
++}
++
++static void
++kk_rt_scratch_release(struct kk_cmd_buffer *cmd)
++{
++   cmd->state.rt.scratch_hazard = cmd->state.rt.scratch_bo != NULL;
++}
++
++static size_t
++kk_rt_scratch_stride(struct kk_cmd_buffer *cmd)
++{
++   assert(cmd->state.rt.pipeline && "Ray tracing pipeline must be bound");
++
++   const struct kk_rt_pipeline *pipeline = cmd->state.rt.pipeline;
++   size_t compiled_size =
++      ALIGN_POT(pipeline->scratch_buffer_size, KK_RT_SCRATCH_STRIDE_ALIGN);
++   if (compiled_size == 0)
++      return 0;
++
++   /* Only pipelines that declared the dynamic state consult the value the
++    * application supplied; everything else uses the compiled layout. */
++   if (!pipeline->dynamic_stack_size || !cmd->state.rt.stack_size_set)
++      return compiled_size;
++
++   /* Requests at or above the compiled layout cannot address any additional
++    * data. */
++   if (cmd->state.rt.stack_size >= compiled_size)
++      return compiled_size;
++
++   /* The application sizes its request from the group stack sizes the driver
++    * reports, which do not include the hit attribute prefix the traversal
++    * loop writes at the deepest callee frame.  Metal also requires the
++    * per-worker frames to stay naturally aligned. */
++   size_t requested_size =
++      ALIGN_POT((size_t)cmd->state.rt.stack_size + KK_RAY_HIT_ATTRIBS_SIZE,
++                KK_RT_SCRATCH_STRIDE_ALIGN);
++
++   return MIN2(requested_size, compiled_size);
++}
++
++static size_t
++kk_rt_worker_count(size_t scratch_per_thread)
++{
++   assert(scratch_per_thread > 0);
++
++   return MAX2((size_t)1, (size_t)(KK_RT_SCRATCH_BUDGET / scratch_per_thread));
++}
++
++static void
++kk_set_rt_scratch_stride(struct kk_cmd_buffer *cmd, size_t stride)
++{
++   struct kk_descriptor_state *desc = &cmd->state.rt.descriptors;
++   desc->root_dirty |= desc->root.rt.scratch_buffer_stride != stride;
++   desc->root.rt.scratch_buffer_stride = stride;
++}
++
++static bool
++kk_prepare_rt_indirect_scratch(struct kk_cmd_buffer *cmd,
++                               uint32_t *max_worker_threads)
++{
++   size_t scratch_per_thread = kk_rt_scratch_stride(cmd);
++   kk_set_rt_scratch_stride(cmd, scratch_per_thread);
++
++   *max_worker_threads = UINT32_MAX;
++   if (scratch_per_thread == 0)
++      return true;
++
++   size_t worker_threads = kk_rt_worker_count(scratch_per_thread);
++   *max_worker_threads = (uint32_t)MIN2(worker_threads, (size_t)UINT32_MAX);
++
++   return kk_ensure_rt_scratch(cmd, scratch_per_thread * *max_worker_threads);
++}
++
++/* Stores the SBT device addresses and strides for shader access. The callable
++ * region is optional, so a missing one reads as a zeroed region. */
++static void
++kk_set_rt_sbt_root(
++   struct kk_descriptor_state *desc,
++   const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
++   const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
++   const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
++   const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable)
++{
++   const VkDeviceAddress callable_addr =
++      pCallableShaderBindingTable ? pCallableShaderBindingTable->deviceAddress
++                                  : 0;
++
++   desc->root_dirty |=
++      desc->root.rt.sbt_raygen_addr != pRaygenShaderBindingTable->deviceAddress;
++   desc->root_dirty |=
++      desc->root.rt.sbt_miss_addr != pMissShaderBindingTable->deviceAddress;
++   desc->root_dirty |=
++      desc->root.rt.sbt_hit_addr != pHitShaderBindingTable->deviceAddress;
++   desc->root_dirty |= desc->root.rt.sbt_callable_addr != callable_addr;
++
++   desc->root.rt.sbt_raygen_addr = pRaygenShaderBindingTable->deviceAddress;
++   desc->root.rt.sbt_miss_addr = pMissShaderBindingTable->deviceAddress;
++   desc->root.rt.sbt_hit_addr = pHitShaderBindingTable->deviceAddress;
++   desc->root.rt.sbt_callable_addr = callable_addr;
++
++   desc->root.rt.sbt_raygen_rec_stride = pRaygenShaderBindingTable->stride;
++   desc->root.rt.sbt_miss_rec_stride = pMissShaderBindingTable->stride;
++   desc->root.rt.sbt_hit_rec_stride = pHitShaderBindingTable->stride;
++   desc->root.rt.sbt_callable_rec_stride =
++      pCallableShaderBindingTable ? pCallableShaderBindingTable->stride : 0;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
+                    uint32_t baseGroupY, uint32_t baseGroupZ,
+@@ -149,3 +346,268 @@ kk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+          encoder, pInfo->addressRange.address, local_size);
+    }
+ }
++
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdTraceRaysKHR(
++   VkCommandBuffer commandBuffer,
++   const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
++   const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
++   const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
++   const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
++   uint32_t width, uint32_t height, uint32_t depth)
++{
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++
++   struct kk_descriptor_state *desc = &cmd->state.rt.descriptors;
++   if (width == 0 || height == 0 || depth == 0)
++      return;
++
++   /* The fourth word is the worker count for each Metal dispatch.  The launch
++    * is split into chunks so each worker handles one logical ray and the
++    * bounded scratch allocation is reused between chunks.
++    */
++   struct kk_ptr launch_size = kk_pool_alloc(cmd, 16, 256u);
++   if (unlikely(!launch_size.gpu))
++      return;
++
++   size_t scratch_per_thread = kk_rt_scratch_stride(cmd);
++   kk_set_rt_scratch_stride(cmd, scratch_per_thread);
++
++   size_t total_threads = (size_t)width * (size_t)height * (size_t)depth;
++   size_t worker_threads = MIN2(total_threads, (size_t)UINT32_MAX);
++   if (scratch_per_thread > 0) {
++      worker_threads =
++         MIN2(worker_threads, kk_rt_worker_count(scratch_per_thread));
++      size_t total_scratch_size = scratch_per_thread * worker_threads;
++      if (!kk_ensure_rt_scratch(cmd, total_scratch_size))
++         return;
++   }
++
++   assert(worker_threads > 0 && worker_threads <= UINT32_MAX);
++   uint32_t *dims = launch_size.cpu;
++   dims[0] = width;
++   dims[1] = height;
++   dims[2] = depth;
++   dims[3] = (uint32_t)worker_threads;
++
++   // Point ray_launch_size_addr to this device buffer
++   desc->root.rt.ray_launch_size_addr = launch_size.gpu;
++   desc->root_dirty = true;
++
++   kk_set_rt_sbt_root(desc, pRaygenShaderBindingTable, pMissShaderBindingTable,
++                      pHitShaderBindingTable, pCallableShaderBindingTable);
++
++   cmd->state.rt.local_size.x = 32;
++   cmd->state.rt.local_size.y = 1;
++   cmd->state.rt.local_size.z = 1;
++
++   for (size_t launch_base = 0; launch_base < total_threads;
++        launch_base += worker_threads) {
++      size_t chunk_threads = MIN2(worker_threads, total_threads - launch_base);
++
++      desc->root_dirty |= desc->root.rt.ray_launch_base != launch_base;
++      desc->root_dirty |= desc->root.rt.ray_launch_count != chunk_threads;
++      desc->root.rt.ray_launch_base = launch_base;
++      desc->root.rt.ray_launch_count = chunk_threads;
++      kk_flush_rt_state(cmd);
++
++      struct mtl_size grid_size = {
++         .x = MIN2(worker_threads, chunk_threads),
++         .y = 1,
++         .z = 1,
++      };
++      mtl_compute_encoder *enc = cs_get_compute(cmd, true);
++      kk_rt_scratch_acquire(cmd, enc);
++      mtl_dispatch_threads(enc, grid_size, cmd->state.rt.local_size);
++      kk_rt_scratch_release(cmd);
++   }
++}
++
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdTraceRaysIndirectKHR(
++   VkCommandBuffer commandBuffer,
++   const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
++   const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
++   const VkStridedDeviceAddressRegionKHR *pHitShaderBindingTable,
++   const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
++   VkDeviceAddress indirectDeviceAddress)
++{
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   struct kk_descriptor_state *desc = &cmd->state.rt.descriptors;
++
++   /* Flatten the Vulkan launch into one-dimensional Metal threadgroups. */
++   cmd->state.rt.local_size.x = 32;
++   cmd->state.rt.local_size.y = 1;
++   cmd->state.rt.local_size.z = 1;
++
++   uint32_t max_worker_threads;
++   if (!kk_prepare_rt_indirect_scratch(cmd, &max_worker_threads))
++      return;
++
++   // Allocate output buffers for conversion shader
++   struct kk_ptr mtl_indirect = kk_pool_alloc(cmd, 12, 256u);
++   struct kk_ptr launch_size = kk_pool_alloc(cmd, 16, 256u);
++   if (unlikely(!mtl_indirect.gpu || !launch_size.gpu))
++      return;
++
++   // Convert Vulkan indirect buffer format to Metal format using conversion
++   // shader
++   mtl_compute_encoder *encoder = cs_get_compute(cmd, true);
++
++   mtl_compute_pipeline_state *conversion_pipeline =
++      kk_device_lib_pipeline(dev, KK_LIB_CONVERT_TRACE_RAYS_INDIRECT);
++   mtl_compute_set_pipeline_state(encoder, conversion_pipeline);
++
++   /* Buffer[0] (In): Vulkan indirect buffer (VkTraceRaysIndirectCommandKHR) */
++   mtl_set_address(cmd->argument_table, indirectDeviceAddress, 0u);
++
++   /* Buffer[1] (Out): Metal indirect buffer
++    * (MTLDispatchThreadgroupsIndirectArguments) */
++   mtl_set_address(cmd->argument_table, mtl_indirect.gpu, 1u);
++
++   /* Buffer[2] (Out): original Vulkan launch dimensions */
++   mtl_set_address(cmd->argument_table, launch_size.gpu, 2u);
++
++   /* Buffer[3] (In): Conversion params (threadgroup size) */
++   struct {
++      uint32_t threadgroup_size_x;
++      uint32_t threadgroup_size_y;
++      uint32_t threadgroup_size_z;
++      uint32_t max_worker_threads;
++   } params = {
++      .threadgroup_size_x = cmd->state.rt.local_size.x,
++      .threadgroup_size_y = cmd->state.rt.local_size.y,
++      .threadgroup_size_z = cmd->state.rt.local_size.z,
++      .max_worker_threads = max_worker_threads,
++   };
++   struct kk_ptr params_gpu =
++      kk_pool_upload(cmd, &params, sizeof(params), 256u);
++   if (unlikely(!params_gpu.gpu))
++      return;
++   mtl_set_address(cmd->argument_table, params_gpu.gpu, 3u);
++
++   /* Dispatch conversion shader (single thread) */
++   struct mtl_size grid_size = {.x = 1, .y = 1, .z = 1};
++   struct mtl_size local_size = {.x = 1, .y = 1, .z = 1};
++   mtl_dispatch_threads(encoder, grid_size, local_size);
++   mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
++                                    MTL_STAGE_DISPATCH);
++
++   kk_set_rt_sbt_root(desc, pRaygenShaderBindingTable, pMissShaderBindingTable,
++                      pHitShaderBindingTable, pCallableShaderBindingTable);
++
++   // Set ray_launch_size_addr to the GPU-produced indirect dimensions.
++   desc->root.rt.ray_launch_size_addr = launch_size.gpu;
++   desc->root.rt.ray_launch_base = 0;
++   desc->root.rt.ray_launch_count = 0;
++   desc->root_dirty = true;
++
++   kk_flush_rt_state(cmd);
++
++   // Get new encoder after state flush
++   encoder = cs_get_compute(cmd, true);
++
++   // Dispatch ray tracing using converted Metal indirect buffer
++   kk_rt_scratch_acquire(cmd, encoder);
++   mtl_dispatch_threadgroups_with_indirect_buffer(encoder, mtl_indirect.gpu,
++                                                  cmd->state.rt.local_size);
++   kk_rt_scratch_release(cmd);
++}
++
++VKAPI_ATTR void VKAPI_CALL
++kk_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer,
++                            VkDeviceAddress indirectDeviceAddress)
++{
++   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   struct kk_descriptor_state *desc = &cmd->state.rt.descriptors;
++
++   cmd->state.rt.local_size.x = 32;
++   cmd->state.rt.local_size.y = 1;
++   cmd->state.rt.local_size.z = 1;
++
++   uint32_t max_worker_threads;
++   if (!kk_prepare_rt_indirect_scratch(cmd, &max_worker_threads))
++      return;
++
++   struct kk_ptr mtl_indirect = kk_pool_alloc(cmd, 12, 256u);
++   struct kk_ptr launch_size = kk_pool_alloc(cmd, 16, 256u);
++   if (unlikely(!mtl_indirect.gpu || !launch_size.gpu))
++      return;
++
++   desc->root.rt.ray_launch_size_addr = launch_size.gpu;
++   desc->root.rt.ray_launch_base = 0;
++   desc->root.rt.ray_launch_count = 0;
++   desc->root_dirty = true;
++
++   /* Upload the complete root first.  The conversion shader patches the SBT
++    * fields in that GPU copy without reading GPU-written indirect data on the
++    * CPU timeline.
++    */
++   kk_flush_rt_state(cmd);
++   uint64_t root_addr = desc->root.addr;
++   if (unlikely(!root_addr))
++      return;
++
++   mtl_compute_encoder *encoder = cs_get_compute(cmd, true);
++   mtl_compute_pipeline_state *conversion_pipeline =
++      kk_device_lib_pipeline(dev, KK_LIB_CONVERT_TRACE_RAYS_INDIRECT2);
++   mtl_compute_set_pipeline_state(encoder, conversion_pipeline);
++
++   mtl_set_address(cmd->argument_table, indirectDeviceAddress, 0u);
++   mtl_set_address(cmd->argument_table, mtl_indirect.gpu, 1u);
++   mtl_set_address(cmd->argument_table, launch_size.gpu, 2u);
++
++   struct {
++      uint32_t threadgroup_size_x;
++      uint32_t max_worker_threads;
++      uint32_t raygen_address_offset;
++      uint32_t miss_address_offset;
++      uint32_t hit_address_offset;
++      uint32_t callable_address_offset;
++      uint32_t raygen_stride_offset;
++      uint32_t miss_stride_offset;
++      uint32_t hit_stride_offset;
++      uint32_t callable_stride_offset;
++   } params = {
++      .threadgroup_size_x = cmd->state.rt.local_size.x,
++      .max_worker_threads = max_worker_threads,
++      .raygen_address_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_raygen_addr),
++      .miss_address_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_miss_addr),
++      .hit_address_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_hit_addr),
++      .callable_address_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_callable_addr),
++      .raygen_stride_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_raygen_rec_stride),
++      .miss_stride_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_miss_rec_stride),
++      .hit_stride_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_hit_rec_stride),
++      .callable_stride_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_callable_rec_stride),
++   };
++   struct kk_ptr params_gpu =
++      kk_pool_upload(cmd, &params, sizeof(params), 256u);
++   if (unlikely(!params_gpu.gpu))
++      return;
++   mtl_set_address(cmd->argument_table, params_gpu.gpu, 3u);
++   mtl_set_address(cmd->argument_table, root_addr, 4u);
++
++   struct mtl_size conversion_grid = {.x = 1, .y = 1, .z = 1};
++   struct mtl_size conversion_local = {.x = 1, .y = 1, .z = 1};
++   mtl_dispatch_threads(encoder, conversion_grid, conversion_local);
++   mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_DISPATCH,
++                                    MTL_STAGE_DISPATCH);
++
++   /* Restore the ray-tracing pipeline and root binding after conversion. */
++   kk_flush_rt_state(cmd);
++   encoder = cs_get_compute(cmd, true);
++   kk_rt_scratch_acquire(cmd, encoder);
++   mtl_dispatch_threadgroups_with_indirect_buffer(encoder, mtl_indirect.gpu,
++                                                  cmd->state.rt.local_size);
++   kk_rt_scratch_release(cmd);
++}
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -9,6 +9,7 @@
+ 
+ #include "kk_entrypoints.h"
+ 
++#include "kk_acceleration_structure.h"
+ #include "kk_buffer.h"
+ #include "kk_cmd_buffer.h"
+ #include "kk_format.h"
+
+--- src/kosmickrisp/vulkan/kk_cmd_meta.c
++++ src/kosmickrisp/vulkan/kk_cmd_meta.c
+@@ -32,7 +32,12 @@ kk_cmd_bind_map_buffer(struct vk_command_buffer *vk_cmd,
+    /* Need to retain since VkBuffers release the mtl_handle too */
+    mtl_retain(buf.buffer);
+    buffer->mtl_handle = buf.buffer;
++   buffer->mtl_handle_offset = buf.offset;
+    buffer->vk.device_address = buf.gpu;
++
++   struct kk_device *dev = kk_cmd_buffer_device(cmd);
++   kk_buffer_add_to_addr_tree(dev, buffer);
++
+    *map_out = buf.cpu;
+ 
+    return VK_SUCCESS;
+@@ -77,6 +82,10 @@ struct kk_meta_save {
+             enum mtl_visibility_result_mode occlusion;
+             bool is_ds_dynamic;
+          } gfx;
++         struct {
++            mtl_compute_pipeline_state *pipeline_state;
++            struct mtl_size local_size;
++         } rt;
+       };
+    } pipeline;
+    struct kk_conditional_rendering_state cond_render;
+@@ -113,9 +122,12 @@ kk_meta_begin(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
+       cmd->state.gfx.occlusion.mode = MTL_VISIBILITY_RESULT_MODE_DISABLED;
+       cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
+       desc->root_dirty = true;
+-   } else {
++   } else if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
+       save->shaders[MESA_SHADER_COMPUTE] =
+          cmd->state.shaders[MESA_SHADER_COMPUTE];
++   } else { // VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR
++      save->pipeline.rt.pipeline_state = cmd->state.rt.pipeline_state;
++      save->pipeline.rt.local_size = cmd->state.rt.local_size;
+    }
+ 
+    save->cond_render = cmd->state.cond_render;
+@@ -179,8 +191,11 @@ kk_meta_end(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
+       cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
+ 
+       desc->root_dirty = true;
+-   } else {
++   } else if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
+       kk_cmd_bind_compute_shader(cmd, save->shaders[MESA_SHADER_COMPUTE]);
++   } else { // VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR
++      cmd->state.rt.local_size = save->pipeline.rt.local_size;
++      cmd->state.rt.pipeline_state = save->pipeline.rt.pipeline_state;
+    }
+ 
+    cmd->state.cond_render = save->cond_render;
+
+--- src/kosmickrisp/vulkan/kk_descriptor_set.c
++++ src/kosmickrisp/vulkan/kk_descriptor_set.c
+@@ -7,6 +7,7 @@
+ 
+ #include "kk_descriptor_set.h"
+ 
++#include "kk_acceleration_structure.h"
+ #include "kk_bo.h"
+ #include "kk_buffer.h"
+ #include "kk_buffer_view.h"
+@@ -226,6 +227,22 @@ write_inline_uniform_data(struct kk_descriptor_set *set,
+    write_desc(set, binding, offset, info->pData, info->dataSize);
+ }
+ 
++static void
++write_acceleration_structure_desc(struct kk_descriptor_set *set,
++                                  const VkAccelerationStructureKHR *const info,
++                                  uint32_t binding, uint32_t elem,
++                                  uint32_t descriptorCount)
++{
++   for (uint32_t i = 0; i < descriptorCount; i++) {
++      VK_FROM_HANDLE(kk_acceleration_structure, accel_struct, info[i]);
++      const struct kk_acceleration_structure_descriptor desc = {
++         .acceleration_structure_header_gpu_address =
++            accel_struct ? accel_struct->header_address : 0,
++      };
++      write_desc(set, binding, elem + i, &desc, sizeof(desc));
++   }
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
+                         const VkWriteDescriptorSet *pDescriptorWrites,
+@@ -292,6 +309,18 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
+          break;
+       }
+ 
++      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
++         const VkWriteDescriptorSetAccelerationStructureKHR *accel_write =
++            vk_find_struct_const(
++               write->pNext, WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR);
++         assert(accel_write->accelerationStructureCount ==
++                write->descriptorCount);
++         write_acceleration_structure_desc(
++            set, accel_write->pAccelerationStructures, write->dstBinding,
++            write->dstArrayElement, write->descriptorCount);
++         break;
++      }
++
+       default:
+          break;
+       }
+@@ -354,7 +383,7 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
+ 
+    for (uint32_t w = 0; w < write_count; w++) {
+       const VkWriteDescriptorSet *write = &writes[w];
+-      assert(write->dstSet == VK_NULL_HANDLE);
++      /* dstSet is ignored for push descriptor writes. */
+ 
+       switch (write->descriptorType) {
+       case VK_DESCRIPTOR_TYPE_SAMPLER:
+@@ -393,6 +422,18 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
+          }
+          break;
+ 
++      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
++         const VkWriteDescriptorSetAccelerationStructureKHR *accel_write =
++            vk_find_struct_const(
++               write->pNext, WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR);
++         assert(accel_write->accelerationStructureCount ==
++                write->descriptorCount);
++         write_acceleration_structure_desc(
++            &set, accel_write->pAccelerationStructures, write->dstBinding,
++            write->dstArrayElement, write->descriptorCount);
++         break;
++      }
++
+       default:
+          break;
+       }
+@@ -772,6 +813,16 @@ kk_descriptor_set_write_template(
+                     data + entry->offset, entry->array_count);
+          break;
+ 
++      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
++         for (uint32_t j = 0; j < entry->array_count; j++) {
++            const VkAccelerationStructureKHR *accel_struct =
++               data + entry->offset + j * entry->stride;
++
++            write_acceleration_structure_desc(set, accel_struct, entry->binding,
++                                              entry->array_element + j, 1);
++         }
++         break;
++
+       default:
+          break;
+       }
+
+--- src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
++++ src/kosmickrisp/vulkan/kk_descriptor_set_layout.c
+@@ -81,6 +81,12 @@ kk_descriptor_stride_align_for_type(
+       *stride = align(*stride, *alignment);
+       break;
+ 
++   case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
++   case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV:
++      *stride = *alignment =
++         sizeof(struct kk_acceleration_structure_descriptor);
++      break;
++
+    default:
+       UNREACHABLE("Invalid descriptor type");
+    }
+
+--- src/kosmickrisp/vulkan/kk_descriptor_types.h
++++ src/kosmickrisp/vulkan/kk_descriptor_types.h
+@@ -42,4 +42,13 @@ struct kk_buffer_address {
+ static_assert(sizeof(struct kk_buffer_address) == 16,
+               "kk_buffer_address has no holes");
+ 
++/* IRDescriptorTableEntry for Acceleration Structure */
++struct kk_acceleration_structure_descriptor {
++   /* Buffer to IRRuntimeAccelerationStructureGPUHeaders */
++   uint64_t acceleration_structure_header_gpu_address;
++   uint64_t textureViewID; /* Always zero */
++   uint64_t metadata;      /* Always zero */
++   uint64_t pad_to_power_2;
++};
++
+ #endif /* KK_DESCRIPTOR_TYPES */
+
+--- src/kosmickrisp/vulkan/kk_device.c
++++ src/kosmickrisp/vulkan/kk_device.c
+@@ -7,6 +7,7 @@
+ 
+ #include "kk_device.h"
+ 
++#include "kk_acceleration_structure.h"
+ #include "kk_cmd_buffer.h"
+ #include "kk_entrypoints.h"
+ #include "kk_instance.h"
+@@ -333,11 +334,30 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+    if (dev->residency_set.handle == NULL)
+       goto fail_compiler;
+ 
++   simple_mtx_init(&dev->deferred_retired_buffers_lock, mtx_plain);
++   dev->deferred_retired_buffers = UTIL_DYNARRAY_INIT;
++
++   /* The buffer address map has to exist before anything can bind buffer
++    * memory, and the acceleration structure bookkeeping before anything can
++    * create one, so set them up alongside the residency set rather than after
++    * the helpers below have run. */
++   simple_mtx_init(&dev->buffer_addr_lock, mtx_plain);
++   rb_tree_init(&dev->buffer_addr_tree);
++   simple_mtx_init(&dev->blas_registry_lock, mtx_plain);
++   dev->blas_registry = UTIL_DYNARRAY_INIT;
++
++   simple_mtx_init(&dev->as_serialization_lock, mtx_plain);
++   dev->as_serialization_map = _mesa_hash_table_u64_create(NULL);
++   if (!dev->as_serialization_map) {
++      result = VK_ERROR_OUT_OF_HOST_MEMORY;
++      goto fail_ray_tracing;
++   }
++
+    if (pCreateInfo->queueCreateInfoCount > 0) {
+       result =
+          kk_queue_init(dev, &dev->queue, &pCreateInfo->pQueueCreateInfos[0], 0);
+       if (result != VK_SUCCESS)
+-         goto fail_vab_memory;
++         goto fail_as_map;
+       dev->has_queue = true;
+    }
+ 
+@@ -373,7 +393,17 @@ fail_mem_cache:
+       kk_queue_finish(dev, &dev->queue);
+       dev->has_queue = false;
+    }
+-fail_vab_memory:
++fail_as_map:
++   _mesa_hash_table_u64_destroy(dev->as_serialization_map);
++   dev->as_serialization_map = NULL;
++fail_ray_tracing:
++   simple_mtx_destroy(&dev->as_serialization_lock);
++   util_dynarray_fini(&dev->blas_registry);
++   simple_mtx_destroy(&dev->blas_registry_lock);
++   simple_mtx_destroy(&dev->buffer_addr_lock);
++   kk_device_release_retired_buffers(dev, &dev->deferred_retired_buffers);
++   util_dynarray_fini(&dev->deferred_retired_buffers);
++   simple_mtx_destroy(&dev->deferred_retired_buffers_lock);
+    mtl_release(dev->residency_set.handle);
+    simple_mtx_destroy(&dev->residency_set.mutex);
+ fail_compiler:
+@@ -414,6 +444,19 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+       dev->has_queue = false;
+    }
+ 
++   kk_device_release_retired_buffers(dev, &dev->deferred_retired_buffers);
++   util_dynarray_fini(&dev->deferred_retired_buffers);
++   simple_mtx_destroy(&dev->deferred_retired_buffers_lock);
++
++   util_dynarray_fini(&dev->blas_registry);
++   simple_mtx_destroy(&dev->blas_registry_lock);
++
++   /* Cleanup AS serialization mapping */
++   _mesa_hash_table_u64_destroy(dev->as_serialization_map);
++   simple_mtx_destroy(&dev->as_serialization_lock);
++
++   simple_mtx_destroy(&dev->buffer_addr_lock);
++
+    /* Release the residency set last once all BOs are released. */
+    mtl_release(dev->residency_set.handle);
+    simple_mtx_destroy(&dev->residency_set.mutex);
+@@ -447,43 +490,143 @@ kk_GetDeviceProcAddr(VkDevice _device, const char *pName)
+ }
+ 
+ void
+-kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap)
++kk_device_add_allocation_to_residency_set(struct kk_device *dev,
++                                          mtl_allocation *allocation)
+ {
+    simple_mtx_lock(&dev->residency_set.mutex);
+-   mtl_residency_set_add_allocation(dev->residency_set.handle, heap);
++   mtl_residency_set_add_allocation(dev->residency_set.handle, allocation);
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
+ void
+-kk_device_remove_heap_from_residency_set(struct kk_device *dev, mtl_heap *heap)
++kk_device_remove_allocation_from_residency_set(struct kk_device *dev,
++                                               mtl_allocation *allocation)
+ {
+    simple_mtx_lock(&dev->residency_set.mutex);
+-   mtl_residency_set_remove_allocation(dev->residency_set.handle, heap);
++   mtl_residency_set_remove_allocation(dev->residency_set.handle, allocation);
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
+ void
+-kk_device_add_buffer_to_residency_set(struct kk_device *dev, mtl_buffer *buffer)
++kk_device_make_resources_resident(struct kk_device *dev)
+ {
+    simple_mtx_lock(&dev->residency_set.mutex);
+-   mtl_residency_set_add_allocation(dev->residency_set.handle, buffer);
++   mtl_residency_set_commit(dev->residency_set.handle);
++   mtl_residency_set_request_residency(dev->residency_set.handle);
+    simple_mtx_unlock(&dev->residency_set.mutex);
+ }
+ 
+ void
+-kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
+-                                           mtl_buffer *buffer)
++kk_device_defer_retired_buffers(struct kk_device *dev,
++                                struct util_dynarray *buffers)
+ {
+-   simple_mtx_lock(&dev->residency_set.mutex);
+-   mtl_residency_set_remove_allocation(dev->residency_set.handle, buffer);
+-   simple_mtx_unlock(&dev->residency_set.mutex);
++   simple_mtx_lock(&dev->deferred_retired_buffers_lock);
++   util_dynarray_foreach(buffers, mtl_buffer *, buffer) {
++      util_dynarray_append(&dev->deferred_retired_buffers, *buffer);
++   }
++   util_dynarray_clear(buffers);
++   simple_mtx_unlock(&dev->deferred_retired_buffers_lock);
+ }
+ 
+ void
+-kk_device_make_resources_resident(struct kk_device *dev)
++kk_device_take_deferred_retired_buffers(struct kk_device *dev,
++                                        struct util_dynarray *buffers)
+ {
+-   simple_mtx_lock(&dev->residency_set.mutex);
+-   mtl_residency_set_commit(dev->residency_set.handle);
+-   mtl_residency_set_request_residency(dev->residency_set.handle);
+-   simple_mtx_unlock(&dev->residency_set.mutex);
++   simple_mtx_lock(&dev->deferred_retired_buffers_lock);
++   *buffers = dev->deferred_retired_buffers;
++   dev->deferred_retired_buffers = UTIL_DYNARRAY_INIT;
++   simple_mtx_unlock(&dev->deferred_retired_buffers_lock);
++}
++
++void
++kk_device_release_retired_buffers(struct kk_device *dev,
++                                  struct util_dynarray *buffers)
++{
++   util_dynarray_foreach(buffers, mtl_buffer *, buffer) {
++      kk_device_remove_allocation_from_residency_set(dev, *buffer);
++      mtl_release(*buffer);
++   }
++   util_dynarray_clear(buffers);
++}
++
++void
++kk_blas_registry_add(struct kk_device *dev,
++                     struct kk_acceleration_structure *blas)
++{
++   simple_mtx_lock(&dev->blas_registry_lock);
++   util_dynarray_append_typed(&dev->blas_registry,
++                              struct kk_acceleration_structure *, blas);
++   simple_mtx_unlock(&dev->blas_registry_lock);
++}
++
++void
++kk_blas_registry_remove(struct kk_device *dev,
++                        struct kk_acceleration_structure *blas)
++{
++   simple_mtx_lock(&dev->blas_registry_lock);
++   util_dynarray_delete_unordered(&dev->blas_registry,
++                                  struct kk_acceleration_structure *, blas);
++   simple_mtx_unlock(&dev->blas_registry_lock);
++}
++
++uint32_t
++kk_blas_registry_count(struct kk_device *dev)
++{
++   simple_mtx_lock(&dev->blas_registry_lock);
++   uint32_t count = util_dynarray_num_elements(
++      &dev->blas_registry, struct kk_acceleration_structure *);
++   simple_mtx_unlock(&dev->blas_registry_lock);
++   return count;
++}
++
++void
++kk_as_serialization_purge_range(struct kk_device *dev, uint64_t start,
++                                uint64_t end)
++{
++   simple_mtx_lock(&dev->as_serialization_lock);
++   hash_table_u64_foreach(dev->as_serialization_map, entry) {
++      if (entry.key >= start && entry.key <= end)
++         _mesa_hash_table_u64_remove(dev->as_serialization_map, entry.key);
++   }
++   simple_mtx_unlock(&dev->as_serialization_lock);
++}
++
++static int
++kk_blas_lookup_entry_compare(const void *a, const void *b)
++{
++   uint64_t lhs = ((const struct kk_blas_lookup_entry *)a)->address;
++   uint64_t rhs = ((const struct kk_blas_lookup_entry *)b)->address;
++
++   return (lhs > rhs) - (lhs < rhs);
++}
++
++bool
++kk_blas_registry_snapshot(struct kk_device *dev,
++                          struct kk_blas_lookup_entry *entries,
++                          uint32_t entry_capacity, uint32_t *out_count)
++{
++   simple_mtx_lock(&dev->blas_registry_lock);
++   uint32_t count = util_dynarray_num_elements(
++      &dev->blas_registry, struct kk_acceleration_structure *);
++   *out_count = count;
++
++   if (count > entry_capacity) {
++      simple_mtx_unlock(&dev->blas_registry_lock);
++      return false;
++   }
++
++   uint32_t index = 0;
++   util_dynarray_foreach(&dev->blas_registry,
++                         struct kk_acceleration_structure *, ptr_ptr) {
++      entries[index++] = (struct kk_blas_lookup_entry){
++         .address = (*ptr_ptr)->header_address,
++         .resource_id = (*ptr_ptr)->gpu_resource_id,
++      };
++   }
++   simple_mtx_unlock(&dev->blas_registry_lock);
++
++   /* The instance-conversion shader binary searches this table, so it has to
++    * be ordered by address. Header addresses are unique per structure. */
++   qsort(entries, count, sizeof(*entries), kk_blas_lookup_entry_compare);
++   return true;
+ }
+
+--- src/kosmickrisp/vulkan/kk_device.h
++++ src/kosmickrisp/vulkan/kk_device.h
+@@ -18,6 +18,7 @@
+ #include "kosmickrisp/clc/kk_precompiled_shader.h"
+ #include "libkk_shaders.h"
+ 
++#include "util/rb_tree.h"
+ #include "util/u_dynarray.h"
+ 
+ #include "vk_device.h"
+@@ -25,9 +26,24 @@
+ #include "vk_queue.h"
+ 
+ struct kk_bo;
++struct kk_acceleration_structure;
+ struct kk_physical_device;
+ struct vk_pipeline_cache;
+ 
++enum kk_device_lib_pipeline {
++   KK_LIB_FILL_ACC_STR_INSTANCE_DESCRIPTORS = 0,
++   KK_LIB_EXPAND_AABBS,
++   KK_LIB_FLATTEN_INSTANCE_ARRAY_OF_POINTERS,
++   KK_LIB_CONVERT_TRACE_RAYS_INDIRECT,
++   KK_LIB_CONVERT_TRACE_RAYS_INDIRECT2,
++   KK_LIB_COUNT,
++};
++
++enum kk_shader_source_type {
++   KK_SHADER_SRC_NIR,
++   KK_SHADER_SRC_MSL,
++};
++
+ struct kk_residency_set {
+    simple_mtx_t mutex;
+    mtl_residency_set *handle;
+@@ -75,6 +91,11 @@ struct kk_precompiled_cache {
+    struct kk_precompiled_shader shaders[LIBKK_NUM_PROGRAMS];
+ };
+ 
++struct kk_blas_lookup_entry {
++   VkDeviceAddress address;
++   uint64_t resource_id;
++};
++
+ struct kk_device {
+    struct vk_device vk;
+ 
+@@ -93,6 +114,7 @@ struct kk_device {
+    struct kk_residency_set residency_set;
+ 
+    struct kk_precompiled_cache precompiled_cache;
++   mtl_compute_pipeline_state *lib_pipelines[KK_LIB_COUNT];
+ 
+    bool has_queue;
+    struct kk_queue queue;
+@@ -105,10 +127,40 @@ struct kk_device {
+ 
+    uint64_t disabled_workarounds;
+    bool gpu_capture_enabled;
++
++   struct rb_tree buffer_addr_tree; /* Tree<kk_buffer*> */
++   simple_mtx_t buffer_addr_lock;
++
++   /* Bottom-level structures only: nothing else can be named by an instance
++    * descriptor, so top-level ones are never registered. */
++   struct util_dynarray
++      blas_registry; /* dynaarray<kk_acceleration_structure*> */
++   simple_mtx_t blas_registry_lock;
++
++   /* Maps device addresses to the acceleration structure they resolve to for
++    * deserialize. An acceleration structure is keyed both on its own header
++    * address and on the address of every blob it has been serialized into. */
++   struct hash_table_u64 *as_serialization_map; /* hash_table_u64<uint64_t ->
++                                                   kk_acceleration_structure*> */
++   simple_mtx_t as_serialization_lock;
++
++   /* Metadata retired by command buffers that were reset without submission.
++    * The next real queue submission adopts these buffers and releases them
++    * from its Metal completion callback. */
++   struct util_dynarray deferred_retired_buffers; /* mtl_buffer * */
++   simple_mtx_t deferred_retired_buffers_lock;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+ 
++static inline mtl_compute_pipeline_state *
++kk_device_lib_pipeline(const struct kk_device *dev,
++                       enum kk_device_lib_pipeline pipeline)
++{
++   assert(pipeline < KK_LIB_COUNT);
++   return dev->lib_pipelines[pipeline];
++}
++
+ static inline struct kk_physical_device *
+ kk_device_physical(const struct kk_device *dev)
+ {
+@@ -119,14 +171,17 @@ VkResult kk_device_init_meta(struct kk_device *dev);
+ void kk_device_finish_meta(struct kk_device *dev);
+ VkResult kk_device_init_lib(struct kk_device *dev);
+ void kk_device_finish_lib(struct kk_device *dev);
+-void kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap);
+-void kk_device_remove_heap_from_residency_set(struct kk_device *dev,
+-                                              mtl_heap *heap);
+-void kk_device_add_buffer_to_residency_set(struct kk_device *dev,
+-                                           mtl_buffer *buffer);
+-void kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
+-                                                mtl_buffer *buffer);
++void kk_device_add_allocation_to_residency_set(struct kk_device *dev,
++                                               mtl_allocation *allocation);
++void kk_device_remove_allocation_from_residency_set(struct kk_device *dev,
++                                                    mtl_allocation *allocation);
+ void kk_device_make_resources_resident(struct kk_device *dev);
++void kk_device_defer_retired_buffers(struct kk_device *dev,
++                                     struct util_dynarray *buffers);
++void kk_device_take_deferred_retired_buffers(struct kk_device *dev,
++                                             struct util_dynarray *buffers);
++void kk_device_release_retired_buffers(struct kk_device *dev,
++                                       struct util_dynarray *buffers);
+ 
+ /* Required to create a sampler */
+ mtl_sampler *kk_sampler_create(struct kk_device *dev,
+@@ -136,4 +191,31 @@ VkResult kk_sampler_heap_add(struct kk_device *dev,
+                              struct kk_rc_sampler **out);
+ void kk_sampler_heap_remove(struct kk_device *dev, struct kk_rc_sampler *rc);
+ 
++/* Registry of the bottom-level structures an instance descriptor can name.
++ * Top-level structures must not be added: they are never referenced this way
++ * and would only make the table the instance-conversion shader searches
++ * larger. */
++void kk_blas_registry_add(struct kk_device *dev,
++                          struct kk_acceleration_structure *blas);
++void kk_blas_registry_remove(struct kk_device *dev,
++                             struct kk_acceleration_structure *blas);
++uint32_t kk_blas_registry_count(struct kk_device *dev);
++/* Copies the whole registry into entries when it fits in entry_capacity and
++ * returns true; otherwise nothing is written and false is returned.  Either
++ * way *out_count reports the registry size observed under the lock, so a
++ * caller that came up short can resize and retry.  Sizing and copying happen
++ * in the same critical section, so the table is never silently truncated by a
++ * concurrent create or destroy.  Entries are written sorted by address, which
++ * is the order the instance-conversion shader binary searches. */
++bool kk_blas_registry_snapshot(struct kk_device *dev,
++                               struct kk_blas_lookup_entry *entries,
++                               uint32_t entry_capacity, uint32_t *out_count);
++
++/* Drops every serialized-blob entry keyed on a device address in
++ * [start, end].  Called when the buffer owning that range goes away, so the
++ * map neither grows without bound nor resolves a recycled address to the
++ * acceleration structure some earlier allocation was serialized from. */
++void kk_as_serialization_purge_range(struct kk_device *dev, uint64_t start,
++                                     uint64_t end);
++
+ #endif // KK_DEVICE_H
+
+--- src/kosmickrisp/vulkan/kk_device_lib.c
++++ src/kosmickrisp/vulkan/kk_device_lib.c
+
+--- src/kosmickrisp/vulkan/kk_device_memory.c
++++ src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -128,14 +128,14 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+          mem->bo->map =
+             mtl_new_buffer_with_length(mem->bo->mtl_handle, mem->vk.size, 0u);
+          mem->bo->size_B = mtl_heap_get_size(mem->bo->mtl_handle);
+-         kk_device_add_heap_to_residency_set(dev, mem->bo->mtl_handle);
++         kk_device_add_allocation_to_residency_set(dev, mem->bo->mtl_handle);
+       } else if (import_host) {
+          /* We can't create a heap from a host pointer. The imported memory will
+           * only be usable for buffers */
+          mem->bo->map = mtl_new_buffer_with_bytes_no_copy(
+             dev->mtl_handle, host_info->pHostPointer, mem->vk.size);
+          mem->bo->size_B = mtl_buffer_get_length(mem->bo->map);
+-         kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
++         kk_device_add_allocation_to_residency_set(dev, mem->bo->map);
+       }
+ 
+       mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
+
+--- src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
++++ src/kosmickrisp/vulkan/kk_nir_lower_descriptors.c
+@@ -233,6 +233,7 @@ is_idx_intrin(nir_intrinsic_instr *intrin)
+ 
+ static nir_def *
+ load_descriptor_for_idx_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
++                               nir_descriptor_type desc_type,
+                                const struct lower_descriptors_ctx *ctx)
+ {
+    nir_def *index = nir_imm_int(b, 0);
+@@ -247,7 +248,13 @@ load_descriptor_for_idx_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
+    uint32_t binding = nir_intrinsic_binding(intrin);
+    index = nir_iadd(b, index, intrin->src[0].ssa);
+ 
+-   return load_descriptor(b, 4, 32, set, binding, index, 0, ctx);
++   bool is_acceleration_structure =
++      desc_type == nir_descriptor_type_acceleration_structure;
++   uint32_t num_components = is_acceleration_structure ? 1 : 4;
++   uint32_t bit_size = is_acceleration_structure ? 64 : 32;
++
++   return load_descriptor(b, num_components, bit_size, set, binding, index, 0,
++                          ctx);
+ }
+ 
+ static bool
+@@ -264,7 +271,8 @@ try_lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
+       return false;
+    }
+ 
+-   nir_def *desc = load_descriptor_for_idx_intrin(b, idx_intrin, ctx);
++   nir_def *desc =
++      load_descriptor_for_idx_intrin(b, idx_intrin, desc_type, ctx);
+ 
+    nir_def_rewrite_uses(&intrin->def, desc);
+ 
+
+--- src/kosmickrisp/vulkan/kk_nir_lower_sbt.c
++++ src/kosmickrisp/vulkan/kk_nir_lower_sbt.c
+@@ -0,0 +1,52 @@
++/*
++ * Copyright 2025 Schrödinger, Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++/**
++ * @file kk_nir_lower_sbt.c
++ * @brief Shader binding table offsets within the root descriptor table
++ *
++ * The MSL backend reads the SBT base addresses and record strides straight out
++ * of the root descriptor buffer, so all this file provides is the mapping from
++ * SBT fields to their offsets in struct kk_root_descriptor_table.
++ */
++
++#include "kk_nir_lower_sbt.h"
++
++#include "kk_cmd_buffer.h"
++
++struct shader_binding_table_info
++kk_nir_lower_sbt_options_kk(void)
++{
++   struct shader_binding_table_info options = {
++      .sbt_buffer_binding = 0,
++      .raygen_addr_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_raygen_addr),
++      .miss_addr_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_miss_addr),
++      .hit_addr_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_hit_addr),
++      .callable_addr_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_callable_addr),
++      .raygen_stride_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_raygen_rec_stride),
++      .miss_stride_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_miss_rec_stride),
++      .hit_stride_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_hit_rec_stride),
++      .callable_stride_offset =
++         offsetof(struct kk_root_descriptor_table, rt.sbt_callable_rec_stride),
++      .ray_launch_size_addr_offset =
++         offsetof(struct kk_root_descriptor_table, rt.ray_launch_size_addr),
++      .ray_launch_base_offset =
++         offsetof(struct kk_root_descriptor_table, rt.ray_launch_base),
++      .ray_launch_count_offset =
++         offsetof(struct kk_root_descriptor_table, rt.ray_launch_count),
++      .scratch_buffer_addr_offset =
++         offsetof(struct kk_root_descriptor_table, rt.scratch_buffer_addr),
++      .scratch_buffer_stride_offset =
++         offsetof(struct kk_root_descriptor_table, rt.scratch_buffer_stride),
++   };
++   return options;
++}
+
+--- src/kosmickrisp/vulkan/kk_nir_lower_sbt.h
++++ src/kosmickrisp/vulkan/kk_nir_lower_sbt.h
+@@ -0,0 +1,20 @@
++/*
++ * Copyright 2025 Schrödinger, Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef KK_NIR_LOWER_SBT_H
++#define KK_NIR_LOWER_SBT_H
++
++#include "kosmickrisp/compiler/nir_to_msl.h"
++
++/**
++ * Create the shader binding table info for KosmicKrisp's root descriptor table
++ * layout.
++ *
++ * This helper computes the offsets based on the actual kk_root_descriptor_table
++ * struct layout, keeping the backend-specific knowledge in the driver code.
++ */
++struct shader_binding_table_info kk_nir_lower_sbt_options_kk(void);
++
++#endif /* KK_NIR_LOWER_SBT_H */
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -44,8 +44,10 @@ kk_get_device_extensions(const struct kk_instance *instance,
+    *ext = (struct vk_device_extension_table){
+       /* Vulkan 1.1 */
+       .KHR_16bit_storage = true,
++      .KHR_acceleration_structure = true,
+       .KHR_bind_memory2 = true,
+       .KHR_dedicated_allocation = true,
++      .KHR_deferred_host_operations = true,
+       .KHR_descriptor_update_template = true,
+       .KHR_device_group = true,
+       .KHR_external_fence = true,
+@@ -56,6 +58,10 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .KHR_maintenance2 = true,
+       .KHR_maintenance3 = true,
+       .KHR_multiview = true,
++      .KHR_pipeline_library = true,
++      .KHR_ray_query = true,
++      .KHR_ray_tracing_maintenance1 = true,
++      .KHR_ray_tracing_pipeline = true,
+       .KHR_relaxed_block_layout = true,
+       .KHR_sampler_ycbcr_conversion = true,
+       .KHR_shader_draw_parameters = true,
+@@ -467,6 +473,21 @@ kk_get_device_features(
+       /* VK_KHR_shader_subgroup_uniform_control_flow */
+       .shaderSubgroupUniformControlFlow = true,
+ 
++      /* VK_KHR_acceleration_structure */
++      .accelerationStructure = true,
++
++      /* VK_KHR_ray_query */
++      .rayQuery = true,
++
++      /* VK_KHR_ray_tracing_pipeline */
++      .rayTracingPipeline = true,
++      .rayTracingPipelineTraceRaysIndirect = true,
++      .rayTraversalPrimitiveCulling = true,
++
++      /* VK_KHR_ray_tracing_maintenance1 */
++      .rayTracingMaintenance1 = true,
++      .rayTracingPipelineTraceRaysIndirect2 = true,
++
+       /* VK_EXT_shader_atomic_float */
+       .shaderBufferFloat32Atomics = true,
+       .shaderBufferFloat32AtomicAdd = true,
+@@ -847,6 +868,29 @@ kk_get_device_properties(const struct kk_physical_device *pdev,
+ 
+       /* VK_KHR_fragment_shader_barycentric */
+       .triStripVertexOrderIndependentOfProvokingVertex = false,
++
++      /* VK_KHR_ray_tracing_pipeline */
++      .shaderGroupHandleSize = KK_RAY_TRACING_GROUP_HANDLE_SIZE,
++      .maxRayRecursionDepth = 31,
++      .maxShaderGroupStride = 16384,
++      .shaderGroupBaseAlignment = KK_RAY_TRACING_GROUP_HANDLE_SIZE,
++      .shaderGroupHandleCaptureReplaySize = 0, /* Not supported */
++      .maxRayDispatchInvocationCount = 1U << 30,
++      .shaderGroupHandleAlignment = KK_RAY_TRACING_GROUP_HANDLE_SIZE,
++      .maxRayHitAttributeSize = KK_RAY_HIT_ATTRIBS_SIZE,
++
++      /* VK_KHR_acceleration_structure */
++      //.maxTriangleCount = UINT32_MAX, // ??
++      .maxGeometryCount = (1 << 24) - 1,
++      .maxInstanceCount = (1 << 24) - 1,
++      .maxPrimitiveCount = (1 << 29) - 1,
++      .maxPerStageDescriptorAccelerationStructures = KK_MAX_DESCRIPTORS,
++      .maxPerStageDescriptorUpdateAfterBindAccelerationStructures =
++         KK_MAX_DESCRIPTORS,
++      .maxDescriptorSetAccelerationStructures = KK_MAX_DESCRIPTORS,
++      .maxDescriptorSetUpdateAfterBindAccelerationStructures =
++         KK_MAX_DESCRIPTORS,
++      .minAccelerationStructureScratchOffsetAlignment = 256,
+    };
+ 
+    char gpu_name[256u];
+
+--- src/kosmickrisp/vulkan/kk_private.h
++++ src/kosmickrisp/vulkan/kk_private.h
+@@ -40,6 +40,9 @@
+ 
+ #define KK_SPARSE_ADDR_SPACE_SIZE (1ull << 39)
+ 
++#define KK_RAY_TRACING_GROUP_HANDLE_SIZE 32
++#define KK_RAY_HIT_ATTRIBS_SIZE          32
++
+ /* Max size of a bound cbuf */
+ #define KK_MAX_CBUF_SIZE (1u << 16)
+ 
+
+--- src/kosmickrisp/vulkan/kk_query_pool.c
++++ src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -35,6 +35,10 @@ kk_reports_per_query(struct kk_query_pool *pool)
+    switch (pool->vk.query_type) {
+    case VK_QUERY_TYPE_OCCLUSION:
+    case VK_QUERY_TYPE_TIMESTAMP:
++   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR:
++   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
++   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
++   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR:
+       return 1;
+    default:
+       UNREACHABLE("Unsupported query type");
+@@ -67,7 +71,7 @@ kk_pool_is_ts(struct kk_query_pool *pool)
+    return pool->vk.query_type == VK_QUERY_TYPE_TIMESTAMP;
+ }
+ 
+-static uint64_t
++uint64_t
+ kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
+                      uint32_t query)
+ {
+@@ -78,7 +82,7 @@ kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
+    return bo->gpu + pool->query_start + (remap_index[query] * sizeof(uint64_t));
+ }
+ 
+-static uint64_t
++uint64_t
+ kk_query_available_addr(struct kk_query_pool *pool, uint32_t query)
+ {
+    assert(query < pool->vk.query_count);
+@@ -177,16 +181,19 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
+          /* We increment as we go so we can clean up properly if we run out */
+          remap_index[pool->oq.queries++] = index;
+       }
+-   } else if (kk_pool_is_ts(pool)) {
+-      /* Timestamps are sampled into a Metal counter heap (one entry per query)
+-       * and resolved into `bo` after the GPU writes them. */
+-      pool->ts.heap =
+-         mtl_new_timestamp_counter_heap(dev->mtl_handle, pool->vk.query_count);
+-      if (pool->ts.heap == NULL) {
+-         kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool), pAllocator);
+-         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   } else {
++      if (kk_pool_is_ts(pool)) {
++         /* Timestamps are sampled into a Metal counter heap (one entry per
++          * query) and resolved into `bo` after the GPU writes them. */
++         pool->ts.heap = mtl_new_timestamp_counter_heap(dev->mtl_handle,
++                                                        pool->vk.query_count);
++         if (pool->ts.heap == NULL) {
++            kk_DestroyQueryPool(device, kk_query_pool_to_handle(pool),
++                                pAllocator);
++            return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++         }
++         pool->ts.stage_map = UTIL_DYNARRAY_INIT;
+       }
+-      pool->ts.stage_map = UTIL_DYNARRAY_INIT;
+ 
+       /* set up default mapping for unique queries */
+       for (unsigned i = 0; i < pool->vk.query_count; ++i) {
+
+--- src/kosmickrisp/vulkan/kk_query_pool.h
++++ src/kosmickrisp/vulkan/kk_query_pool.h
+@@ -31,6 +31,8 @@ struct kk_oq_state {
+    unsigned queries;
+ };
+ 
++struct kk_device;
++
+ struct kk_query_pool {
+    struct vk_query_pool vk;
+ 
+@@ -51,4 +53,8 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_query_pool, vk.base, VkQueryPool,
+ 
+ uint16_t *kk_pool_index_ptr(const struct kk_query_pool *pool);
+ 
++uint64_t kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
++                              uint32_t query);
++uint64_t kk_query_available_addr(struct kk_query_pool *pool, uint32_t query);
++
+ #endif /* KK_QUERY_POOL_H */
+
+--- src/kosmickrisp/vulkan/kk_queue.c
++++ src/kosmickrisp/vulkan/kk_queue.c
+@@ -17,15 +17,37 @@
+ 
+ #include "vk_cmd_queue.h"
+ 
++struct kk_commit_feedback {
++   struct kk_queue *queue;
++   struct util_dynarray command_retired_buffers;
++   struct util_dynarray deferred_retired_buffers;
++};
++
+ static void
+ commit_callback(struct mtl_feedback_data *data)
+ {
++   struct kk_commit_feedback *feedback = data->user_data;
++   struct kk_queue *queue = feedback->queue;
++   struct kk_device *dev = kk_queue_device(queue);
++
+    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+-      struct kk_device *dev = (struct kk_device *)data->user_data;
+       vk_device_set_lost(
+          &dev->vk, "Command queue error: %s, with message \"%s\"",
+          mtl_command_queue_error_to_string(data->error), data->error_message);
+    }
++
++   kk_device_release_retired_buffers(dev, &feedback->command_retired_buffers);
++   kk_device_release_retired_buffers(dev, &feedback->deferred_retired_buffers);
++   util_dynarray_fini(&feedback->command_retired_buffers);
++   util_dynarray_fini(&feedback->deferred_retired_buffers);
++
++   mtx_lock(&queue->feedback_lock);
++   assert(queue->pending_feedback_count > 0);
++   queue->pending_feedback_count--;
++   cnd_broadcast(&queue->feedback_cond);
++   mtx_unlock(&queue->feedback_lock);
++
++   free(feedback);
+ }
+ 
+ static void
+@@ -44,6 +66,36 @@ rerecord_cmd_buffer(struct kk_cmd_buffer *cmd)
+    kk_device_make_resources_resident(dev);
+ }
+ 
++static VkResult
++kk_queue_commit_cmd_buffer(struct kk_queue *queue, struct kk_device *dev,
++                           struct kk_cmd_buffer *cmd_buffer,
++                           mtl_command_buffer **cmds, uint32_t count)
++{
++   mtl_commit_options *options = mtl_new_commit_options();
++   struct kk_commit_feedback *feedback = calloc(1, sizeof(*feedback));
++   if (!options || !feedback) {
++      mtl_release(options);
++      free(feedback);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
++   feedback->queue = queue;
++   feedback->command_retired_buffers = cmd_buffer->retired_buffers;
++   cmd_buffer->retired_buffers = UTIL_DYNARRAY_INIT;
++   kk_device_take_deferred_retired_buffers(dev,
++                                           &feedback->deferred_retired_buffers);
++
++   mtx_lock(&queue->feedback_lock);
++   queue->pending_feedback_count++;
++   mtx_unlock(&queue->feedback_lock);
++
++   mtl_commit_options_add_feedback_handler(options, commit_callback, feedback);
++   mtl_command_queue_commit(queue->mtl_handle, cmds, count, options);
++   mtl_release(options);
++
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+ {
+@@ -66,6 +118,8 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+     * Otherwise, users are playing with fire. */
+    kk_device_make_resources_resident(dev);
+ 
++   VkResult result = VK_SUCCESS;
++
+    for (uint32_t i = 0; i < submit->command_buffer_count; ++i) {
+       struct kk_cmd_buffer *cmd_buffer =
+          container_of(submit->command_buffers[i], struct kk_cmd_buffer, vk);
+@@ -74,7 +128,6 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+        * support multiple submissions. */
+       if (cmd_buffer->submitted)
+          rerecord_cmd_buffer(cmd_buffer);
+-      cmd_buffer->submitted = true;
+ 
+       mtl_command_buffer **cmds =
+          util_dynarray_begin(&cmd_buffer->submit_cmd_bufs);
+@@ -86,14 +139,23 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+                                              cmd_buffer->drawable);
+       }
+ 
+-      /* Metal complains with empty submissions. */
+-      if (count > 0u) {
+-         mtl_commit_options_add_feedback_handler(queue->commit_options,
+-                                                 commit_callback, dev);
+-         mtl_command_queue_commit(queue->mtl_handle, cmds, count,
+-                                  queue->commit_options);
++      /* Metal complains with empty submissions. Once a commit has failed we
++       * stop committing, but the loop still has to run to completion so every
++       * drawable gets signalled and every semaphore below is signalled. */
++      if (count > 0u && result == VK_SUCCESS) {
++         result =
++            kk_queue_commit_cmd_buffer(queue, dev, cmd_buffer, cmds, count);
++      }
++
++      if (count == 0u || result != VK_SUCCESS) {
++         /* There is no Metal completion callback for a submission we did not
++          * commit. Preserve any retired generation until a later real
++          * submission. */
++         kk_device_defer_retired_buffers(dev, &cmd_buffer->retired_buffers);
+       }
+ 
++      cmd_buffer->submitted = true;
++
+       if (cmd_buffer->drawable) {
+          mtl_command_queue_signal_drawable(queue->mtl_handle,
+                                            cmd_buffer->drawable);
+@@ -101,6 +163,9 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+       }
+    }
+ 
++   /* Signal unconditionally: dropping the signals on a failed submission would
++    * leave fences and timeline semaphores waiting forever instead of letting
++    * the application observe the error. */
+    for (uint32_t i = 0u; i < submit->signal_count; ++i) {
+       struct vk_sync_signal *signal = &submit->signals[i];
+       struct kk_sync_timeline *sync =
+@@ -109,6 +174,10 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+                        signal->signal_value);
+    }
+ 
++   if (result != VK_SUCCESS)
++      return vk_device_set_lost(&dev->vk,
++                                "Failed to allocate Metal commit state");
++
+    return VK_SUCCESS;
+ }
+ 
+@@ -146,9 +215,30 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+       return result;
+ 
+    queue->mtl_handle = mtl_new_command_queue(dev->mtl_handle);
++   if (!queue->mtl_handle) {
++      vk_queue_finish(&queue->vk);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++
+    mtl_command_queue_add_residency_set(queue->mtl_handle,
+                                        dev->residency_set.handle);
+-   queue->commit_options = mtl_new_commit_options();
++
++   if (mtx_init(&queue->feedback_lock, mtx_plain) != thrd_success) {
++      mtl_command_queue_remove_residency_set(queue->mtl_handle,
++                                             dev->residency_set.handle);
++      mtl_release(queue->mtl_handle);
++      vk_queue_finish(&queue->vk);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   if (cnd_init(&queue->feedback_cond) != thrd_success) {
++      mtx_destroy(&queue->feedback_lock);
++      mtl_command_queue_remove_residency_set(queue->mtl_handle,
++                                             dev->residency_set.handle);
++      mtl_release(queue->mtl_handle);
++      vk_queue_finish(&queue->vk);
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   queue->pending_feedback_count = 0;
+ 
+    queue->vk.driver_submit = kk_queue_submit;
+ 
+@@ -158,9 +248,16 @@ kk_queue_init(struct kk_device *dev, struct kk_queue *queue,
+ void
+ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
+ {
++   mtx_lock(&queue->feedback_lock);
++   while (queue->pending_feedback_count > 0)
++      cnd_wait(&queue->feedback_cond, &queue->feedback_lock);
++   mtx_unlock(&queue->feedback_lock);
++
++   cnd_destroy(&queue->feedback_cond);
++   mtx_destroy(&queue->feedback_lock);
++
+    mtl_command_queue_remove_residency_set(queue->mtl_handle,
+                                           dev->residency_set.handle);
+-   mtl_release(queue->commit_options);
+    mtl_release(queue->mtl_handle);
+    vk_queue_finish(&queue->vk);
+ }
+
+--- src/kosmickrisp/vulkan/kk_queue.h
++++ src/kosmickrisp/vulkan/kk_queue.h
+@@ -17,7 +17,13 @@
+ struct kk_queue {
+    struct vk_queue vk;
+    struct mtl_command_queue *mtl_handle;
+-   mtl_commit_options *commit_options;
++
++   /* Metal feedback handlers run asynchronously. Device teardown waits for
++    * every handler so its queue/device pointers and deferred buffers stay
++    * valid until the callback has finished. */
++   mtx_t feedback_lock;
++   cnd_t feedback_cond;
++   uint32_t pending_feedback_count;
+ };
+ 
+ static inline struct kk_device *
+
+--- src/kosmickrisp/vulkan/kk_ray_tracing_pipeline.c
++++ src/kosmickrisp/vulkan/kk_ray_tracing_pipeline.c
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+
+--- src/kosmickrisp/vulkan/kk_shader.h
++++ src/kosmickrisp/vulkan/kk_shader.h
+@@ -15,6 +15,7 @@
+ 
+ #include "vk_pipeline_cache.h"
+ 
++#include "vk_pipeline.h"
+ #include "vk_shader.h"
+ 
+ struct kk_cmd_buffer;
+@@ -102,6 +103,9 @@ struct kk_shader_info {
+       struct {
+          struct mtl_size local_size;
+       } cs;
++      struct {
++         struct mtl_size local_size;
++      } rt;
+    };
+ };
+ 
+@@ -116,6 +120,7 @@ struct kk_pipeline_handles {
+          uint32_t pre_render_count;
+       } gfx;
+       mtl_compute_pipeline_state *cs;
++      mtl_compute_pipeline_state *rt;
+    };
+ };
+ 
+@@ -130,6 +135,13 @@ struct kk_shader {
+    struct kk_pipeline_handles pipeline;
+    struct kk_shader_info info;
+    struct msl_compile_data msl_data[MESA_SHADER_STAGES];
++
++   /* For ray tracing: NIR is stored here until all shaders in the pipeline
++    * are collected and compiled together to MSL */
++   nir_shader *nir;
++
++   const char *entrypoint_name;
++   const char *msl_code;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
+@@ -172,4 +184,52 @@ VkResult kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
+ void kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd,
+                                 struct kk_shader *shader);
+ 
++/* kk_rt_stage and kk_rt_group are defined in
++ * kosmickrisp/kk_ray_tracing_common.h */
++
++struct kk_rt_pipeline {
++   struct vk_pipeline base;
++
++   /* Shader stages */
++   uint32_t stage_count;
++   struct kk_rt_stage *stages;
++
++   /* Shader groups (for SBT) */
++   uint32_t group_count;
++   struct kk_rt_group *groups;
++
++   /* Metal resources - compiled together */
++   mtl_library *library; /* Single Metal library with all functions */
++   mtl_intersection_function_table
++      *intersection_table; /* Intersection function table for AABB primitives */
++
++   /* Set when the pipeline declared
++    * VK_DYNAMIC_STATE_RAY_TRACING_PIPELINE_STACK_SIZE_KHR.  Only such
++    * pipelines let vkCmdSetRayTracingPipelineStackSizeKHR shrink the
++    * per-worker scratch stride below the compiled layout. */
++   bool dynamic_stack_size;
++   size_t scratch_buffer_size; /* Per-worker scratch frame size the generated
++                                  MSL was compiled against */
++};
++
++VK_DEFINE_NONDISP_HANDLE_CASTS(kk_rt_pipeline, base.base, VkPipeline,
++                               VK_OBJECT_TYPE_PIPELINE)
++
++VkResult kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
++                            struct vk_shader_compile_info *infos,
++                            const struct vk_graphics_pipeline_state *state,
++                            const struct vk_features *enabled_features,
++                            const VkAllocationCallbacks *pAllocator,
++                            struct vk_shader **shaders_out);
++
++VkResult kk_compile_ray_tracing_pipeline(
++   struct kk_device *device, uint32_t shader_count,
++   struct vk_shader_compile_info *infos, struct kk_rt_group *groups,
++   uint32_t group_count, uint32_t max_recursion_depth,
++   struct vk_shader **shaders_out, size_t *scratch_buffer_size_out);
++
++void kk_preprocess_nir(UNUSED struct vk_physical_device *vk_pdev,
++                       nir_shader *nir,
++                       UNUSED const struct vk_pipeline_robustness_state *rs);
++
+ #endif /* KK_SHADER_H */
+
+--- src/kosmickrisp/vulkan/meson.build
++++ src/kosmickrisp/vulkan/meson.build
+@@ -50,12 +50,15 @@ idep_kk_device_dispatch_table = declare_dependency(
+ )
+ 
+ kk_files = files(
++  'kk_acceleration_structure.h',
++  'kk_acceleration_structure.c',
+   'kk_bo.h',
+   'kk_bo.c',
+   'kk_buffer_view.h',
+   'kk_buffer_view.c',
+   'kk_buffer.h',
+   'kk_buffer.c',
++  'kk_cmd_acceleration_structure.c',
+   'kk_cmd_buffer.h',
+   'kk_cmd_buffer.c',
+   'kk_cmd_clear.c',
+@@ -91,6 +94,8 @@ kk_files = files(
+   'kk_nir_lower_descriptors.c',
+   'kk_nir_lower_multiview.c',
+   'kk_nir_lower_null_images.c',
++  'kk_nir_lower_sbt.h',
++  'kk_nir_lower_sbt.c',
+   'kk_nir_lower_textures.c',
+   'kk_nir_lower_vbo.h',
+   'kk_nir_lower_vbo.c',
+@@ -102,6 +107,7 @@ kk_files = files(
+   'kk_query_table.c',
+   'kk_queue.h',
+   'kk_queue.c',
++  'kk_ray_tracing_pipeline.c',
+   'kk_sampler.h',
+   'kk_sampler.c',
+   'kk_shader.h',
+
+--- src/kosmickrisp/kk_ray_tracing_common.h
++++ src/kosmickrisp/kk_ray_tracing_common.h
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2025 Schrödinger, Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#pragma once
++
++#include "compiler/shader_enums.h"
++#include "vulkan/vulkan_core.h"
++
++struct nir_shader;
++struct kk_shader;
++
++struct kk_rt_stage {
++   struct kk_shader *shader; /* Full kk_shader pointer (for driver use) */
++   struct nir_shader *nir;   /* NIR shader (for compiler use) */
++   mesa_shader_stage stage;
++};
++
++struct kk_rt_group {
++   VkRayTracingShaderGroupTypeKHR type;
++   uint32_t stage_count;
++   struct kk_rt_stage stages[3]; /* Max: closest_hit + any_hit + intersection */
++};
+
+--- src/util/tests/rb_tree_test.cpp
++++ src/util/tests/rb_tree_test.cpp
+@@ -366,3 +366,130 @@ TEST(IntervalTreeTest, InsertAndSearch)
+                                  0, 2);
+     }
+ }
++
++struct u64interval_test_node {
++    struct u64interval_node node;
++};
++
++static unsigned
++count_u64interval_matches(struct rb_tree *tree, uint64_t start, uint64_t end)
++{
++    struct u64interval interval = { start, end };
++    uint64_t previous_start = 0;
++    unsigned count = 0;
++
++    u64interval_tree_foreach (struct u64interval_test_node, n, interval,
++                              tree, node) {
++        EXPECT_LE(n->node.interval.start, end);
++        EXPECT_GE(n->node.interval.end, start);
++        EXPECT_GE(n->node.interval.start, previous_start);
++
++        previous_start = n->node.interval.start;
++        count++;
++    }
++
++    return count;
++}
++
++static void
++validate_u64interval_search(struct rb_tree *tree,
++                            struct u64interval_test_node *nodes,
++                            int first_node, int last_node,
++                            uint64_t start, uint64_t end)
++{
++    unsigned expected_count = 0;
++
++    for (int i = first_node; i <= last_node; i++) {
++        if (nodes[i].node.interval.start <= end &&
++            nodes[i].node.interval.end >= start)
++            expected_count++;
++    }
++
++    EXPECT_EQ(expected_count, count_u64interval_matches(tree, start, end));
++}
++
++TEST(U64IntervalTreeTest, InsertAndSearch)
++{
++    const uint64_t offset = 1ull << 32;
++    struct u64interval_test_node nodes[ARRAY_SIZE(test_numbers) / 2];
++    struct rb_tree tree;
++
++    rb_tree_init(&tree);
++
++    for (unsigned i = 0; 2 * i < ARRAY_SIZE(test_numbers); i++) {
++        nodes[i].node.interval.start =
++            offset + MIN2(test_numbers[2 * i], test_numbers[2 * i + 1]);
++        nodes[i].node.interval.end =
++            offset + MAX2(test_numbers[2 * i], test_numbers[2 * i + 1]);
++        u64interval_tree_insert(&tree, &nodes[i].node);
++        rb_tree_validate(&tree);
++        validate_u64interval_search(&tree, nodes, 0, i,
++                                    offset, offset + 100);
++        validate_u64interval_search(&tree, nodes, 0, i,
++                                    offset, offset + 50);
++        validate_u64interval_search(&tree, nodes, 0, i,
++                                    offset + 50, offset + 100);
++        validate_u64interval_search(&tree, nodes, 0, i,
++                                    offset, offset + 2);
++    }
++
++    for (unsigned i = 0; 2 * i < ARRAY_SIZE(test_numbers); i++) {
++        u64interval_tree_remove(&tree, &nodes[i].node);
++        rb_tree_validate(&tree);
++        validate_u64interval_search(&tree, nodes, i + 1,
++                                    ARRAY_SIZE(test_numbers) / 2 - 1,
++                                    offset, offset + 100);
++        validate_u64interval_search(&tree, nodes, i + 1,
++                                    ARRAY_SIZE(test_numbers) / 2 - 1,
++                                    offset, offset + 50);
++        validate_u64interval_search(&tree, nodes, i + 1,
++                                    ARRAY_SIZE(test_numbers) / 2 - 1,
++                                    offset + 50, offset + 100);
++        validate_u64interval_search(&tree, nodes, i + 1,
++                                    ARRAY_SIZE(test_numbers) / 2 - 1,
++                                    offset, offset + 2);
++    }
++}
++
++TEST(U64IntervalTreeTest, AddressSpaceBoundaries)
++{
++    static const struct u64interval intervals[] = {
++        { 0x100000000ull, 0x1000000ffull },
++        { 0x100000080ull, 0x100000180ull },
++        { 0x200000000ull, 0x200000100ull },
++        { UINT64_MAX - 0x100, UINT64_MAX - 1 },
++    };
++    struct u64interval_test_node nodes[ARRAY_SIZE(intervals)];
++    struct rb_tree tree;
++
++    rb_tree_init(&tree);
++
++    for (unsigned i = 0; i < ARRAY_SIZE(intervals); i++) {
++        nodes[i].node.interval = intervals[i];
++        u64interval_tree_insert(&tree, &nodes[i].node);
++        rb_tree_validate(&tree);
++    }
++
++    EXPECT_EQ(0u, count_u64interval_matches(&tree, 0, UINT32_MAX));
++    EXPECT_EQ(2u, count_u64interval_matches(&tree, 0x100000090ull,
++                                            0x100000090ull));
++    EXPECT_EQ(1u, count_u64interval_matches(&tree, 0x100000170ull,
++                                            0x100000170ull));
++    EXPECT_EQ(1u, count_u64interval_matches(&tree, 0x200000080ull,
++                                            0x200000080ull));
++    EXPECT_EQ(1u, count_u64interval_matches(&tree, UINT64_MAX - 0x80,
++                                            UINT64_MAX - 0x80));
++    EXPECT_EQ(4u, count_u64interval_matches(&tree, 0, UINT64_MAX));
++
++    u64interval_tree_remove(&tree, &nodes[0].node);
++    rb_tree_validate(&tree);
++    EXPECT_EQ(1u, count_u64interval_matches(&tree, 0x100000090ull,
++                                            0x100000090ull));
++
++    for (unsigned i = 1; i < ARRAY_SIZE(intervals); i++) {
++        u64interval_tree_remove(&tree, &nodes[i].node);
++        rb_tree_validate(&tree);
++    }
++
++    EXPECT_TRUE(rb_tree_is_empty(&tree));
++}
+
+--- src/util/rb_tree.c
++++ src/util/rb_tree.c
+@@ -634,6 +634,101 @@ uinterval_node_next(struct uinterval_node *node,
+     return next ? rb_node_data(struct uinterval_node, next, node) : NULL;
+ }
+ 
++static int
++u64interval_cmp(struct u64interval a, struct u64interval b)
++{
++    if (a.end < b.start)
++        return -1;
++    else if (b.end < a.start)
++        return 1;
++    else
++        return 0;
++}
++
++static int
++u64interval_node_cmp(const struct rb_node *_a, const struct rb_node *_b)
++{
++    const struct u64interval_node *a = rb_node_data(struct u64interval_node, _a, node);
++    const struct u64interval_node *b = rb_node_data(struct u64interval_node, _b, node);
++
++    if (a->interval.start < b->interval.start)
++        return 1;
++    else if (a->interval.start > b->interval.start)
++        return -1;
++    else
++        return 0;
++}
++
++static int
++u64interval_search_cmp(const struct rb_node *_node, const void *_interval)
++{
++    const struct u64interval_node *node = rb_node_data(struct u64interval_node, _node, node);
++    const struct u64interval *interval = _interval;
++
++    return u64interval_cmp(node->interval, *interval);
++}
++
++static bool
++u64interval_max_cmp(const struct rb_node *_node, const void *data)
++{
++    const struct u64interval_node *node = rb_node_data(struct u64interval_node, _node, node);
++    const struct u64interval *interval = data;
++
++    return node->max_end >= interval->start;
++}
++
++static void
++u64interval_update_max(struct rb_node *_node)
++{
++    struct u64interval_node *node = rb_node_data(struct u64interval_node, _node, node);
++    node->max_end = node->interval.end;
++    if (node->node.left) {
++        struct u64interval_node *left = rb_node_data(struct u64interval_node, node->node.left, node);
++        node->max_end = MAX2(node->max_end, left->max_end);
++    }
++    if (node->node.right) {
++        struct u64interval_node *right = rb_node_data(struct u64interval_node, node->node.right, node);
++        node->max_end = MAX2(node->max_end, right->max_end);
++    }
++}
++
++void
++u64interval_tree_insert(struct rb_tree *tree, struct u64interval_node *node)
++{
++    rb_augmented_tree_insert(tree, &node->node, u64interval_node_cmp,
++                             u64interval_update_max);
++}
++
++void
++u64interval_tree_remove(struct rb_tree *tree, struct u64interval_node *node)
++{
++    rb_augmented_tree_remove(tree, &node->node, u64interval_update_max);
++}
++
++struct u64interval_node *
++u64interval_tree_first(struct rb_tree *tree, struct u64interval interval)
++{
++    if (!tree->root)
++        return NULL;
++
++    struct rb_node *node =
++        rb_node_min_intersecting(tree->root, &interval, u64interval_search_cmp,
++                                 u64interval_max_cmp);
++
++    return node ? rb_node_data(struct u64interval_node, node, node) : NULL;
++}
++
++struct u64interval_node *
++u64interval_node_next(struct u64interval_node *node,
++                      struct u64interval interval)
++{
++    struct rb_node *next =
++        rb_node_next_intersecting(&node->node, &interval, u64interval_search_cmp,
++                                  u64interval_max_cmp);
++
++    return next ? rb_node_data(struct u64interval_node, next, node) : NULL;
++}
++
+ static void
+ validate_rb_node(struct rb_node *n, int black_depth)
+ {
+
+--- src/util/rb_tree.h
++++ src/util/rb_tree.h
+@@ -454,6 +454,60 @@ struct uinterval_node *uinterval_node_next(struct uinterval_node *node,
+         (iter = rb_node_data(type, (struct uinterval_node *)__node, field), true); \
+         __node = (type *)uinterval_node_next((struct uinterval_node *)__node, interval))
+ 
++/** 64-bit Unsigned interval
++ *
++ * Intervals are closed by convention.
++ */
++struct u64interval {
++   uint64_t start, end;
++};
++
++struct u64interval_node {
++   struct rb_node node;
++
++   /* Must be filled in before inserting */
++   struct u64interval interval;
++
++   /* Managed internally by the tree */
++   uint64_t max_end;
++};
++
++/** Insert a node into a 64-bit unsigned interval tree. */
++void u64interval_tree_insert(struct rb_tree *tree, struct u64interval_node *node);
++
++/** Remove a node from a 64-bit unsigned interval tree. */
++void u64interval_tree_remove(struct rb_tree *tree, struct u64interval_node *node);
++
++/** Get the first node intersecting the given interval. */
++struct u64interval_node *u64interval_tree_first(struct rb_tree *tree,
++                                                struct u64interval interval);
++
++/** Get the next node after \p node intersecting the given interval. */
++struct u64interval_node *u64interval_node_next(struct u64interval_node *node,
++                                               struct u64interval interval);
++
++/** Iterate over the nodes in the tree intersecting the given interval
++ *
++ * The iteration itself should take O(k log n) time, where k is the number of
++ * iterations of the loop and n is the size of the tree.
++ *
++ * \param   type    The type of the containing data structure
++ *
++ * \param   iter    The variable name for current node in the iteration;
++ *                  this will be declared as a pointer to \p type
++ *
++ * \param  interval The interval to be tested against.
++ *
++ * \param   T       The red-black tree
++ *
++ * \param   field   The u64interval_node field in containing data structure
++ */
++#define u64interval_tree_foreach(type, iter, interval, T, field) \
++   for (type *iter, *__node = (type *)u64interval_tree_first(T, interval); \
++        __node != NULL && \
++        (iter = rb_node_data(type, (struct u64interval_node *)__node, field), true); \
++        __node = (type *)u64interval_node_next((struct u64interval_node *)__node, interval))
++
+ /** Validate a red-black tree
+  *
+  * This function walks the tree and validates that this is a valid red-
+
+--- src/.clang-format
++++ src/.clang-format
+@@ -68,6 +68,7 @@ ForEachMacros:
+   - rb_tree_foreach_rev_safe
+   - rb_tree_foreach_safe
+   - uinterval_tree_foreach
++  - u64interval_tree_foreach
+ 
+   - set_foreach
+   - set_foreach_remove
+

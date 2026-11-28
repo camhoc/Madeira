@@ -1,0 +1,64 @@
+# ntdll: Avoid redundant NtYieldExecution and select() in NtDelayExecution.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12598 state=merged
+# While attempting to play Deadlock on my MacOS laptop, I noticed the game really struggled with CPU. Upon profiling it, 35% of the CPU time was being spent on **`NtYieldExecution` . `sched_yield`**  is notoriously expensive  on MacOS, so it's good practice to avoid calling it in busy loops.
+
+We now only call `NtYieldExecution` when the caller actually calls `Sleep(0)`.
+
+Additionally, by splitting up the three cases (sleep \< 0, sleep == 0 and sleep \> 1), we can avoid calling **`NtQuerySystemTime`** unless absolutely necessary.
+
+I also changed the `select` call to `nanosleep` , but if there's a reason we weren't using `nanosleep` before I can change it back.
+--- dlls/ntdll/unix/sync.c
++++ dlls/ntdll/unix/sync.c
+@@ -2440,31 +2440,34 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
+     {
+         for (;;) select( 0, NULL, NULL, NULL, NULL );
+     }
++    else if (!timeout->QuadPart)
++    {
++        return NtYieldExecution();
++    }
++    else if (timeout->QuadPart < 0)
++    {
++        struct timespec ts, rem;
++        timeout_t diff = -timeout->QuadPart;
++
++        ts.tv_sec  = diff / TICKSPERSEC;
++        ts.tv_nsec = (diff % TICKSPERSEC) * 100;
++        while (nanosleep( &ts, &rem ) == -1 && errno == EINTR)
++            ts = rem;
++    }
+     else
+     {
+         LARGE_INTEGER now;
+-        timeout_t when, diff;
+-
+-        if ((when = timeout->QuadPart) < 0)
+-        {
+-            NtQuerySystemTime( &now );
+-            when = now.QuadPart - when;
+-        }
+-
+-        /* Note that we yield after establishing the desired timeout, but
+-           we only care about the result of the yield for zero timeouts */
+-        status = NtYieldExecution();
+-        if (!when) return status;
++        timeout_t when = timeout->QuadPart, diff;
+ 
+         for (;;)
+         {
+-            struct timeval tv;
++            struct timespec ts;
+             NtQuerySystemTime( &now );
+-            diff = (when - now.QuadPart + 9) / 10;
++            diff = when - now.QuadPart;
+             if (diff <= 0) break;
+-            tv.tv_sec  = diff / 1000000;
+-            tv.tv_usec = diff % 1000000;
+-            if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
++            ts.tv_sec  = diff / TICKSPERSEC;
++            ts.tv_nsec = (diff % TICKSPERSEC) * 100;
++            if (nanosleep( &ts, NULL ) != -1 || errno != EINTR) break;
+         }
+     }
+     return STATUS_SUCCESS;
+

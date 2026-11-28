@@ -1,0 +1,182 @@
+# rtworkq: Wait for in-flight finalization callbacks on queue shutdown.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11605 state=opened
+# ## Summary
+
+`shutdown_queue()` in `dlls/rtworkq/queue.c` can call `DeleteCriticalSection(&queue->cs)` while a finalization callback is still executing in the thread pool. The callback then calls `EnterCriticalSection()` on the deleted critical section and the process crashes with `STATUS_INVALID_HANDLE` (0xc0000008).
+
+## Evidence
+
+Observed while running a Unity 2021.3 game (Media Foundation video pipeline) under Proton (GE-Proton11-3). The game crashes intermittently during normal gameplay; video playback itself usually succeeds.
+
+Seven collected minidumps were parsed (ExceptionStream):
+
+- Exception code `0xc0000008` (`STATUS_INVALID_HANDLE`) in 6 dumps, `0xc0000022` in 1
+- The crashing thread differs every time
+- The crash offset is **identical in all 7 dumps**: inside `serial_queue_finalization_callback()`, at the `EnterCriticalSection(&queue->cs)` call at the top of the function
+
+## Analysis
+
+When a serial work queue is destroyed (last handle released via `unlock_user_queue()` -> `shutdown_queue()`), `pool_queue_shutdown()` calls `CloseThreadpoolCleanupGroupMembers()` and then `shutdown_queue()` deletes the queue's critical section. However, a work item dispatched to the target thread pool may have completed its main callback while its finalization callback (`serial_queue_finalization_callback`) is still running (or about to run) on a pool thread. That callback unconditionally enters the (now deleted) serial queue's critical section.
+
+!5158 ("rtworkq: Avoid closing a thread pool object while its callbacks are running") fixed a related race for the cancel path (`queue_cancel_item()` waits for thread pool callbacks), but the shutdown path remains unprotected.
+
+## Fix
+
+Track in-flight finalization callbacks per queue: `pool_queue_submit()` increments the counter of the queue owning the finalization callback (`item->queue`; for serial queues this is the serial queue whose critical section the callback will enter), and a wrapper (`pool_queue_finalization_callback`) de
+--- dlls/rtworkq/tests/rtworkq.c
++++ dlls/rtworkq/tests/rtworkq.c
+@@ -669,6 +669,55 @@ static void test_queue_shutdown(void)
+     IRtwqAsyncCallback_Release(&test_callback2->IRtwqAsyncCallback_iface);
+ }
+ 
++static void test_serial_queue_shutdown(void)
++{
++    IRtwqAsyncResult *callback_result;
++    IRtwqAsyncResult *results[8];
++    struct test_callback *callbacks[8];
++    unsigned int i, j;
++    DWORD res, queue;
++    HRESULT hr;
++
++    hr = RtwqStartup();
++    ok(hr == S_OK, "Failed to start up, hr %#lx.\n", hr);
++
++    /* Destroy serial queues while their finalization callbacks may still be in flight.
++     * Without proper synchronization in the queue shutdown path this crashes when the
++     * finalization callback enters the deleted queue critical section. Pending items
++     * keep the finalization callbacks chaining through the queue, to widen the window. */
++    for (i = 0; i < 50; ++i)
++    {
++        hr = RtwqAllocateSerialWorkQueue(RTWQ_CALLBACK_QUEUE_STANDARD, &queue);
++        ok(hr == S_OK, "Failed to allocate queue, hr %#lx.\n", hr);
++
++        for (j = 0; j < ARRAY_SIZE(results); ++j)
++        {
++            callbacks[j] = create_test_callback();
++            hr = RtwqCreateAsyncResult(NULL, &callbacks[j]->IRtwqAsyncCallback_iface, NULL, &results[j]);
++            ok(hr == S_OK, "Failed to create result, hr %#lx.\n", hr);
++            hr = RtwqPutWorkItem(queue, 0, results[j]);
++            ok(hr == S_OK, "got %#lx\n", hr);
++        }
++
++        /* The first callback was invoked, the finalization callbacks for the remaining
++         * items may still be running. */
++        res = wait_async_callback_result(&callbacks[0]->IRtwqAsyncCallback_iface, 1000, &callback_result);
++        ok(res == 0, "got %#lx\n", res);
++
++        hr = RtwqUnlockWorkQueue(queue);
++        ok(hr == S_OK, "Failed to unlock queue, hr %#lx.\n", hr);
++
++        for (j = 0; j < ARRAY_SIZE(results); ++j)
++        {
++            IRtwqAsyncResult_Release(results[j]);
++            IRtwqAsyncCallback_Release(&callbacks[j]->IRtwqAsyncCallback_iface);
++        }
++    }
++
++    hr = RtwqShutdown();
++    ok(hr == S_OK, "Failed to shut down, hr %#lx.\n", hr);
++}
++
+ START_TEST(rtworkq)
+ {
+     test_platform_init();
+@@ -676,4 +725,5 @@ START_TEST(rtworkq)
+     test_work_queue();
+     test_scheduled_items();
+     test_queue_shutdown();
++    test_serial_queue_shutdown();
+ }
+
+--- dlls/rtworkq/queue.c
++++ dlls/rtworkq/queue.c
+@@ -198,6 +198,10 @@ struct queue
+     /* Data used for serial queues only. */
+     PTP_SIMPLE_CALLBACK finalization_callback;
+     DWORD target_queue;
++    /* Number of finalization callbacks that are still in flight. Shutdown has to wait
++     * for them to finish before the critical section can be deleted. */
++    LONG inflight;
++    HANDLE inflight_event;
+ };
+ 
+ static void shutdown_queue(struct queue *queue);
+@@ -393,6 +397,24 @@ static void CALLBACK standard_queue_worker(TP_CALLBACK_INSTANCE *instance, void
+     IUnknown_Release(&item->IUnknown_iface);
+ }
+ 
++static void CALLBACK pool_queue_finalization_callback(PTP_CALLBACK_INSTANCE instance, void *context)
++{
++    struct work_item *item = context;
++    /* The finalization callback below may release the last reference to the item,
++     * so snapshot the queue before calling it. */
++    struct queue *queue = item->queue;
++
++    if (item->finalization_callback)
++        item->finalization_callback(instance, context);
++
++    /* Done under the queue critical section, so that it can't race with shutdown_queue()
++     * checking the counter and resetting the event. */
++    EnterCriticalSection(&queue->cs);
++    if (!--queue->inflight)
++        SetEvent(queue->inflight_event);
++    LeaveCriticalSection(&queue->cs);
++}
++
+ static void pool_queue_submit(struct queue *queue, struct work_item *item)
+ {
+     TP_CALLBACK_PRIORITY callback_priority;
+@@ -406,11 +428,16 @@ static void pool_queue_submit(struct queue *queue, struct work_item *item)
+         callback_priority = TP_CALLBACK_PRIORITY_HIGH;
+ 
+     env = queue->envs[callback_priority];
+-    env.FinalizationCallback = item->finalization_callback;
+     /* Worker pool callback will release one reference. Grab one more to keep object alive when
+        we need finalization callback. */
+     if (item->finalization_callback)
++    {
+         IUnknown_AddRef(&item->IUnknown_iface);
++        /* Count the finalization callback as in flight, so that queue shutdown can wait
++         * for it before deleting the critical section the callback is going to enter. */
++        env.FinalizationCallback = pool_queue_finalization_callback;
++        InterlockedIncrement(&item->queue->inflight);
++    }
+     item->u.work_object = CreateThreadpoolWork(standard_queue_worker, item, (TP_CALLBACK_ENVIRON *)&env);
+     item->type = WORK_ITEM_WORK;
+     SubmitThreadpoolWork(item->u.work_object);
+@@ -463,6 +490,7 @@ static HRESULT serial_queue_init(const struct queue_desc *desc, struct queue *qu
+     queue->target_queue = desc->target_queue;
+     lock_user_queue(queue->target_queue);
+     queue->finalization_callback = serial_queue_finalization_callback;
++    queue->inflight_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+ 
+     return S_OK;
+ }
+@@ -699,6 +727,26 @@ static void shutdown_queue(struct queue *queue)
+     }
+     LeaveCriticalSection(&queue->cs);
+ 
++    /* A finalization callback could still be executing at this point, wait for it to
++     * complete before deleting the critical section it is going to enter. The check
++     * and the event reset are done under the queue critical section, which the
++     * finalization wrapper also takes when decrementing the counter, so a callback
++     * finishing concurrently can't be missed and a stale signal can't cut the wait short. */
++    if (queue->inflight_event)
++    {
++        BOOL wait;
++
++        EnterCriticalSection(&queue->cs);
++        wait = queue->inflight != 0;
++        if (wait)
++            ResetEvent(queue->inflight_event);
++        LeaveCriticalSection(&queue->cs);
++
++        if (wait)
++            WaitForSingleObject(queue->inflight_event, INFINITE);
++        CloseHandle(queue->inflight_event);
++    }
++
+     DeleteCriticalSection(&queue->cs);
+ 
+     memset(queue, 0, sizeof(*queue));
+

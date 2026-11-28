@@ -1,0 +1,34 @@
+# kk: NaN constants keep their sign and payload
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46119 state=opened
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+
+kk: NaN constants keep their sign and payload
+
+Before, every NaN constant was written as NAN (0x7fc00000) and the sign
+or payload was lost. For example, 0xffc00000 came out as 0x7fc00000.
+
+The idea is that now NaN is written with its exact bits.
+
+Assisted-by: LLM
+Original Language: ESP
+--- src/kosmickrisp/compiler/msl_type_inference.c
++++ src/kosmickrisp/compiler/msl_type_inference.c
+@@ -763,7 +763,13 @@ emit_src_component(struct nir_to_msl_ctx *ctx, nir_src *src, unsigned comp)
+       } else if (v == -INFINITY) {
+          P(ctx, "(-INFINITY");
+       } else if (isnan(v)) {
+-         P(ctx, "(NAN");
++         if (src->ssa->bit_size == 16) {
++            P(ctx, "(as_type<half>(ushort(0x%04x))",
++              (unsigned)nir_src_comp_as_uint(*src, comp));
++         } else {
++            P(ctx, "(as_type<float>(uint(0x%08x))",
++              (unsigned)nir_src_comp_as_uint(*src, comp));
++         }
+       } else {
+          /* Building the types explicitly is required since the MSL compiler is
+           * too dumb to understand that "max(as_type<int>(t53), -2147483648)" is
+

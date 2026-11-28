@@ -1,0 +1,225 @@
+# agx: Relax pressure scheduler bail condition + set lload/lstore missing bit
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42482 state=closed
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+This MR contains two performance optimizations for compute shaders, motivated by slow LLM inference on Asahi Linux using llama.cpp (see https://github.com/ggml-org/llama.cpp/issues/10982).
+
+1 relax pressure scheduler bail condition
+
+Currently the pressure scheduler in the agx backend bails when compiling compute shaders (e.g. matrix multiplication) in llama.cpp's vulkan backend. This is due to the scheduler's reordered output having higher peak register pressure than its input. I found that when the scheduler is forced to never bail, prefill performance improves by around 18%. This patch relaxes the bail condition for compute shaders, allowing the pressure scheduler to produce code with higher register pressure than the original, as long as the higher pressure stays within the same workgroup occupancy tier.
+
+2 set bit47 in lload/lstore instruction
+
+When disassembling shader dumps compiled on macOS I always get `Unexpected set bits: [40, 47]` (see https://github.com/xingjianll/perf2/blob/main/metal/dumps/loop_lload_16/loop_lload_16.mesa.s), so these two bits appear to be set unconditionally in Metal emitted binaries. Bit 40 seems performance-unrelated, whereas setting bit 47 gives a sizeable performance improvement.
+
+3 result
+
+Running llama.cpp's standard perf harness gives the following results for prefilling (the speed at which llama.cpp processes the input prompt, measured in token/second, matmul bounded, higher is better) llama2-7B-Q4_0:
+
+| current | bail relax | bail relax + bit47 |
+|--------:|-----------:|-------------------:|
+| 258.81 ± 0.99 | 305.32 ± 0.58 | 345.25 ± 0.54 |
+
+My machine is M1 Ultra Mac Studio with 48-core GPU, and the program used for perf is llama.cpp on 1593d5684. The full llama.cpp vulkan backend test result that tests all of its compute shaders is in comparison.md.
+
+compile llama.cpp:
+
+```
+  cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE
+--- src/asahi/compiler/agx_pack.c
++++ src/asahi/compiler/agx_pack.c
+@@ -784,8 +784,9 @@ agx_pack_instr(struct util_dynarray *emission, struct util_dynarray *fixups,
+          ((R & BITFIELD_MASK(6)) << 9) | (L ? BITFIELD64_BIT(15) : 0) |
+          ((A & BITFIELD_MASK(6)) << 16) | (At << 22) | (I->format << 24) |
+          ((O & BITFIELD64_MASK(6)) << 28) | (Ot ? BITFIELD64_BIT(34) : 0) |
+-         (((uint64_t)I->mask) << 36) | (((uint64_t)(O >> 6)) << 48) |
+-         (((uint64_t)(A >> 6)) << 58) | (((uint64_t)(R >> 6)) << 60);
++         (((uint64_t)I->mask) << 36) | BITFIELD64_BIT(47) |
++         (((uint64_t)(O >> 6)) << 48) | (((uint64_t)(A >> 6)) << 58) |
++         (((uint64_t)(R >> 6)) << 60);
+ 
+       unsigned size = L ? 8 : 6;
+       memcpy(util_dynarray_grow_bytes(emission, 1, size), &raw, size);
+
+--- src/asahi/compiler/agx_pressure_schedule.c
++++ src/asahi/compiler/agx_pressure_schedule.c
+@@ -8,8 +8,12 @@
+ 
+ #include "util/dag.h"
+ #include "util/sparse_bitset.h"
++#include "agx_compile.h"
+ #include "agx_compiler.h"
+ #include "agx_opcodes.h"
++#include "shader_enums.h"
++
++#define AGX_CORE_SHARED_BYTES 65536
+ 
+ struct sched_ctx {
+    /* Dependency graph */
+@@ -197,28 +201,41 @@ choose_instr(struct sched_ctx *s)
+    return best;
+ }
+ 
+-static void
+-pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s)
++static signed
++block_max_pressure(agx_block *block, struct u_sparse_bitset *live,
++                   unsigned *nr_ins_out)
+ {
+-   /* off by a constant, that's ok */
+    signed pressure = 0;
+-   signed orig_max_pressure = 0;
++   signed max_pressure = 0;
+    unsigned nr_ins = 0;
+ 
+-   u_sparse_bitset_dup(&s->live, &block->live_out);
++   u_sparse_bitset_dup(live, &block->live_out);
+ 
+    agx_foreach_instr_in_block_rev(block, I) {
+-      pressure += calculate_pressure_delta(I, &s->live);
+-      orig_max_pressure = MAX2(pressure, orig_max_pressure);
+-      agx_liveness_ins_update(&s->live, I);
++      pressure += calculate_pressure_delta(I, live);
++      max_pressure = MAX2(pressure, max_pressure);
++      agx_liveness_ins_update(live, I);
+       nr_ins++;
+    }
+ 
++   if (nr_ins_out)
++      *nr_ins_out = nr_ins;
++
++   return max_pressure;
++}
++
++static void
++pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s,
++                        signed occupancy_ceiling)
++{
++   unsigned nr_ins = 0;
++   signed orig_max_pressure = block_max_pressure(block, &s->live, &nr_ins);
++
+    u_sparse_bitset_dup(&s->live, &block->live_out);
+ 
+    /* off by a constant, that's ok */
++   signed pressure = 0;
+    signed max_pressure = 0;
+-   pressure = 0;
+ 
+    struct sched_node **schedule = calloc(nr_ins, sizeof(struct sched_node *));
+    nr_ins = 0;
+@@ -234,7 +251,7 @@ pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s)
+    }
+ 
+    /* Bail if it looks like it's worse */
+-   if (max_pressure >= orig_max_pressure) {
++   if (max_pressure >= MAX2(orig_max_pressure, occupancy_ceiling)) {
+       free(schedule);
+       return;
+    }
+@@ -248,17 +265,83 @@ pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s)
+    free(schedule);
+ }
+ 
++static unsigned
++calculate_register_demand(agx_context *ctx)
++{
++   void *memctx = ralloc_context(NULL);
++   struct u_sparse_bitset live;
++   u_sparse_bitset_init(&live, ctx->alloc, memctx);
++
++   signed demand = 0;
++   agx_foreach_block(ctx, block)
++      demand = MAX2(demand, block_max_pressure(block, &live, NULL));
++
++   ralloc_free(memctx);
++   return demand;
++}
++
++/*
++ * Compute the register-pressure ceiling that the shader's occupancy already
++ * permits. Occupancy is bounded by registers and shared memory.
++ * We compute how many whole workgroups fit under each limit, take the
++ * smaller, and return the register budget available at that occupancy.
++ *
++ * Returns 0 for non-compute shaders and for shaders already at
++ * the register limit for a single workgroup.
++ */
++static signed
++calculate_occupancy_ceiling(agx_context *ctx)
++{
++   if (!mesa_shader_stage_is_compute(ctx->stage))
++      return 0;
++
++   unsigned threads_per_wg;
++   if (ctx->nir->info.workgroup_size_variable) {
++      threads_per_wg = 1024;
++   } else {
++      threads_per_wg = ctx->nir->info.workgroup_size[0] *
++                       ctx->nir->info.workgroup_size[1] *
++                       ctx->nir->info.workgroup_size[2];
++   }
++
++   unsigned demand = calculate_register_demand(ctx);
++
++   /* Already at the register limit for one workgroup */
++   if (demand >= agx_max_registers_for_occupancy(threads_per_wg))
++      return 0;
++
++   /* reg_wgs is how many whole workgroups can be resident given the register
++    * demand. Numerator is the max number of threads that can run concurrently
++    * on a core given the current program's register demand. Denominator is the
++    * shader's required number of threads per workgroup. */
++   unsigned reg_wgs =
++      agx_occupancy_for_register_count(demand).max_threads / threads_per_wg;
++
++   /* shmem_wgs is how many whole workgroups can be resident given shared
++    * memory: the core's shared memory divided by each workgroup's shared_size.
++    * With no shared memory, registers are the only limit. */
++   unsigned shmem_wgs = ctx->nir->info.shared_size
++                           ? AGX_CORE_SHARED_BYTES / ctx->nir->info.shared_size
++                           : reg_wgs;
++   unsigned wgs = MIN2(reg_wgs, shmem_wgs);
++
++   signed ceiling = agx_max_registers_for_occupancy(wgs * threads_per_wg);
++   return ceiling;
++}
++
+ void
+ agx_pressure_schedule(agx_context *ctx)
+ {
+    agx_compute_liveness(ctx);
+    void *memctx = ralloc_context(ctx);
+ 
++   signed occupancy_ceiling = calculate_occupancy_ceiling(ctx);
++
+    agx_foreach_block(ctx, block) {
+       struct sched_ctx sctx = {.dag = create_dag(ctx, block, memctx)};
+       u_sparse_bitset_init(&sctx.live, ctx->alloc, memctx);
+ 
+-      pressure_schedule_block(ctx, block, &sctx);
++      pressure_schedule_block(ctx, block, &sctx, occupancy_ceiling);
+    }
+ 
+    /* Clean up after liveness analysis */
+
+--- src/asahi/isa/AGX2.xml
++++ src/asahi/isa/AGX2.xml
+@@ -1416,6 +1416,7 @@
+     <localmemindex/>
+     <modifier name="format" bit="24:27" kind="format"/>
+     <modifier name="mask" kind="mask" bit="36:39"/>
++    <exact bit="47">1</exact>
+   </ins>
+ 
+   <ins name="lstore" length="6/8">
+@@ -1425,6 +1426,7 @@
+     <localmemindex/>
+     <modifier name="format" bit="24:27" kind="format"/>
+     <modifier name="mask" kind="mask" bit="36:39"/>
++    <exact bit="47">1</exact>
+   </ins>
+ 
+   <ins name="barrier" length="2">
+

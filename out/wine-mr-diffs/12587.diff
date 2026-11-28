@@ -1,0 +1,431 @@
+# ntdll: Add support for partial-FP context flags.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12587 state=merged
+# Those flags allow addressing lower and higher part of FP registers. This is needed to implement YMM context on ARM64EC by storing XMM registers in v0..15 and YMM highs in v16..v31.
+--- dlls/ntdll/tests/exception.c
++++ dlls/ntdll/tests/exception.c
+@@ -7930,6 +7930,59 @@ static void test_thread_context(void)
+     ok( context.X[0] == fill, "unexpected x0 = %Ix\n", context.X[0] );
+     ok( context.X[18] == fill, "unexpected x18 = %Ix\n", context.X[18] );
+ 
++    context.ContextFlags = CONTEXT_ARM64_FLOATING_POINT;
++    context.V[0].Low = 1;
++    context.V[16].Low = 2;
++    status = pNtSetContextThread( thread, &context );
++    ok( !status, "NtSetContextThread failed %08lx\n", status );
++
++    memset( &context, 0xcc, sizeof(context) );
++    context.ContextFlags = CONTEXT_ARM64_FLOATING_POINT;
++    status = pNtGetContextThread( thread, &context );
++    ok( !status, "NtGetContextThread failed %08lx\n", status );
++    ok( context.V[0].Low == 1, "unexpected v0 = %Ix\n", context.V[0].Low );
++    ok( context.V[16].Low == 2, "unexpected v16 = %Ix\n", context.V[16].Low );
++
++    memset( &context, 0xcc, sizeof(context) );
++    context.ContextFlags = CONTEXT_ARM64_FLOATING_POINT_LOW;
++    status = pNtGetContextThread( thread, &context );
++    ok( !status, "NtGetContextThread failed %08lx\n", status );
++    ok( context.V[0].Low == 1, "unexpected v0 = %Ix\n", context.V[0].Low );
++    ok( context.V[16].Low == fill, "unexpected v16 = %Ix\n", context.V[16].Low );
++
++    memset( &context, 0xcc, sizeof(context) );
++    context.ContextFlags = CONTEXT_ARM64_FLOATING_POINT_HIGH;
++    status = pNtGetContextThread( thread, &context );
++    ok( !status, "NtGetContextThread failed %08lx\n", status );
++    ok( context.V[0].Low == fill, "unexpected v0 = %Ix\n", context.V[0].Low );
++    ok( context.V[16].Low == 2, "unexpected v16 = %Ix\n", context.V[16].Low );
++
++    context.ContextFlags = CONTEXT_ARM64_FLOATING_POINT_LOW;
++    context.V[0].Low = 3;
++    context.V[16].Low = 4;
++    status = pNtSetContextThread( thread, &context );
++    ok( !status, "NtSetContextThread failed %08lx\n", status );
++
++    memset( &context, 0xcc, sizeof(context) );
++    context.ContextFlags = CONTEXT_ARM64_FLOATING_POINT;
++    status = pNtGetContextThread( thread, &context );
++    ok( !status, "NtGetContextThread failed %08lx\n", status );
++    ok( context.V[0].Low == 3, "unexpected v0 = %Ix\n", context.V[0].Low );
++    ok( context.V[16].Low == 2, "unexpected v16 = %Ix\n", context.V[16].Low );
++
++    context.ContextFlags = CONTEXT_ARM64_FLOATING_POINT_HIGH;
++    context.V[0].Low = 5;
++    context.V[16].Low = 6;
++    status = pNtSetContextThread( thread, &context );
++    ok( !status, "NtSetContextThread failed %08lx\n", status );
++
++    memset( &context, 0xcc, sizeof(context) );
++    context.ContextFlags = CONTEXT_ARM64_FLOATING_POINT;
++    status = pNtGetContextThread( thread, &context );
++    ok( !status, "NtGetContextThread failed %08lx\n", status );
++    ok( context.V[0].Low == 3, "unexpected v0 = %Ix\n", context.V[0].Low );
++    ok( context.V[16].Low == 6, "unexpected v16 = %Ix\n", context.V[16].Low );
++
+     status = pNtSetContextThread( thread, &orig_context );
+     ok( !status, "NtSetContextThread failed %08lx\n", status );
+ 
+
+--- dlls/ntdll/unix/signal_arm64.c
++++ dlls/ntdll/unix/signal_arm64.c
+@@ -449,11 +449,15 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
+         if (is_emulated_code( frame->pc )) flags |= RESTORE_FLAGS_EMULATION;
+         else frame->restore_flags &= ~RESTORE_FLAGS_EMULATION;
+     }
+-    if (flags & CONTEXT_FLOATING_POINT)
++    if (flags & (CONTEXT_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_LOW))
+     {
+         frame->fpcr = context->Fpcr;
+         frame->fpsr = context->Fpsr;
+-        memcpy( frame->v, context->V, sizeof(frame->v) );
++        memcpy( frame->v, context->V, 16 * sizeof(frame->v[0]) );
++    }
++    if (flags & (CONTEXT_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_HIGH))
++    {
++        memcpy( &frame->v[16], &context->V[16], 16 * sizeof(frame->v[0]) );
+     }
+     if (flags & CONTEXT_ARM64_X18)
+     {
+@@ -499,12 +503,17 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
+         context->Cpsr = frame->cpsr;
+         context->ContextFlags |= CONTEXT_CONTROL;
+     }
+-    if (needed_flags & CONTEXT_FLOATING_POINT)
++    if (needed_flags & (CONTEXT_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_LOW))
+     {
+         context->Fpcr = frame->fpcr;
+         context->Fpsr = frame->fpsr;
+-        memcpy( context->V, frame->v, sizeof(context->V) );
+-        context->ContextFlags |= CONTEXT_FLOATING_POINT;
++        memcpy( context->V, frame->v, 16 * sizeof(context->V[0]) );
++        context->ContextFlags |= CONTEXT_ARM64 | (needed_flags & (CONTEXT_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_LOW));
++    }
++    if (needed_flags & (CONTEXT_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_HIGH))
++    {
++        memcpy( &context->V[16], &frame->v[16], 16 * sizeof(frame->v[0]) );
++        context->ContextFlags |= CONTEXT_ARM64 | (needed_flags & CONTEXT_ARM64_FLOATING_POINT_HIGH);
+     }
+     if (needed_flags & CONTEXT_ARM64_X18)
+     {
+
+--- dlls/ntdll/unix/thread.c
++++ dlls/ntdll/unix/thread.c
+@@ -179,7 +179,7 @@ static unsigned int get_server_context_flags( const void *context, USHORT machin
+         if (flags & CONTEXT_I386_FLOATING_POINT) ret |= SERVER_CTX_FLOATING_POINT;
+         if (flags & CONTEXT_I386_DEBUG_REGISTERS) ret |= SERVER_CTX_DEBUG_REGISTERS;
+         if (flags & CONTEXT_I386_EXTENDED_REGISTERS) ret |= SERVER_CTX_EXTENDED_REGISTERS | SERVER_CTX_FLOATING_POINT;
+-        if (flags & CONTEXT_I386_XSTATE) ret |= SERVER_CTX_YMM_REGISTERS;
++        if (flags & CONTEXT_I386_XSTATE) ret |= SERVER_CTX_VECTOR_REGISTERS;
+         break;
+     case IMAGE_FILE_MACHINE_AMD64:
+         flags = ((const AMD64_CONTEXT *)context)->ContextFlags & ~CONTEXT_AMD64;
+@@ -188,7 +188,7 @@ static unsigned int get_server_context_flags( const void *context, USHORT machin
+         if (flags & CONTEXT_AMD64_SEGMENTS) ret |= SERVER_CTX_SEGMENTS;
+         if (flags & CONTEXT_AMD64_FLOATING_POINT) ret |= SERVER_CTX_FLOATING_POINT;
+         if (flags & CONTEXT_AMD64_DEBUG_REGISTERS) ret |= SERVER_CTX_DEBUG_REGISTERS;
+-        if (flags & CONTEXT_AMD64_XSTATE) ret |= SERVER_CTX_YMM_REGISTERS;
++        if (flags & CONTEXT_AMD64_XSTATE) ret |= SERVER_CTX_VECTOR_REGISTERS;
+         break;
+     case IMAGE_FILE_MACHINE_ARMNT:
+         flags = ((const ARM_CONTEXT *)context)->ContextFlags & ~CONTEXT_ARM;
+@@ -201,7 +201,8 @@ static unsigned int get_server_context_flags( const void *context, USHORT machin
+         flags = ((const ARM64_NT_CONTEXT *)context)->ContextFlags & ~CONTEXT_ARM64;
+         if (flags & CONTEXT_ARM64_CONTROL) ret |= SERVER_CTX_CONTROL;
+         if (flags & CONTEXT_ARM64_INTEGER) ret |= SERVER_CTX_INTEGER;
+-        if (flags & CONTEXT_ARM64_FLOATING_POINT) ret |= SERVER_CTX_FLOATING_POINT;
++        if (flags & (CONTEXT_ARM64_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_LOW)) ret |= SERVER_CTX_FLOATING_POINT;
++        if (flags & (CONTEXT_ARM64_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_HIGH)) ret |= SERVER_CTX_VECTOR_REGISTERS;
+         if (flags & CONTEXT_ARM64_X18) ret |= SERVER_CTX_TLS;
+         if (flags & CONTEXT_ARM64_DEBUG_REGISTERS) ret |= SERVER_CTX_DEBUG_REGISTERS;
+         break;
+@@ -221,9 +222,8 @@ static unsigned int get_native_context_flags( USHORT native_machine, USHORT wow_
+     switch (MAKELONG( native_machine, wow_machine ))
+     {
+     case MAKELONG( IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386 ):
+-        return SERVER_CTX_DEBUG_REGISTERS | SERVER_CTX_FLOATING_POINT | SERVER_CTX_YMM_REGISTERS | SERVER_CTX_EXEC_SPACE;
+     case MAKELONG( IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_ARMNT ):
+-        return SERVER_CTX_DEBUG_REGISTERS | SERVER_CTX_FLOATING_POINT | SERVER_CTX_EXEC_SPACE;
++        return SERVER_CTX_DEBUG_REGISTERS | SERVER_CTX_FLOATING_POINT | SERVER_CTX_VECTOR_REGISTERS | SERVER_CTX_EXEC_SPACE;
+     default:
+         return SERVER_CTX_EXEC_SPACE;
+     }
+@@ -240,8 +240,8 @@ static void xstate_to_server( struct context_data *to, const CONTEXT_EX *xctx )
+     const XSTATE *xs = (const XSTATE *)((const char *)xctx + xctx->XState.Offset);
+ 
+     if (xs->CompactionMask && !(xs->CompactionMask & 4)) return;
+-    to->flags |= SERVER_CTX_YMM_REGISTERS;
+-    if (xs->Mask & 4) memcpy( &to->ymm.regs.ymm_high, &xs->YmmContext, sizeof(xs->YmmContext) );
++    to->flags |= SERVER_CTX_VECTOR_REGISTERS;
++    if (xs->Mask & 4) memcpy( &to->vector.ymm_regs.ymm_high, &xs->YmmContext, sizeof(xs->YmmContext) );
+ }
+ 
+ 
+@@ -599,10 +599,10 @@ static NTSTATUS context_to_server( struct context_data *to, USHORT to_machine, c
+             for (i = 0; i < 18; i++) to->integer.arm64_regs.x0[i] = from->X[i];
+             for (i = 19; i <= 28; i++) to->integer.arm64_regs.x19[i - 19] = from->X[i];
+         }
+-        if (flags & CONTEXT_ARM64_FLOATING_POINT)
++        if (flags & (CONTEXT_ARM64_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_LOW))
+         {
+             to->flags |= SERVER_CTX_FLOATING_POINT;
+-            for (i = 0; i < 32; i++)
++            for (i = 0; i < 16; i++)
+             {
+                 to->fp.arm64_regs.q[i].low = from->V[i].Low;
+                 to->fp.arm64_regs.q[i].high = from->V[i].High;
+@@ -610,6 +610,15 @@ static NTSTATUS context_to_server( struct context_data *to, USHORT to_machine, c
+             to->fp.arm64_regs.fpcr = from->Fpcr;
+             to->fp.arm64_regs.fpsr = from->Fpsr;
+         }
++        if (flags & (CONTEXT_ARM64_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_HIGH))
++        {
++            to->flags |= SERVER_CTX_VECTOR_REGISTERS;
++            for (i = 0; i < 16; i++)
++            {
++                to->vector.arm64_regs.q16[i].low = from->V[i + 16].Low;
++                to->vector.arm64_regs.q16[i].high = from->V[i + 16].High;
++            }
++        }
+         if (flags & CONTEXT_ARM64_X18)
+         {
+             to->flags |= SERVER_CTX_TLS;
+@@ -655,10 +664,10 @@ static void xstate_from_server( CONTEXT_EX *xctx, const struct context_data *fro
+         if (!(xs->CompactionMask & 4)) return;
+     }
+ 
+-    for (i = 0; i < ARRAY_SIZE( from->ymm.regs.ymm_high); i++)
++    for (i = 0; i < ARRAY_SIZE( from->vector.ymm_regs.ymm_high); i++)
+     {
+-        if (!from->ymm.regs.ymm_high[i].low && !from->ymm.regs.ymm_high[i].high) continue;
+-        memcpy( &xs->YmmContext, &from->ymm.regs, sizeof(xs->YmmContext) );
++        if (!from->vector.ymm_regs.ymm_high[i].low && !from->vector.ymm_regs.ymm_high[i].high) continue;
++        memcpy( &xs->YmmContext, &from->vector.ymm_regs, sizeof(xs->YmmContext) );
+         xs->Mask |= 4;
+         break;
+     }
+@@ -751,7 +760,7 @@ static NTSTATUS context_from_server( void *dst, const struct context_data *from,
+             to->ContextFlags |= CONTEXT_I386_EXTENDED_REGISTERS;
+             memcpy( to->ExtendedRegisters, from->ext.i386_regs, sizeof(to->ExtendedRegisters) );
+         }
+-        if ((from->flags & SERVER_CTX_YMM_REGISTERS) && (to_flags & CONTEXT_I386_XSTATE))
++        if ((from->flags & SERVER_CTX_VECTOR_REGISTERS) && (to_flags & CONTEXT_I386_XSTATE))
+             xstate_from_server( (CONTEXT_EX *)(to + 1), from );
+         exception_request_flags_from_server( &to->ContextFlags, from );
+         return STATUS_SUCCESS;
+@@ -816,7 +825,7 @@ static NTSTATUS context_from_server( void *dst, const struct context_data *from,
+             to->Dr6 = from->debug.x86_64_regs.dr6;
+             to->Dr7 = from->debug.x86_64_regs.dr7;
+         }
+-        if ((from->flags & SERVER_CTX_YMM_REGISTERS) && (to_flags & CONTEXT_I386_XSTATE))
++        if ((from->flags & SERVER_CTX_VECTOR_REGISTERS) && (to_flags & CONTEXT_I386_XSTATE))
+             xstate_from_server( (CONTEXT_EX *)(to + 1), from );
+         exception_request_flags_from_server( &to->ContextFlags, from );
+         return STATUS_SUCCESS;
+@@ -879,7 +888,7 @@ static NTSTATUS context_from_server( void *dst, const struct context_data *from,
+             to->Dr6 = from->debug.x86_64_regs.dr6;
+             to->Dr7 = from->debug.x86_64_regs.dr7;
+         }
+-        if ((from->flags & SERVER_CTX_YMM_REGISTERS) && (to_flags & CONTEXT_AMD64_XSTATE))
++        if ((from->flags & SERVER_CTX_VECTOR_REGISTERS) && (to_flags & CONTEXT_AMD64_XSTATE))
+             xstate_from_server( (CONTEXT_EX *)(to + 1), from );
+         exception_request_flags_from_server( &to->ContextFlags, from );
+         return STATUS_SUCCESS;
+@@ -952,7 +961,7 @@ static NTSTATUS context_from_server( void *dst, const struct context_data *from,
+             to->Dr6 = from->debug.i386_regs.dr6;
+             to->Dr7 = from->debug.i386_regs.dr7;
+         }
+-        if ((from->flags & SERVER_CTX_YMM_REGISTERS) && (to_flags & CONTEXT_AMD64_XSTATE))
++        if ((from->flags & SERVER_CTX_VECTOR_REGISTERS) && (to_flags & CONTEXT_AMD64_XSTATE))
+             xstate_from_server( (CONTEXT_EX *)(to + 1), from );
+         exception_request_flags_from_server( &to->ContextFlags, from );
+         return STATUS_SUCCESS;
+@@ -1026,10 +1035,11 @@ static NTSTATUS context_from_server( void *dst, const struct context_data *from,
+             for (i = 0; i < 18; i++) to->X[i] = from->integer.arm64_regs.x0[i];
+             for (i = 19; i <= 28; i++) to->X[i] = from->integer.arm64_regs.x19[i - 19];
+         }
+-        if ((from->flags & SERVER_CTX_FLOATING_POINT) && (to_flags & CONTEXT_ARM64_FLOATING_POINT))
++        if ((from->flags & SERVER_CTX_FLOATING_POINT) &&
++            (to_flags & (CONTEXT_ARM64_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_LOW)))
+         {
+-            to->ContextFlags |= CONTEXT_ARM64_FLOATING_POINT;
+-            for (i = 0; i < 32; i++)
++            to->ContextFlags |= CONTEXT_ARM64 | (to_flags & (CONTEXT_ARM64_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_LOW));
++            for (i = 0; i < 16; i++)
+             {
+                 to->V[i].Low = from->fp.arm64_regs.q[i].low;
+                 to->V[i].High = from->fp.arm64_regs.q[i].high;
+@@ -1037,6 +1047,20 @@ static NTSTATUS context_from_server( void *dst, const struct context_data *from,
+             to->Fpcr = from->fp.arm64_regs.fpcr;
+             to->Fpsr = from->fp.arm64_regs.fpsr;
+         }
++        if ((from->flags & SERVER_CTX_VECTOR_REGISTERS) &&
++            (to_flags & (CONTEXT_ARM64_FLOATING_POINT | CONTEXT_ARM64_FLOATING_POINT_HIGH)))
++        {
++            to->ContextFlags |= CONTEXT_ARM64 | (to_flags & CONTEXT_ARM64_FLOATING_POINT_HIGH);
++            for (i = 0; i < 16; i++)
++            {
++                to->V[i + 16].Low = from->vector.arm64_regs.q16[i].low;
++                to->V[i + 16].High = from->vector.arm64_regs.q16[i].high;
++            }
++        }
++        else if (to_flags & CONTEXT_ARM64_FLOATING_POINT)
++        {
++            memset( &to->V[16], 0, 16 * sizeof(*to->V) );
++        }
+         if (from->flags & SERVER_CTX_TLS)
+         {
+             to->ContextFlags |= CONTEXT_ARM64_X18;
+
+--- include/wine/server_protocol.h
++++ include/wine/server_protocol.h
+
+--- include/winnt.h
++++ include/winnt.h
+@@ -1801,13 +1801,17 @@ typedef struct _KNONVOLATILE_CONTEXT_POINTERS
+ #endif /* __arm__ */
+ 
+ #define CONTEXT_ARM64           0x400000
+-#define CONTEXT_ARM64_CONTROL         (CONTEXT_ARM64 | 0x00000001)
+-#define CONTEXT_ARM64_INTEGER         (CONTEXT_ARM64 | 0x00000002)
+-#define CONTEXT_ARM64_FLOATING_POINT  (CONTEXT_ARM64 | 0x00000004)
+-#define CONTEXT_ARM64_DEBUG_REGISTERS (CONTEXT_ARM64 | 0x00000008)
+-#define CONTEXT_ARM64_X18       (CONTEXT_ARM64 | 0x00000010)
++#define CONTEXT_ARM64_CONTROL             (CONTEXT_ARM64 | 0x00000001)
++#define CONTEXT_ARM64_INTEGER             (CONTEXT_ARM64 | 0x00000002)
++#define CONTEXT_ARM64_FLOATING_POINT      (CONTEXT_ARM64 | 0x00000004)
++#define CONTEXT_ARM64_DEBUG_REGISTERS     (CONTEXT_ARM64 | 0x00000008)
++#define CONTEXT_ARM64_X18                 (CONTEXT_ARM64 | 0x00000010)
++#define CONTEXT_ARM64_XSTATE              (CONTEXT_ARM64 | 0x00000020)
++#define CONTEXT_ARM64_FLOATING_POINT_LOW  (CONTEXT_ARM64 | 0x00000040)
++#define CONTEXT_ARM64_FLOATING_POINT_HIGH (CONTEXT_ARM64 | 0x00000080)
+ #define CONTEXT_ARM64_FULL (CONTEXT_ARM64_CONTROL | CONTEXT_ARM64_INTEGER | CONTEXT_ARM64_FLOATING_POINT)
+-#define CONTEXT_ARM64_ALL  (CONTEXT_ARM64_FULL | CONTEXT_ARM64_DEBUG_REGISTERS | CONTEXT_ARM64_X18)
++#define CONTEXT_ARM64_ALL  (CONTEXT_ARM64_FULL | CONTEXT_ARM64_DEBUG_REGISTERS | CONTEXT_ARM64_X18 | \
++                            CONTEXT_ARM64_FLOATING_POINT_LOW | CONTEXT_ARM64_FLOATING_POINT_HIGH)
+ 
+ #define CONTEXT_ARM64_UNWOUND_TO_CALL 0x20000000
+ #define CONTEXT_ARM64_RET_TO_GUEST    0x04000000
+@@ -2085,6 +2089,7 @@ typedef struct DECLSPEC_ALIGN(16) _ARM64EC_NT_CONTEXT
+ #define CONTEXT_INTEGER CONTEXT_ARM64_INTEGER
+ #define CONTEXT_FLOATING_POINT CONTEXT_ARM64_FLOATING_POINT
+ #define CONTEXT_DEBUG_REGISTERS CONTEXT_ARM64_DEBUG_REGISTERS
++#define CONTEXT_XSTATE CONTEXT_ARM64_XSTATE
+ #define CONTEXT_FULL CONTEXT_ARM64_FULL
+ #define CONTEXT_ALL CONTEXT_ARM64_ALL
+ #define CONTEXT_RET_TO_GUEST CONTEXT_ARM64_RET_TO_GUEST
+
+--- server/protocol.def
++++ server/protocol.def
+@@ -168,7 +168,7 @@ struct context_data
+                  unsigned char regs[80]; } i386_regs;
+         struct { struct { unsigned __int64 low, high; } fpregs[32]; } x86_64_regs;
+         struct { unsigned __int64 d[32]; unsigned int fpscr; } arm_regs;
+-        struct { struct { unsigned __int64 low, high; } q[32]; unsigned int fpcr, fpsr; } arm64_regs;
++        struct { struct { unsigned __int64 low, high; } q[16]; unsigned int fpcr, fpsr; } arm64_regs;
+     } fp;  /* selected by SERVER_CTX_FLOATING_POINT */
+     union
+     {
+@@ -187,8 +187,9 @@ struct context_data
+     } exec_space;                /* selected by SERVER_CTX_EXEC_SPACE */
+     union
+     {
+-        struct { struct { unsigned __int64 low, high; } ymm_high[16]; } regs;
+-    } ymm;                       /* selected by SERVER_CTX_YMM_REGISTERS */
++        struct { struct { unsigned __int64 low, high; } ymm_high[16]; } ymm_regs;
++        struct { struct { unsigned __int64 low, high; } q16[16]; } arm64_regs;
++    } vector;                    /* selected by SERVER_CTX_VECTOR_REGISTERS */
+     union
+     {
+         unsigned __int64 arm64_x18;
+@@ -201,7 +202,7 @@ struct context_data
+ #define SERVER_CTX_FLOATING_POINT     0x0008
+ #define SERVER_CTX_DEBUG_REGISTERS    0x0010
+ #define SERVER_CTX_EXTENDED_REGISTERS 0x0020
+-#define SERVER_CTX_YMM_REGISTERS      0x0040
++#define SERVER_CTX_VECTOR_REGISTERS   0x0040
+ #define SERVER_CTX_EXEC_SPACE         0x0080
+ #define SERVER_CTX_TLS                0x0100
+ 
+
+--- server/request_handlers.h
++++ server/request_handlers.h
+
+--- server/thread.c
++++ server/thread.c
+@@ -1616,7 +1616,7 @@ static void copy_context( struct context_data *to, const struct context_data *fr
+     if (flags & SERVER_CTX_FLOATING_POINT) to->fp = from->fp;
+     if (flags & SERVER_CTX_DEBUG_REGISTERS) to->debug = from->debug;
+     if (flags & SERVER_CTX_EXTENDED_REGISTERS) to->ext = from->ext;
+-    if (flags & SERVER_CTX_YMM_REGISTERS) to->ymm = from->ymm;
++    if (flags & SERVER_CTX_VECTOR_REGISTERS) to->vector = from->vector;
+     if (flags & SERVER_CTX_EXEC_SPACE) to->exec_space = from->exec_space;
+     if (flags & SERVER_CTX_TLS) to->tls = from->tls;
+ }
+
+--- server/trace.c
++++ server/trace.c
+@@ -751,11 +751,11 @@ static void dump_varargs_context( const char *prefix, data_size_t size )
+         if (ctx.flags & SERVER_CTX_EXTENDED_REGISTERS)
+             dump_uints( ",extended=", (const unsigned int *)ctx.ext.i386_regs,
+                         sizeof(ctx.ext.i386_regs) / sizeof(int) );
+-        if (ctx.flags & SERVER_CTX_YMM_REGISTERS)
++        if (ctx.flags & SERVER_CTX_VECTOR_REGISTERS)
+             for (i = 0; i < 16; i++)
+             {
+                 fprintf( stderr, ",ymm%u=", i );
+-                dump_uint128( "", (const unsigned __int64 *)&ctx.ymm.regs.ymm_high[i] );
++                dump_uint128( "", (const unsigned __int64 *)&ctx.vector.ymm_regs.ymm_high[i] );
+             }
+         break;
+     case IMAGE_FILE_MACHINE_AMD64:
+@@ -804,11 +804,11 @@ static void dump_varargs_context( const char *prefix, data_size_t size )
+                 fprintf( stderr, ",fp%u=", i );
+                 dump_uint128( "", (const unsigned __int64 *)&ctx.fp.x86_64_regs.fpregs[i] );
+             }
+-        if (ctx.flags & SERVER_CTX_YMM_REGISTERS)
++        if (ctx.flags & SERVER_CTX_VECTOR_REGISTERS)
+             for (i = 0; i < 16; i++)
+             {
+                 fprintf( stderr, ",ymm%u=", i );
+-                dump_uint128( "", (const unsigned __int64 *)&ctx.ymm.regs.ymm_high[i] );
++                dump_uint128( "", (const unsigned __int64 *)&ctx.vector.ymm_regs.ymm_high[i] );
+             }
+         break;
+     case IMAGE_FILE_MACHINE_ARMNT:
+@@ -880,12 +880,24 @@ static void dump_varargs_context( const char *prefix, data_size_t size )
+         }
+         if (ctx.flags & SERVER_CTX_FLOATING_POINT)
+         {
+-            for (i = 0; i < 32; i++)
++            for (i = 0; i < 16; i++)
+             {
+                 fprintf( stderr, ",q%u=", i );
+                 dump_uint64( "", &ctx.fp.arm64_regs.q[i].high );
+                 dump_uint64( "", &ctx.fp.arm64_regs.q[i].low );
+             }
++        }
++        if (ctx.flags & SERVER_CTX_VECTOR_REGISTERS)
++        {
++            for (i = 0; i < 16; i++)
++            {
++                fprintf( stderr, ",q%u=", i + 16 );
++                dump_uint64( "", &ctx.vector.arm64_regs.q16[i].high );
++                dump_uint64( "", &ctx.vector.arm64_regs.q16[i].low );
++            }
++        }
++        if (ctx.flags & SERVER_CTX_FLOATING_POINT)
++        {
+             fprintf( stderr, ",fpcr=%08x,fpsr=%08x", ctx.fp.arm64_regs.fpcr, ctx.fp.arm64_regs.fpsr );
+         }
+         break;
+
+--- tools/make_requests
++++ tools/make_requests
+@@ -43,7 +43,7 @@ my %formats =
+     "union apc_call"           => [ 64, 8 ],
+     "union apc_result"         => [ 40, 8 ],
+     "struct async_data"        => [ 40, 8 ],
+-    "struct context_data"      => [ 1720, 8 ],
++    "struct context_data"      => [ 1712, 8 ],
+     "struct cursor_pos"        => [ 24, 8 ],
+     "union debug_event_data"   => [ 160, 8 ],
+     "struct filesystem_event"  => [ 12, 4 ],
+

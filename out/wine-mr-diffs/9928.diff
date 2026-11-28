@@ -1,0 +1,233 @@
+# Draft: dsound: Speed up resampling.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/9928 state=closed
+# This implements a number of optimizations, in particular:
+- Swapping around the resampling loops in case of downsampling, allowing the FIR step to stay fixed regardless of the resampling ratio.
+- Rearranging the FIR array elements to make the access sequential.
+- Adding SSE versions of the resampling functions.
+
+Together, these amount to more than a 5x reduction of `cp_fields_resample` execution time. The quality of the resampling should be the same, or even improve slightly, due to a more precise `rem` calculation and removal of the FIR step rounding, although I haven't yet conducted any measurements.
+
+**UPDATE**
+
+Added some more optimizations:
+- Using fixed point math inside the resampling functions.
+- Optimizing the SSE versions by hand.
+- Adding AVX+FMA3 versions of the resampling functions.
+- Getting and putting all channel samples in one go.
+
+Combined with the previous ones, these bring the total speedup to 15x for upsampling and 13x for downsampling compared to the upstream.
+
+**UPDATE 2**
+
+Added even more optimizations:
+- Mixing and applying the volume in the put functions.
+- Directly resampling interleaved stereo.
+- Adding SSE2 version of `getsamples16`.
+- Adding SSE version of `putsamples_stereo` and `putsamples_mono2stereo`.
+
+With these changes the speed of the Wine resampler gets very close to the current native DirectSound resampler. It's only about 15% slower on my Zen+ laptop CPU and on my Zen 4 desktop CPU it's actually faster than native.
+--- dlls/dsound/buffer.c
++++ dlls/dsound/buffer.c
+@@ -1038,6 +1038,7 @@ HRESULT secondarybuffer_create(DirectSoundDevice *device, const DSBUFFERDESC *ds
+ 	HRESULT err = DS_OK;
+ 	DWORD capf = 0;
+ 	size_t bufsize;
++	size_t buflen;
+ 
+         TRACE("(%p,%p,%p)\n", device, dsbd, buffer);
+ 
+@@ -1094,7 +1095,9 @@ HRESULT secondarybuffer_create(DirectSoundDevice *device, const DSBUFFERDESC *ds
+ 
+ 	/* Allocate an empty buffer */
+ 	bufsize = (sizeof(*(dsb->buffer)) + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
+-	dsb->buffer = malloc(bufsize + dsb->buflen);
++	/* Add some padding at the end to simplify SSE2 processing */
++	buflen = dsb->buflen + 15;
++	dsb->buffer = malloc(bufsize + buflen);
+         if (!dsb->buffer) {
+                 IDirectSoundBuffer8_Release(&dsb->IDirectSoundBuffer8_iface);
+ 		return DSERR_OUTOFMEMORY;
+@@ -1107,7 +1110,7 @@ HRESULT secondarybuffer_create(DirectSoundDevice *device, const DSBUFFERDESC *ds
+ 	dsb->buffer->lockedbytes = 0;
+ 	list_init(&dsb->buffer->buffers);
+ 	list_add_head(&dsb->buffer->buffers, &dsb->entry);
+-	FillMemory(dsb->buffer->memory, dsb->buflen, dsbd->lpwfxFormat->wBitsPerSample == 8 ? 128 : 0);
++	FillMemory(dsb->buffer->memory, buflen, dsbd->lpwfxFormat->wBitsPerSample == 8 ? 128 : 0);
+ 
+ 	/* It's not necessary to initialize values to zero since */
+ 	/* we allocated this structure with calloc... */
+
+--- dlls/dsound/dsound_convert.c
++++ dlls/dsound/dsound_convert.c
+
+--- dlls/dsound/dsound_main.c
++++ dlls/dsound/dsound_main.c
+@@ -33,6 +33,7 @@
+  */
+ 
+ #include <stdarg.h>
++#include <intrin.h>
+ 
+ #define COBJMACROS
+ #include "windef.h"
+@@ -63,6 +64,12 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dsound);
+ 
++#ifdef __i386__
++BOOL fma_supported;
++BOOL sse2_supported;
++BOOL sse_supported;
++#endif
++
+ struct list DSOUND_renderers = LIST_INIT(DSOUND_renderers);
+ CRITICAL_SECTION DSOUND_renderers_lock;
+ static CRITICAL_SECTION_DEBUG DSOUND_renderers_lock_debug =
+@@ -82,6 +89,19 @@ GUID *DSOUND_capture_guids;
+ /* All default settings, you most likely don't want to touch these, see wiki on UsefulRegistryKeys */
+ int ds_hel_buflen = 32768 * 2;
+ 
++static void init_cpu_features(void)
++{
++#ifdef __i386__
++    if (IsProcessorFeaturePresent(PF_AVX_INSTRUCTIONS_AVAILABLE)) {
++        int regs[4];
++        __cpuid(regs, 1);
++        fma_supported = !!(regs[2] & (1 << 12));
++    }
++    sse2_supported = IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE);
++    sse_supported = IsProcessorFeaturePresent(PF_XMMI_INSTRUCTIONS_AVAILABLE);
++#endif
++}
++
+ /*
+  * Get a config key from either the app-specific or the default config
+  */
+@@ -787,6 +807,7 @@ BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD fdwReason, LPVOID lpvReserved)
+         DisableThreadLibraryCalls(hInstDLL);
+         /* Increase refcount on dsound by 1 */
+         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)hInstDLL, &hInstDLL);
++        init_cpu_features();
+         break;
+     case DLL_PROCESS_DETACH:
+         if (lpvReserved) break;
+
+--- dlls/dsound/dsound_private.h
++++ dlls/dsound/dsound_private.h
+@@ -43,13 +43,15 @@ typedef struct IDirectSoundBufferImpl        IDirectSoundBufferImpl;
+ typedef struct DirectSoundDevice             DirectSoundDevice;
+ 
+ /* dsound_convert.h */
+-typedef float (*bitsgetfunc)(const IDirectSoundBufferImpl *, BYTE *, DWORD);
+-typedef void (*bitsputfunc)(const IDirectSoundBufferImpl *, DWORD, DWORD, float);
++typedef void (*bitsgetfunc)(const IDirectSoundBufferImpl *dsb, BYTE *base, DWORD count, float *dst);
++typedef void (*bitsputfunc)(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *values);
+ extern const bitsgetfunc getbpp[5];
+-void putieee32(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+-void putieee32_sum(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
++#ifdef __i386__
++extern const bitsgetfunc getbpp_sse2[5];
++#endif
++extern const bitsgetfunc getbpp_mono[5];
+ void mixieee32(float *src, float *dst, unsigned samples);
+-typedef void (*normfunc)(const void *, void *, unsigned);
++typedef void (*normfunc)(const void *src, void *dst, unsigned samples);
+ extern const normfunc normfunctions[4];
+ 
+ typedef struct _DSVOLUMEPAN
+@@ -167,23 +169,34 @@ struct IDirectSoundBufferImpl
+     BOOL                        ds3db_need_recalc;
+     /* Used for bit depth conversion */
+     int                         mix_channels;
+-    bitsgetfunc get, get_aux;
+-    bitsputfunc put, put_aux;
++    bitsgetfunc get;
++    bitsputfunc put;
+     int                         num_filters;
+     DSFilter*                   filters;
+ 
+     struct list entry;
+ };
+ 
+-float get_mono(const IDirectSoundBufferImpl *dsb, BYTE *base, DWORD channel);
+-void put_mono2stereo(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+-void put_mono2quad(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+-void put_stereo2quad(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+-void put_mono2surround51(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+-void put_stereo2surround51(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+-void put_surround512stereo(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+-void put_surround712stereo(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
+-void put_quad2stereo(const IDirectSoundBufferImpl *dsb, DWORD pos, DWORD channel, float value);
++void putsamples(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *values);
++void putsamples_mono(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *values);
++#ifdef __i386__
++void putsamples_stereo_sse(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *values);
++#endif
++void putsamples_stereo(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *values);
++void putsamples_quad(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *values);
++void putsamples_surround51(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *values);
++void putsamples_surround71(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *values);
++void putsamples_mono2stereo(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *value);
++#ifdef __i386__
++void putsamples_mono2stereo_sse(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *value);
++#endif
++void putsamples_mono2quad(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *value);
++void putsamples_stereo2quad(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *value);
++void putsamples_mono2surround51(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *value);
++void putsamples_stereo2surround51(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *value);
++void putsamples_surround512stereo(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *value);
++void putsamples_surround712stereo(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *value);
++void putsamples_quad2stereo(const IDirectSoundBufferImpl *dsb, BYTE *buf, float *volumes, DWORD count, float *value);
+ 
+ HRESULT secondarybuffer_create(DirectSoundDevice *device, const DSBUFFERDESC *dsbd,
+         IDirectSoundBuffer **buffer);
+@@ -251,6 +264,12 @@ HRESULT IDirectSoundCaptureImpl_Create(IUnknown *outer_unk, REFIID riid, void **
+ #define STATE_CAPTURING 2
+ #define STATE_STOPPING  3
+ 
++#ifdef __i386__
++extern BOOL fma_supported;
++extern BOOL sse2_supported;
++extern BOOL sse_supported;
++#endif
++
+ extern CRITICAL_SECTION DSOUND_renderers_lock;
+ extern struct list DSOUND_renderers;
+ 
+
+--- dlls/dsound/fir.h
++++ dlls/dsound/fir.h
+@@ -86,9 +86,11 @@ int main()
+     fprintf(stderr, "q %f\n", (double)output.q);
+     fprintf(stderr, "status %s\n", get_pm_status_str(output.status));
+ 
+-    printf("static const int fir_width = %d;\n", fir_width);
+-    printf("static const int fir_step = %d;\n", fir_step);
+-    printf("static const float fir[] = {");
++    printf("#define FIR_WIDTH_SHIFT %d\n", fir_width_shift);
++    printf("#define FIR_WIDTH %d\n", fir_width);
++    printf("#define FIR_STEP_SHIFT %d\n", fir_step_shift);
++    printf("#define FIR_STEP %d\n", fir_step);
++    printf("static const float DECLSPEC_ALIGN(32) fir[] = {");
+     // Print the FIR array with an additional row at the end. This simplifies
+     // calculation of the interpolated value by allowing the index to overflow
+     // into the extra row. It just repeats the first row, starting from its
+@@ -112,9 +114,11 @@ int main()
+     printf("};\n");
+ }
+ */
+-static const int fir_width = 64;
+-static const int fir_step = 128;
+-static const float fir[] = {
++#define FIR_WIDTH_SHIFT 6
++#define FIR_WIDTH 64
++#define FIR_STEP_SHIFT 7
++#define FIR_STEP 128
++static const float DECLSPEC_ALIGN(32) fir[] = {
+      0.0000000000e+00, -2.4830013102e-06,  1.9318705150e-06,  2.6614854151e-06,
+     -1.5313785194e-05,  4.2076214553e-05, -9.1417167945e-05,  1.7455895136e-04,
+     -3.0567859821e-04,  5.0191365396e-04, -7.8311909082e-04,  1.1713337628e-03,
+
+--- dlls/dsound/mixer.c
++++ dlls/dsound/mixer.c
+

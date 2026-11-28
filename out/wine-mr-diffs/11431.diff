@@ -1,0 +1,3732 @@
+# Draft: ntdll: Flag LFH backing blocks correctly in heap_walk_blocks.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11431 state=closed
+# HeapWalk() in Wine erroneously reports LFH (Low Fragmentation Heap) internal backing blocks as standard busy blocks (PROCESS_HEAP_ENTRY_BUSY). This causes tools relying on HeapWalk() to misreport false positive memory leaks compared to native Windows behavior.
+
+When a block has the BLOCK_FLAG_LFH flag set, it represents an LFH group region rather than an ordinary user allocation. If it contains active LFH groups, report it with LFH/Region flags instead of a busy block to match Windows behavior and prevent false positives in leak detectors.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=59938
+
+Signed-off-by: Kyle Yang kyle.chaoxin.yang@gmail.com
+--- dlls/avifil32/icmstream.c
++++ dlls/avifil32/icmstream.c
+@@ -248,19 +248,17 @@ static HRESULT WINAPI ICMStream_fnCreate(IAVIStream *iface, LPARAM lParam1,
+       This->dwBytesPerFrame = 0;
+     }
+ 
+-    if (icinfo.dwFlags & VIDCF_COMPRESSFRAMES) {
+-      memset(&icFrames, 0, sizeof(icFrames));
+-      icFrames.lpbiOutput  = This->lpbiOutput;
+-      icFrames.lpbiInput   = This->lpbiInput;
+-      icFrames.lFrameCount = This->sInfo.dwLength;
+-      icFrames.lQuality    = This->sInfo.dwQuality;
+-      icFrames.lDataRate   = pco->dwBytesPerSecond;
+-      icFrames.lKeyRate    = This->lKeyFrameEvery;
+-      icFrames.dwRate      = This->sInfo.dwRate;
+-      icFrames.dwScale     = This->sInfo.dwScale;
+-      ICSendMessage(This->hic, ICM_COMPRESS_FRAMES_INFO,
+-		    (LPARAM)&icFrames, (LPARAM)sizeof(icFrames));
+-    }
++    memset(&icFrames, 0, sizeof(icFrames));
++    icFrames.lpbiOutput  = This->lpbiOutput;
++    icFrames.lpbiInput   = This->lpbiInput;
++    icFrames.lFrameCount = This->sInfo.dwLength;
++    icFrames.lQuality    = This->sInfo.dwQuality;
++    icFrames.lDataRate   = pco->dwBytesPerSecond;
++    icFrames.lKeyRate    = This->lKeyFrameEvery;
++    icFrames.dwRate      = This->sInfo.dwRate;
++    icFrames.dwScale     = This->sInfo.dwScale;
++    ICSendMessage(This->hic, ICM_COMPRESS_FRAMES_INFO,
++		  (LPARAM)&icFrames, (LPARAM)sizeof(icFrames));
+   } else
+     This->sInfo.fccHandler = comptypeDIB;
+ 
+
+--- dlls/bcrypt/tests/bcrypt.c
++++ dlls/bcrypt/tests/bcrypt.c
+@@ -654,6 +654,15 @@ static void test_aes(void)
+     ok(!lstrcmpW((const WCHAR *)mode, BCRYPT_CHAIN_MODE_CFB), "got %s\n", wine_dbgstr_w((const WCHAR *)mode));
+     ok(size == 64, "got %lu\n", size);
+ 
++    len = size = 0;
++    ret = BCryptGetProperty(alg, BCRYPT_MESSAGE_BLOCK_LENGTH, (UCHAR *)&len, sizeof(len), &size, 0);
++    ok(ret == STATUS_SUCCESS, "got %#lx\n", ret);
++    ok(len == 1, "got %lu\n", len);
++
++    len = 16;
++    ret = BCryptSetProperty(alg, BCRYPT_MESSAGE_BLOCK_LENGTH, (UCHAR *)&len, 0, 0);
++    ok(ret == STATUS_INVALID_PARAMETER, "got %#lx\n", ret);
++
+     test_alg_name(alg, L"AES");
+ 
+     ret = BCryptCloseAlgorithmProvider(alg, 0);
+@@ -671,6 +680,14 @@ static void test_aes(void)
+         ok(!lstrcmpW((const WCHAR *)mode, BCRYPT_CHAIN_MODE_CBC), "got %s\n", wine_dbgstr_w((const WCHAR *)mode));
+         ok(size == 64, "got %lu\n", size);
+     }
++
++    alg = NULL;
++    ret = BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_GMAC_ALGORITHM, MS_PRIMITIVE_PROVIDER, 0);
++    ok(ret == STATUS_SUCCESS, "got %#lx\n", ret);
++    ok(alg != NULL, "alg not set\n");
++
++    ret = BCryptCloseAlgorithmProvider(alg, 0);
++    ok(ret == STATUS_SUCCESS, "got %#lx\n", ret);
+ }
+ 
+ static void test_3des(void)
+@@ -2973,12 +2990,18 @@ static void test_RSA(void)
+     ret = BCryptImportKeyPair(alg, NULL, BCRYPT_RSAPUBLIC_BLOB, &key, rsaPublicBlob, sizeof(rsaPublicBlob), 0);
+     ok(!ret, "BCryptImportKeyPair failed: %#lx\n", ret);
+ 
+-    keylen = 0;
++    size = keylen = 0;
+     ret = BCryptGetProperty(key, BCRYPT_KEY_STRENGTH, (UCHAR *)&keylen, sizeof(keylen), &size, 0);
+     ok(!ret, "got %#lx\n", ret);
+     ok(size == sizeof(keylen), "got %lu\n", size);
+     ok(keylen == 2048, "got %lu\n", keylen);
+ 
++    size = len = 0;
++    ret = BCryptGetProperty(key, BCRYPT_SIGNATURE_LENGTH, (UCHAR *)&len, sizeof(len), &size, 0);
++    ok(!ret, "got %#lx\n", ret);
++    ok(size == sizeof(len), "got %lu\n", size);
++    ok(len == 256, "got %lu\n", len);
++
+     pad.pszAlgId = BCRYPT_SHA1_ALGORITHM;
+     ret = BCryptVerifySignature(key, &pad, rsaHash, sizeof(rsaHash), rsaSignature, sizeof(rsaSignature), BCRYPT_PAD_PKCS1);
+     ok(!ret, "BCryptVerifySignature failed: %#lx\n", ret);
+@@ -3186,7 +3209,7 @@ static void test_RSA_SIGN(void)
+     BCRYPT_KEY_HANDLE key = NULL;
+     BCRYPT_RSAKEY_BLOB *rsablob;
+     NTSTATUS ret;
+-    ULONG size, size2;
++    ULONG size, size2, len;
+     BYTE *buf, buf2[sizeof(BCRYPT_RSAKEY_BLOB) + sizeof(rsaPublicBlob)];
+ 
+     ret = BCryptOpenAlgorithmProvider(&alg, BCRYPT_RSA_SIGN_ALGORITHM, NULL, 0);
+@@ -3247,6 +3270,12 @@ static void test_RSA_SIGN(void)
+     ret = BCryptFinalizeKeyPair(key, 0);
+     ok(ret == STATUS_SUCCESS, "got %#lx\n", ret);
+ 
++    size = len = 0;
++    ret = BCryptGetProperty(key, BCRYPT_SIGNATURE_LENGTH, (UCHAR *)&len, sizeof(len), &size, 0);
++    ok(!ret, "got %#lx\n", ret);
++    ok(size == sizeof(len), "got %lu\n", size);
++    ok(len == 64, "got %lu\n", len);
++
+     size = 0;
+     ret = BCryptExportKey(key, NULL, BCRYPT_RSAPRIVATE_BLOB, NULL, 0, &size, 0);
+     ok(ret == STATUS_SUCCESS, "got %#lx\n", ret);
+@@ -3643,6 +3672,13 @@ static void test_ECDH(void)
+     status = BCryptSetProperty(alg, BCRYPT_ECC_CURVE_NAME, (UCHAR *)BCRYPT_ECC_CURVE_25519, sizeof(BCRYPT_ECC_CURVE_25519), 0);
+     ok(status == STATUS_SUCCESS, "got %#lx\n", status);
+ 
++    status = BCryptGenerateKeyPair(alg, &key, 253, 0);
++    ok(status == STATUS_INVALID_PARAMETER, "got %#lx\n", status);
++
++    status = BCryptGenerateKeyPair(alg, &key, 255, 0);
++    ok(status == STATUS_SUCCESS, "got %#lx\n", status);
++    BCryptDestroyKey(key);
++
+     status = BCryptGenerateKeyPair(alg, &key, 0, 0);
+     ok(status == STATUS_SUCCESS, "got %#lx\n", status);
+ 
+
+--- dlls/bcrypt/bcrypt_main.c
++++ dlls/bcrypt/bcrypt_main.c
+@@ -54,6 +54,7 @@ enum alg_id
+     ALG_ID_3DES,
+     ALG_ID_CHACHA20_POLY1305,
+     ALG_ID_AES,
++    ALG_ID_AES_GMAC,
+     ALG_ID_RC4,
+ 
+     /* hash */
+@@ -134,6 +135,7 @@ struct algorithm
+     enum chain_mode   mode;
+     ULONG             flags;
+     enum ecc_curve_id curve_id;
++    enum chain_mode   chain_mode;
+ };
+ 
+ struct aes_key
+@@ -343,12 +345,14 @@ static const struct
+     ULONG        hash_length;
+     ULONG        block_bits;
+     enum ecc_curve_id curve_id;
++    enum chain_mode   chain_mode;
+ }
+ builtin_algorithms[] =
+ {
+     {  BCRYPT_3DES_ALGORITHM,       BCRYPT_CIPHER_INTERFACE,                522,    0,    0 },
+     {  BCRYPT_CHACHA20_POLY1305_ALGORITHM, BCRYPT_CIPHER_INTERFACE,         166,    0,    0 },
+     {  BCRYPT_AES_ALGORITHM,        BCRYPT_CIPHER_INTERFACE,                654,    0,    0 },
++    {  BCRYPT_AES_GMAC_ALGORITHM,   BCRYPT_CIPHER_INTERFACE,                654,    0,    0, 0, CHAIN_MODE_GCM },
+     {  BCRYPT_RC4_ALGORITHM,        BCRYPT_CIPHER_INTERFACE,                654,    0,    0 },
+     {  BCRYPT_SHA256_ALGORITHM,     BCRYPT_HASH_INTERFACE,                  286,   32,  512 },
+     {  BCRYPT_SHA384_ALGORITHM,     BCRYPT_HASH_INTERFACE,                  382,   48, 1024 },
+@@ -458,7 +462,7 @@ static const struct algorithm pseudo_algorithms[] =
+     {{ MAGIC_ALG }, ALG_ID_RSA },
+     {{ MAGIC_ALG }, ALG_ID_ECDSA },
+     {{ 0 }}, /* AES_CMAC */
+-    {{ 0 }}, /* AES_GMAC */
++    {{ MAGIC_ALG }, ALG_ID_AES_GMAC, CHAIN_MODE_GCM },
+     {{ MAGIC_ALG }, ALG_ID_MD2, 0, BCRYPT_ALG_HANDLE_HMAC_FLAG },
+     {{ MAGIC_ALG }, ALG_ID_MD4, 0, BCRYPT_ALG_HANDLE_HMAC_FLAG },
+     {{ MAGIC_ALG }, ALG_ID_3DES, CHAIN_MODE_CBC },
+@@ -599,10 +603,11 @@ static struct algorithm *create_algorithm( enum alg_id id, DWORD flags )
+ {
+     struct algorithm *ret;
+     if (!(ret = calloc( 1, sizeof(*ret) ))) return NULL;
+-    ret->hdr.magic = MAGIC_ALG;
+-    ret->id        = id;
+-    ret->flags     = flags;
+-    ret->curve_id  = builtin_algorithms[id].curve_id;
++    ret->hdr.magic  = MAGIC_ALG;
++    ret->id         = id;
++    ret->flags      = flags;
++    ret->curve_id   = builtin_algorithms[id].curve_id;
++    ret->chain_mode = builtin_algorithms[id].chain_mode;
+     return ret;
+ }
+ 
+@@ -684,24 +689,26 @@ NTSTATUS WINAPI BCryptGetFipsAlgorithmMode(BOOLEAN *enabled)
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS get_dword_property( UCHAR *buf, ULONG size, ULONG *ret_size, DWORD value )
++{
++    *ret_size = sizeof(value);
++    if (size < sizeof(value)) return STATUS_BUFFER_TOO_SMALL;
++    if (buf) *(DWORD *)buf = value;
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS get_generic_alg_property( enum alg_id id, const WCHAR *prop, UCHAR *buf, ULONG size, ULONG *ret_size )
+ {
+     if (!wcscmp( prop, BCRYPT_OBJECT_LENGTH ))
+     {
+         if (!builtin_algorithms[id].object_length) return STATUS_NOT_SUPPORTED;
+-        *ret_size = sizeof(ULONG);
+-        if (size < sizeof(ULONG)) return STATUS_BUFFER_TOO_SMALL;
+-        if (buf) *(ULONG *)buf = builtin_algorithms[id].object_length;
+-        return STATUS_SUCCESS;
++        return get_dword_property( buf, size, ret_size, builtin_algorithms[id].object_length );
+     }
+ 
+     if (!wcscmp( prop, BCRYPT_HASH_LENGTH ))
+     {
+         if (!builtin_algorithms[id].hash_length) return STATUS_NOT_SUPPORTED;
+-        *ret_size = sizeof(ULONG);
+-        if (size < sizeof(ULONG)) return STATUS_BUFFER_TOO_SMALL;
+-        if (buf) *(ULONG*)buf = builtin_algorithms[id].hash_length;
+-        return STATUS_SUCCESS;
++        return get_dword_property( buf, size, ret_size, builtin_algorithms[id].hash_length );
+     }
+ 
+     if (!wcscmp( prop, BCRYPT_ALGORITHM_NAME ))
+@@ -718,12 +725,8 @@ static NTSTATUS get_generic_alg_property( enum alg_id id, const WCHAR *prop, UCH
+ static NTSTATUS get_3des_property( enum chain_mode mode, const WCHAR *prop, UCHAR *buf, ULONG size, ULONG *ret_size )
+ {
+     if (!wcscmp( prop, BCRYPT_BLOCK_LENGTH ))
+-    {
+-        *ret_size = sizeof(ULONG);
+-        if (size < sizeof(ULONG)) return STATUS_BUFFER_TOO_SMALL;
+-        if (buf) *(ULONG *)buf = BLOCK_LENGTH_3DES;
+-        return STATUS_SUCCESS;
+-    }
++        return get_dword_property( buf, size, ret_size, BLOCK_LENGTH_3DES );
++
+     if (!wcscmp( prop, BCRYPT_CHAINING_MODE ))
+     {
+         const WCHAR *str;
+@@ -760,12 +763,11 @@ static NTSTATUS get_3des_property( enum chain_mode mode, const WCHAR *prop, UCHA
+ static NTSTATUS get_aes_property( enum chain_mode mode, const WCHAR *prop, UCHAR *buf, ULONG size, ULONG *ret_size )
+ {
+     if (!wcscmp( prop, BCRYPT_BLOCK_LENGTH ))
+-    {
+-        *ret_size = sizeof(ULONG);
+-        if (size < sizeof(ULONG)) return STATUS_BUFFER_TOO_SMALL;
+-        if (buf) *(ULONG *)buf = BLOCK_LENGTH_AES;
+-        return STATUS_SUCCESS;
+-    }
++        return get_dword_property( buf, size, ret_size, BLOCK_LENGTH_AES );
++
++    if (!wcscmp( prop, BCRYPT_MESSAGE_BLOCK_LENGTH ))
++        return get_dword_property( buf, size, ret_size, 1 );
++
+     if (!wcscmp( prop, BCRYPT_CHAINING_MODE ))
+     {
+         const WCHAR *str;
+@@ -818,12 +820,7 @@ static NTSTATUS get_aes_property( enum chain_mode mode, const WCHAR *prop, UCHAR
+ static NTSTATUS get_rc4_property( enum chain_mode mode, const WCHAR *prop, UCHAR *buf, ULONG size, ULONG *ret_size )
+ {
+     if (!wcscmp( prop, BCRYPT_BLOCK_LENGTH ))
+-    {
+-        *ret_size = sizeof(ULONG);
+-        if (size < sizeof(ULONG)) return STATUS_BUFFER_TOO_SMALL;
+-        if (buf) *(ULONG *)buf = BLOCK_LENGTH_RC4;
+-        return STATUS_SUCCESS;
+-    }
++        return get_dword_property( buf, size, ret_size, BLOCK_LENGTH_RC4 );
+ 
+     FIXME( "unsupported property %s\n", debugstr_w(prop) );
+     return STATUS_NOT_IMPLEMENTED;
+@@ -832,12 +829,7 @@ static NTSTATUS get_rc4_property( enum chain_mode mode, const WCHAR *prop, UCHAR
+ static NTSTATUS get_rsa_property( enum chain_mode mode, const WCHAR *prop, UCHAR *buf, ULONG size, ULONG *ret_size )
+ {
+     if (!wcscmp( prop, BCRYPT_PADDING_SCHEMES ))
+-    {
+-        *ret_size = sizeof(ULONG);
+-        if (size < sizeof(ULONG)) return STATUS_BUFFER_TOO_SMALL;
+-        if (buf) *(ULONG *)buf = BCRYPT_SUPPORTED_PAD_PKCS1_SIG | BCRYPT_SUPPORTED_PAD_OAEP;
+-        return STATUS_SUCCESS;
+-    }
++        return get_dword_property( buf, size, ret_size, BCRYPT_SUPPORTED_PAD_PKCS1_SIG | BCRYPT_SUPPORTED_PAD_OAEP );
+ 
+     FIXME( "unsupported property %s\n", debugstr_w(prop) );
+     return STATUS_NOT_IMPLEMENTED;
+@@ -873,12 +865,7 @@ static NTSTATUS get_pbkdf2_property( enum chain_mode mode, const WCHAR *prop, UC
+ static NTSTATUS get_chacha20_poly1305_property( const WCHAR *prop, UCHAR *buf, ULONG size, ULONG *ret_size )
+ {
+     if (!wcscmp( prop, BCRYPT_BLOCK_LENGTH ))
+-    {
+-        *ret_size = sizeof(ULONG);
+-        if (size < sizeof(ULONG)) return STATUS_BUFFER_TOO_SMALL;
+-        if (buf) *(ULONG *)buf = BLOCK_LENGTH_CHACHA20_POLY1305;
+-        return STATUS_SUCCESS;
+-    }
++        return get_dword_property( buf, size, ret_size, BLOCK_LENGTH_CHACHA20_POLY1305 );
+ 
+     FIXME( "unsupported property %s\n", debugstr_w(prop) );
+     return STATUS_NOT_IMPLEMENTED;
+@@ -901,6 +888,7 @@ static NTSTATUS get_alg_property( const struct algorithm *alg, const WCHAR *prop
+         return get_chacha20_poly1305_property( prop, buf, size, ret_size );
+ 
+     case ALG_ID_AES:
++    case ALG_ID_AES_GMAC:
+         return get_aes_property( alg->mode, prop, buf, size, ret_size );
+ 
+     case ALG_ID_RC4:
+@@ -986,6 +974,9 @@ static NTSTATUS set_alg_property( struct algorithm *alg, const WCHAR *prop, UCHA
+                 return STATUS_NOT_IMPLEMENTED;
+             }
+         }
++        else if (!wcscmp( (WCHAR *)prop, BCRYPT_MESSAGE_BLOCK_LENGTH ))
++            return STATUS_INVALID_PARAMETER;
++
+         FIXME( "unsupported aes algorithm property %s\n", debugstr_w(prop) );
+         return STATUS_NOT_IMPLEMENTED;
+ 
+@@ -1184,14 +1175,8 @@ static NTSTATUS get_key_property( const struct key *key, const WCHAR *prop, UCHA
+ {
+     if (!wcscmp( prop, BCRYPT_KEY_STRENGTH ))
+     {
+-        *ret_size = sizeof(DWORD);
+-        if (size < sizeof(DWORD)) return STATUS_BUFFER_TOO_SMALL;
+-        if (buf)
+-        {
+-            if (is_symmetric_key(key)) *(DWORD *)buf = key->s.block_size * 8;
+-            else *(DWORD *)buf = key->a.bitlen;
+-        }
+-        return STATUS_SUCCESS;
++        DWORD value = is_symmetric_key (key ) ? key->s.block_size * 8 : key->a.bitlen;
++        return get_dword_property( buf, size, ret_size, value );
+     }
+ 
+     switch (key->alg_id)
+@@ -1200,6 +1185,7 @@ static NTSTATUS get_key_property( const struct key *key, const WCHAR *prop, UCHA
+         return get_3des_property( key->s.mode, prop, buf, size, ret_size );
+ 
+     case ALG_ID_AES:
++    case ALG_ID_AES_GMAC:
+         if (!wcscmp( prop, BCRYPT_AUTH_TAG_LENGTH )) return STATUS_NOT_SUPPORTED;
+         return get_aes_property( key->s.mode, prop, buf, size, ret_size );
+ 
+@@ -1207,6 +1193,11 @@ static NTSTATUS get_key_property( const struct key *key, const WCHAR *prop, UCHA
+         if (wcscmp( prop, BCRYPT_DH_PARAMETERS )) return STATUS_NOT_SUPPORTED;
+         return get_dh_parameters( key, buf, size, ret_size );
+ 
++    case ALG_ID_RSA:
++    case ALG_ID_RSA_SIGN:
++        if (wcscmp( prop, BCRYPT_SIGNATURE_LENGTH )) return STATUS_NOT_SUPPORTED;
++        return get_dword_property( buf, size, ret_size, key->a.bitlen / 8 );
++
+     default:
+         FIXME( "unsupported algorithm %u\n", key->alg_id );
+         return STATUS_NOT_IMPLEMENTED;
+@@ -1586,6 +1577,7 @@ static NTSTATUS generate_symmetric_key( const struct algorithm *alg, const UCHAR
+     switch (alg->id)
+     {
+     case ALG_ID_AES:
++    case ALG_ID_AES_GMAC:
+         if ((status = validate_len_aes( &key_lengths, secret_len, &secret_len )) ||
+             (status = alloc_aes_key( key, alg->mode, BLOCK_LENGTH_AES, secret, secret_len )))
+         {
+@@ -1770,6 +1762,7 @@ static NTSTATUS decrypt_symmetric( struct key *key, const UCHAR *input, ULONG in
+     switch (key->alg_id)
+     {
+     case ALG_ID_AES:
++    case ALG_ID_AES_GMAC:
+         switch (key->s.mode)
+         {
+         case CHAIN_MODE_ECB:
+@@ -2114,6 +2107,7 @@ static NTSTATUS encrypt_symmetric( struct key *key, const UCHAR *input, ULONG in
+     switch (key->alg_id)
+     {
+     case ALG_ID_AES:
++    case ALG_ID_AES_GMAC:
+         switch (key->s.mode)
+         {
+         case CHAIN_MODE_ECB:
+@@ -3367,6 +3361,22 @@ NTSTATUS WINAPI BCryptImportKeyPair( BCRYPT_ALG_HANDLE handle, BCRYPT_KEY_HANDLE
+     return STATUS_SUCCESS;
+ }
+ 
++static ULONG curve_size( enum ecc_curve_id curve_id )
++{
++    switch (curve_id)
++    {
++    case ECC_CURVE_25519:           return 255;
++    case ECC_CURVE_BRAINPOOLP256R1:
++    case ECC_CURVE_P256R1:          return 256;
++    case ECC_CURVE_BRAINPOOLP384R1:
++    case ECC_CURVE_P384R1:          return 384;
++    case ECC_CURVE_P521R1:          return 521;
++    default:
++        FIXME( "unsupported curve %u\n", curve_id );
++        return 0;
++    }
++}
++
+ static NTSTATUS generate_key_pair( const struct algorithm *alg, ULONG bitlen, ULONG flags, struct key **ret_key )
+ {
+     NTSTATUS status;
+@@ -3397,7 +3407,7 @@ static NTSTATUS generate_key_pair( const struct algorithm *alg, ULONG bitlen, UL
+     case ALG_ID_ECDSA_P256:
+     case ALG_ID_ECDSA_P384:
+     case ALG_ID_ECDSA_P521:
+-        if (bitlen && bitlen != curve_strength( alg->curve_id ))
++        if (bitlen && bitlen != curve_size( alg->curve_id ))
+         {
+             destroy_key( key );
+             return STATUS_INVALID_PARAMETER;
+@@ -3522,6 +3532,7 @@ static NTSTATUS duplicate_key( const struct key *src, struct key **ret_key )
+     switch (src->alg_id)
+     {
+     case ALG_ID_AES:
++    case ALG_ID_AES_GMAC:
+         if ((status = alloc_key( src->alg_id, src->flags, &dst ))) return status;
+         if ((status = alloc_aes_key( dst, src->s.mode, src->s.block_size, src->s.secret, src->s.secret_len )))
+         {
+
+--- dlls/cldapi/Makefile.in
++++ dlls/cldapi/Makefile.in
+@@ -1 +1,4 @@
+ MODULE = cldapi.dll
++
++SOURCES = \
++	main.c
+
+--- dlls/cldapi/cldapi.spec
++++ dlls/cldapi/cldapi.spec
+@@ -11,7 +11,7 @@
+ @ stub CfExecute
+ @ stub CfGetCorrelationVector
+ @ stub CfGetLastSyncStatus
+-@ stub CfGetPlaceholderInfo
++@ stdcall CfGetPlaceholderInfo(ptr long ptr long ptr)
+ @ stub CfGetPlaceholderRangeInfo
+ @ stub CfGetPlaceholderRangeInfoForHydration
+ @ stub CfGetPlaceholderStateFromAttributeTag
+
+--- dlls/cldapi/main.c
++++ dlls/cldapi/main.c
+@@ -0,0 +1,30 @@
++/*
++ * Copyright 2026 Louis Lenders
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "windef.h"
++#include "cfapi.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(cldapi);
++
++HRESULT WINAPI CfGetPlaceholderInfo(HANDLE h, CF_PLACEHOLDER_INFO_CLASS info, void *buf, DWORD len, DWORD *retlen)
++{
++    FIXME("%p %d %p %lu %p: stub\n", h, info, buf, len, retlen);
++
++    return E_NOTIMPL;
++}
+
+--- dlls/crypt32/collectionstore.c
++++ dlls/crypt32/collectionstore.c
+@@ -51,12 +51,12 @@ static DWORD Collection_release(WINECRYPT_CERTSTORE *store, DWORD flags)
+     WINE_STORE_LIST_ENTRY *entry, *next;
+     LONG ref;
+ 
+-    if(flags)
++    if(flags & ~CERT_CLOSE_STORE_FORCE_FLAG)
+         FIXME("Unimplemented flags %lx\n", flags);
+ 
+     ref = InterlockedDecrement(&cs->hdr.ref);
+     TRACE("(%p) ref=%ld\n", store, ref);
+-    if(ref)
++    if(ref && !(flags & CERT_CLOSE_STORE_FORCE_FLAG))
+         return ERROR_SUCCESS;
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(entry, next, &cs->stores, WINE_STORE_LIST_ENTRY, entry)
+
+--- dlls/crypt32/provstore.c
++++ dlls/crypt32/provstore.c
+@@ -54,13 +54,13 @@ static DWORD ProvStore_release(WINECRYPT_CERTSTORE *cert_store, DWORD flags)
+     WINE_PROVIDERSTORE *store = (WINE_PROVIDERSTORE*)cert_store;
+     LONG ref;
+ 
+-    if(flags)
++    if(flags & ~CERT_CLOSE_STORE_FORCE_FLAG)
+         FIXME("Unimplemented flags %lx\n", flags);
+ 
+     ref = InterlockedDecrement(&store->hdr.ref);
+     TRACE("(%p) ref=%ld\n", store, ref);
+ 
+-    if(ref)
++    if(ref && !(flags & CERT_CLOSE_STORE_FORCE_FLAG))
+         return ERROR_SUCCESS;
+ 
+     if (store->provCloseStore)
+
+--- dlls/crypt32/regstore.c
++++ dlls/crypt32/regstore.c
+@@ -320,10 +320,10 @@ static void WINAPI CRYPT_RegCloseStore(HCERTSTORE hCertStore, DWORD dwFlags)
+     WINE_REGSTOREINFO *store = hCertStore;
+ 
+     TRACE("(%p, %08lx)\n", store, dwFlags);
+-    if (dwFlags)
++    if (dwFlags & ~CERT_CLOSE_STORE_FORCE_FLAG)
+         FIXME("Unimplemented flags: %08lx\n", dwFlags);
+ 
+-    CRYPT_RegFlushStore(store, FALSE);
++    CRYPT_RegFlushStore(store, dwFlags & CERT_CLOSE_STORE_FORCE_FLAG);
+     RegCloseKey(store->key);
+     CloseHandle(store->key_modified_event);
+     store->cs.DebugInfo->Spare[0] = 0;
+
+--- dlls/crypt32/store.c
++++ dlls/crypt32/store.c
+@@ -369,12 +369,12 @@ static DWORD MemStore_release(WINECRYPT_CERTSTORE *cert_store, DWORD flags)
+     WINE_MEMSTORE *store = (WINE_MEMSTORE*)cert_store;
+     LONG ref;
+ 
+-    if(flags & ~CERT_CLOSE_STORE_CHECK_FLAG)
++    if(flags & ~(CERT_CLOSE_STORE_CHECK_FLAG | CERT_CLOSE_STORE_FORCE_FLAG))
+         FIXME("Unimplemented flags %lx\n", flags);
+ 
+     ref = InterlockedDecrement(&store->hdr.ref);
+     TRACE("(%p) ref=%ld\n", store, ref);
+-    if(ref)
++    if(ref && !(flags & CERT_CLOSE_STORE_FORCE_FLAG))
+         return (flags & CERT_CLOSE_STORE_CHECK_FLAG) ? CRYPT_E_PENDING_CLOSE : ERROR_SUCCESS;
+ 
+     free_contexts(&store->certs);
+
+--- dlls/ddraw/ddraw.c
++++ dlls/ddraw/ddraw.c
+@@ -1143,7 +1143,8 @@ static HRESULT WINAPI ddraw7_SetDisplayMode(IDirectDraw7 *iface, DWORD width, DW
+             DDSURFACEDESC2 *surface_desc = &ddraw->primary->surface_desc;
+ 
+             if (FAILED(hr = wined3d_swapchain_resize_buffers(ddraw->wined3d_swapchain, 0,
+-                    surface_desc->dwWidth, surface_desc->dwHeight, mode.format_id, WINED3D_MULTISAMPLE_NONE, 0)))
++                    surface_desc->dwWidth, surface_desc->dwHeight, mode.format_id,
++                    WINED3D_MULTISAMPLE_NONE, 0, 0)))
+                 ERR("Failed to resize buffers, hr %#lx.\n", hr);
+             else
+                 ddrawformat_from_wined3dformat(&ddraw->primary->surface_desc.ddpfPixelFormat, mode.format_id);
+
+--- dlls/dxcore/tests/dxcore.c
++++ dlls/dxcore/tests/dxcore.c
+@@ -246,6 +246,24 @@ static void test_GetProperty(void)
+         hr = IDXCoreAdapter_GetProperty(adapter, DedicatedAdapterMemory, sizeof(memory), &memory);
+         ok(hr == S_OK, "Got hr %#lx.\n", hr);
+ 
++        /* DedicatedSystemMemory */
++        hr = IDXCoreAdapter_GetProperty(adapter, DedicatedSystemMemory, 0, NULL);
++        ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
++        hr = IDXCoreAdapter_GetProperty(adapter, DedicatedSystemMemory, 0, &memory);
++        ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++        hr = IDXCoreAdapter_GetProperty(adapter, DedicatedSystemMemory, sizeof(memory) - 1, &memory);
++        ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++
++        hr = IDXCoreAdapter_GetPropertySize(adapter, DedicatedSystemMemory, NULL);
++        ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
++
++        hr = IDXCoreAdapter_GetPropertySize(adapter, DedicatedSystemMemory, &size);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        ok(size == sizeof(memory), "Got size %Iu.\n", size);
++
++        hr = IDXCoreAdapter_GetProperty(adapter, DedicatedSystemMemory, sizeof(memory), &memory);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
+         /* SharedSystemMemory */
+         hr = IDXCoreAdapter_GetProperty(adapter, SharedSystemMemory, 0, NULL);
+         ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
+
+--- dlls/dxcore/dxcore.c
++++ dlls/dxcore/dxcore.c
+@@ -110,6 +110,7 @@ static HRESULT dxcore_adapter_get_property_size(struct dxcore_adapter *adapter,
+         [DriverVersion] = sizeof(LARGE_INTEGER),
+         [HardwareID] = sizeof(DXCoreHardwareID),
+         [DedicatedAdapterMemory] = sizeof(UINT64),
++        [DedicatedSystemMemory] = sizeof(UINT64),
+         [SharedSystemMemory] = sizeof(UINT64),
+         [IsHardware] = sizeof(BYTE),
+     };
+@@ -120,6 +121,7 @@ static HRESULT dxcore_adapter_get_property_size(struct dxcore_adapter *adapter,
+         case DriverVersion:
+         case HardwareID:
+         case DedicatedAdapterMemory:
++        case DedicatedSystemMemory:
+         case SharedSystemMemory:
+         case IsHardware:
+             *size = property_sizes[property];
+@@ -182,6 +184,11 @@ static HRESULT STDMETHODCALLTYPE dxcore_adapter_GetProperty(IDXCoreAdapter *ifac
+             *(UINT64 *)buffer = adapter->identifier.video_memory;
+             break;
+ 
++        case DedicatedSystemMemory:
++            FIXME("Returning 0 for DedicatedSystemMemory.\n");
++            *(UINT64 *)buffer = 0;
++            break;
++
+         case SharedSystemMemory:
+             *(UINT64 *)buffer = adapter->identifier.shared_system_memory;
+             break;
+
+--- dlls/dxgi/tests/dxgi.c
++++ dlls/dxgi/tests/dxgi.c
+@@ -894,6 +894,19 @@ static BOOL dxgi_1_4_supported(IUnknown *device, BOOL is_d3d12)
+     return SUCCEEDED(hr);
+ }
+ 
++static BOOL dxgi_1_5_supported(IUnknown *device, BOOL is_d3d12)
++{
++    IDXGIFactory5 *factory5;
++    IDXGIFactory *factory;
++    HRESULT hr;
++
++    get_factory(device, is_d3d12, &factory);
++    if (SUCCEEDED(hr = IDXGIFactory_QueryInterface(factory, &IID_IDXGIFactory5, (void **)&factory5)))
++        IDXGIFactory5_Release(factory5);
++    IDXGIFactory_Release(factory);
++    return SUCCEEDED(hr);
++}
++
+ #define get_adapter(a, b) get_adapter_(__LINE__, a, b)
+ static IDXGIAdapter *get_adapter_(unsigned int line, IUnknown *device, BOOL is_d3d12)
+ {
+@@ -4421,22 +4434,24 @@ static void check_resource_desc_(unsigned int line, ID3D12Resource *resource,
+ 
+ static void test_swapchain_resize(IUnknown *device, BOOL is_d3d12)
+ {
++    IDXGISwapChain3 *swapchain3 = NULL, *tmp_swapchain3;
++    IDXGISwapChain *swapchain, *tmp_swapchain;
+     DXGI_SWAP_CHAIN_DESC swapchain_desc;
++    BOOL ret, is_dxgi_1_5_supported;
+     DXGI_SWAP_EFFECT swap_effect;
+     IDXGIResource *dxgi_resource;
+-    IDXGISwapChain3 *swapchain3;
+     IUnknown *present_queue[2];
+-    IDXGISwapChain *swapchain;
+     ID3D12Resource *resource;
+     ID3D10Texture2D *texture;
+     HRESULT hr, expected_hr;
++    IDXGISurface1 *surface1;
+     IDXGISurface *surface;
+     IDXGIFactory *factory;
+     RECT client_rect, r;
+     UINT node_mask[2];
+     ULONG refcount;
+     HWND window;
+-    BOOL ret;
++    HDC hdc;
+ 
+     get_factory(device, is_d3d12, &factory);
+ 
+@@ -4723,7 +4738,6 @@ static void test_swapchain_resize(IUnknown *device, BOOL is_d3d12)
+         hr = IDXGISwapChain3_ResizeBuffers1(swapchain3, 2, 320, 240,
+                 DXGI_FORMAT_B8G8R8A8_UNORM, 0, node_mask, present_queue);
+         todo_wine ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
+-        IDXGISwapChain3_Release(swapchain3);
+     }
+     else
+     {
+@@ -4748,10 +4762,312 @@ static void test_swapchain_resize(IUnknown *device, BOOL is_d3d12)
+         hr = IDXGISwapChain3_ResizeBuffers1(swapchain3, 0, 320, 240,
+                 DXGI_FORMAT_B8G8R8A8_UNORM, 0, node_mask, present_queue);
+         ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++    }
++
++    /* Test ResizeBuffers() flags */
++    is_dxgi_1_5_supported = dxgi_1_5_supported(device, is_d3d12);
++    for (unsigned int flag = DXGI_SWAP_CHAIN_FLAG_NONPREROTATED;
++            flag <= DXGI_SWAP_CHAIN_FLAG_RESTRICTED_TO_ALL_HOLOGRAPHIC_DISPLAYS; flag <<= 1)
++    {
++        /* DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED can't be turned off. Test it in a separate test */
++        if (flag == DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED)
++            continue;
++
++        if (!is_dxgi_1_5_supported & (flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
++                || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICTED_TO_ALL_HOLOGRAPHIC_DISPLAYS))
++            continue;
++
++        winetest_push_context("flag %#x", flag);
++
++        hr = IDXGISwapChain_ResizeBuffers(swapchain, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM, flag);
++        if (flag == DXGI_SWAP_CHAIN_FLAG_NONPREROTATED
++                || flag == DXGI_SWAP_CHAIN_FLAG_DISPLAY_ONLY
++                || flag == DXGI_SWAP_CHAIN_FLAG_FULLSCREEN_VIDEO)
++        {
++            todo_wine
++            ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++        }
++        else if (flag == DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
++                || flag == DXGI_SWAP_CHAIN_FLAG_FOREGROUND_LAYER
++                || flag == DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO
++                || flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
++        {
++            todo_wine_if(flag != DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
++            ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++        }
++        else
++        {
++            ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++            hr = IDXGISwapChain_GetDesc(swapchain, &swapchain_desc);
++            ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++            todo_wine_if(!is_d3d12 && !(flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH
++                    || flag == DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE))
++            ok(swapchain_desc.Flags == flag, "Got unexpected Flags %#x.\n", swapchain_desc.Flags);
++        }
++
++        /* If a flag is allowed at swapchain creation, then it must be allowed in ResizeBuffers() */
++        swapchain_desc.Flags = flag;
++        swapchain_desc.OutputWindow = create_window();
++        if (flag == DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
++                || flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
++            swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
++        else
++            swapchain_desc.SwapEffect = swap_effect;
++        hr = IDXGIFactory_CreateSwapChain(factory, device, &swapchain_desc, &tmp_swapchain);
++        if ((is_d3d12 && (flag == DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE
++                || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICTED_CONTENT
++                || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICT_SHARED_RESOURCE_DRIVER))
++                || flag == DXGI_SWAP_CHAIN_FLAG_NONPREROTATED
++                || flag == DXGI_SWAP_CHAIN_FLAG_DISPLAY_ONLY
++                || flag == DXGI_SWAP_CHAIN_FLAG_FOREGROUND_LAYER
++                || flag == DXGI_SWAP_CHAIN_FLAG_FULLSCREEN_VIDEO
++                || flag == DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO)
++        {
++            todo_wine
++            ok(hr == DXGI_ERROR_INVALID_CALL, "Creating a swapchain with flag %#x succeeded.\n", flag);
++            if (hr == S_OK)
++                IDXGISwapChain_Release(tmp_swapchain);
++            DestroyWindow(swapchain_desc.OutputWindow);
++            winetest_pop_context();
++            continue;
++        }
++        else
++        {
++            ok(hr == S_OK, "Failed to create swapchain, hr %#lx.\n", hr);
++        }
++
++        hr = IDXGISwapChain_GetDesc(tmp_swapchain, &swapchain_desc);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        todo_wine_if(!is_d3d12 && !(flag == DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE
++                || flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH
++                || flag == DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
++        ok(swapchain_desc.Flags == flag, "Got unexpected Flags %#x.\n", swapchain_desc.Flags);
++        /* Test turning on the flag used at swapchain creation */
++        hr = IDXGISwapChain_ResizeBuffers(tmp_swapchain, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM, flag);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        /* Test turning off the flag used at swapchain creation */
++        hr = IDXGISwapChain_ResizeBuffers(tmp_swapchain, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
++        if ((!is_d3d12 && (flag == DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE
++                || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICTED_CONTENT
++                || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICT_SHARED_RESOURCE_DRIVER))
++                || flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH
++                || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICTED_TO_ALL_HOLOGRAPHIC_DISPLAYS)
++            ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        else
++            todo_wine_if(flag != DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
++            ok(hr == DXGI_ERROR_INVALID_CALL || hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++        IDXGISwapChain_Release(tmp_swapchain);
++        DestroyWindow(swapchain_desc.OutputWindow);
++
++        winetest_pop_context();
++    }
++
++    hr = IDXGISwapChain_ResizeBuffers(swapchain, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = IDXGISwapChain_GetDesc(swapchain, &swapchain_desc);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ok(!swapchain_desc.Flags, "Got unexpected Flags %#x.\n", swapchain_desc.Flags);
++
++    /* Test ResizeBuffers1() flags */
++    if (swapchain3)
++    {
++        node_mask[0] = 1;
++        node_mask[1] = 1;
++        present_queue[0] = device;
++        present_queue[1] = device;
++
++        for (unsigned int flag = DXGI_SWAP_CHAIN_FLAG_NONPREROTATED;
++                flag <= DXGI_SWAP_CHAIN_FLAG_RESTRICTED_TO_ALL_HOLOGRAPHIC_DISPLAYS; flag <<= 1)
++        {
++            /* DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED can't be turned off. Test it in a separate test */
++            if (flag == DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED)
++                continue;
++
++            if (!is_dxgi_1_5_supported & (flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
++                    || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICTED_TO_ALL_HOLOGRAPHIC_DISPLAYS))
++                continue;
++
++            winetest_push_context("flag %#x", flag);
++
++            hr = IDXGISwapChain3_ResizeBuffers1(swapchain3, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM,
++                    flag, node_mask, present_queue);
++            if (is_d3d12)
++            {
++                if (flag == DXGI_SWAP_CHAIN_FLAG_NONPREROTATED
++                        || flag == DXGI_SWAP_CHAIN_FLAG_DISPLAY_ONLY
++                        || flag == DXGI_SWAP_CHAIN_FLAG_FULLSCREEN_VIDEO)
++                {
++                    todo_wine
++                    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++                }
++                else if (flag == DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
++                        || flag == DXGI_SWAP_CHAIN_FLAG_FOREGROUND_LAYER
++                        || flag == DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO
++                        || flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
++                {
++                    todo_wine_if(flag != DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
++                    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++                }
++                else
++                {
++                    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++                    hr = IDXGISwapChain_GetDesc(swapchain, &swapchain_desc);
++                    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++                    ok(swapchain_desc.Flags == flag, "Got unexpected Flags %#x.\n", swapchain_desc.Flags);
++                }
++            }
++            else
++            {
++                if (flag == DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
++                        || flag == DXGI_SWAP_CHAIN_FLAG_FOREGROUND_LAYER
++                        || flag == DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO
++                        || flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
++                    todo_wine
++                    ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++                else
++                    todo_wine
++                    ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++            }
++
++            /* If a flag is allowed at swapchain creation, then it must be allowed in ResizeBuffers1() */
++            swapchain_desc.Flags = flag;
++            swapchain_desc.OutputWindow = create_window();
++            if (flag == DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
++                    || flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
++                swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
++            else
++                swapchain_desc.SwapEffect = swap_effect;
++            hr = IDXGIFactory_CreateSwapChain(factory, device, &swapchain_desc, &tmp_swapchain);
++            if ((is_d3d12 && (flag == DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE
++                    || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICTED_CONTENT
++                    || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICT_SHARED_RESOURCE_DRIVER))
++                    || flag == DXGI_SWAP_CHAIN_FLAG_NONPREROTATED
++                    || flag == DXGI_SWAP_CHAIN_FLAG_DISPLAY_ONLY
++                    || flag == DXGI_SWAP_CHAIN_FLAG_FOREGROUND_LAYER
++                    || flag == DXGI_SWAP_CHAIN_FLAG_FULLSCREEN_VIDEO
++                    || flag == DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO)
++            {
++                todo_wine
++                ok(hr == DXGI_ERROR_INVALID_CALL, "Creating a swapchain with flag %#x succeeded.\n", flag);
++                if (hr == S_OK)
++                    IDXGISwapChain_Release(tmp_swapchain);
++                DestroyWindow(swapchain_desc.OutputWindow);
++                winetest_pop_context();
++                continue;
++            }
++            else
++            {
++                ok(hr == S_OK, "Failed to create swapchain, hr %#lx.\n", hr);
++            }
++
++            hr = IDXGISwapChain_QueryInterface(tmp_swapchain, &IID_IDXGISwapChain3, (void **)&tmp_swapchain3);
++            ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++            hr = IDXGISwapChain_GetDesc(tmp_swapchain, &swapchain_desc);
++            ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++            todo_wine_if(!is_d3d12 && !(flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH
++                    || flag == DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE
++                    || flag == DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
++            ok(swapchain_desc.Flags == flag, "Got unexpected Flags %#x.\n", swapchain_desc.Flags);
++            /* Test turning on the flag used at swapchain creation */
++            hr = IDXGISwapChain3_ResizeBuffers1(tmp_swapchain3, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM,
++                    flag, node_mask, present_queue);
++            todo_wine_if(!is_d3d12)
++            ok(hr == (is_d3d12 ? S_OK : DXGI_ERROR_INVALID_CALL), "Got unexpected hr %#lx.\n", hr);
++            /* Test turning off the flag used at swapchain creation */
++            hr = IDXGISwapChain3_ResizeBuffers1(tmp_swapchain3, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM,
++                    0, node_mask, present_queue);
++            if (is_d3d12 && (flag == DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH
++                    || flag == DXGI_SWAP_CHAIN_FLAG_RESTRICTED_TO_ALL_HOLOGRAPHIC_DISPLAYS))
++                ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++            else
++                todo_wine_if(!(is_d3d12 && flag == DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
++                ok(hr == DXGI_ERROR_INVALID_CALL || hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++            IDXGISwapChain3_Release(tmp_swapchain3);
++            IDXGISwapChain_Release(tmp_swapchain);
++            DestroyWindow(swapchain_desc.OutputWindow);
++
++            winetest_pop_context();
++        }
++
++        hr = IDXGISwapChain3_ResizeBuffers1(swapchain3, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM, 0,
++                node_mask, present_queue);
++        todo_wine_if(!is_d3d12)
++        ok(hr == (is_d3d12 ? S_OK : DXGI_ERROR_INVALID_CALL), "Got unexpected hr %#lx.\n", hr);
++        hr = IDXGISwapChain_GetDesc(swapchain, &swapchain_desc);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        ok(!swapchain_desc.Flags, "Got unexpected Flags %#x.\n", swapchain_desc.Flags);
++
+         IDXGISwapChain3_Release(swapchain3);
+     }
+ 
+     IDXGISwapChain_Release(swapchain);
++
++    /* Test DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE */
++    swapchain = create_swapchain(device, is_d3d12, window, 0, swap_effect);
++
++    hr = IDXGISwapChain_ResizeBuffers(swapchain, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM,
++            DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = IDXGISwapChain_GetDesc(swapchain, &swapchain_desc);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ok(swapchain_desc.Flags == DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE, "Got unexpected Flags %#x.\n",
++            swapchain_desc.Flags);
++    hr = IDXGISwapChain_GetBuffer(swapchain, 0, &IID_IDXGISurface1, (void **)&surface1);
++    if (hr == S_OK)
++    {
++        hr = IDXGISurface1_GetDC(surface1, FALSE, &hdc);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        IDXGISurface1_ReleaseDC(surface1, NULL);
++        IDXGISurface1_Release(surface1);
++    }
++
++    hr = IDXGISwapChain_ResizeBuffers(swapchain, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    hr = IDXGISwapChain_GetDesc(swapchain, &swapchain_desc);
++    ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++    ok(!swapchain_desc.Flags, "Got unexpected Flags %#x.\n", swapchain_desc.Flags);
++    hr = IDXGISwapChain_GetBuffer(swapchain, 0, &IID_IDXGISurface1, (void **)&surface1);
++    if (hr == S_OK)
++    {
++        hr = IDXGISurface1_GetDC(surface1, FALSE, &hdc);
++        todo_wine_if(hr == 0x8876086c)
++        ok(hr == DXGI_ERROR_INVALID_CALL, "Got unexpected hr %#lx.\n", hr);
++        IDXGISurface1_Release(surface1);
++    }
++
++    IDXGISwapChain_Release(swapchain);
++
++    /* Test DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED */
++    if (dxgi_1_4_supported(device, is_d3d12))
++    {
++        swapchain = create_swapchain(device, is_d3d12, window, 0, swap_effect);
++
++        hr = IDXGISwapChain_ResizeBuffers(swapchain, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM,
++                DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        hr = IDXGISwapChain_GetDesc(swapchain, &swapchain_desc);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        todo_wine_if(!is_d3d12)
++        ok(swapchain_desc.Flags == DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED, "Got unexpected Flags %#x.\n",
++                swapchain_desc.Flags);
++        /* Note that MSDN says that DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED can only be used with
++         * DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL. Apparently that is not the case */
++        ok(swapchain_desc.SwapEffect == swap_effect, "Got unexpected SwapEffect %#x.\n",
++                swapchain_desc.SwapEffect);
++
++        /* DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED can't be turned off once it's turned on */
++        hr = IDXGISwapChain_ResizeBuffers(swapchain, 2, 320, 240, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
++        todo_wine
++        ok(hr == E_INVALIDARG, "Got unexpected hr %#lx.\n", hr);
++        hr = IDXGISwapChain_GetDesc(swapchain, &swapchain_desc);
++        ok(hr == S_OK, "Got unexpected hr %#lx.\n", hr);
++        todo_wine
++        ok(swapchain_desc.Flags == DXGI_SWAP_CHAIN_FLAG_HW_PROTECTED, "Got unexpected Flags %#x.\n",
++                swapchain_desc.Flags);
++
++        IDXGISwapChain_Release(swapchain);
++    }
++
+     DestroyWindow(window);
+     refcount = IDXGIFactory_Release(factory);
+     ok(refcount == !is_d3d12, "Got unexpected refcount %lu.\n", refcount);
+
+--- dlls/dxgi/dxgi_private.h
++++ dlls/dxgi/dxgi_private.h
+@@ -95,6 +95,7 @@ void wined3d_display_mode_from_dxgi1(struct wined3d_display_mode *wined3d_mode,
+ DXGI_USAGE dxgi_usage_from_wined3d_bind_flags(unsigned int wined3d_bind_flags);
+ unsigned int wined3d_bind_flags_from_dxgi_usage(DXGI_USAGE usage);
+ unsigned int dxgi_swapchain_flags_from_wined3d(unsigned int wined3d_flags);
++unsigned int wined3d_swapchain_flags_from_dxgi(unsigned int flags);
+ HRESULT dxgi_get_output_from_window(IWineDXGIFactory *factory, HWND window, IDXGIOutput **dxgi_output)
+        ;
+ HRESULT wined3d_swapchain_desc_from_dxgi(struct wined3d_swapchain_desc *wined3d_desc,
+
+--- dlls/dxgi/swapchain.c
++++ dlls/dxgi/swapchain.c
+@@ -549,6 +549,9 @@ static HRESULT d3d11_swapchain_create_d3d11_textures(struct d3d11_swapchain *swa
+ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_ResizeBuffers(IDXGISwapChain4 *iface,
+         UINT buffer_count, UINT width, UINT height, DXGI_FORMAT format, UINT flags)
+ {
++    static const UINT supported_flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH
++            | DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE
++            | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+     struct d3d11_swapchain *swapchain = d3d11_swapchain_from_IDXGISwapChain4(iface);
+     struct wined3d_swapchain_desc wined3d_desc;
+     struct wined3d_texture *texture;
+@@ -559,11 +562,17 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_ResizeBuffers(IDXGISwapChain4 *
+     TRACE("iface %p, buffer_count %u, width %u, height %u, format %s, flags %#x.\n",
+             iface, buffer_count, width, height, debug_dxgi_format(format), flags);
+ 
+-    if (flags)
+-        FIXME("Ignoring flags %#x.\n", flags);
++    if (flags & ~supported_flags)
++        FIXME("Ignoring flags %#x.\n", flags & ~supported_flags);
+ 
+     wined3d_mutex_lock();
+     wined3d_swapchain_get_desc(swapchain->wined3d_swapchain, &wined3d_desc);
++    if (!(wined3d_desc.flags & WINED3D_SWAPCHAIN_FRAME_LATENCY_WAITABLE_OBJECT)
++            != !(flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
++    {
++        wined3d_mutex_unlock();
++        return E_INVALIDARG;
++    }
+     for (i = 0; i < wined3d_desc.backbuffer_count; ++i)
+     {
+         texture = wined3d_swapchain_get_back_buffer(swapchain->wined3d_swapchain, i);
+@@ -577,8 +586,10 @@ static HRESULT STDMETHODCALLTYPE d3d11_swapchain_ResizeBuffers(IDXGISwapChain4 *
+     }
+     if (format != DXGI_FORMAT_UNKNOWN)
+         wined3d_desc.backbuffer_format = wined3dformat_from_dxgi_format(format);
++    wined3d_desc.flags = wined3d_swapchain_flags_from_dxgi(flags);
+     hr = wined3d_swapchain_resize_buffers(swapchain->wined3d_swapchain, buffer_count, width, height,
+-            wined3d_desc.backbuffer_format, wined3d_desc.multisample_type, wined3d_desc.multisample_quality);
++            wined3d_desc.backbuffer_format, wined3d_desc.multisample_type,
++            wined3d_desc.multisample_quality, wined3d_desc.flags);
+     /* wined3d_swapchain_resize_buffers() may recreate swapchain textures.
+      * We do not need to remove the reference to the wined3d swapchain from the
+      * old d3d11 textures: we just validated above that they have 0 references,
+@@ -2600,13 +2611,18 @@ static HRESULT d3d12_swapchain_op_resize_buffers_execute(struct d3d12_swapchain
+ static HRESULT d3d12_swapchain_resize_buffers(struct d3d12_swapchain *swapchain,
+         UINT buffer_count, UINT width, UINT height, DXGI_FORMAT format, UINT flags)
+ {
++    static const UINT supported_flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH
++            | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+     DXGI_SWAP_CHAIN_DESC1 *desc, new_desc;
+     struct d3d12_swapchain_op *op;
+     unsigned int i;
+     ULONG refcount;
+ 
+-    if (flags)
+-        FIXME("Ignoring flags %#x.\n", flags);
++    if (flags & ~supported_flags)
++        FIXME("Ignoring flags %#x.\n", flags & ~supported_flags);
++
++    if ((swapchain->desc.Flags ^ flags) & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
++        return E_INVALIDARG;
+ 
+     for (i = 0; i < swapchain->desc.BufferCount; ++i)
+     {
+@@ -2620,6 +2636,7 @@ static HRESULT d3d12_swapchain_resize_buffers(struct d3d12_swapchain *swapchain,
+ 
+     desc = &swapchain->desc;
+     new_desc = swapchain->desc;
++    new_desc.Flags = flags;
+ 
+     if (buffer_count)
+         new_desc.BufferCount = buffer_count;
+@@ -2651,6 +2668,9 @@ static HRESULT d3d12_swapchain_resize_buffers(struct d3d12_swapchain *swapchain,
+             && desc->Format == new_desc.Format && desc->BufferCount == new_desc.BufferCount)
+     {
+         swapchain->current_buffer_index = 0;
++        /* DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE is not applicable on D3D12. So there is no need to
++         * recreate buffers when the flag gets toggled */
++        swapchain->desc.Flags = flags;
+         return S_OK;
+     }
+ 
+
+--- dlls/dxgi/utils.c
++++ dlls/dxgi/utils.c
+@@ -540,13 +540,19 @@ unsigned int dxgi_swapchain_flags_from_wined3d(unsigned int wined3d_flags)
+         flags |= DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE;
+     }
+ 
++    if (wined3d_flags & WINED3D_SWAPCHAIN_FRAME_LATENCY_WAITABLE_OBJECT)
++    {
++        wined3d_flags &= ~WINED3D_SWAPCHAIN_FRAME_LATENCY_WAITABLE_OBJECT;
++        flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
++    }
++
+     if (wined3d_flags)
+         FIXME("Unhandled flags %#x.\n", flags);
+ 
+     return flags;
+ }
+ 
+-static unsigned int wined3d_swapchain_flags_from_dxgi(unsigned int flags)
++unsigned int wined3d_swapchain_flags_from_dxgi(unsigned int flags)
+ {
+     unsigned int wined3d_flags = DXGI_WINED3D_SWAPCHAIN_FLAGS; /* WINED3D_SWAPCHAIN_DISCARD_DEPTHSTENCIL? */
+ 
+
+--- dlls/gdiplus/tests/graphics.c
++++ dlls/gdiplus/tests/graphics.c
+@@ -3407,7 +3407,7 @@ static void test_string_functions(void)
+     expectf(0.0, bounds.X);
+     expectf(0.0, bounds.Y);
+     todo_wine expect(5, codepointsfitted);
+-    todo_wine expect(1, linesfilled);
++    expect(1, linesfilled);
+ 
+     /* Cut off everything after the first space. */
+     rc.Width = char_bounds.Width + char_width * 2.1;
+@@ -3443,7 +3443,7 @@ static void test_string_functions(void)
+     expectf_(char_bounds.Width, bounds.Width, 0.01);
+     expectf_(char_bounds.Height + char_height * 3, bounds.Height, 0.05);
+     expect(6, codepointsfitted);
+-    todo_wine expect(4, linesfilled);
++    expect(4, linesfilled);
+ 
+     for (i = 0; i < 4; i++)
+         regions[i] = (GpRegion *)0xdeadbeef;
+
+--- dlls/gdiplus/graphics.c
++++ dlls/gdiplus/graphics.c
+@@ -5815,7 +5815,7 @@ GpStatus gdip_format_string(GpGraphics *graphics, HDC hdc,
+                break;
+             }
+ 
+-            if(*(stringdup + sum + lret) == '\r' && lret + 1 < fit
++            if(*(stringdup + sum + lret) == '\r' && sum + lret + 1 < length
+                && *(stringdup + sum + lret + 1) == '\n')
+             {
+                unixstyle_newline = FALSE;
+@@ -5823,6 +5823,30 @@ GpStatus gdip_format_string(GpGraphics *graphics, HDC hdc,
+             }
+         }
+ 
++        /* If no newline found within fit, check position fit for \n or \r\n.
++         * Wine's GetTextExtentExPointW may assign non-zero advance width to
++         * newline characters (rendering them as missing-glyph boxes), causing
++         * them to be excluded from the fit count. When this happens, the
++         * newline is invisible to the scan above, leading to incorrect line
++         * breaking under StringFormatFlagsNoWrap. */
++        if (lret == fit && sum + fit < length)
++        {
++            if (*(stringdup + sum + fit) == '\n')
++            {
++                unixstyle_newline = TRUE;
++                fitcpy = fit + 1;
++                fit++;
++            }
++            else if (sum + fit + 1 < length &&
++                     *(stringdup + sum + fit) == '\r' &&
++                     *(stringdup + sum + fit + 1) == '\n')
++            {
++                unixstyle_newline = FALSE;
++                fitcpy = fit + 2;
++                fit += 2;
++            }
++        }
++
+         /* Line break code (may look strange, but it imitates windows). */
+         if(lret < fit)
+             lineend = fit = lret;    /* this is not an off-by-one error */
+
+--- dlls/kernel32/tests/file.c
++++ dlls/kernel32/tests/file.c
+@@ -5806,6 +5806,16 @@ static void test_GetFinalPathNameByHandleW(void)
+     wcscpy(test_path, temp_path);
+     wcscat(test_path, L"link");
+     success = CreateSymbolicLinkW(test_path, temp_path, SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE);
++    if (!success && GetLastError() == ERROR_PRIVILEGE_NOT_HELD)
++    {
++        win_skip("Insufficient permissions to perform symlink tests.\n");
++        return;
++    }
++    if (!success && GetLastError() == ERROR_INVALID_PARAMETER /* <= Win10v1607 */)
++    {
++        win_skip("Flag SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE not supported, skipping test.\n");
++        return;
++    }
+     ok(success, "got error %ld.\n", GetLastError());
+ 
+     wcscpy(test_path, temp_path);
+
+--- dlls/kernel32/tests/heap.c
++++ dlls/kernel32/tests/heap.c
+@@ -974,7 +974,6 @@ static void test_HeapCreate(void)
+     SetLastError( 0xdeadbeef );
+     while ((ret = HeapWalk( heap, &entry ))) entries[count++] = entry;
+     ok( GetLastError() == ERROR_NO_MORE_ITEMS, "got error %lu\n", GetLastError() );
+-    todo_wine
+     ok( count > 24, "got count %lu\n", count );
+     if (count < 2) count = 2;
+ 
+@@ -983,15 +982,13 @@ static void test_HeapCreate(void)
+     ok( entries[0].cbData <= 0x1000 /* sizeof(*heap) */, "got cbData %#lx\n", entries[0].cbData );
+     ok( entries[0].cbOverhead == 0, "got cbOverhead %#x\n", entries[0].cbOverhead );
+     ok( entries[0].iRegionIndex == 0, "got iRegionIndex %d\n", entries[0].iRegionIndex );
+-    todo_wine /* Wine currently reports the LFH group as a single block here */
+     ok( entries[1].wFlags == 0, "got wFlags %#x\n", entries[1].wFlags );
+ 
+     for (i = 0; i < 0x12; i++)
+     {
+-        todo_wine
+         ok( entries[4 + i].wFlags == 0, "got wFlags %#x\n", entries[4 + i].wFlags );
+-        todo_wine
+-        ok( entries[4 + i].cbData == 0x20, "got cbData %#lx\n", entries[4 + i].cbData );
++        /* FIXME: all should be 0x20, but now win32 = 0x20, win64 = 0x18 */
++        ok( entries[4 + i].cbData == 0x20 || entries[4 + i].cbData == 0x18, "got cbData %#lx\n", entries[4 + i].cbData );
+         todo_wine
+         ok( entries[4 + i].cbOverhead == 2 * sizeof(void *), "got cbOverhead %#x\n", entries[4 + i].cbOverhead );
+     }
+@@ -1007,10 +1004,10 @@ static void test_HeapCreate(void)
+     rtl_entry.lpData = NULL;
+     SetLastError( 0xdeadbeef );
+     while (!RtlWalkHeap( heap, &rtl_entry )) rtl_entries[count++] = rtl_entry;
+-    todo_wine
+     ok( count > 24, "got count %lu\n", count );
+     if (count < 2) count = 2;
+ 
++
+     for (i = 3; i < count; ++i)
+     {
+         winetest_push_context( "%Iu", i );
+@@ -1050,7 +1047,6 @@ static void test_HeapCreate(void)
+     SetLastError( 0xdeadbeef );
+     while ((ret = HeapWalk( heap, &entry ))) entries[count++] = entry;
+     ok( GetLastError() == ERROR_NO_MORE_ITEMS, "got error %lu\n", GetLastError() );
+-    todo_wine
+     ok( count > 24, "got count %lu\n", count );
+     if (count < 2) count = 2;
+ 
+@@ -1064,8 +1060,8 @@ static void test_HeapCreate(void)
+     for (i = 1; i < count - 2; i++)
+     {
+         if (entries[i].wFlags != PROCESS_HEAP_ENTRY_BUSY) continue;
+-        todo_wine /* Wine currently reports the LFH group as a single block */
+         ok( entries[i].cbData == 0x18 + 2 * sizeof(void *), "got cbData %#lx\n", entries[i].cbData );
++        todo_wine_if(sizeof(void *) == 4)
+         ok( entries[i].cbOverhead == 0x8, "got cbOverhead %#x\n", entries[i].cbOverhead );
+     }
+ 
+@@ -1080,7 +1076,6 @@ static void test_HeapCreate(void)
+     rtl_entry.lpData = NULL;
+     SetLastError( 0xdeadbeef );
+     while (!RtlWalkHeap( heap, &rtl_entry )) rtl_entries[count++] = rtl_entry;
+-    todo_wine
+     ok( count > 24, "got count %lu\n", count );
+     if (count < 2) count = 2;
+ 
+@@ -1273,6 +1268,155 @@ static struct mem_entry *mem_entry_from_HANDLE( HLOCAL handle )
+     return CONTAINING_RECORD( handle, struct mem_entry, ptr );
+ }
+ 
++static DWORD count_busy_entries( HANDLE heap, SIZE_T *busy_bytes )
++{
++    PROCESS_HEAP_ENTRY entry;
++    DWORD busy_count = 0;
++    *busy_bytes = 0;
++
++    memset( &entry, 0, sizeof(entry) );
++    HeapLock( heap );
++    while (HeapWalk( heap, &entry ))
++    {
++        if (entry.wFlags & PROCESS_HEAP_ENTRY_BUSY)
++        {
++            busy_count++;
++            *busy_bytes += entry.cbData;
++        }
++    }
++    HeapUnlock( heap );
++    return busy_count;
++}
++
++static void test_HeapWalk_LFH(void)
++{
++    HANDLE heap;
++    ULONG compat_info;
++    void **blocks;
++    SIZE_T busy_bytes, alloc_count = 150;
++    DWORD busy_count;
++    SIZE_T i;
++    BOOL ret;
++
++    /* Wine bug 59938: HeapWalk reports cached LFH group containers as
++     * PROCESS_HEAP_ENTRY_BUSY after every application block has been freed.
++     *
++     * In heap_walk_blocks() (dlls/ntdll/heap.c), the only check is:
++     *     if (block_get_flags(block) & BLOCK_FLAG_FREE) -> FREE
++     *     else -> BUSY
++     * An LFH group container has BLOCK_FLAG_LFH but NOT BLOCK_FLAG_FREE
++     * while the bin keeps it cached, so it is incorrectly reported as BUSY.
++     *
++     * On Windows, HeapWalk reports 0 BUSY entries after all blocks are freed
++     * on a private LFH heap. On Wine, cached group containers cause a
++     * non-zero count. */
++
++    blocks = HeapAlloc( GetProcessHeap(), 0, alloc_count * sizeof(*blocks) );
++    ok( !!blocks, "HeapAlloc failed\n" );
++
++    /* Test 1: LFH heap, allocate then free all blocks. */
++
++    heap = HeapCreate( 0, 0, 0 );
++    ok( !!heap, "HeapCreate failed, error %lu\n", GetLastError() );
++
++    compat_info = 2; /* enable LFH */
++    ret = pHeapSetInformation( heap, HeapCompatibilityInformation, &compat_info, sizeof(compat_info) );
++    ok( ret, "HeapSetInformation failed, error %lu\n", GetLastError() );
++
++    for (i = 0; i < alloc_count; i++)
++    {
++        blocks[i] = HeapAlloc( heap, 0, 16 + (i % 8) * 16 );
++        ok( !!blocks[i], "HeapAlloc %Iu failed, error %lu\n", i, GetLastError() );
++    }
++
++    for (i = 0; i < alloc_count; i++)
++    {
++        ret = HeapFree( heap, 0, blocks[i] );
++        ok( ret, "HeapFree %Iu failed, error %lu\n", i, GetLastError() );
++    }
++
++    busy_count = count_busy_entries( heap, &busy_bytes );
++    ok( busy_count == 0, "expected 0 BUSY entries after freeing all blocks, got %lu (%Iu bytes)\n",
++        busy_count, busy_bytes );
++
++    ret = HeapDestroy( heap );
++    ok( ret, "HeapDestroy failed, error %lu\n", GetLastError() );
++
++
++    /* Test 2: LFH heap with ReAlloc, then free all blocks.
++     * HeapReAlloc to grow blocks forces relocation out of LFH slots,
++     * leaving behind cached group containers that are never reclaimed. */
++
++    heap = HeapCreate( 0, 0, 0 );
++    // ok( !!heap, "HeapCreate failed, error %lu\n", GetLastError() );
++
++    compat_info = 2;
++    ret = pHeapSetInformation( heap, HeapCompatibilityInformation, &compat_info, sizeof(compat_info) );
++    ok( ret, "HeapSetInformation failed, error %lu\n", GetLastError() );
++
++    for (i = 0; i < alloc_count; i++)
++    {
++        blocks[i] = HeapAlloc( heap, 0, 16 + (i % 8) * 16 );
++        ok( !!blocks[i], "HeapAlloc %Iu failed, error %lu\n", i, GetLastError() );
++    }
++
++    for (i = 0; i < alloc_count; i++)
++    {
++        void *p = HeapReAlloc( heap, 0, blocks[i], 256 + (i % 16) * 32 );
++        ok( !!p, "HeapReAlloc %Iu failed, error %lu\n", i, GetLastError() );
++        if (p) blocks[i] = p;
++    }
++
++    for (i = 0; i < alloc_count; i++)
++    {
++        ret = HeapFree( heap, 0, blocks[i] );
++        ok( ret, "HeapFree %Iu failed, error %lu\n", i, GetLastError() );
++    }
++
++    busy_count = count_busy_entries( heap, &busy_bytes );
++    ok( busy_count == 0, "expected 0 BUSY entries after freeing all blocks, got %lu (%Iu bytes)\n",
++        busy_count, busy_bytes );
++
++    ret = HeapDestroy( heap );
++    ok( ret, "HeapDestroy failed, error %lu\n", GetLastError() );
++
++
++    /* Test 3: BUSY count before vs after free on LFH heap.
++     * While blocks are allocated, BUSY count should be non-zero.
++     * After freeing all, BUSY count should be 0. */
++
++    heap = HeapCreate( 0, 0, 0 );
++    ok( !!heap, "HeapCreate failed, error %lu\n", GetLastError() );
++
++    compat_info = 2;
++    ret = pHeapSetInformation( heap, HeapCompatibilityInformation, &compat_info, sizeof(compat_info) );
++    ok( ret, "HeapSetInformation failed, error %lu\n", GetLastError() );
++
++    for (i = 0; i < alloc_count; i++)
++    {
++        blocks[i] = HeapAlloc( heap, 0, 32 ); /* uniform size -> single LFH bin */
++        ok( !!blocks[i], "HeapAlloc %Iu failed, error %lu\n", i, GetLastError() );
++    }
++
++    busy_count = count_busy_entries( heap, &busy_bytes );
++    ok( busy_count > 0, "expected some BUSY entries while blocks are allocated, got %lu\n", busy_count );
++
++    for (i = 0; i < alloc_count; i++)
++    {
++        ret = HeapFree( heap, 0, blocks[i] );
++        ok( ret, "HeapFree %Iu failed, error %lu\n", i, GetLastError() );
++    }
++
++    busy_count = count_busy_entries( heap, &busy_bytes );
++    ok( busy_count == 0, "expected 0 BUSY entries after freeing all blocks, got %lu (%Iu bytes)\n",
++        busy_count, busy_bytes );
++
++    ret = HeapDestroy( heap );
++    ok( ret, "HeapDestroy failed, error %lu\n", GetLastError() );
++
++    HeapFree( GetProcessHeap(), 0, blocks );
++}
++
+ static BOOL is_mem_entry( HLOCAL handle )
+ {
+     return ((UINT_PTR)handle & ((sizeof(void *) << 1) - 1)) == sizeof(void *);
+@@ -3877,6 +4021,7 @@ START_TEST(heap)
+     }
+ 
+     test_HeapCreate();
++    test_HeapWalk_LFH();
+     test_GlobalAlloc();
+     test_LocalAlloc();
+ 
+
+--- dlls/mf/tests/transform.c
++++ dlls/mf/tests/transform.c
+@@ -7370,7 +7370,6 @@ static void test_wmv_decoder(BOOL use_2d_buffer)
+             .output_sample_desc = &output_sample_desc_rgb,
+             .result_bitmap = use_2d_buffer ? L"rgb32frame.bmp" : L"rgb32frame-flip.bmp",
+             .delta = 5,
+-            .todo = use_2d_buffer,
+         },
+ 
+         {
+@@ -7393,7 +7392,6 @@ static void test_wmv_decoder(BOOL use_2d_buffer)
+             .output_sample_desc = &output_sample_desc_rgb,
+             .result_bitmap = use_2d_buffer ? L"rgb32frame.bmp" : L"rgb32frame-flip.bmp",
+             .delta = 5,
+-            .todo = use_2d_buffer,
+         },
+ 
+         {
+@@ -7417,7 +7415,6 @@ static void test_wmv_decoder(BOOL use_2d_buffer)
+             .output_sample_desc = &output_sample_desc_rgb,
+             .result_bitmap = use_2d_buffer ? L"rgb32frame-flip.bmp" : L"rgb32frame.bmp",
+             .delta = 5,
+-            .todo = use_2d_buffer,
+         },
+ 
+         {
+
+--- dlls/msxml3/tests/domdoc.c
++++ dlls/msxml3/tests/domdoc.c
+@@ -4789,6 +4789,55 @@ static void test_IXMLDOMDocument2(void)
+     ok(!wcscmp(V_BSTR(&var), L"XSLPattern"), "Unexpected value %s.\n", debugstr_w(V_BSTR(&var)));
+     VariantClear(&var);
+ 
++    /* Empty or null value will reset a property. */
++    V_VT(&var) = VT_BSTR;
++    V_BSTR(&var) = SysAllocString(L"xmlns:ns=\'uri\'");
++    hr = IXMLDOMDocument2_setProperty(doc2, _bstr_("SelectionNamespaces"), var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    VariantClear(&var);
++
++    memset(&var, 0, sizeof(var));
++    hr = IXMLDOMDocument2_getProperty(doc2, _bstr_("SelectionNamespaces"), &var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(!wcscmp(V_BSTR(&var), L"xmlns:ns=\'uri\'"), "Unexpected value %s.\n", debugstr_w(V_BSTR(&var)));
++    VariantClear(&var);
++
++    V_VT(&var) = VT_BSTR;
++    V_BSTR(&var) = NULL;
++    hr = IXMLDOMDocument2_setProperty(doc2, _bstr_("SelectionNamespaces"), var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    VariantClear(&var);
++
++    memset(&var, 0, sizeof(var));
++    hr = IXMLDOMDocument2_getProperty(doc2, _bstr_("SelectionNamespaces"), &var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(!wcscmp(V_BSTR(&var), L""), "Unexpected value %s.\n", debugstr_w(V_BSTR(&var)));
++    VariantClear(&var);
++
++    V_VT(&var) = VT_BSTR;
++    V_BSTR(&var) = SysAllocString(L"xmlns:ns=\'uri\'");
++    hr = IXMLDOMDocument2_setProperty(doc2, _bstr_("SelectionNamespaces"), var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    VariantClear(&var);
++
++    memset(&var, 0, sizeof(var));
++    hr = IXMLDOMDocument2_getProperty(doc2, _bstr_("SelectionNamespaces"), &var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(!wcscmp(V_BSTR(&var), L"xmlns:ns=\'uri\'"), "Unexpected value %s.\n", debugstr_w(V_BSTR(&var)));
++    VariantClear(&var);
++
++    V_VT(&var) = VT_BSTR;
++    V_BSTR(&var) = SysAllocString(L"");
++    hr = IXMLDOMDocument2_setProperty(doc2, _bstr_("SelectionNamespaces"), var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    VariantClear(&var);
++
++    memset(&var, 0, sizeof(var));
++    hr = IXMLDOMDocument2_getProperty(doc2, _bstr_("SelectionNamespaces"), &var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(!wcscmp(V_BSTR(&var), L""), "Unexpected value %s.\n", debugstr_w(V_BSTR(&var)));
++    VariantClear(&var);
++
+     IXMLDOMDocument2_Release( doc2 );
+     IXMLDOMDocument_Release( doc );
+     free_bstrs();
+
+--- dlls/msxml3/xpath.c
++++ dlls/msxml3/xpath.c
+@@ -7749,6 +7749,9 @@ HRESULT xpath_parse_selection_namespaces(const WCHAR *value, struct domdoc_prope
+     HRESULT hr = S_OK;
+     WCHAR *uri;
+ 
++    if (!value)
++        return S_OK;
++
+     ctxt.cur = ctxt.base = value;
+ 
+     while (*ctxt.cur)
+
+--- dlls/msxml6/tests/domdoc.c
++++ dlls/msxml6/tests/domdoc.c
+@@ -1277,6 +1277,69 @@ static void test_max_element_depth_values(void)
+     free_bstrs();
+ }
+ 
++static void test_selection_namespaces(void)
++{
++    IXMLDOMDocument2 *doc;
++    VARIANT var;
++    HRESULT hr;
++
++    hr = CoCreateInstance(&CLSID_DOMDocument60, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IXMLDOMDocument2, (void **)&doc);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    /* Empty or null value will reset a property. */
++    V_VT(&var) = VT_BSTR;
++    V_BSTR(&var) = SysAllocString(L"xmlns:ns=\'uri\'");
++    hr = IXMLDOMDocument2_setProperty(doc, _bstr_(L"SelectionNamespaces"), var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    VariantClear(&var);
++
++    memset(&var, 0, sizeof(var));
++    hr = IXMLDOMDocument2_getProperty(doc, _bstr_(L"SelectionNamespaces"), &var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(!wcscmp(V_BSTR(&var), L"xmlns:ns=\'uri\'"), "Unexpected value %s.\n", debugstr_w(V_BSTR(&var)));
++    VariantClear(&var);
++
++    V_VT(&var) = VT_BSTR;
++    V_BSTR(&var) = NULL;
++    hr = IXMLDOMDocument2_setProperty(doc, _bstr_(L"SelectionNamespaces"), var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    VariantClear(&var);
++
++    memset(&var, 0, sizeof(var));
++    hr = IXMLDOMDocument2_getProperty(doc, _bstr_(L"SelectionNamespaces"), &var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(!wcscmp(V_BSTR(&var), L""), "Unexpected value %s.\n", debugstr_w(V_BSTR(&var)));
++    VariantClear(&var);
++
++    V_VT(&var) = VT_BSTR;
++    V_BSTR(&var) = SysAllocString(L"xmlns:ns=\'uri\'");
++    hr = IXMLDOMDocument2_setProperty(doc, _bstr_(L"SelectionNamespaces"), var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    VariantClear(&var);
++
++    memset(&var, 0, sizeof(var));
++    hr = IXMLDOMDocument2_getProperty(doc, _bstr_(L"SelectionNamespaces"), &var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(!wcscmp(V_BSTR(&var), L"xmlns:ns=\'uri\'"), "Unexpected value %s.\n", debugstr_w(V_BSTR(&var)));
++    VariantClear(&var);
++
++    V_VT(&var) = VT_BSTR;
++    V_BSTR(&var) = SysAllocString(L"");
++    hr = IXMLDOMDocument2_setProperty(doc, _bstr_(L"SelectionNamespaces"), var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    VariantClear(&var);
++
++    memset(&var, 0, sizeof(var));
++    hr = IXMLDOMDocument2_getProperty(doc, _bstr_(L"SelectionNamespaces"), &var);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    ok(!wcscmp(V_BSTR(&var), L""), "Unexpected value %s.\n", debugstr_w(V_BSTR(&var)));
++    VariantClear(&var);
++
++    IXMLDOMDocument2_Release(doc);
++    free_bstrs();
++}
++
+ START_TEST(domdoc)
+ {
+     HRESULT hr;
+@@ -1303,6 +1366,7 @@ START_TEST(domdoc)
+     test_interfaces();
+     test_dtd_validation();
+     test_max_element_depth_values();
++    test_selection_namespaces();
+ 
+     CoUninitialize();
+ }
+
+--- dlls/ntdll/heap.c
++++ dlls/ntdll/heap.c
+@@ -355,6 +355,12 @@ static inline void block_set_base( struct block *block, const void *base )
+     block->base_offset = (offset - (char *)base) / REGION_ALIGN;
+ }
+ 
++static inline void *block_get_base( const struct block *block, WORD base_offset )
++{
++    const char *offset = (const char *)((UINT_PTR)block & ~(REGION_ALIGN - 1));
++    return (void *)(offset - (UINT_PTR)base_offset * REGION_ALIGN);
++}
++
+ static inline void block_set_type( struct block *block, UINT type )
+ {
+     block->block_type = type;
+@@ -2401,8 +2407,12 @@ static NTSTATUS heap_walk_blocks( const struct heap *heap, const SUBHEAP *subhea
+     const struct block *blocks = first_block( subheap );
+ 
+     if (entry->lpData == commit_end) return STATUS_NO_MORE_ENTRIES;
+-    if (entry->lpData == base) block = blocks;
+-    else if (!(block = next_block( subheap, block )))
++    if (entry->lpData == base)
++        block = blocks;
++    else
++        block = next_block( subheap, block );
++
++    if (!block)
+     {
+         entry->lpData = (void *)commit_end;
+         entry->cbData = end - commit_end;
+@@ -2412,6 +2422,15 @@ static NTSTATUS heap_walk_blocks( const struct heap *heap, const SUBHEAP *subhea
+         return STATUS_SUCCESS;
+     }
+ 
++    if (block_get_flags( block ) & BLOCK_FLAG_LFH)
++    {
++        if (block_get_base(block, block->base_offset) == subheap_base(subheap))
++        {
++            struct group* group = (struct group *)(block + 1);
++            block = &group->first_block;
++        }
++    }
++
+     if (block_get_flags( block ) & BLOCK_FLAG_FREE)
+     {
+         entry->lpData = (char *)block + block_get_overhead( block );
+
+--- dlls/ntdll/loader.c
++++ dlls/ntdll/loader.c
+@@ -127,6 +127,7 @@ static const char * const reason_names[] =
+ struct file_id
+ {
+     BYTE ObjectId[16];
++    BYTE BirthVolumeId[16];
+ };
+ 
+ #define HASH_MAP_SIZE 32
+@@ -2723,7 +2724,8 @@ static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDL
+ 
+     if (!NtFsControlFile( handle, 0, NULL, NULL, &io, FSCTL_GET_OBJECT_ID, NULL, 0, &fid, sizeof(fid) ))
+     {
+-        memcpy( id, fid.ObjectId, sizeof(*id) );
++        memcpy( id->ObjectId, fid.ObjectId, sizeof(id->ObjectId) );
++        memcpy( id->BirthVolumeId, fid.BirthVolumeId, sizeof(id->BirthVolumeId) );
+         if ((*pwm = find_fileid_module( id )))
+         {
+             TRACE( "%s is the same file as existing module %p %s\n", debugstr_w( nt_name->Buffer ),
+
+--- dlls/shell32/tests/shellpath.c
++++ dlls/shell32/tests/shellpath.c
+@@ -1332,6 +1332,15 @@ static const struct knownFolderDef known_folders[] = {
+                  NULL,
+                  0,
+                  KFDF_PRECREATE | KFDF_ROAMABLE),
++    KNOWN_FOLDER(FOLDERID_AppDataDocuments,
++                 NO_CSIDL,
++                 "AppDataDocuments",
++                 KF_CATEGORY_PERUSER,
++                 FOLDERID_LocalAppData, GUID_NULL,
++                 "Documents",
++                 NULL,
++                 0,
++                 KFDF_PRECREATE | KFDF_ROAMABLE),
+ };
+ #undef KNOWN_FOLDER
+ BOOL known_folder_found[ARRAY_SIZE(known_folders)];
+
+--- dlls/shell32/shellpath.c
++++ dlls/shell32/shellpath.c
+@@ -2094,6 +2094,15 @@ static const CSIDL_DATA CSIDL_Data[] =
+         .path       = L"Screenshots",
+         .flags      = KFDF_PRECREATE | KFDF_ROAMABLE,
+     },
++    { /* 0x75 */
++        .id         = &FOLDERID_AppDataDocuments,
++        .type       = CSIDL_Type_User,
++        .category   = KF_CATEGORY_PERUSER,
++        .name       = L"AppDataDocuments",
++        .parent     = &FOLDERID_LocalAppData,
++        .path       = L"Documents",
++        .flags      = KFDF_PRECREATE | KFDF_ROAMABLE,
++    },
+ };
+ 
+ static int csidl_from_id( const KNOWNFOLDERID *id )
+
+--- dlls/wined3d/device.c
++++ dlls/wined3d/device.c
+@@ -5005,6 +5005,7 @@ HRESULT CDECL wined3d_device_reset(struct wined3d_device *device,
+     static struct wined3d_rendertarget_view *const views[WINED3D_MAX_RENDER_TARGETS];
+     const struct wined3d_d3d_info *d3d_info = &device->adapter->d3d_info;
+     struct wined3d_device_context *context = &device->cs->c;
++    BOOL backbuffer_resized, flags_changed, windowed;
+     struct wined3d_swapchain_state *swapchain_state;
+     struct wined3d_state *state = context->state;
+     struct wined3d_swapchain_desc *current_desc;
+@@ -5012,7 +5013,6 @@ HRESULT CDECL wined3d_device_reset(struct wined3d_device *device,
+     struct wined3d_rendertarget_view *view;
+     struct wined3d_swapchain *swapchain;
+     struct wined3d_view_desc view_desc;
+-    BOOL backbuffer_resized, windowed;
+     HRESULT hr = WINED3D_OK;
+     HWND device_window;
+     unsigned int i;
+@@ -5112,6 +5112,7 @@ HRESULT CDECL wined3d_device_reset(struct wined3d_device *device,
+ 
+     backbuffer_resized = swapchain_desc->backbuffer_width != current_desc->backbuffer_width
+             || swapchain_desc->backbuffer_height != current_desc->backbuffer_height;
++    flags_changed = swapchain_desc->flags != current_desc->flags;
+     windowed = current_desc->windowed;
+ 
+     if (!swapchain_desc->windowed != !windowed || swapchain->reapply_mode
+@@ -5166,13 +5167,11 @@ HRESULT CDECL wined3d_device_reset(struct wined3d_device *device,
+ 
+     if (FAILED(hr = wined3d_swapchain_resize_buffers(swapchain, swapchain_desc->backbuffer_count,
+             swapchain_desc->backbuffer_width, swapchain_desc->backbuffer_height, swapchain_desc->backbuffer_format,
+-            swapchain_desc->multisample_type, swapchain_desc->multisample_quality)))
++            swapchain_desc->multisample_type, swapchain_desc->multisample_quality, swapchain_desc->flags)))
+         return hr;
+ 
+-    if (swapchain_desc->flags != current_desc->flags)
++    if (flags_changed)
+     {
+-        current_desc->flags = swapchain_desc->flags;
+-
+         update_swapchain_flags(swapchain->front_buffer);
+         for (i = 0; i < current_desc->backbuffer_count; ++i)
+         {
+
+--- dlls/wined3d/swapchain.c
++++ dlls/wined3d/swapchain.c
+@@ -2030,7 +2030,8 @@ void wined3d_swapchain_activate(struct wined3d_swapchain *swapchain, BOOL activa
+ 
+ HRESULT CDECL wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapchain, unsigned int buffer_count,
+         unsigned int width, unsigned int height, enum wined3d_format_id format_id,
+-        enum wined3d_multisample_type multisample_type, unsigned int multisample_quality)
++        enum wined3d_multisample_type multisample_type, unsigned int multisample_quality,
++        unsigned int flags)
+ {
+     struct wined3d_swapchain_desc *desc = &swapchain->state.desc;
+     bool recreate = false;
+@@ -2096,6 +2097,13 @@ HRESULT CDECL wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapcha
+         recreate = true;
+     }
+ 
++    if (flags)
++    {
++        if ((desc->flags ^ flags) & WINED3D_SWAPCHAIN_GDI_COMPATIBLE)
++            recreate = true;
++        desc->flags = flags;
++    }
++
+     if (recreate)
+     {
+         struct wined3d_texture *new_texture;
+
+--- dlls/wined3d/wined3d.spec
++++ dlls/wined3d/wined3d.spec
+@@ -310,7 +310,7 @@
+ @ cdecl wined3d_swapchain_get_state(ptr)
+ @ cdecl wined3d_swapchain_incref(ptr)
+ @ cdecl wined3d_swapchain_present(ptr ptr ptr ptr long long)
+-@ cdecl wined3d_swapchain_resize_buffers(ptr long long long long long long)
++@ cdecl wined3d_swapchain_resize_buffers(ptr long long long long long long long)
+ @ cdecl wined3d_swapchain_set_gamma_ramp(ptr long ptr)
+ @ cdecl wined3d_swapchain_set_max_frame_latency(ptr long)
+ @ cdecl wined3d_swapchain_set_palette(ptr ptr)
+
+--- dlls/winegstreamer/unixlib.h
++++ dlls/winegstreamer/unixlib.h
+@@ -192,7 +192,7 @@ struct wg_sample
+     UINT32 flags;
+     UINT32 max_size;
+     UINT32 size;
+-    UINT32 stride;
++    INT32 stride;
+     UINT64 data; /* pointer to user memory */
+ };
+ 
+@@ -335,7 +335,7 @@ struct wg_parser_stream_seek_params
+ struct wg_transform_attrs
+ {
+     UINT32 output_plane_align;
+-    UINT32 output_plane_stride;
++    INT32 output_plane_stride;
+     UINT32 input_queue_length;
+     BOOL allow_format_change;
+     BOOL low_latency;
+
+--- dlls/winegstreamer/wg_sample.c
++++ dlls/winegstreamer/wg_sample.c
+@@ -125,8 +125,6 @@ HRESULT wg_sample_create_mf(IMFSample *mf_sample, struct wg_sample **out)
+             sample->u.mf.buffer = NULL;
+             sample->u.mf.buffer2d = buffer2d;
+             IMF2DBuffer2_GetContiguousLength(buffer2d, &current_length);
+-            if (pitch < 0)
+-                pitch = -pitch;
+         }
+         else
+         {
+
+--- dlls/winegstreamer/wg_transform.c
++++ dlls/winegstreamer/wg_transform.c
+@@ -103,10 +103,11 @@ static struct wg_transform *get_transform(wg_transform_t trans)
+     return (struct wg_transform *)(ULONG_PTR)trans;
+ }
+ 
+-static void align_video_info_planes(MFVideoInfo *video_info, gsize plane_align, guint stride,
++static void align_video_info_planes(MFVideoInfo *video_info, gsize plane_align, gint stride,
+         GstVideoInfo *info, GstVideoAlignment *align)
+ {
+     bool fix_nv12 = !plane_align && info->finfo->format == GST_VIDEO_FORMAT_NV12 && (info->width & 3) && (info->width & 3) != 3;
++    bool bottom_up = video_info->VideoFlags & MFVideoFlag_BottomUpLinearRep;
+     const MFVideoArea *aperture = &video_info->MinimumDisplayAperture;
+ 
+     gst_video_alignment_reset(align);
+@@ -133,6 +134,10 @@ static void align_video_info_planes(MFVideoInfo *video_info, gsize plane_align,
+         gst_video_format_info_component(finfo, 0, comp);
+         pixel_stride = finfo->pixel_stride[comp[0]];
+ 
++        bottom_up = stride < 0;
++        if (bottom_up)
++            stride = -stride;
++
+         if (stride % pixel_stride)
+             GST_ERROR("Stride %u not aligned to pixel size", stride);
+         stride /= pixel_stride;
+@@ -143,7 +148,7 @@ static void align_video_info_planes(MFVideoInfo *video_info, gsize plane_align,
+             align->padding_right += stride - width;
+     }
+ 
+-    if (video_info->VideoFlags & MFVideoFlag_BottomUpLinearRep)
++    if (bottom_up)
+     {
+         gsize top = align->padding_top;
+         align->padding_top = align->padding_bottom;
+@@ -169,7 +174,7 @@ static void align_video_info_planes(MFVideoInfo *video_info, gsize plane_align,
+         gst_video_info_align(info, align);
+     }
+ 
+-    if (video_info->VideoFlags & MFVideoFlag_BottomUpLinearRep)
++    if (bottom_up)
+     {
+         for (guint i = 0; i < ARRAY_SIZE(info->offset); ++i)
+         {
+
+--- dlls/winevulkan/loader_thunks.c
++++ dlls/winevulkan/loader_thunks.c
+@@ -5266,6 +5266,14 @@ VkResult WINAPI vkGetImageViewOpaqueCaptureDescriptorDataEXT(VkDevice device, co
+     return params.result;
+ }
+ 
++void WINAPI vkGetLatencyTimingsLegacyNV(VkDevice device, void *pTimings)
++{
++    struct vkGetLatencyTimingsLegacyNV_params params;
++    params.device = device;
++    params.pTimings = pTimings;
++    UNIX_CALL_CHECKED(vkGetLatencyTimingsLegacyNV, &params);
++}
++
+ void WINAPI vkGetLatencyTimingsNV(VkDevice device, VkSwapchainKHR swapchain, VkGetLatencyMarkerInfoNV *pLatencyMarkerInfo)
+ {
+     struct vkGetLatencyTimingsNV_params params;
+@@ -6220,6 +6228,14 @@ void WINAPI vkGetShaderModuleIdentifierEXT(VkDevice device, VkShaderModule shade
+     UNIX_CALL_CHECKED(vkGetShaderModuleIdentifierEXT, &params);
+ }
+ 
++void WINAPI vkGetSleepStatusLegacyNV(VkDevice device, VkBool32 *pLowLatencyMode)
++{
++    struct vkGetSleepStatusLegacyNV_params params;
++    params.device = device;
++    params.pLowLatencyMode = pLowLatencyMode;
++    UNIX_CALL_CHECKED(vkGetSleepStatusLegacyNV, &params);
++}
++
+ VkResult WINAPI vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain, uint32_t *pSwapchainImageCount, VkImage *pSwapchainImages)
+ {
+     struct vkGetSwapchainImagesKHR_params params;
+@@ -6352,6 +6368,15 @@ VkResult WINAPI vkInvalidateMappedMemoryRanges(VkDevice device, uint32_t memoryR
+     return params.result;
+ }
+ 
++void WINAPI vkLatencySleepLegacyNV(VkDevice device, VkSemaphore signalSemaphore, uint64_t value)
++{
++    struct vkLatencySleepLegacyNV_params params;
++    params.device = device;
++    params.signalSemaphore = signalSemaphore;
++    params.value = value;
++    UNIX_CALL_CHECKED(vkLatencySleepLegacyNV, &params);
++}
++
+ VkResult WINAPI vkLatencySleepNV(VkDevice device, VkSwapchainKHR swapchain, const VkLatencySleepInfoNV *pSleepInfo)
+ {
+     struct vkLatencySleepNV_params params;
+@@ -6451,6 +6476,14 @@ void WINAPI vkQueueInsertDebugUtilsLabelEXT(VkQueue queue, const VkDebugUtilsLab
+     UNIX_CALL_CHECKED(vkQueueInsertDebugUtilsLabelEXT, &params);
+ }
+ 
++void WINAPI vkQueueNotifyOutOfBandLegacyNV(VkQueue queue, uint32_t queueType)
++{
++    struct vkQueueNotifyOutOfBandLegacyNV_params params;
++    params.queue = queue;
++    params.queueType = queueType;
++    UNIX_CALL_CHECKED(vkQueueNotifyOutOfBandLegacyNV, &params);
++}
++
+ void WINAPI vkQueueNotifyOutOfBandNV(VkQueue queue, const VkOutOfBandQueueTypeInfoNV *pQueueTypeInfo)
+ {
+     struct vkQueueNotifyOutOfBandNV_params params;
+@@ -6714,6 +6747,15 @@ void WINAPI vkSetHdrMetadataEXT(VkDevice device, uint32_t swapchainCount, const
+     UNIX_CALL_CHECKED(vkSetHdrMetadataEXT, &params);
+ }
+ 
++void WINAPI vkSetLatencyMarkerLegacyNV(VkDevice device, uint64_t frameID, uint32_t marker)
++{
++    struct vkSetLatencyMarkerLegacyNV_params params;
++    params.device = device;
++    params.frameID = frameID;
++    params.marker = marker;
++    UNIX_CALL_CHECKED(vkSetLatencyMarkerLegacyNV, &params);
++}
++
+ void WINAPI vkSetLatencyMarkerNV(VkDevice device, VkSwapchainKHR swapchain, const VkSetLatencyMarkerInfoNV *pLatencyMarkerInfo)
+ {
+     struct vkSetLatencyMarkerNV_params params;
+@@ -6723,6 +6765,16 @@ void WINAPI vkSetLatencyMarkerNV(VkDevice device, VkSwapchainKHR swapchain, cons
+     UNIX_CALL_CHECKED(vkSetLatencyMarkerNV, &params);
+ }
+ 
++void WINAPI vkSetLatencySleepModeLegacyNV(VkDevice device, VkBool32 lowLatencyMode, VkBool32 lowLatencyBoost, uint32_t minimumIntervalUs)
++{
++    struct vkSetLatencySleepModeLegacyNV_params params;
++    params.device = device;
++    params.lowLatencyMode = lowLatencyMode;
++    params.lowLatencyBoost = lowLatencyBoost;
++    params.minimumIntervalUs = minimumIntervalUs;
++    UNIX_CALL_CHECKED(vkSetLatencySleepModeLegacyNV, &params);
++}
++
+ VkResult WINAPI vkSetLatencySleepModeNV(VkDevice device, VkSwapchainKHR swapchain, const VkLatencySleepModeInfoNV *pSleepModeInfo)
+ {
+     struct vkSetLatencySleepModeNV_params params;
+@@ -6767,6 +6819,13 @@ VkResult WINAPI vkSetSwapchainPresentTimingQueueSizeEXT(VkDevice device, VkSwapc
+     return params.result;
+ }
+ 
++void WINAPI vkShutdownLatencyDeviceLegacyNV(VkDevice device)
++{
++    struct vkShutdownLatencyDeviceLegacyNV_params params;
++    params.device = device;
++    UNIX_CALL_CHECKED(vkShutdownLatencyDeviceLegacyNV, &params);
++}
++
+ VkResult WINAPI vkSignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
+ {
+     struct vkSignalSemaphore_params params;
+@@ -7578,6 +7637,7 @@ static const struct vulkan_func vk_device_dispatch_table[] =
+     {"vkGetImageViewHandle64NVX", vkGetImageViewHandle64NVX},
+     {"vkGetImageViewHandleNVX", vkGetImageViewHandleNVX},
+     {"vkGetImageViewOpaqueCaptureDescriptorDataEXT", vkGetImageViewOpaqueCaptureDescriptorDataEXT},
++    {"vkGetLatencyTimingsLegacyNV", vkGetLatencyTimingsLegacyNV},
+     {"vkGetLatencyTimingsNV", vkGetLatencyTimingsNV},
+     {"vkGetMemoryHostPointerPropertiesEXT", vkGetMemoryHostPointerPropertiesEXT},
+     {"vkGetMemoryWin32HandleKHR", vkGetMemoryWin32HandleKHR},
+@@ -7616,6 +7676,7 @@ static const struct vulkan_func vk_device_dispatch_table[] =
+     {"vkGetShaderInstrumentationValuesARM", vkGetShaderInstrumentationValuesARM},
+     {"vkGetShaderModuleCreateInfoIdentifierEXT", vkGetShaderModuleCreateInfoIdentifierEXT},
+     {"vkGetShaderModuleIdentifierEXT", vkGetShaderModuleIdentifierEXT},
++    {"vkGetSleepStatusLegacyNV", vkGetSleepStatusLegacyNV},
+     {"vkGetSwapchainImagesKHR", vkGetSwapchainImagesKHR},
+     {"vkGetSwapchainTimeDomainPropertiesEXT", vkGetSwapchainTimeDomainPropertiesEXT},
+     {"vkGetSwapchainTimingPropertiesEXT", vkGetSwapchainTimingPropertiesEXT},
+@@ -7629,6 +7690,7 @@ static const struct vulkan_func vk_device_dispatch_table[] =
+     {"vkImportSemaphoreWin32HandleKHR", vkImportSemaphoreWin32HandleKHR},
+     {"vkInitializePerformanceApiINTEL", vkInitializePerformanceApiINTEL},
+     {"vkInvalidateMappedMemoryRanges", vkInvalidateMappedMemoryRanges},
++    {"vkLatencySleepLegacyNV", vkLatencySleepLegacyNV},
+     {"vkLatencySleepNV", vkLatencySleepNV},
+     {"vkMapMemory", vkMapMemory},
+     {"vkMapMemory2", vkMapMemory2},
+@@ -7639,6 +7701,7 @@ static const struct vulkan_func vk_device_dispatch_table[] =
+     {"vkQueueBindSparse", vkQueueBindSparse},
+     {"vkQueueEndDebugUtilsLabelEXT", vkQueueEndDebugUtilsLabelEXT},
+     {"vkQueueInsertDebugUtilsLabelEXT", vkQueueInsertDebugUtilsLabelEXT},
++    {"vkQueueNotifyOutOfBandLegacyNV", vkQueueNotifyOutOfBandLegacyNV},
+     {"vkQueueNotifyOutOfBandNV", vkQueueNotifyOutOfBandNV},
+     {"vkQueuePresentKHR", vkQueuePresentKHR},
+     {"vkQueueSetPerfHintQCOM", vkQueueSetPerfHintQCOM},
+@@ -7667,11 +7730,14 @@ static const struct vulkan_func vk_device_dispatch_table[] =
+     {"vkSetEvent", vkSetEvent},
+     {"vkSetGpaDeviceClockModeAMD", vkSetGpaDeviceClockModeAMD},
+     {"vkSetHdrMetadataEXT", vkSetHdrMetadataEXT},
++    {"vkSetLatencyMarkerLegacyNV", vkSetLatencyMarkerLegacyNV},
+     {"vkSetLatencyMarkerNV", vkSetLatencyMarkerNV},
++    {"vkSetLatencySleepModeLegacyNV", vkSetLatencySleepModeLegacyNV},
+     {"vkSetLatencySleepModeNV", vkSetLatencySleepModeNV},
+     {"vkSetPrivateData", vkSetPrivateData},
+     {"vkSetPrivateDataEXT", vkSetPrivateDataEXT},
+     {"vkSetSwapchainPresentTimingQueueSizeEXT", vkSetSwapchainPresentTimingQueueSizeEXT},
++    {"vkShutdownLatencyDeviceLegacyNV", vkShutdownLatencyDeviceLegacyNV},
+     {"vkSignalSemaphore", vkSignalSemaphore},
+     {"vkSignalSemaphoreKHR", vkSignalSemaphoreKHR},
+     {"vkTransitionImageLayout", vkTransitionImageLayout},
+
+--- dlls/winevulkan/loader_thunks.h
++++ dlls/winevulkan/loader_thunks.h
+@@ -579,6 +579,7 @@ enum unix_call
+     unix_vkGetImageViewHandle64NVX,
+     unix_vkGetImageViewHandleNVX,
+     unix_vkGetImageViewOpaqueCaptureDescriptorDataEXT,
++    unix_vkGetLatencyTimingsLegacyNV,
+     unix_vkGetLatencyTimingsNV,
+     unix_vkGetMemoryHostPointerPropertiesEXT,
+     unix_vkGetMemoryWin32HandleKHR,
+@@ -674,6 +675,7 @@ enum unix_call
+     unix_vkGetShaderInstrumentationValuesARM,
+     unix_vkGetShaderModuleCreateInfoIdentifierEXT,
+     unix_vkGetShaderModuleIdentifierEXT,
++    unix_vkGetSleepStatusLegacyNV,
+     unix_vkGetSwapchainImagesKHR,
+     unix_vkGetSwapchainTimeDomainPropertiesEXT,
+     unix_vkGetSwapchainTimingPropertiesEXT,
+@@ -687,6 +689,7 @@ enum unix_call
+     unix_vkImportSemaphoreWin32HandleKHR,
+     unix_vkInitializePerformanceApiINTEL,
+     unix_vkInvalidateMappedMemoryRanges,
++    unix_vkLatencySleepLegacyNV,
+     unix_vkLatencySleepNV,
+     unix_vkMapMemory,
+     unix_vkMapMemory2,
+@@ -697,6 +700,7 @@ enum unix_call
+     unix_vkQueueBindSparse,
+     unix_vkQueueEndDebugUtilsLabelEXT,
+     unix_vkQueueInsertDebugUtilsLabelEXT,
++    unix_vkQueueNotifyOutOfBandLegacyNV,
+     unix_vkQueueNotifyOutOfBandNV,
+     unix_vkQueuePresentKHR,
+     unix_vkQueueSetPerfHintQCOM,
+@@ -725,11 +729,14 @@ enum unix_call
+     unix_vkSetEvent,
+     unix_vkSetGpaDeviceClockModeAMD,
+     unix_vkSetHdrMetadataEXT,
++    unix_vkSetLatencyMarkerLegacyNV,
+     unix_vkSetLatencyMarkerNV,
++    unix_vkSetLatencySleepModeLegacyNV,
+     unix_vkSetLatencySleepModeNV,
+     unix_vkSetPrivateData,
+     unix_vkSetPrivateDataEXT,
+     unix_vkSetSwapchainPresentTimingQueueSizeEXT,
++    unix_vkShutdownLatencyDeviceLegacyNV,
+     unix_vkSignalSemaphore,
+     unix_vkSignalSemaphoreKHR,
+     unix_vkSubmitDebugUtilsMessageEXT,
+@@ -5000,6 +5007,12 @@ struct vkGetImageViewOpaqueCaptureDescriptorDataEXT_params
+     VkResult result;
+ };
+ 
++struct vkGetLatencyTimingsLegacyNV_params
++{
++    VkDevice device;
++    void *pTimings;
++};
++
+ struct vkGetLatencyTimingsNV_params
+ {
+     VkDevice device;
+@@ -5764,6 +5777,12 @@ struct vkGetShaderModuleIdentifierEXT_params
+     VkShaderModuleIdentifierEXT *pIdentifier;
+ };
+ 
++struct vkGetSleepStatusLegacyNV_params
++{
++    VkDevice device;
++    VkBool32 *pLowLatencyMode;
++};
++
+ struct vkGetSwapchainImagesKHR_params
+ {
+     VkDevice device;
+@@ -5870,6 +5889,13 @@ struct vkInvalidateMappedMemoryRanges_params
+     VkResult result;
+ };
+ 
++struct vkLatencySleepLegacyNV_params
++{
++    VkDevice device;
++    VkSemaphore DECLSPEC_ALIGN(8) signalSemaphore;
++    uint64_t DECLSPEC_ALIGN(8) value;
++};
++
+ struct vkLatencySleepNV_params
+ {
+     VkDevice device;
+@@ -5949,6 +5975,12 @@ struct vkQueueInsertDebugUtilsLabelEXT_params
+     const VkDebugUtilsLabelEXT *pLabelInfo;
+ };
+ 
++struct vkQueueNotifyOutOfBandLegacyNV_params
++{
++    VkQueue queue;
++    uint32_t queueType;
++};
++
+ struct vkQueueNotifyOutOfBandNV_params
+ {
+     VkQueue queue;
+@@ -6156,6 +6188,13 @@ struct vkSetHdrMetadataEXT_params
+     const VkHdrMetadataEXT *pMetadata;
+ };
+ 
++struct vkSetLatencyMarkerLegacyNV_params
++{
++    VkDevice device;
++    uint64_t DECLSPEC_ALIGN(8) frameID;
++    uint32_t marker;
++};
++
+ struct vkSetLatencyMarkerNV_params
+ {
+     VkDevice device;
+@@ -6163,6 +6202,14 @@ struct vkSetLatencyMarkerNV_params
+     const VkSetLatencyMarkerInfoNV *pLatencyMarkerInfo;
+ };
+ 
++struct vkSetLatencySleepModeLegacyNV_params
++{
++    VkDevice device;
++    VkBool32 lowLatencyMode;
++    VkBool32 lowLatencyBoost;
++    uint32_t minimumIntervalUs;
++};
++
+ struct vkSetLatencySleepModeNV_params
+ {
+     VkDevice device;
+@@ -6199,6 +6246,11 @@ struct vkSetSwapchainPresentTimingQueueSizeEXT_params
+     VkResult result;
+ };
+ 
++struct vkShutdownLatencyDeviceLegacyNV_params
++{
++    VkDevice device;
++};
++
+ struct vkSignalSemaphore_params
+ {
+     VkDevice device;
+
+--- dlls/winevulkan/make_vulkan
++++ dlls/winevulkan/make_vulkan
+@@ -62,7 +62,7 @@ from enum import Enum
+ LOGGER = logging.Logger("vulkan")
+ LOGGER.addHandler(logging.StreamHandler())
+ 
+-VK_XML_VERSION = "1.4.353"
++VK_XML_VERSION = "1.4.357"
+ 
+ # Filenames to create.
+ WINE_VULKAN_H = "../../include/wine/vulkan.h"
+
+--- dlls/winevulkan/vulkan_thunks.c
++++ dlls/winevulkan/vulkan_thunks.c
+
+--- dlls/winevulkan/winevulkan.json
++++ dlls/winevulkan/winevulkan.json
+@@ -2,6 +2,6 @@
+     "file_format_version": "1.0.0",
+     "ICD": {
+         "library_path": ".\\winevulkan.dll",
+-        "api_version": "1.4.353"
++        "api_version": "1.4.357"
+     }
+ }
+
+--- dlls/winewayland.drv/wayland_surface.c
++++ dlls/winewayland.drv/wayland_surface.c
+@@ -1182,12 +1182,13 @@ static void wayland_client_surface_update(struct client_surface *client)
+     struct wayland_client_surface *surface = impl_from_client_surface(client);
+     HWND hwnd = client->hwnd, toplevel = client->toplevel;
+     struct wayland_win_data *data;
++    BOOL visible = FALSE;
+ 
+     TRACE("%s\n", debugstr_client_surface(client));
+-
++    if(toplevel) visible = NtUserIsWindowVisible(hwnd);
+     if (!(data = wayland_win_data_get(hwnd))) return;
+ 
+-    if (toplevel && NtUserIsWindowVisible(hwnd))
++    if (toplevel && visible)
+         wayland_client_surface_attach(surface, toplevel, &client->monitor_rect);
+     else
+         wayland_client_surface_attach(surface, NULL, NULL);
+
+--- dlls/winewayland.drv/window.c
++++ dlls/winewayland.drv/window.c
+@@ -813,10 +813,11 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
+     RECT rect = new_client->client.monitor_rect;
+     struct wayland_client_surface *old_client;
+     struct wayland_win_data *data;
++    BOOL visible = FALSE;
+ 
+     /* ownership is shared with the callers, the last caller to release
+      * its reference will also destroy it and clear our pointer. */
+-
++    if(toplevel) visible = NtUserIsWindowVisible(hwnd);
+     if (!(data = wayland_win_data_get(hwnd))) return;
+ 
+     if (new_client != data->client_surface)
+@@ -826,7 +827,7 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
+ 
+         if ((data->client_surface = new_client))
+         {
+-            if (toplevel && NtUserIsWindowVisible(hwnd))
++            if (toplevel && visible)
+                 wayland_client_surface_attach(new_client, toplevel, &rect);
+             else
+                 wayland_client_surface_attach(new_client, NULL, NULL);
+
+--- dlls/winex11.drv/keyboard.c
++++ dlls/winex11.drv/keyboard.c
+@@ -1346,6 +1346,11 @@ static void update_key_state( BYTE *keystate, BYTE key, int down )
+     else keystate[key] &= ~0x80;
+ }
+ 
++static BOOL scan_is_extended( WORD scan )
++{
++    return scan & 0x100 || scan == 0x36;
++}
++
+ /***********************************************************************
+  *           X11DRV_KeymapNotify
+  *
+@@ -1430,7 +1435,7 @@ BOOL X11DRV_KeymapNotify( HWND hwnd, XEvent *event )
+             {
+                 TRACE( "Sending KEYUP for a modifier %#.2x\n", vkey);
+                 flags = KEYEVENTF_KEYUP;
+-                if (keys[vkey].scan & 0x100) flags |= KEYEVENTF_EXTENDEDKEY;
++                if (scan_is_extended( keys[vkey].scan )) flags |= KEYEVENTF_EXTENDEDKEY;
+                 X11DRV_send_keyboard_input( keymapnotify_hwnd, vkey, keys[vkey].scan & 0xff, flags, NtGetTickCount() );
+             }
+ 
+@@ -1595,7 +1600,7 @@ BOOL X11DRV_KeyEvent( HWND hwnd, XEvent *xev )
+ 
+     dwFlags = 0;
+     if ( event->type == KeyRelease ) dwFlags |= KEYEVENTF_KEYUP;
+-    if ( scan & 0x100 ) dwFlags |= KEYEVENTF_EXTENDEDKEY;
++    if (scan_is_extended( scan )) dwFlags |= KEYEVENTF_EXTENDEDKEY;
+ 
+     update_lock_state( hwnd, vkey, event->state, event_time );
+ 
+
+--- dlls/wminet_utils/main.c
++++ dlls/wminet_utils/main.c
+@@ -128,3 +128,10 @@ HRESULT WINAPI GetNames(int vFunc, IWbemClassObject *ptr, LPCWSTR wszQualifierNa
+ 
+     return IWbemClassObject_GetNames(ptr, wszQualifierName, lFlags, pQualifierVal, pNames);
+ }
++
++HRESULT WINAPI BeginMethodEnumeration(int vFunc, IWbemClassObject *ptr, LONG lEnumFlags)
++{
++    TRACE("%i %p %lx\n", vFunc, ptr, lEnumFlags);
++
++    return IWbemClassObject_BeginMethodEnumeration(ptr, lEnumFlags);
++}
+
+--- dlls/wminet_utils/wminet_utils.spec
++++ dlls/wminet_utils/wminet_utils.spec
+@@ -1,5 +1,5 @@
+ @ stub BeginEnumeration
+-@ stub BeginMethodEnumeration
++@ stdcall BeginMethodEnumeration(long ptr long)
+ @ stub BlessIWbemServices
+ @ stub BlessIWbemServicesObject
+ @ stub Clone
+
+--- dlls/ws2_32/tests/sock.c
++++ dlls/ws2_32/tests/sock.c
+@@ -6823,6 +6823,7 @@ static void test_connect_events(struct event_test_ctx *ctx)
+     const struct sockaddr_in addr = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+     SOCKET listener, server, client;
+     struct sockaddr_in destaddr;
++    struct sockaddr_in invalid_addr;
+     int len, ret;
+ 
+     listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+@@ -6937,6 +6938,95 @@ static void test_connect_events(struct event_test_ctx *ctx)
+     closesocket(server);
+ 
+     closesocket(listener);
++
++    memset( &invalid_addr, 0, sizeof(invalid_addr) );
++    invalid_addr.sin_family = AF_INET;
++    invalid_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    invalid_addr.sin_port = htons(255);
++
++    /* Test events getting cleared on second connect after connection got refused.
++     * w10pro64 sometimes takes over 2 seconds for an error to be reported,
++     * so make the test interactive-only. */
++
++    if (winetest_interactive)
++    {
++        client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++        ok(client != -1, "failed to create socket, error %u\n", WSAGetLastError());
++
++        select_events(ctx, client, FD_ACCEPT | FD_CLOSE | FD_CONNECT | FD_OOB | FD_READ | FD_WRITE);
++        check_events(ctx, 0, 0, 0);
++        check_events(ctx, 0, 0, 0);
++
++        /* set event by connecting to closed port */
++        ret = connect(client, (struct sockaddr *)&invalid_addr, sizeof(invalid_addr));
++        ok(ret == SOCKET_ERROR, "expected SOCKET_ERROR, got %d\n", ret);
++        check_events(ctx, MAKELONG(FD_CONNECT, WSAECONNREFUSED), 0, 4000);
++        check_events(ctx, 0, 0, 0);
++
++        /* set event by connecting to closed port, second try, should behave the same */
++        ret = connect(client, (struct sockaddr *)&invalid_addr, sizeof(invalid_addr));
++        ok(ret == SOCKET_ERROR, "expected SOCKET_ERROR, got %d\n", ret);
++        check_events(ctx, MAKELONG(FD_CONNECT, WSAECONNREFUSED), 0, 4000);
++        check_events(ctx, 0, 0, 0);
++
++        /* set event by connecting to closed port */
++        ret = connect(client, (struct sockaddr *)&invalid_addr, sizeof(invalid_addr));
++        ok(ret == SOCKET_ERROR, "expected SOCKET_ERROR, got %d\n", ret);
++        /* try with invalid size, after event was set */
++        ret = connect(client, (struct sockaddr *)&invalid_addr, 1);
++        ok(ret == SOCKET_ERROR, "expected SOCKET_ERROR, got %d\n", ret);
++        check_events(ctx, MAKELONG(FD_CONNECT, WSAECONNREFUSED), 0, 4000);
++        check_events(ctx, 0, 0, 0);
++
++        /* set event by connecting to closed port */
++        ret = connect(client, (struct sockaddr *)&invalid_addr, sizeof(invalid_addr));
++        ok(ret == SOCKET_ERROR, "expected SOCKET_ERROR, got %d\n", ret);
++        /* try with invalid sin_family, after event was set */
++        invalid_addr.sin_family = 0xf1;
++        ret = connect(client, (struct sockaddr *)&invalid_addr, sizeof(invalid_addr));
++        ok(ret == SOCKET_ERROR, "expected SOCKET_ERROR, got %d\n", ret);
++        check_events(ctx, MAKELONG(FD_CONNECT, WSAECONNREFUSED), 0, 4000);
++        check_events(ctx, 0, 0, 0);
++        invalid_addr.sin_family = AF_INET;
++
++        closesocket(client);
++    }
++
++    if (winetest_interactive && !ctx->is_message)
++    {
++        /* setup listener */
++        listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++        ok(listener != -1, "failed to create socket, error %u\n", WSAGetLastError());
++        ret = bind(listener, (const struct sockaddr *)&addr, sizeof(addr));
++        ok(!ret, "failed to bind, error %u\n", WSAGetLastError());
++        len = sizeof(destaddr);
++        ret = getsockname(listener, (struct sockaddr *)&destaddr, &len);
++        ok(!ret, "failed to get address, error %u\n", WSAGetLastError());
++        ret = listen(listener, 2);
++        ok(!ret, "failed to listen, error %u\n", WSAGetLastError());
++        client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++        ok(client != -1, "failed to create socket, error %u\n", WSAGetLastError());
++        select_events(ctx, client, FD_ACCEPT | FD_CLOSE | FD_CONNECT | FD_OOB | FD_READ | FD_WRITE);
++        check_events(ctx, 0, 0, 0);
++        check_events(ctx, 0, 0, 0);
++
++        /* set event by connecting to closed port */
++        ret = connect(client, (struct sockaddr *)&invalid_addr, sizeof(invalid_addr));
++        ok(ret == SOCKET_ERROR, "expected SOCKET_ERROR, got %d\n", ret);
++        check_poll_todo(client, 0);
++        Sleep(2000);
++        /* try successful connect, after event was set */
++        ret = connect(client, (struct sockaddr *)&destaddr, sizeof(destaddr));
++        ok(ret == SOCKET_ERROR, "expected SOCKET_ERROR, got %d\n", ret);
++        ok(WSAGetLastError() == WSAEWOULDBLOCK, "expected WSAEWOULDBLOCK, got %u\n", WSAGetLastError());
++        check_poll(client, POLLWRNORM);
++        check_events(ctx, MAKELONG(FD_CONNECT | FD_WRITE, WSAECONNREFUSED), 0, 4000);
++        check_events(ctx, 0, 0, 0);
++
++        closesocket(client);
++
++        closesocket(listener);
++    }
+ }
+ 
+ /* perform a blocking recv() even on a nonblocking socket */
+@@ -7415,6 +7505,7 @@ static void test_events(void)
+     struct event_test_ctx ctx;
+ 
+     ctx.is_message = FALSE;
++    winetest_push_context("is_message=0");
+     ctx.event = CreateEventW(NULL, TRUE, FALSE, NULL);
+ 
+     test_accept_events(&ctx);
+@@ -7426,7 +7517,9 @@ static void test_events(void)
+ 
+     CloseHandle(ctx.event);
+ 
++    winetest_pop_context();
+     ctx.is_message = TRUE;
++    winetest_push_context("is_message=1");
+     ctx.window = CreateWindowA("Message", NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
+ 
+     test_accept_events(&ctx);
+@@ -7437,6 +7530,7 @@ static void test_events(void)
+     test_oob_events(&ctx);
+ 
+     DestroyWindow(ctx.window);
++    winetest_pop_context();
+ }
+ 
+ static void test_ipv6only(void)
+
+--- include/wine/strmbase.h
++++ include/wine/strmbase.h
+@@ -125,6 +125,7 @@ struct strmbase_sink_ops
+     HRESULT (*sink_begin_flush)(struct strmbase_sink *pin);
+     HRESULT (*sink_end_flush)(struct strmbase_sink *pin);
+     HRESULT (*sink_new_segment)(struct strmbase_sink *pin, REFERENCE_TIME start, REFERENCE_TIME stop, double rate);
++    HRESULT (*sink_receive_can_block)(struct strmbase_sink *pin);
+ };
+ 
+ /* Base Pin */
+
+--- include/wine/vulkan.h
++++ include/wine/vulkan.h
+
+--- include/wine/wined3d.h
++++ include/wine/wined3d.h
+@@ -2922,7 +2922,8 @@ HRESULT __cdecl wined3d_swapchain_present(struct wined3d_swapchain *swapchain, c
+         const RECT *dst_rect, HWND dst_window_override, unsigned int swap_interval, uint32_t flags);
+ HRESULT __cdecl wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapchain, unsigned int buffer_count,
+         unsigned int width, unsigned int height, enum wined3d_format_id format_id,
+-        enum wined3d_multisample_type multisample_type, unsigned int multisample_quality);
++        enum wined3d_multisample_type multisample_type, unsigned int multisample_quality,
++        unsigned int flags);
+ HRESULT __cdecl wined3d_swapchain_set_gamma_ramp(const struct wined3d_swapchain *swapchain,
+         uint32_t flags, const struct wined3d_gamma_ramp *ramp);
+ HRESULT __cdecl wined3d_swapchain_set_max_frame_latency(struct wined3d_swapchain *swapchain, unsigned int latency);
+
+--- include/Makefile.in
++++ include/Makefile.in
+@@ -67,6 +67,7 @@ SOURCES = \
+ 	bthsdpdef.h \
+ 	cderr.h \
+ 	cdosys.idl \
++	cfapi.h \
+ 	cfg.h \
+ 	cfgmgr32.h \
+ 	cguid.h \
+
+--- include/bcrypt.h
++++ include/bcrypt.h
+@@ -94,6 +94,7 @@ extern "C" {
+ 
+ #define BCRYPT_3DES_ALGORITHM       L"3DES"
+ #define BCRYPT_AES_ALGORITHM        L"AES"
++#define BCRYPT_AES_GMAC_ALGORITHM   L"AES-GMAC"
+ #define BCRYPT_CHACHA20_POLY1305_ALGORITHM L"CHACHA20_POLY1305"
+ #define BCRYPT_DES_ALGORITHM        L"DES"
+ #define BCRYPT_DH_ALGORITHM         L"DH"
+@@ -142,6 +143,8 @@ extern "C" {
+ #define BCRYPT_KDF_RAW_SECRET       L"TRUNCATE"
+ 
+ #define BCRYPT_DH_PARAMETERS        L"DHParameters"
++
++#define BCRYPT_MESSAGE_BLOCK_LENGTH L"MessageBlockLength"
+ #else
+ static const WCHAR BCRYPT_ALGORITHM_NAME[] = {'A','l','g','o','r','i','t','h','m','N','a','m','e',0};
+ static const WCHAR BCRYPT_AUTH_TAG_LENGTH[] = {'A','u','t','h','T','a','g','L','e','n','g','t','h',0};
+@@ -190,6 +193,7 @@ static const WCHAR MS_PLATFORM_CRYPTO_PROVIDER[] = \
+ 
+ static const WCHAR BCRYPT_3DES_ALGORITHM[] = {'3','D','E','S',0};
+ static const WCHAR BCRYPT_AES_ALGORITHM[] = {'A','E','S',0};
++static const WCHAR BCRYPT_AES_GMAC_ALGORITHM[] = {'A','E','S','-','G','M','A','C',0};
+ static const WCHAR BCRYPT_CHACHA20_POLY1305_ALGORITHM[] = {'C','H','A','C','H','A','2','0','_','P','O','L','Y','1','3','0','5',0};
+ static const WCHAR BCRYPT_DES_ALGORITHM[] = {'D','E','S',0};
+ static const WCHAR BCRYPT_DH_ALGORITHM[] = {'D','H',0};
+@@ -238,6 +242,7 @@ static const WCHAR BCRYPT_KDF_SP80056A_CONCAT[] = {'S','P','8','0','0','_','5','
+ static const WCHAR BCRYPT_KDF_RAW_SECRET[] = {'T','R','U','N','C','A','T','E',0};
+ 
+ static const WCHAR BCRYPT_DH_PARAMETERS[] = {'D','H','P','a','r','a','m','e','t','e','r','s',0};
++static const WCHAR BCRYPT_MESSAGE_BLOCK_LENGTH[] = {'M','e','s','s','a','g','e','B','l','o','c','k','L','e','n','g','t','h',0};
+ #endif
+ 
+ #define BCRYPT_ECDSA_PUBLIC_P256_MAGIC  0x31534345
+
+--- include/cfapi.h
++++ include/cfapi.h
+@@ -0,0 +1,30 @@
++/*
++ * Copyright 2026 Louis Lenders
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef CFAPI_H
++#define CFAPI_H
++
++typedef enum CF_PLACEHOLDER_INFO_CLASS
++{
++  CF_PLACEHOLDER_INFO_BASIC    = 0,
++  CF_PLACEHOLDER_INFO_STANDARD = 1
++} CF_PLACEHOLDER_INFO_CLASS;
++
++HRESULT WINAPI CfGetPlaceholderInfo(HANDLE h, CF_PLACEHOLDER_INFO_CLASS info, void *buf, DWORD len, DWORD *retlen);
++
++#endif  /* CFAPI_H */
+
+--- libs/strmbase/pin.c
++++ libs/strmbase/pin.c
+@@ -1148,10 +1148,14 @@ static HRESULT WINAPI MemInputPin_ReceiveMultiple(IMemInputPin * iface, IMediaSa
+ static HRESULT WINAPI MemInputPin_ReceiveCanBlock(IMemInputPin * iface)
+ {
+     struct strmbase_sink *pin = impl_from_IMemInputPin(iface);
++    HRESULT hr = S_OK;
+ 
+     TRACE("pin %p %s:%s.\n", pin, debugstr_w(pin->pin.filter->name), debugstr_w(pin->pin.name));
+ 
+-    return S_OK;
++    if (pin->pFuncsTable->sink_receive_can_block)
++        hr = pin->pFuncsTable->sink_receive_can_block(pin);
++
++    return hr;
+ }
+ 
+ static const IMemInputPinVtbl MemInputPin_Vtbl =
+
+--- programs/winhlp32/macro.c
++++ programs/winhlp32/macro.c
+@@ -671,7 +671,21 @@ static void CALLBACK MACRO_NoShow(void)
+ 
+ void CALLBACK MACRO_PopupContext(LPCSTR str, LONG u)
+ {
+-    WINE_FIXME("(%s, %lu)\n", debugstr_a(str), u);
++    HLPFILE_WINDOWINFO* wi;
++    HLPFILE *hlpfile;
++    POINT origin = { 0, 0 };
++
++    WINE_TRACE("(%s, %lu)\n", debugstr_a(str), u);
++
++    if (!(hlpfile = WINHELP_LookupHelpFile(str)))
++    {
++        WINE_ERR("Failed to load .hlp file for %s\n", debugstr_a(str));
++        return;
++    }
++
++    GetCursorPos(&origin);
++    wi = WINHELP_GetPopupWindowInfo(hlpfile, MACRO_CurrentWindow(), MAKELPARAM(origin.x, origin.y));
++    WINHELP_OpenHelpWindow(HLPFILE_PageByMap, hlpfile, u, wi, SW_NORMAL);
+ }
+ 
+ static void CALLBACK MACRO_PopupHash(LPCSTR str, LONG u)
+
+--- programs/winhlp32/winhelp.c
++++ programs/winhlp32/winhelp.c
+@@ -293,8 +293,7 @@ HLPFILE_WINDOWINFO*     WINHELP_GetWindowInfo(HLPFILE* hlpfile, LPCSTR name)
+  *
+  *
+  */
+-static HLPFILE_WINDOWINFO*     WINHELP_GetPopupWindowInfo(HLPFILE* hlpfile,
+-                                                          WINHELP_WINDOW* parent, LPARAM mouse)
++HLPFILE_WINDOWINFO* WINHELP_GetPopupWindowInfo(HLPFILE* hlpfile, WINHELP_WINDOW* parent, LPARAM mouse)
+ {
+     static      HLPFILE_WINDOWINFO      wi;
+ 
+@@ -316,7 +315,9 @@ static HLPFILE_WINDOWINFO*     WINHELP_GetPopupWindowInfo(HLPFILE* hlpfile,
+ 
+     wi.style = SW_SHOW;
+     wi.win_style = WS_POPUP | WS_BORDER;
+-    if (parent->page->file->has_popup_color)
++    if (hlpfile->has_popup_color)
++        wi.sr_color = hlpfile->popup_color;
++    else if (parent->page && parent->page->file->has_popup_color)
+         wi.sr_color = parent->page->file->popup_color;
+     else
+         wi.sr_color = parent->info->sr_color;
+
+--- programs/winhlp32/winhelp.h
++++ programs/winhlp32/winhelp.h
+@@ -170,6 +170,7 @@ BOOL WINHELP_CreateIndexWindow(BOOL);
+ void WINHELP_DeleteBackSet(WINHELP_WINDOW*);
+ HLPFILE* WINHELP_LookupHelpFile(LPCSTR lpszFile);
+ HLPFILE_WINDOWINFO* WINHELP_GetWindowInfo(HLPFILE* hlpfile, LPCSTR name);
++HLPFILE_WINDOWINFO* WINHELP_GetPopupWindowInfo(HLPFILE* hlpfile, WINHELP_WINDOW* parent, LPARAM mouse);
+ void WINHELP_LayoutMainWindow(WINHELP_WINDOW* win);
+ WINHELP_WINDOW* WINHELP_GrabWindow(WINHELP_WINDOW*);
+ BOOL WINHELP_ReleaseWindow(WINHELP_WINDOW*);
+
+--- server/change.c
++++ server/change.c
+@@ -125,18 +125,11 @@ static enum server_fd_type dir_get_fd_type( struct fd *fd );
+ 
+ static const struct fd_ops dir_fd_ops =
+ {
+-    dir_get_poll_events,         /* get_poll_events */
+-    default_poll_event,          /* poll_event */
+-    dir_get_fd_type,             /* get_fd_type */
+-    no_fd_read,                  /* read */
+-    no_fd_write,                 /* write */
+-    no_fd_flush,                 /* flush */
+-    default_fd_get_file_info,    /* get_file_info */
+-    no_fd_get_volume_info,       /* get_volume_info */
+-    default_fd_ioctl,            /* ioctl */
+-    default_fd_cancel_async,     /* cancel_async */
+-    default_fd_queue_async,      /* queue_async */
+-    default_fd_reselect_async    /* reselect_async */
++    .get_poll_events = dir_get_poll_events,
++    .get_fd_type     = dir_get_fd_type,
++    .get_file_info   = default_fd_get_file_info,
++    .ioctl           = default_fd_ioctl,
++    .queue_async     = default_fd_queue_async,
+ };
+ 
+ static struct list change_list = LIST_INIT(change_list);
+@@ -640,13 +633,8 @@ static void inotify_poll_event( struct fd *fd, int event );
+ 
+ static const struct fd_ops inotify_fd_ops =
+ {
+-    inotify_get_poll_events,     /* get_poll_events */
+-    inotify_poll_event,          /* poll_event */
+-    NULL,                        /* flush */
+-    NULL,                        /* get_fd_type */
+-    NULL,                        /* ioctl */
+-    NULL,                        /* queue_async */
+-    NULL                         /* reselect_async */
++    .get_poll_events = inotify_get_poll_events,
++    .poll_event      = inotify_poll_event,
+ };
+ 
+ static int inotify_get_poll_events( struct fd *fd )
+
+--- server/console.c
++++ server/console.c
+@@ -95,18 +95,13 @@ static void console_ioctl( struct fd *fd, ioctl_code_t code, struct async *async
+ 
+ static const struct fd_ops console_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    console_get_fd_type,          /* get_fd_type */
+-    console_read,                 /* read */
+-    no_fd_write,                  /* write */
+-    console_flush,                /* flush */
+-    console_get_file_info,        /* get_file_info */
+-    console_get_volume_info,      /* get_volume_info */
+-    console_ioctl,                /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    default_fd_queue_async,       /* queue_async */
+-    default_fd_reselect_async     /* reselect_async */
++    .get_fd_type     = console_get_fd_type,
++    .read            = console_read,
++    .flush           = console_flush,
++    .get_file_info   = console_get_file_info,
++    .get_volume_info = console_get_volume_info,
++    .ioctl           = console_ioctl,
++    .queue_async     = default_fd_queue_async,
+ };
+ 
+ struct console_host_ioctl
+@@ -156,18 +151,9 @@ static void console_server_ioctl( struct fd *fd, ioctl_code_t code, struct async
+ 
+ static const struct fd_ops console_server_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    console_get_fd_type,          /* get_fd_type */
+-    no_fd_read,                   /* read */
+-    no_fd_write,                  /* write */
+-    no_fd_flush,                  /* flush */
+-    no_fd_get_file_info,          /* get_file_info */
+-    no_fd_get_volume_info,        /* get_volume_info */
+-    console_server_ioctl,         /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    default_fd_queue_async,       /* queue_async */
+-    default_fd_reselect_async     /* reselect_async */
++    .get_fd_type = console_get_fd_type,
++    .ioctl       = console_server_ioctl,
++    .queue_async = default_fd_queue_async,
+ };
+ 
+ struct font_info
+@@ -214,18 +200,12 @@ static void screen_buffer_ioctl( struct fd *fd, ioctl_code_t code, struct async
+ 
+ static const struct fd_ops screen_buffer_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    console_get_fd_type,          /* get_fd_type */
+-    no_fd_read,                   /* read */
+-    screen_buffer_write,          /* write */
+-    no_fd_flush,                  /* flush */
+-    console_get_file_info,        /* get_file_info */
+-    console_get_volume_info,      /* get_volume_info */
+-    screen_buffer_ioctl,          /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    default_fd_queue_async,       /* queue_async */
+-    default_fd_reselect_async     /* reselect_async */
++    .get_fd_type     = console_get_fd_type,
++    .write           = screen_buffer_write,
++    .get_file_info   = console_get_file_info,
++    .get_volume_info = console_get_volume_info,
++    .ioctl           = screen_buffer_ioctl,
++    .queue_async     = default_fd_queue_async,
+ };
+ 
+ static void console_device_dump( struct object *obj, int verbose );
+@@ -276,18 +256,13 @@ static void console_input_ioctl( struct fd *fd, ioctl_code_t code, struct async
+ 
+ static const struct fd_ops console_input_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    console_get_fd_type,          /* get_fd_type */
+-    console_input_read,           /* read */
+-    no_fd_write,                  /* write */
+-    console_input_flush,          /* flush */
+-    console_get_file_info,        /* get_file_info */
+-    console_get_volume_info,      /* get_volume_info */
+-    console_input_ioctl,          /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    default_fd_queue_async,       /* queue_async */
+-    default_fd_reselect_async     /* reselect_async */
++    .get_fd_type     = console_get_fd_type,
++    .read            = console_input_read,
++    .flush           = console_input_flush,
++    .get_file_info   = console_get_file_info,
++    .get_volume_info = console_get_volume_info,
++    .ioctl           = console_input_ioctl,
++    .queue_async     = default_fd_queue_async,
+ };
+ 
+ struct console_output
+@@ -322,18 +297,12 @@ static void console_output_ioctl( struct fd *fd, ioctl_code_t code, struct async
+ 
+ static const struct fd_ops console_output_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    console_get_fd_type,          /* get_fd_type */
+-    no_fd_read,                   /* read */
+-    console_output_write,         /* write */
+-    no_fd_flush,                  /* flush */
+-    console_get_file_info,        /* get_file_info */
+-    console_get_volume_info,      /* get_volume_info */
+-    console_output_ioctl,         /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    default_fd_queue_async,       /* queue_async */
+-    default_fd_reselect_async     /* reselect_async */
++    .get_fd_type     = console_get_fd_type,
++    .write           = console_output_write,
++    .get_file_info   = console_get_file_info,
++    .get_volume_info = console_get_volume_info,
++    .ioctl           = console_output_ioctl,
++    .queue_async     = default_fd_queue_async,
+ };
+ 
+ struct console_connection
+@@ -367,18 +336,9 @@ static void console_connection_ioctl( struct fd *fd, ioctl_code_t code, struct a
+ 
+ static const struct fd_ops console_connection_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    console_get_fd_type,          /* get_fd_type */
+-    no_fd_read,                   /* read */
+-    no_fd_write,                  /* write */
+-    no_fd_flush,                  /* flush */
+-    no_fd_get_file_info,          /* get_file_info */
+-    no_fd_get_volume_info,        /* get_volume_info */
+-    console_connection_ioctl,     /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    default_fd_queue_async,       /* queue_async */
+-    default_fd_reselect_async     /* reselect_async */
++    .get_fd_type = console_get_fd_type,
++    .ioctl       = console_connection_ioctl,
++    .queue_async = default_fd_queue_async,
+ };
+ 
+ static int queue_host_ioctl( struct console_server *server, unsigned int code, unsigned int output,
+
+--- server/d3dkmt.c
++++ server/d3dkmt.c
+@@ -64,18 +64,7 @@ static enum server_fd_type d3dkmt_get_fd_type( struct fd *fd )
+ 
+ static const struct fd_ops d3dkmt_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    d3dkmt_get_fd_type,           /* get_fd_type */
+-    no_fd_read,                   /* read */
+-    no_fd_write,                  /* write */
+-    no_fd_flush,                  /* flush */
+-    no_fd_get_file_info,          /* get_file_info */
+-    no_fd_get_volume_info,        /* get_volume_info */
+-    no_fd_ioctl,                  /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    no_fd_queue_async,            /* queue_async */
+-    default_fd_reselect_async     /* reselect_async */
++    .get_fd_type = d3dkmt_get_fd_type,
+ };
+ 
+ struct keyed_wait
+
+--- server/device.c
++++ server/device.c
+@@ -177,18 +177,15 @@ static const struct object_ops device_file_ops =
+ 
+ static const struct fd_ops device_file_fd_ops =
+ {
+-    default_fd_get_poll_events,       /* get_poll_events */
+-    default_poll_event,               /* poll_event */
+-    device_file_get_fd_type,          /* get_fd_type */
+-    device_file_read,                 /* read */
+-    device_file_write,                /* write */
+-    device_file_flush,                /* flush */
+-    default_fd_get_file_info,         /* get_file_info */
+-    device_file_get_volume_info,      /* get_volume_info */
+-    device_file_ioctl,                /* ioctl */
+-    device_file_cancel_async,         /* cancel_async */
+-    default_fd_queue_async,           /* queue_async */
+-    default_fd_reselect_async,        /* reselect_async */
++    .get_fd_type     = device_file_get_fd_type,
++    .read            = device_file_read,
++    .write           = device_file_write,
++    .flush           = device_file_flush,
++    .get_file_info   = default_fd_get_file_info,
++    .get_volume_info = device_file_get_volume_info,
++    .ioctl           = device_file_ioctl,
++    .cancel_async    = device_file_cancel_async,
++    .queue_async     = default_fd_queue_async,
+ };
+ 
+ 
+
+--- server/directory.c
++++ server/directory.c
+@@ -395,14 +395,18 @@ void init_directories( struct fd *intl_fd )
+     static const WCHAR event_high_pagedW[] = {'H','i','g','h','P','a','g','e','d','P','o','o','l','C','o','n','d','i','t','i','o','n'};
+     static const WCHAR event_high_nonpgW[] = {'H','i','g','h','N','o','n','P','a','g','e','d','P','o','o','l','C','o','n','d','i','t','i','o','n'};
+     static const WCHAR keyed_event_crit_sectW[] = {'C','r','i','t','S','e','c','O','u','t','O','f','M','e','m','o','r','y','E','v','e','n','t'};
+-    static const struct unicode_str kernel_events[] =
++    static const struct
+     {
+-        { event_low_memW, sizeof(event_low_memW) },
+-        { event_low_pagedW, sizeof(event_low_pagedW) },
+-        { event_low_nonpgW, sizeof(event_low_nonpgW) },
+-        { event_high_memW, sizeof(event_high_memW) },
+-        { event_high_pagedW, sizeof(event_high_pagedW) },
+-        { event_high_nonpgW, sizeof(event_high_nonpgW) }
++        struct unicode_str name;
++        int initial_state;
++    } kernel_events[] =
++    {
++        { { event_low_memW, sizeof(event_low_memW) }, 0 },
++        { { event_low_pagedW, sizeof(event_low_pagedW) }, 0 },
++        { { event_low_nonpgW, sizeof(event_low_nonpgW) }, 0 },
++        { { event_high_memW, sizeof(event_high_memW) }, 1 },
++        { { event_high_pagedW, sizeof(event_high_pagedW) }, 1 },
++        { { event_high_nonpgW, sizeof(event_high_nonpgW) }, 1 }
+     };
+     static const struct unicode_str keyed_event_crit_sect_str = {keyed_event_crit_sectW, sizeof(keyed_event_crit_sectW)};
+ 
+@@ -456,7 +460,10 @@ void init_directories( struct fd *intl_fd )
+ 
+     /* events */
+     for (i = 0; i < ARRAY_SIZE( kernel_events ); i++)
+-        release_object( create_event( &dir_kernel->obj, &kernel_events[i], OBJ_PERMANENT, 1, 0, NULL ));
++    {
++        release_object( create_event( &dir_kernel->obj, &kernel_events[i].name, OBJ_PERMANENT,
++                                      1, kernel_events[i].initial_state, NULL ));
++    }
+     release_object( create_keyed_event( &dir_kernel->obj, &keyed_event_crit_sect_str, OBJ_PERMANENT, NULL ));
+ 
+     /* mappings */
+
+--- server/fd.c
++++ server/fd.c
+@@ -461,7 +461,8 @@ static int get_next_timeout( struct timespec *ts );
+ 
+ static inline void fd_poll_event( struct fd *fd, int event )
+ {
+-    fd->fd_ops->poll_event( fd, event );
++    if (fd->fd_ops->poll_event) fd->fd_ops->poll_event( fd, event );
++    else default_poll_event( fd, event );
+ }
+ 
+ #ifdef USE_EPOLL
+@@ -1625,6 +1626,13 @@ void set_fd_events( struct fd *fd, int events )
+     }
+ }
+ 
++/* get the events we want to poll() for */
++static int get_poll_events( struct fd *fd )
++{
++    if (fd->fd_ops->get_poll_events) return fd->fd_ops->get_poll_events( fd );
++    return default_fd_get_poll_events( fd );
++}
++
+ /* prepare an fd for unmounting its corresponding device */
+ static inline void unmount_fd( struct fd *fd )
+ {
+@@ -2189,7 +2197,7 @@ void default_poll_event( struct fd *fd, int event )
+ 
+     /* if an error occurred, stop polling this fd to avoid busy-looping */
+     if (event & (POLLERR | POLLHUP)) set_fd_events( fd, -1 );
+-    else if (!fd->inode) set_fd_events( fd, fd->fd_ops->get_poll_events( fd ) );
++    else if (!fd->inode) set_fd_events( fd, get_poll_events( fd ) );
+ }
+ 
+ void fd_queue_async( struct fd *fd, struct async *async, int type )
+@@ -2217,7 +2225,7 @@ void fd_queue_async( struct fd *fd, struct async *async, int type )
+     if (type != ASYNC_TYPE_WAIT)
+     {
+         if (!fd->inode)
+-            set_fd_events( fd, fd->fd_ops->get_poll_events( fd ) );
++            set_fd_events( fd, get_poll_events( fd ) );
+         else  /* regular files are always ready for read and write */
+             async_wake_up( queue, STATUS_ALERTED );
+     }
+@@ -2243,22 +2251,14 @@ void fd_async_wake_up( struct fd *fd, int type, unsigned int status )
+ 
+ void fd_cancel_async( struct fd *fd, struct async *async )
+ {
+-    fd->fd_ops->cancel_async( fd, async );
++    if (fd->fd_ops->cancel_async) fd->fd_ops->cancel_async( fd, async );
++    else async_terminate( async, STATUS_CANCELLED );
+ }
+ 
+ void fd_reselect_async( struct fd *fd, struct async_queue *queue )
+ {
+-    fd->fd_ops->reselect_async( fd, queue );
+-}
+-
+-void no_fd_queue_async( struct fd *fd, struct async *async, int type, int count )
+-{
+-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
+-}
+-
+-void default_fd_cancel_async( struct fd *fd, struct async *async )
+-{
+-    async_terminate( async, STATUS_CANCELLED );
++    if (fd->fd_ops->reselect_async) fd->fd_ops->reselect_async( fd, queue );
++    else default_fd_reselect_async( fd, queue );
+ }
+ 
+ void default_fd_queue_async( struct fd *fd, struct async *async, int type, int count )
+@@ -2272,9 +2272,9 @@ void default_fd_reselect_async( struct fd *fd, struct async_queue *queue )
+ {
+     if (queue == &fd->read_q || queue == &fd->write_q)
+     {
+-        int poll_events = fd->fd_ops->get_poll_events( fd );
++        int poll_events = get_poll_events( fd );
+         int events = check_fd_events( fd, poll_events );
+-        if (events) fd->fd_ops->poll_event( fd, events );
++        if (events) fd_poll_event( fd, events );
+         else set_fd_events( fd, poll_events );
+     }
+ }
+@@ -2559,30 +2559,6 @@ static void delete_reparse_point( struct fd *fd, struct async *async )
+     xattr_fremove( fd->unix_fd, XATTR_REPARSE );
+ }
+ 
+-/* default read() routine */
+-void no_fd_read( struct fd *fd, struct async *async, file_pos_t pos )
+-{
+-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
+-}
+-
+-/* default write() routine */
+-void no_fd_write( struct fd *fd, struct async *async, file_pos_t pos )
+-{
+-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
+-}
+-
+-/* default flush() routine */
+-void no_fd_flush( struct fd *fd, struct async *async )
+-{
+-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
+-}
+-
+-/* default get_file_info() routine */
+-void no_fd_get_file_info( struct fd *fd, obj_handle_t handle, unsigned int info_class )
+-{
+-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
+-}
+-
+ /* default get_file_info() routine */
+ void default_fd_get_file_info( struct fd *fd, obj_handle_t handle, unsigned int info_class )
+ {
+@@ -2656,18 +2632,6 @@ void default_fd_get_file_info( struct fd *fd, obj_handle_t handle, unsigned int
+     }
+ }
+ 
+-/* default get_volume_info() routine */
+-void no_fd_get_volume_info( struct fd *fd, struct async *async, unsigned int info_class )
+-{
+-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
+-}
+-
+-/* default ioctl() routine */
+-void no_fd_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+-{
+-    set_error( STATUS_OBJECT_TYPE_MISMATCH );
+-}
+-
+ /* default ioctl() routine */
+ void default_fd_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+ {
+@@ -2980,7 +2944,8 @@ DECL_HANDLER(flush)
+ 
+     if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+     {
+-        fd->fd_ops->flush( fd, async );
++        if (fd->fd_ops->flush) fd->fd_ops->flush( fd, async );
++        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
+         reply->event = async_handoff( async, NULL, 1 );
+         release_object( async );
+     }
+@@ -2994,7 +2959,8 @@ DECL_HANDLER(get_file_info)
+ 
+     if (fd)
+     {
+-        fd->fd_ops->get_file_info( fd, req->handle, req->info_class );
++        if (fd->fd_ops->get_file_info) fd->fd_ops->get_file_info( fd, req->handle, req->info_class );
++        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
+         release_object( fd );
+     }
+ }
+@@ -3009,7 +2975,8 @@ DECL_HANDLER(get_volume_info)
+ 
+     if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+     {
+-        fd->fd_ops->get_volume_info( fd, async, req->info_class );
++        if (fd->fd_ops->get_volume_info) fd->fd_ops->get_volume_info( fd, async, req->info_class );
++        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
+         reply->wait = async_handoff( async, NULL, 1 );
+         release_object( async );
+     }
+@@ -3086,7 +3053,8 @@ DECL_HANDLER(read)
+ 
+     if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+     {
+-        fd->fd_ops->read( fd, async, req->pos );
++        if (fd->fd_ops->read) fd->fd_ops->read( fd, async, req->pos );
++        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
+         reply->wait = async_handoff( async, NULL, 0 );
+         reply->options = fd->options;
+         release_object( async );
+@@ -3104,7 +3072,8 @@ DECL_HANDLER(write)
+ 
+     if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+     {
+-        fd->fd_ops->write( fd, async, req->pos );
++        if (fd->fd_ops->write) fd->fd_ops->write( fd, async, req->pos );
++        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
+         reply->wait = async_handoff( async, &reply->size, 0 );
+         reply->options = fd->options;
+         release_object( async );
+@@ -3123,7 +3092,8 @@ DECL_HANDLER(ioctl)
+ 
+     if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+     {
+-        fd->fd_ops->ioctl( fd, req->code, async );
++        if (fd->fd_ops->ioctl) fd->fd_ops->ioctl( fd, req->code, async );
++        else set_error( STATUS_OBJECT_TYPE_MISMATCH );
+         reply->wait = async_handoff( async, NULL, 0 );
+         reply->options = fd->options;
+         release_object( async );
+@@ -3153,7 +3123,8 @@ DECL_HANDLER(register_async)
+ 
+     if ((fd = get_handle_fd_obj( current->process, req->async.handle, access )))
+     {
+-        if (get_unix_fd( fd ) != -1 && (async = create_async( fd, current, &req->async, NULL )))
++        if (!fd->fd_ops->queue_async) set_error( STATUS_OBJECT_TYPE_MISMATCH );
++        else if (get_unix_fd( fd ) != -1 && (async = create_async( fd, current, &req->async, NULL )))
+         {
+             fd->fd_ops->queue_async( fd, async, req->type, req->count );
+             release_object( async );
+
+--- server/file.c
++++ server/file.c
+@@ -103,18 +103,10 @@ static const struct object_ops file_ops =
+ 
+ static const struct fd_ops file_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    file_get_fd_type,             /* get_fd_type */
+-    no_fd_read,                   /* read */
+-    no_fd_write,                  /* write */
+-    no_fd_flush,                  /* flush */
+-    default_fd_get_file_info,     /* get_file_info */
+-    no_fd_get_volume_info,        /* get_volume_info */
+-    default_fd_ioctl,             /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    default_fd_queue_async,       /* queue_async */
+-    default_fd_reselect_async     /* reselect_async */
++    .get_fd_type   = file_get_fd_type,
++    .get_file_info = default_fd_get_file_info,
++    .ioctl         = default_fd_ioctl,
++    .queue_async   = default_fd_queue_async,
+ };
+ 
+ /* create a file from a file descriptor */
+
+--- server/file.h
++++ server/file.h
+@@ -116,16 +116,8 @@ extern void fd_cancel_async( struct fd *fd, struct async *async );
+ extern void fd_queue_async( struct fd *fd, struct async *async, int type );
+ extern void fd_async_wake_up( struct fd *fd, int type, unsigned int status );
+ extern void fd_reselect_async( struct fd *fd, struct async_queue *queue );
+-extern void no_fd_read( struct fd *fd, struct async *async, file_pos_t pos );
+-extern void no_fd_write( struct fd *fd, struct async *async, file_pos_t pos );
+-extern void no_fd_flush( struct fd *fd, struct async *async );
+-extern void no_fd_get_file_info( struct fd *fd, obj_handle_t handle, unsigned int info_class );
+ extern void default_fd_get_file_info( struct fd *fd, obj_handle_t handle, unsigned int info_class );
+-extern void no_fd_get_volume_info( struct fd *fd, struct async *async, unsigned int info_class );
+-extern void no_fd_ioctl( struct fd *fd, ioctl_code_t code, struct async *async );
+ extern void default_fd_ioctl( struct fd *fd, ioctl_code_t code, struct async *async );
+-extern void default_fd_cancel_async( struct fd *fd, struct async *async );
+-extern void no_fd_queue_async( struct fd *fd, struct async *async, int type, int count );
+ extern void default_fd_queue_async( struct fd *fd, struct async *async, int type, int count );
+ extern void default_fd_reselect_async( struct fd *fd, struct async_queue *queue );
+ extern void main_loop(void);
+
+--- server/mailslot.c
++++ server/mailslot.c
+@@ -94,18 +94,11 @@ static void mailslot_get_file_info( struct fd *fd, obj_handle_t handle, unsigned
+ 
+ static const struct fd_ops mailslot_fd_ops =
+ {
+-    default_fd_get_poll_events, /* get_poll_events */
+-    default_poll_event,         /* poll_event */
+-    mailslot_get_fd_type,       /* get_fd_type */
+-    mailslot_read,              /* read */
+-    mailslot_write,             /* write */
+-    no_fd_flush,                /* flush */
+-    mailslot_get_file_info,     /* get_file_info */
+-    no_fd_get_volume_info,      /* get_volume_info */
+-    default_fd_ioctl,           /* ioctl */
+-    default_fd_cancel_async,    /* cancel_async */
+-    no_fd_queue_async,          /* queue_async */
+-    default_fd_reselect_async   /* reselect_async */
++    .get_fd_type   = mailslot_get_fd_type,
++    .read          = mailslot_read,
++    .write         = mailslot_write,
++    .get_file_info = mailslot_get_file_info,
++    .ioctl         = default_fd_ioctl,
+ };
+ 
+ 
+@@ -140,18 +133,12 @@ static void mail_writer_write( struct fd *fd, struct async *async, file_pos_t po
+ 
+ static const struct fd_ops mail_writer_fd_ops =
+ {
+-    default_fd_get_poll_events,  /* get_poll_events */
+-    default_poll_event,          /* poll_event */
+-    mail_writer_get_fd_type,     /* get_fd_type */
+-    mail_writer_read,            /* read */
+-    mail_writer_write,           /* write */
+-    no_fd_flush,                 /* flush */
+-    default_fd_get_file_info,    /* get_file_info */
+-    no_fd_get_volume_info,       /* get_volume_info */
+-    default_fd_ioctl,            /* ioctl */
+-    default_fd_cancel_async,     /* cancel_async */
+-    default_fd_queue_async,      /* queue_async */
+-    default_fd_reselect_async    /* reselect_async */
++    .get_fd_type   = mail_writer_get_fd_type,
++    .read          = mail_writer_read,
++    .write         = mail_writer_write,
++    .get_file_info = default_fd_get_file_info,
++    .ioctl         = default_fd_ioctl,
++    .queue_async   = default_fd_queue_async,
+ };
+ 
+ 
+@@ -204,18 +191,10 @@ static const struct object_ops mailslot_device_file_ops =
+ 
+ static const struct fd_ops mailslot_device_fd_ops =
+ {
+-    default_fd_get_poll_events,         /* get_poll_events */
+-    default_poll_event,                 /* poll_event */
+-    mailslot_device_file_get_fd_type,   /* get_fd_type */
+-    no_fd_read,                         /* read */
+-    no_fd_write,                        /* write */
+-    no_fd_flush,                        /* flush */
+-    default_fd_get_file_info,           /* get_file_info */
+-    no_fd_get_volume_info,              /* get_volume_info */
+-    default_fd_ioctl,                   /* ioctl */
+-    default_fd_cancel_async,            /* cancel_async */
+-    default_fd_queue_async,             /* queue_async */
+-    default_fd_reselect_async           /* reselect_async */
++    .get_fd_type   = mailslot_device_file_get_fd_type,
++    .get_file_info = default_fd_get_file_info,
++    .ioctl         = default_fd_ioctl,
++    .queue_async   = default_fd_queue_async,
+ };
+ 
+ static struct mailslot_message *get_first_message( struct mailslot *mailslot )
+
+--- server/mapping.c
++++ server/mapping.c
+@@ -153,18 +153,7 @@ static const struct object_ops mapping_ops =
+ 
+ static const struct fd_ops mapping_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    mapping_get_fd_type,          /* get_fd_type */
+-    no_fd_read,                   /* read */
+-    no_fd_write,                  /* write */
+-    no_fd_flush,                  /* flush */
+-    no_fd_get_file_info,          /* get_file_info */
+-    no_fd_get_volume_info,        /* get_volume_info */
+-    no_fd_ioctl,                  /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    no_fd_queue_async,            /* queue_async */
+-    default_fd_reselect_async     /* reselect_async */
++    .get_fd_type = mapping_get_fd_type,
+ };
+ 
+ /* free address ranges for PE image mappings */
+
+--- server/named_pipe.c
++++ server/named_pipe.c
+@@ -174,18 +174,14 @@ static const struct object_ops pipe_server_ops =
+ 
+ static const struct fd_ops pipe_server_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    pipe_end_get_fd_type,         /* get_fd_type */
+-    pipe_end_read,                /* read */
+-    pipe_end_write,               /* write */
+-    pipe_end_flush,               /* flush */
+-    pipe_end_get_file_info,       /* get_file_info */
+-    pipe_end_get_volume_info,     /* get_volume_info */
+-    pipe_server_ioctl,            /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    no_fd_queue_async,            /* queue_async */
+-    pipe_end_reselect_async       /* reselect_async */
++    .get_fd_type     = pipe_end_get_fd_type,
++    .read            = pipe_end_read,
++    .write           = pipe_end_write,
++    .flush           = pipe_end_flush,
++    .get_file_info   = pipe_end_get_file_info,
++    .get_volume_info = pipe_end_get_volume_info,
++    .ioctl           = pipe_server_ioctl,
++    .reselect_async  = pipe_end_reselect_async,
+ };
+ 
+ /* client end functions */
+@@ -208,18 +204,14 @@ static const struct object_ops pipe_client_ops =
+ 
+ static const struct fd_ops pipe_client_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    pipe_end_get_fd_type,         /* get_fd_type */
+-    pipe_end_read,                /* read */
+-    pipe_end_write,               /* write */
+-    pipe_end_flush,               /* flush */
+-    pipe_end_get_file_info,       /* get_file_info */
+-    pipe_end_get_volume_info,     /* get_volume_info */
+-    pipe_client_ioctl,            /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    no_fd_queue_async,            /* queue_async */
+-    pipe_end_reselect_async       /* reselect_async */
++    .get_fd_type     = pipe_end_get_fd_type,
++    .read            = pipe_end_read,
++    .write           = pipe_end_write,
++    .flush           = pipe_end_flush,
++    .get_file_info   = pipe_end_get_file_info,
++    .get_volume_info = pipe_end_get_volume_info,
++    .ioctl           = pipe_client_ioctl,
++    .reselect_async  = pipe_end_reselect_async,
+ };
+ 
+ static void named_pipe_device_dump( struct object *obj, int verbose );
+@@ -261,18 +253,10 @@ static const struct object_ops named_pipe_device_file_ops =
+ 
+ static const struct fd_ops named_pipe_device_fd_ops =
+ {
+-    default_fd_get_poll_events,              /* get_poll_events */
+-    default_poll_event,                      /* poll_event */
+-    named_pipe_device_file_get_fd_type,      /* get_fd_type */
+-    no_fd_read,                              /* read */
+-    no_fd_write,                             /* write */
+-    no_fd_flush,                             /* flush */
+-    default_fd_get_file_info,                /* get_file_info */
+-    no_fd_get_volume_info,                   /* get_volume_info */
+-    named_pipe_device_ioctl,                 /* ioctl */
+-    default_fd_cancel_async,                 /* cancel_async */
+-    default_fd_queue_async,                  /* queue_async */
+-    default_fd_reselect_async                /* reselect_async */
++    .get_fd_type   = named_pipe_device_file_get_fd_type,
++    .get_file_info = default_fd_get_file_info,
++    .ioctl         = named_pipe_device_ioctl,
++    .queue_async   = default_fd_queue_async,
+ };
+ 
+ static void named_pipe_dir_dump( struct object *obj, int verbose );
+@@ -300,18 +284,9 @@ static const struct object_ops named_pipe_dir_ops =
+ 
+ static const struct fd_ops named_pipe_dir_fd_ops =
+ {
+-    default_fd_get_poll_events,              /* get_poll_events */
+-    default_poll_event,                      /* poll_event */
+-    NULL,                                    /* get_fd_type */
+-    no_fd_read,                              /* read */
+-    no_fd_write,                             /* write */
+-    no_fd_flush,                             /* flush */
+-    default_fd_get_file_info,                /* get_file_info */
+-    no_fd_get_volume_info,                   /* get_volume_info */
+-    named_pipe_dir_ioctl,                    /* ioctl */
+-    default_fd_cancel_async,                 /* cancel_async */
+-    default_fd_queue_async,                  /* queue_async */
+-    default_fd_reselect_async                /* reselect_async */
++    .get_file_info = default_fd_get_file_info,
++    .ioctl         = named_pipe_dir_ioctl,
++    .queue_async   = default_fd_queue_async,
+ };
+ 
+ static void named_pipe_dump( struct object *obj, int verbose )
+
+--- server/process.c
++++ server/process.c
+@@ -111,14 +111,7 @@ static const struct object_ops process_ops =
+ 
+ static const struct fd_ops process_fd_ops =
+ {
+-    NULL,                        /* get_poll_events */
+-    process_poll_event,          /* poll_event */
+-    NULL,                        /* flush */
+-    NULL,                        /* get_fd_type */
+-    NULL,                        /* ioctl */
+-    NULL,                        /* queue_async */
+-    NULL,                        /* reselect_async */
+-    NULL                         /* cancel async */
++    .poll_event = process_poll_event,
+ };
+ 
+ /* process startup info */
+
+--- server/queue.c
++++ server/queue.c
+@@ -169,14 +169,7 @@ static const struct object_ops msg_queue_ops =
+ 
+ static const struct fd_ops msg_queue_fd_ops =
+ {
+-    NULL,                        /* get_poll_events */
+-    msg_queue_poll_event,        /* poll_event */
+-    NULL,                        /* flush */
+-    NULL,                        /* get_fd_type */
+-    NULL,                        /* ioctl */
+-    NULL,                        /* queue_async */
+-    NULL,                        /* reselect_async */
+-    NULL                         /* cancel async */
++    .poll_event = msg_queue_poll_event,
+ };
+ 
+ 
+
+--- server/request.c
++++ server/request.c
+@@ -90,13 +90,7 @@ static const struct object_ops master_socket_ops =
+ 
+ static const struct fd_ops master_socket_fd_ops =
+ {
+-    NULL,                          /* get_poll_events */
+-    master_socket_poll_event,      /* poll_event */
+-    NULL,                          /* flush */
+-    NULL,                          /* get_fd_type */
+-    NULL,                          /* ioctl */
+-    NULL,                          /* queue_async */
+-    NULL                           /* reselect_async */
++    .poll_event = master_socket_poll_event,
+ };
+ 
+ 
+
+--- server/serial.c
++++ server/serial.c
+@@ -94,18 +94,11 @@ static const struct object_ops serial_ops =
+ 
+ static const struct fd_ops serial_fd_ops =
+ {
+-    default_fd_get_poll_events,   /* get_poll_events */
+-    default_poll_event,           /* poll_event */
+-    serial_get_fd_type,           /* get_fd_type */
+-    no_fd_read,                   /* read */
+-    no_fd_write,                  /* write */
+-    no_fd_flush,                  /* flush */
+-    default_fd_get_file_info,     /* get_file_info */
+-    no_fd_get_volume_info,        /* get_volume_info */
+-    serial_ioctl,                 /* ioctl */
+-    default_fd_cancel_async,      /* cancel_async */
+-    serial_queue_async,           /* queue_async */
+-    serial_reselect_async         /* reselect_async */
++    .get_fd_type    = serial_get_fd_type,
++    .get_file_info  = default_fd_get_file_info,
++    .ioctl          = serial_ioctl,
++    .queue_async    = serial_queue_async,
++    .reselect_async = serial_reselect_async,
+ };
+ 
+ /* check if the given fd is a serial port */
+
+--- server/signal.c
++++ server/signal.c
+@@ -66,13 +66,7 @@ static void handler_poll_event( struct fd *fd, int event );
+ 
+ static const struct fd_ops handler_fd_ops =
+ {
+-    NULL,                     /* get_poll_events */
+-    handler_poll_event,       /* poll_event */
+-    NULL,                     /* flush */
+-    NULL,                     /* get_fd_type */
+-    NULL,                     /* ioctl */
+-    NULL,                     /* queue_async */
+-    NULL                      /* reselect_async */
++    .poll_event = handler_poll_event,
+ };
+ 
+ static struct handler *handler_sighup;
+
+--- server/sock.c
++++ server/sock.c
+@@ -490,18 +490,13 @@ static const struct object_ops sock_ops =
+ 
+ static const struct fd_ops sock_fd_ops =
+ {
+-    sock_get_poll_events,         /* get_poll_events */
+-    sock_poll_event,              /* poll_event */
+-    sock_get_fd_type,             /* get_fd_type */
+-    no_fd_read,                   /* read */
+-    no_fd_write,                  /* write */
+-    no_fd_flush,                  /* flush */
+-    default_fd_get_file_info,     /* get_file_info */
+-    no_fd_get_volume_info,        /* get_volume_info */
+-    sock_ioctl,                   /* ioctl */
+-    sock_cancel_async,            /* cancel_async */
+-    no_fd_queue_async,            /* queue_async */
+-    sock_reselect_async           /* reselect_async */
++    .get_poll_events = sock_get_poll_events,
++    .poll_event      = sock_poll_event,
++    .get_fd_type     = sock_get_fd_type,
++    .get_file_info   = default_fd_get_file_info,
++    .ioctl           = sock_ioctl,
++    .cancel_async    = sock_cancel_async,
++    .reselect_async  = sock_reselect_async,
+ };
+ 
+ static int sockaddr_from_unix( const union unix_sockaddr *uaddr, struct WS_sockaddr *wsaddr, socklen_t wsaddrlen )
+@@ -2728,6 +2723,11 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+             set_error( STATUS_INVALID_ADDRESS );
+             return;
+         }
++        if (sock->state == SOCK_UNCONNECTED) /* clear events */
++        {
++            sock->pending_events &= ~AFD_POLL_CONNECT_ERR;
++            sock->reported_events &= ~AFD_POLL_CONNECT_ERR;
++        }
+         if (unix_addr.addr.sa_family == AF_INET && !memcmp( &unix_addr.in.sin_addr, magic_loopback_addr, 4 ))
+             unix_addr.in.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
+ 
+@@ -3694,18 +3694,8 @@ static const struct object_ops ifchange_ops =
+ 
+ static const struct fd_ops ifchange_fd_ops =
+ {
+-    ifchange_get_poll_events, /* get_poll_events */
+-    ifchange_poll_event,      /* poll_event */
+-    NULL,                     /* get_fd_type */
+-    no_fd_read,               /* read */
+-    no_fd_write,              /* write */
+-    no_fd_flush,              /* flush */
+-    no_fd_get_file_info,      /* get_file_info */
+-    no_fd_get_volume_info,    /* get_volume_info */
+-    no_fd_ioctl,              /* ioctl */
+-    NULL,                     /* cancel_async */
+-    NULL,                     /* queue_async */
+-    NULL                      /* reselect_async */
++    .get_poll_events = ifchange_get_poll_events,
++    .poll_event      = ifchange_poll_event,
+ };
+ 
+ static void ifchange_dump( struct object *obj, int verbose )
+
+--- server/thread.c
++++ server/thread.c
+@@ -176,13 +176,7 @@ static const struct object_ops thread_ops =
+ 
+ static const struct fd_ops thread_fd_ops =
+ {
+-    NULL,                       /* get_poll_events */
+-    thread_poll_event,          /* poll_event */
+-    NULL,                       /* flush */
+-    NULL,                       /* get_fd_type */
+-    NULL,                       /* ioctl */
+-    NULL,                       /* queue_async */
+-    NULL                        /* reselect_async */
++    .poll_event = thread_poll_event,
+ };
+ 
+ static struct list thread_list = LIST_INIT(thread_list);
+
+--- ANNOUNCE.md
++++ ANNOUNCE.md
+
+--- AUTHORS
++++ AUTHORS
+@@ -30,6 +30,7 @@ Adrian Thiele
+ Adrian Thurston
+ Agustin Principe
+ Aida Jonikienė
++Aidan Racaniello
+ Aidan Thornton
+ Ake Rehnman
+ Akihiro Sagawa
+@@ -67,6 +68,7 @@ Alexander Morozov
+ Alexander Nicolaysen Sørnes
+ Alexander Puzankov
+ Alexander Scott-Johns
++Alexander Shaikhulin
+ Alexander V. Lukyanov
+ Alexander Wilms
+ Alexander Yaworsky
+@@ -113,6 +115,7 @@ Anders Kjersem
+ Anderson Lizardo
+ Andoni Morales Alastruey
+ András Kovács
++Andrea Faulds
+ Andreas Bjerkeholt
+ Andreas Damm
+ Andreas Fuchs
+@@ -200,6 +203,7 @@ Aviad Pineles
+ Axel Davy
+ Axel Schmidt
+ Bang Jun-Young
++Barath Kannan
+ Bartosz Kosiorek
+ Bart Van Assche
+ Baruch Rutman
+@@ -259,6 +263,7 @@ Brad Pepers
+ Brad Smith
+ Brandon Moore
+ Brandon Woodmansee
++Brandow Lucas
+ Brendan McGrath
+ Brendan Shanks
+ Brian Chang
+@@ -726,6 +731,7 @@ Hervé Chanal
+ Hervé Poussineau
+ Hib Eris
+ Hidenori Takeshima
++Hieu Le Minh
+ Hilko Bengen
+ Hin-Tak Leung
+ Hippocrates Sendoukas
+@@ -1035,6 +1041,7 @@ Kaj Kaloinen
+ Kalen Alwardt
+ Kalevi J Hautaniemi
+ Kamil Pošvic
++Kang Kang
+ Kanit Therdsteerasukdi
+ Kareem Aladli
+ Karl Backström
+@@ -1120,7 +1127,9 @@ Kun Yang
+ Kurt Kartaltepe
+ Kusanagi Kouichi
+ Kyle Luna
++Kyle Yang
+ Kyrylo Babikov
++Lakulish Antani
+ Lance Jackson
+ Lars-Ake Fredlund
+ Lars Heete
+@@ -1155,6 +1164,7 @@ Liu Spider
+ Loïc Hoguin
+ Loïc Maury
+ Loïc Rebmeister
++Lokesh Poovaragan
+ Lorenzo Ferrillo
+ Louis Lenders
+ Louis Philippe Gagnon
+@@ -1293,6 +1303,7 @@ Michael Abbott
+ Michael Abd-El-Malek
+ Michael Beach
+ Michael Bond
++Michael Brabec
+ Michael Cardenas
+ Michael C. Maggio
+ Michael Cronenworth
+@@ -1490,6 +1501,7 @@ Paul TBBle Hampson
+ Paul van Schayck
+ Paul Vriens
+ Pavel Borecki
++Pavel Cheloveckov
+ Pavel Kankovsky
+ Pavel Ondračka
+ Pavel Roskin
+@@ -2027,6 +2039,7 @@ Yorick Hardy
+ Yoshiji Emoto
+ Yoshiro Takeno
+ Young Chung
++Yue Zhang
+ Yuri Hérouard
+ Yuri Khan
+ Yuri Kozlov
+@@ -2052,6 +2065,7 @@ Zhennan Cai
+ Zhipeng Zhao
+ Zhiyi Zhang
+ Zhou Qiankang
++Zhou Zhang
+ Ziia Shi
+ Zimler Attila
+ Ziqing Hui
+
+--- VERSION
++++ VERSION
+@@ -1 +1 @@
+-Wine version 11.13
++Wine version 11.14
+
+--- configure
++++ configure
+@@ -1,6 +1,6 @@
+ #! /bin/sh
+ # Guess values for system-dependent variables and create Makefiles.
+-# Generated by GNU Autoconf 2.73 for Wine 11.13.
++# Generated by GNU Autoconf 2.73 for Wine 11.14.
+ #
+ # Report bugs to <wine-devel@winehq.org>.
+ #
+@@ -587,8 +587,8 @@ MAKEFLAGS=
+ # Identity of this package.
+ PACKAGE_NAME='Wine'
+ PACKAGE_TARNAME='wine'
+-PACKAGE_VERSION='11.13'
+-PACKAGE_STRING='Wine 11.13'
++PACKAGE_VERSION='11.14'
++PACKAGE_STRING='Wine 11.14'
+ PACKAGE_BUGREPORT='wine-devel@winehq.org'
+ PACKAGE_URL='https://www.winehq.org'
+ 
+@@ -2509,7 +2509,7 @@ if test "$ac_init_help" = "long"; then
+   # Omit some internal or obsolete options to make the list less imposing.
+   # This message is too long to be a string in the A/UX 3.1 sh.
+   cat <<_ACEOF
+-'configure' configures Wine 11.13 to adapt to many kinds of systems.
++'configure' configures Wine 11.14 to adapt to many kinds of systems.
+ 
+ Usage: $0 [OPTION]... [VAR=VALUE]...
+ 
+@@ -2579,7 +2579,7 @@ fi
+ 
+ if test -n "$ac_init_help"; then
+   case $ac_init_help in
+-     short | recursive ) echo "Configuration of Wine 11.13:";;
++     short | recursive ) echo "Configuration of Wine 11.14:";;
+    esac
+   cat <<\_ACEOF
+ 
+@@ -2940,7 +2940,7 @@ fi
+ test -n "$ac_init_help" && exit $ac_status
+ if $ac_init_version; then
+   cat <<\_ACEOF
+-Wine configure 11.13
++Wine configure 11.14
+ generated by GNU Autoconf 2.73
+ 
+ Copyright (C) 2026 Free Software Foundation, Inc.
+@@ -3346,7 +3346,7 @@ cat >config.log <<_ACEOF
+ This file contains any messages produced by compilers while
+ running configure, to aid debugging if configure makes a mistake.
+ 
+-It was created by Wine $as_me 11.13, which was
++It was created by Wine $as_me 11.14, which was
+ generated by GNU Autoconf 2.73.  Invocation command line was
+ 
+   $ $0$ac_configure_args_raw
+@@ -23964,7 +23964,7 @@ cat >>"$CONFIG_STATUS" <<\_ACEOF || ac_write_fail=1
+ # report actual input values of CONFIG_FILES etc. instead of their
+ # values after options handling.
+ ac_log="
+-This file was extended by Wine $as_me 11.13, which was
++This file was extended by Wine $as_me 11.14, which was
+ generated by GNU Autoconf 2.73.  Invocation command line was
+ 
+   CONFIG_FILES    = $CONFIG_FILES
+@@ -24024,7 +24024,7 @@ ac_cs_config_escaped=`printf '%s\n' "$ac_cs_config" | sed "s/^ //; s/'/'\\\\\\\\
+ cat >>"$CONFIG_STATUS" <<_ACEOF || ac_write_fail=1
+ ac_cs_config='$ac_cs_config_escaped'
+ ac_cs_version="\\
+-Wine config.status 11.13
++Wine config.status 11.14
+ configured by $0, generated by GNU Autoconf 2.73,
+   with options \\"\$ac_cs_config\\"
+ 
+

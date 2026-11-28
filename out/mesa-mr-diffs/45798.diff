@@ -1,0 +1,663 @@
+# Draft: kk: keep independent geometry shader side effects in the compute pass
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45798 state=closed
+# In this MR, I updated poly’s geometry shader emulation so that work only used for side effects (like buffer stores or atomics) stays in the compute pass instead of being replayed again during rasterization. I enabled this optimization for KosmicKrisp, while keeping the default behavior intact for existing poly callers. If a shader has texture operations or atomics that affect outputs or control flow, it safely falls back to the standard path. I also rebased this into a clean two-commit series on current upstream (poly helper first, then KK hookup) and stripped out all unrelated commits from the earlier branch. On Linux, the logic passed 36 CPU test cases with NIR validation enabled. 
+
+My MacBook is currently in for repair, so I haven’t been able to retest this isolated rebase on native Apple hardware yet. Because of that, I’m keeping this MR as a Draft for now. All previous test runs, build logs, and validation reports on macOS / Apple silicon are available on my GitHub: https://github.com/niltonperimneto/mesa. I’d appreciate any feedback on the approach while I wait for my machine to come back!
+
+_AI disclosure: This series was prepared with AI assistance; commits carry Generated-by: LLM._
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -1140,8 +1140,8 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_in, NULL, NULL);
+ 
+       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
+-      NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
+-               &shader->info.gs);
++      NIR_PASS(_, nir, poly_nir_lower_gs_with_side_effects, &count, &rast,
++               &pre_gs, &shader->info.gs, true);
+ 
+       /* Only transform feedback and pipeline statistics need these, and KK
+        * exposes neither */
+
+--- src/poly/nir/tests/gs_side_effects_test.c
++++ src/poly/nir/tests/gs_side_effects_test.c
+@@ -0,0 +1,293 @@
++/* SPDX-License-Identifier: MIT */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include "nir_builder.h"
++#include "poly_nir_gs_side_effects.h"
++
++#define CHECK(expr) do { \
++   if (!(expr)) { \
++      fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr); \
++      abort(); \
++   } \
++} while (0)
++
++static const nir_shader_compiler_options options = {0};
++
++static unsigned
++count_op(nir_shader *s, nir_intrinsic_op op)
++{
++   unsigned count = 0;
++   nir_foreach_function_impl(impl, s) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_intrinsic &&
++                nir_instr_as_intrinsic(instr)->intrinsic == op)
++               count++;
++         }
++      }
++   }
++   return count;
++}
++
++static void
++output(nir_builder *b, nir_def *value)
++{
++   nir_store_output(b, value, nir_imm_int(b, 0),
++                    .src_type = nir_type_uint32,
++                    .io_semantics.location = VARYING_SLOT_VAR0,
++                    .io_semantics.num_slots = 1);
++}
++
++static nir_builder
++builder(void)
++{
++   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY,
++                                                 &options, "side effects");
++   b.shader->info.io_lowered = true;
++   b.shader->info.gs.invocations = 1;
++   b.shader->info.gs.vertices_out = 1;
++   b.shader->info.gs.input_primitive = MESA_PRIM_POINTS;
++   b.shader->info.gs.output_primitive = MESA_PRIM_POINTS;
++   b.shader->info.gs.active_stream_mask = 1;
++   return b;
++}
++
++static void
++check_clone(nir_builder *b, bool expected)
++{
++   nir_validate_shader(b->shader, "before side-effect separation");
++   nir_shader *copy = poly_nir_clone_gs_without_side_effects(b->shader);
++   if ((copy != NULL) != expected) {
++      nir_print_shader(b->shader, stderr);
++      fprintf(stderr, "expected clone: %d\n", expected);
++   }
++   CHECK((copy != NULL) == expected);
++   if (copy) {
++      nir_validate_shader(copy, "after side-effect separation");
++      CHECK(count_op(copy, nir_intrinsic_store_global) == 0);
++      CHECK(count_op(copy, nir_intrinsic_global_atomic) == 0);
++      CHECK(count_op(copy, nir_intrinsic_image_store) == 0);
++      CHECK(count_op(copy, nir_intrinsic_bindless_image_store) == 0);
++      CHECK(count_op(copy, nir_intrinsic_image_atomic) == 0);
++      CHECK(count_op(copy, nir_intrinsic_bindless_image_atomic) == 0);
++   }
++   ralloc_free(copy);
++   ralloc_free(b->shader);
++}
++
++static void
++store_and_atomic(bool atomic, bool used)
++{
++   nir_builder b = builder();
++   nir_def *addr = nir_imm_int64(&b, 4096);
++   nir_def *value = nir_imm_int(&b, 1);
++   if (atomic) {
++      nir_def *result = nir_global_atomic(&b, 32, addr, value,
++                                         .atomic_op = nir_atomic_op_iadd);
++      if (used)
++         value = result;
++   } else {
++      nir_store_global(&b, value, addr, .align_mul = 4);
++   }
++   output(&b, value);
++   nir_shader *copy = poly_nir_clone_gs_without_side_effects(b.shader);
++   CHECK((copy != NULL) == !used);
++   CHECK(count_op(b.shader, atomic ? nir_intrinsic_global_atomic
++                                  : nir_intrinsic_store_global) == 1);
++   ralloc_free(copy);
++   check_clone(&b, !used);
++}
++
++static void
++memory_load(unsigned kind, unsigned access, bool used)
++{
++   nir_builder b = builder();
++   nir_def *addr = nir_imm_int64(&b, 4096);
++   nir_def *value;
++   if (kind == 0) {
++      value = nir_load_global(&b, 1, 32, addr, .align_mul = 4, .access = access);
++   } else if (kind == 1) {
++      value = nir_load_global_bounded(&b, 1, 32, addr, nir_imm_int64(&b, 64),
++                                      nir_imm_int64(&b, 0),
++                                      .align_mul = 4, .access = access);
++   } else {
++      value = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
++                            .align_mul = 4, .access = access);
++   }
++   nir_store_global(&b, value, addr, .align_mul = 4);
++   output(&b, used ? value : nir_imm_int(&b, 0));
++   check_clone(&b, !used || ((access & ACCESS_CAN_REORDER) &&
++                             !(access & ACCESS_VOLATILE)));
++}
++
++static void
++texture(void)
++{
++   nir_builder b = builder();
++   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 2);
++   tex->op = nir_texop_txf;
++   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
++   tex->dest_type = nir_type_uint32;
++   tex->coord_components = 2;
++   tex->src[0].src_type = nir_tex_src_coord;
++   tex->src[0].src = nir_src_for_ssa(nir_imm_ivec2(&b, 0, 0));
++   tex->src[1].src_type = nir_tex_src_lod;
++   tex->src[1].src = nir_src_for_ssa(nir_imm_int(&b, 0));
++   nir_def_init(&tex->instr, &tex->def, 4, 32);
++   nir_builder_instr_insert(&b, &tex->instr);
++   output(&b, nir_channel(&b, &tex->def, 0));
++   check_clone(&b, false);
++}
++
++static void
++barrier_and_fallback(void)
++{
++   nir_builder b = builder();
++   nir_store_global(&b, nir_imm_int(&b, 1), nir_imm_int64(&b, 4096),
++                     .align_mul = 4);
++   nir_barrier(&b, .memory_scope = SCOPE_DEVICE,
++                .memory_semantics = NIR_MEMORY_ACQ_REL,
++                .memory_modes = nir_var_mem_global);
++   output(&b, nir_imm_int(&b, 0));
++   nir_shader *copy = poly_nir_clone_gs_without_side_effects(b.shader);
++   CHECK(copy != NULL);
++   CHECK(count_op(copy, nir_intrinsic_barrier) == 0);
++   CHECK(count_op(b.shader, nir_intrinsic_barrier) == 1);
++   ralloc_free(copy);
++   poly_nir_strip_gs_side_effects(b.shader, false, false);
++   CHECK(count_op(b.shader, nir_intrinsic_store_global) == 1);
++   CHECK(count_op(b.shader, nir_intrinsic_barrier) == 1);
++   poly_nir_strip_gs_side_effects(b.shader, true, false);
++   CHECK(count_op(b.shader, nir_intrinsic_store_global) == 0);
++   CHECK(count_op(b.shader, nir_intrinsic_barrier) == 1);
++   ralloc_free(b.shader);
++}
++
++static void
++image_effect(bool bindless, unsigned operation)
++{
++   nir_builder b = builder();
++   nir_def *handle = bindless ? nir_imm_int64(&b, 4096) : nir_imm_int(&b, 0);
++   nir_def *coord = nir_imm_ivec4(&b, 0, 0, 0, 0);
++   nir_def *zero = nir_imm_int(&b, 0);
++   nir_def *value = nir_imm_int(&b, 1);
++   if (operation == 0) {
++      if (bindless)
++         nir_bindless_image_store(&b, handle, coord, zero, value, zero,
++                                  .image_dim = GLSL_SAMPLER_DIM_2D,
++                                  .format = PIPE_FORMAT_R32_UINT,
++                                  .src_type = nir_type_uint32);
++      else
++         nir_image_store(&b, handle, coord, zero, value, zero,
++                         .image_dim = GLSL_SAMPLER_DIM_2D,
++                         .format = PIPE_FORMAT_R32_UINT,
++                         .src_type = nir_type_uint32);
++   } else if (operation <= 2) {
++      nir_def *result = bindless
++         ? nir_bindless_image_atomic(&b, 32, handle, coord, zero, value,
++                                      .image_dim = GLSL_SAMPLER_DIM_2D,
++                                      .format = PIPE_FORMAT_R32_UINT,
++                                      .atomic_op = nir_atomic_op_iadd)
++         : nir_image_atomic(&b, 32, handle, coord, zero, value,
++                             .image_dim = GLSL_SAMPLER_DIM_2D,
++                             .format = PIPE_FORMAT_R32_UINT,
++                             .atomic_op = nir_atomic_op_iadd);
++      if (operation == 2)
++         value = result;
++   } else {
++      unsigned access = operation == 4 ? ACCESS_CAN_REORDER : 0;
++      value = bindless
++         ? nir_bindless_image_load(&b, 1, 32, handle, coord, zero, zero,
++                                    .image_dim = GLSL_SAMPLER_DIM_2D,
++                                    .format = PIPE_FORMAT_R32_UINT,
++                                    .dest_type = nir_type_uint32,
++                                    .access = access)
++         : nir_image_load(&b, 1, 32, handle, coord, zero, zero,
++                           .image_dim = GLSL_SAMPLER_DIM_2D,
++                           .format = PIPE_FORMAT_R32_UINT,
++                           .dest_type = nir_type_uint32, .access = access);
++   }
++   output(&b, value);
++   check_clone(&b, operation < 2 || operation == 4);
++}
++
++static void
++atomic_feeds_store_only(void)
++{
++   nir_builder b = builder();
++   nir_def *addr = nir_imm_int64(&b, 4096);
++   nir_def *result = nir_global_atomic(&b, 32, addr, nir_imm_int(&b, 1),
++                                      .atomic_op = nir_atomic_op_iadd);
++   nir_push_if(&b, nir_ieq_imm(&b, result, 0));
++   nir_store_global(&b, result, addr, .align_mul = 4);
++   nir_pop_if(&b, NULL);
++   check_clone(&b, true);
++}
++
++static void
++control_dependency(void)
++{
++   nir_builder b = builder();
++   nir_def *result = nir_global_atomic(&b, 32, nir_imm_int64(&b, 4096),
++                                      nir_imm_int(&b, 1),
++                                      .atomic_op = nir_atomic_op_iadd);
++   nir_push_if(&b, nir_ieq_imm(&b, result, 0));
++   output(&b, nir_imm_int(&b, 1));
++   nir_pop_if(&b, NULL);
++   check_clone(&b, false);
++}
++
++static void
++constant_input(void)
++{
++   nir_builder b = builder();
++   nir_def *value = nir_load_global_constant(&b, 1, 32,
++                                            nir_imm_int64(&b, 4096),
++                                            .align_mul = 4);
++   output(&b, value);
++   check_clone(&b, true);
++}
++
++static void
++unhandled_store(void)
++{
++   nir_builder b = builder();
++   nir_store_ssbo(&b, nir_imm_int(&b, 1), nir_imm_int(&b, 0),
++                  nir_imm_int(&b, 0), .align_mul = 4);
++   check_clone(&b, false);
++}
++
++int
++main(void)
++{
++   glsl_type_singleton_init_or_ref();
++   store_and_atomic(false, false);
++   store_and_atomic(true, false);
++   store_and_atomic(true, true);
++   for (unsigned kind = 0; kind < 3; kind++) {
++      memory_load(kind, 0, false);
++      memory_load(kind, 0, true);
++      memory_load(kind, ACCESS_CAN_REORDER, true);
++      memory_load(kind, ACCESS_VOLATILE, true);
++      memory_load(kind, ACCESS_VOLATILE, false);
++   }
++   for (unsigned bindless = 0; bindless < 2; bindless++)
++      for (unsigned op = 0; op < 5; op++)
++         image_effect(bindless, op);
++   atomic_feeds_store_only();
++   control_dependency();
++   constant_input();
++   unhandled_store();
++   texture();
++   barrier_and_fallback();
++   nir_builder b = builder();
++   output(&b, nir_read_first_invocation(&b, nir_load_primitive_id(&b)));
++   check_clone(&b, false);
++   b = builder();
++   output(&b, nir_channel(&b, nir_shader_clock(&b, .memory_scope = SCOPE_DEVICE), 0));
++   check_clone(&b, false);
++   glsl_type_singleton_decref();
++   puts("36 geometry side-effect cases passed");
++   return 0;
++}
+
+--- src/poly/nir/meson.build
++++ src/poly/nir/meson.build
+@@ -3,6 +3,7 @@
+ 
+ libpoly_nir_files = files(
+   'poly_nir_lower_gs.c',
++  'poly_nir_gs_side_effects.c',
+   'poly_nir_lower_sysvals.c',
+   'poly_nir_lower_tess.c',
+   'poly_nir_lower_vs.c',
+@@ -18,3 +19,16 @@ libpoly_nir = static_library(
+   dependencies: [idep_nir, idep_mesautil, idep_libpoly],
+   build_by_default : false,
+ )
++
++if with_tests
++  test(
++    'poly-gs-side-effects',
++    executable(
++      'poly-gs-side-effects-test',
++      ['tests/gs_side_effects_test.c', 'poly_nir_gs_side_effects.c'],
++      dependencies : [idep_nir, idep_mesautil],
++      include_directories : include_directories('.'),
++    ),
++    suite : ['poly'],
++  )
++endif
+
+--- src/poly/nir/poly_nir.h
++++ src/poly/nir/poly_nir.h
+@@ -48,6 +48,18 @@ struct poly_gs_info {
+    uint8_t topology[64];
+ };
+ 
++/* side_effects_in_main runs the GS stores and atomics only in the main shader
++ * when the output does not depend on them. A caller asking for it must
++ * dispatch the main shader for every draw, with exactly one thread per
++ * primitive and instance.
++ */
++bool poly_nir_lower_gs_with_side_effects(struct nir_shader *gs,
++                                        struct nir_shader **gs_count,
++                                        struct nir_shader **gs_copy,
++                                        struct nir_shader **pre_gs,
++                                        struct poly_gs_info *info,
++                                        bool side_effects_in_main);
++
+ bool poly_nir_lower_gs(struct nir_shader *gs, struct nir_shader **gs_count,
+                        struct nir_shader **gs_copy, struct nir_shader **pre_gs,
+                        struct poly_gs_info *info);
+
+--- src/poly/nir/poly_nir_gs_side_effects.c
++++ src/poly/nir/poly_nir_gs_side_effects.c
+@@ -0,0 +1,127 @@
++/*
++ * Copyright 2023 Alyssa Rosenzweig
++ * Copyright 2023 Valve Corporation
++ * Copyright 2015 Intel Corporation
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nir_builder.h"
++#include "poly_nir_gs_side_effects.h"
++
++static bool strip_side_effect_from_copy(nir_builder *b,
++                                       nir_intrinsic_instr *intr, void *data);
++
++/* Strip side effects along with the code that only fed them */
++static void
++strip_side_effects(nir_shader *s, nir_intrinsic_pass_cb strip, void *data)
++{
++   bool progress;
++   do {
++      progress = false;
++      NIR_PASS(progress, s, nir_shader_intrinsics_pass, strip,
++               nir_metadata_control_flow, data);
++
++      NIR_PASS(progress, s, nir_opt_dce);
++      NIR_PASS(progress, s, nir_opt_dead_cf);
++   } while (progress);
++}
++
++static bool
++strip_side_effect_from_main(nir_builder *b, nir_intrinsic_instr *intr,
++                            void *data)
++{
++   switch (intr->intrinsic) {
++   case nir_intrinsic_global_atomic:
++   case nir_intrinsic_global_atomic_swap:
++   case nir_intrinsic_image_atomic:
++   case nir_intrinsic_image_atomic_swap:
++   case nir_intrinsic_bindless_image_atomic:
++   case nir_intrinsic_bindless_image_atomic_swap:
++      if (list_is_empty(&intr->def.uses)) {
++         nir_instr_remove(&intr->instr);
++         return true;
++      }
++
++      return false;
++
++   case nir_intrinsic_store_global:
++   case nir_intrinsic_image_store:
++   case nir_intrinsic_bindless_image_store:
++   case nir_intrinsic_fence_pbe_to_tex_agx:
++   case nir_intrinsic_bindless_image_fence_kk:
++      if (data) {
++         nir_instr_remove(&intr->instr);
++         return true;
++      }
++
++      return false;
++
++   default:
++      return false;
++   }
++}
++
++/* With the side effects gone, barriers have nothing left to order */
++static bool
++strip_side_effect_from_copy(nir_builder *b, nir_intrinsic_instr *intr,
++                            void *data)
++{
++   if (intr->intrinsic == nir_intrinsic_barrier) {
++      nir_instr_remove(&intr->instr);
++      return true;
++   }
++
++   return strip_side_effect_from_main(b, intr, (void *)true);
++}
++
++static bool
++can_replay_without_side_effects(nir_shader *shader)
++{
++   nir_foreach_function_impl(impl, shader) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_tex)
++               return false;
++
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (nir_intrinsic_writes_external_memory(intr) ||
++                nir_intrinsic_has_semantic(intr, NIR_INTRINSIC_SUBGROUP) ||
++                (nir_intrinsic_infos[intr->intrinsic].has_dest &&
++                 !nir_intrinsic_can_reorder(intr)))
++               return false;
++         }
++      }
++   }
++
++   return true;
++}
++
++/*
++ * Clone the GS without its side effects, as the source of the rasterization
++ * shader when the main shader runs them. Returns NULL if the GS output depends
++ * on the side effects: an atomic is left, or a load of memory the draw writes.
++ */
++nir_shader *
++poly_nir_clone_gs_without_side_effects(const nir_shader *gs)
++{
++   nir_shader *clone = nir_shader_clone(NULL, gs);
++
++   strip_side_effects(clone, strip_side_effect_from_copy, NULL);
++   if (!can_replay_without_side_effects(clone)) {
++      ralloc_free(clone);
++      return NULL;
++   }
++
++   return clone;
++}
++
++void
++poly_nir_strip_gs_side_effects(nir_shader *shader, bool stores, bool barriers)
++{
++   strip_side_effects(shader, barriers ? strip_side_effect_from_copy
++                                      : strip_side_effect_from_main,
++                      (void *)(uintptr_t)stores);
++}
+
+--- src/poly/nir/poly_nir_gs_side_effects.h
++++ src/poly/nir/poly_nir_gs_side_effects.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: MIT */
++
++#pragma once
++
++#include "nir.h"
++
++nir_shader *poly_nir_clone_gs_without_side_effects(const nir_shader *gs);
++
++void poly_nir_strip_gs_side_effects(nir_shader *shader, bool stores,
++                                  bool barriers);
+
+--- src/poly/nir/poly_nir_lower_gs.c
++++ src/poly/nir/poly_nir_lower_gs.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "poly/nir/poly_nir.h"
++#include "poly_nir_gs_side_effects.h"
+ #include "compiler/nir/nir_builder.h"
+ #include "gallium/include/pipe/p_defines.h"
+ #include "poly/cl/libpoly.h"
+@@ -170,6 +171,9 @@ struct lower_gs_state {
+    int count_index[POLY_MAX_VERTEX_STREAMS];
+ 
+    struct poly_gs_info *info;
++
++   /* Whether only the main shader runs the side effects */
++   bool side_effects_in_main;
+ };
+ 
+ /* Helpers for loading from the vertex state buffer */
+@@ -520,6 +524,10 @@ create_geometry_count_shader(nir_shader *gs, struct lower_gs_state *state)
+       shader->info.name = "count";
+    }
+ 
++   /* Before our own count writes, which must stay */
++   if (state->side_effects_in_main)
++      poly_nir_strip_gs_side_effects(shader, true, true);
++
+    NIR_PASS(_, shader, nir_shader_intrinsics_pass, lower_gs_count_instr,
+             nir_metadata_control_flow, state);
+ 
+@@ -631,41 +639,6 @@ lower_to_gs_rast(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+    }
+ }
+ 
+-static bool
+-strip_side_effect_from_main(nir_builder *b, nir_intrinsic_instr *intr,
+-                            void *data)
+-{
+-   switch (intr->intrinsic) {
+-   case nir_intrinsic_global_atomic:
+-   case nir_intrinsic_global_atomic_swap:
+-   case nir_intrinsic_image_atomic:
+-   case nir_intrinsic_image_atomic_swap:
+-   case nir_intrinsic_bindless_image_atomic:
+-   case nir_intrinsic_bindless_image_atomic_swap:
+-      if (list_is_empty(&intr->def.uses)) {
+-         nir_instr_remove(&intr->instr);
+-         return true;
+-      }
+-
+-      return false;
+-
+-   case nir_intrinsic_store_global:
+-   case nir_intrinsic_image_store:
+-   case nir_intrinsic_bindless_image_store:
+-   case nir_intrinsic_fence_pbe_to_tex_agx:
+-   case nir_intrinsic_bindless_image_fence_kk:
+-      if (data) {
+-         nir_instr_remove(&intr->instr);
+-         return true;
+-      }
+-
+-      return false;
+-
+-   default:
+-      return false;
+-   }
+-}
+-
+ /*
+  * The stream # is encoded into the lower bits of an index. The stream
+  * multiplier is the factor to multiply vertex IDs before adding the stream #.
+@@ -1241,8 +1214,10 @@ optimize_static_topology(struct poly_gs_info *info, nir_shader *gs)
+ }
+ 
+ bool
+-poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
+-                  nir_shader **pre_gs, struct poly_gs_info *info)
++poly_nir_lower_gs_with_side_effects(nir_shader *gs, nir_shader **gs_count,
++                                    nir_shader **gs_copy, nir_shader **pre_gs,
++                                    struct poly_gs_info *info,
++                                    bool side_effects_in_main)
+ {
+    /* Lower I/O as assumed by the rest of GS lowering */
+    if (gs->xfb_info != NULL) {
+@@ -1354,7 +1329,13 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
+    /* Ensure that outputs_written is still accurate after DCE. */
+    nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+ 
+-   *gs_copy = create_gs_rast_shader(gs, &gs_state);
++   nir_shader *stripped = NULL;
++   if (side_effects_in_main && gs->info.writes_memory)
++      stripped = poly_nir_clone_gs_without_side_effects(gs);
++
++   gs_state.side_effects_in_main = stripped != NULL;
++   *gs_copy = create_gs_rast_shader(stripped ? stripped : gs, &gs_state);
++   ralloc_free(stripped);
+ 
+    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_id,
+             nir_metadata_control_flow, NULL);
+@@ -1372,15 +1353,8 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
+       *gs_count = NULL;
+ 
+    /* Strip stores and atomics */
+-   do {
+-      progress = false;
+-      NIR_PASS(progress, gs, nir_shader_intrinsics_pass,
+-               strip_side_effect_from_main, nir_metadata_control_flow,
+-               (void *)true);
+-
+-      NIR_PASS(progress, gs, nir_opt_dce);
+-      NIR_PASS(progress, gs, nir_opt_dead_cf);
+-   } while (progress);
++   if (!gs_state.side_effects_in_main)
++      poly_nir_strip_gs_side_effects(gs, true, false);
+ 
+    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_gs_instr,
+             nir_metadata_none, &gs_state);
+@@ -1404,15 +1378,8 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
+    } while (progress);
+ 
+    /* Strip remaining atomics, but not stores - since those are from us */
+-   do {
+-      progress = false;
+-      NIR_PASS(progress, gs, nir_shader_intrinsics_pass,
+-               strip_side_effect_from_main, nir_metadata_control_flow,
+-               (void *)false);
+-
+-      NIR_PASS(progress, gs, nir_opt_dce);
+-      NIR_PASS(progress, gs, nir_opt_dead_cf);
+-   } while (progress);
++   if (!gs_state.side_effects_in_main)
++      poly_nir_strip_gs_side_effects(gs, false, false);
+ 
+    /* All those variables we created should've gone away by now */
+    NIR_PASS(_, gs, nir_remove_dead_variables, nir_var_function_temp, NULL);
+@@ -1525,3 +1492,11 @@ poly_nir_lower_vs_before_gs(struct nir_shader *vs)
+    return nir_shader_intrinsics_pass(vs, lower_vs_before_gs,
+                                      nir_metadata_control_flow, NULL);
+ }
++
++bool
++poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
++                  nir_shader **pre_gs, struct poly_gs_info *info)
++{
++   return poly_nir_lower_gs_with_side_effects(gs, gs_count, gs_copy, pre_gs,
++                                              info, false);
++}
+

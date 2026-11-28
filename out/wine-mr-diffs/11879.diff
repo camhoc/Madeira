@@ -1,0 +1,89 @@
+# gdi32, win32u, winex11.drv: Get functions get_dib_info_size in sync.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11879 state=opened
+# I received a ASan-unix report of a memcpy copying 48 bytes from a 40 bytes allocation. 
+
+This difference originates from different versions of the function `get_dib_info_size` being used for allocation and for copying.
+
+Should these functions stay in sync?
+
+CC: @alexhenrie, @jacek 
+
+<details>
+<summary>ASan details</summary>
+
+```
+=================================================================
+==wine==1416068==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x5040000caeb8 at pc 0x7f0ce8ef2936 bp 0x7ffffe10dda0 sp 0x7ffffe10d560
+READ of size 48 at 0x5040000caeb8 thread T0 (explorer.exe)
+    #0 0x7f0ce8ef2935 in memcpy ../../../../src/libsanitizer/sanitizer_common/sanitizer_common_interceptors_memintrinsics.inc:115
+    #1 0x7f0ce4f79201 in create_pixmap_from_image dlls/winex11.drv/bitblt.c:1491
+    #2 0x7f0ce4f7c2dc in select_pattern_brush dlls/winex11.drv/brush.c:217
+    #3 0x7f0ce4f7c2dc in X11DRV_SelectBrush dlls/winex11.drv/brush.c:246
+    #4 0x7f0ce501effc in xrenderdrv_SelectBrush dlls/winex11.drv/xrender.c:2162
+    #5 0x7f0ce55372c7 in NtGdiSelectBrush dlls/win32u/brush.c:324
+    #6 0x7f0ce60d24b5 in __wine_syscall_dispatcher (dlls/ntdll/ntdll.so+0xd04b5) (BuildId: 18795575aabe3d8691ef3d5a5753583bf6925254)
+    #7 0x7f0ce60d2238 in KeUserModeCallback dlls/ntdll/unix/signal_x86_64.c:1814
+    #8 0x7f0ce56d6c2c in dispatch_win_proc_params dlls/win32u/message.c:474
+    #9 0x7f0ce56eccb0 in call_window_proc dlls/win32u/message.c:2406
+    #10 0x7f0ce56e61e8 in process_message dlls/win32u/message.c:4469
+    #11 0x7f0ce56e7363 in send_client_message dlls/win32u/message.c:4615
+    #12 0x7f0ce56e7363 in send_message_timeout dlls/win32u/message.c:4626
+    #13 0x7f0ce56e78e0 in send_message dlls/win32u/message.c:4647
+    #14 0x7f0ce556fc7d in send_erase dlls/win32u/dce.c:1633
+    #15 0x7f0ce557142e in erase_now dlls/win32u/dce.c:1767
+    #16 0x7f0ce585f1ed in set_window_pos dlls/win32u/window.c:4192
+    #17 0x7f0ce5861b8f in NtUserSetWindowPos dlls/win32u/window.c:
+--- dlls/gdi32/gdi_private.h
++++ dlls/gdi32/gdi_private.h
+@@ -286,13 +286,16 @@ static inline int get_dib_stride( int width, int bpp )
+     return ((width * bpp + 31) >> 3) & ~3;
+ }
+ 
+-/* only for use on sanitized BITMAPINFO structures */
++/* only for use on sanitized BITMAPINFO structures,
++ * keep other copies of get_dib_info_size in sync. */
+ static inline int get_dib_info_size( const BITMAPINFO *info, UINT coloruse )
+ {
+     if (info->bmiHeader.biCompression == BI_BITFIELDS)
+         return sizeof(BITMAPINFOHEADER) + 3 * sizeof(DWORD);
+     if (coloruse == DIB_PAL_COLORS)
+         return sizeof(BITMAPINFOHEADER) + info->bmiHeader.biClrUsed * sizeof(WORD);
++    if (!info->bmiHeader.biClrUsed && info->bmiHeader.biBitCount <= 8)
++        return FIELD_OFFSET( BITMAPINFO, bmiColors[1 << info->bmiHeader.biBitCount] );
+     return FIELD_OFFSET( BITMAPINFO, bmiColors[info->bmiHeader.biClrUsed] );
+ }
+ 
+
+--- dlls/win32u/ntgdi_private.h
++++ dlls/win32u/ntgdi_private.h
+@@ -625,13 +625,16 @@ static inline int get_dib_image_size( const BITMAPINFO *info )
+         * abs( info->bmiHeader.biHeight );
+ }
+ 
+-/* only for use on sanitized BITMAPINFO structures */
++/* only for use on sanitized BITMAPINFO structures,
++ * keep other copies of get_dib_info_size in sync. */
+ static inline int get_dib_info_size( const BITMAPINFO *info, UINT coloruse )
+ {
+     if (info->bmiHeader.biCompression == BI_BITFIELDS)
+         return sizeof(BITMAPINFOHEADER) + 3 * sizeof(DWORD);
+     if (coloruse == DIB_PAL_COLORS)
+         return sizeof(BITMAPINFOHEADER) + info->bmiHeader.biClrUsed * sizeof(WORD);
++    if (!info->bmiHeader.biClrUsed && info->bmiHeader.biBitCount <= 8)
++        return FIELD_OFFSET( BITMAPINFO, bmiColors[1 << info->bmiHeader.biBitCount] );
+     return FIELD_OFFSET( BITMAPINFO, bmiColors[info->bmiHeader.biClrUsed] );
+ }
+ 
+
+--- dlls/winex11.drv/bitblt.c
++++ dlls/winex11.drv/bitblt.c
+@@ -936,6 +936,8 @@ static void free_ximage_bits( struct gdi_image_bits *bits )
+     XFree( bits->ptr );
+ }
+ 
++/* only for use on sanitized BITMAPINFO structures,
++ * keep other copies of get_dib_info_size in sync. */
+ static inline int get_dib_info_size( const BITMAPINFO *info, UINT coloruse )
+ {
+     if (info->bmiHeader.biCompression == BI_BITFIELDS)
+

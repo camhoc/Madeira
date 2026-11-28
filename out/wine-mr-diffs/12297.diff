@@ -1,0 +1,37 @@
+# ntdll: Reject PAGE_NOACCESS combined with PAGE_GUARD.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12297 state=opened
+# Windows rejects PAGE_NOACCESS combined with PAGE_GUARD. Reject this combination in get_vprot_flags() with STATUS_INVALID_PAGE_PROTECTION.\
+Add regression tests checking that VirtualProtect() and VirtualAlloc() fail with ERROR_INVALID_PARAMETER for this combination.
+
+https://learn.microsoft.com/en-us/windows/win32/memory/memory-protection-constants.
+--- dlls/kernel32/tests/virtual.c
++++ dlls/kernel32/tests/virtual.c
+@@ -3534,6 +3534,16 @@ static void test_VirtualProtect(void)
+     ok(status == STATUS_SUCCESS, "NtProtectVirtualMemory should succeed, got %08lx\n", status);
+     ok(old_prot == PAGE_NOACCESS, "got %#lx != expected PAGE_NOACCESS\n", old_prot);
+ 
++    SetLastError(0xdeadbeef);
++    ret = VirtualProtect(base, si.dwPageSize, PAGE_NOACCESS | PAGE_GUARD, &old_prot);
++    ok(!ret, "VirtualProtect should fail\n");
++    ok(GetLastError() == ERROR_INVALID_PARAMETER, "expected ERROR_INVALID_PARAMETER, got %ld\n", GetLastError());
++
++    SetLastError(0xdeadbeef);
++    ptr = VirtualAlloc(0, si.dwPageSize, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS | PAGE_GUARD);
++    ok(!ptr, "VirtualAlloc should fail\n");
++    ok(GetLastError() == ERROR_INVALID_PARAMETER, "expected ERROR_INVALID_PARAMETER, got %ld\n", GetLastError());
++
+     for (i = 0; i < ARRAY_SIZE(td); i++)
+     {
+         SetLastError(0xdeadbeef);
+
+--- dlls/ntdll/unix/virtual.c
++++ dlls/ntdll/unix/virtual.c
+@@ -1863,6 +1863,7 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image
+         *vprot = VPROT_EXEC | VPROT_READ | VPROT_WRITECOPY;
+         break;
+     case PAGE_NOACCESS:
++        if (protect & PAGE_GUARD) return STATUS_INVALID_PAGE_PROTECTION;
+         *vprot = 0;
+         break;
+     default:
+

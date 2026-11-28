@@ -1,0 +1,31 @@
+# loader: Load ntdll.so with RTLD_NODELETE.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12711 state=merged
+# ntdll.so is loaded at startup and kept for the lifetime of the process. Add RTLD_NODELETE in both loaders to make this lifetime explicit to the dynamic linker.
+
+On OpenBSD, this allows ld.so to apply mimmutable() protection to its RELRO pages, strengthening the existing memory protections.
+
+Patch by [Bryan Steele (@brynet)](https://github.com/brynet), originally posted in [NethIafin/wine#38](https://github.com/NethIafin/wine/issues/38).
+--- loader/main.c
++++ loader/main.c
+@@ -156,7 +156,7 @@ static void *try_dlopen( const char *argv0 )
+     else
+         path = build_path( dir, "ntdll.so" );
+ 
+-    handle = dlopen( path, RTLD_NOW );
++    handle = dlopen( path, RTLD_NOW | RTLD_NODELETE );
+     free( p );
+     free( dir );
+     free( path );
+
+--- tools/wine/wine.c
++++ tools/wine/wine.c
+@@ -29,7 +29,7 @@ static const char *libdir;
+ 
+ static void *try_dlopen( const char *path, struct strarray *errors )
+ {
+-    void *handle = dlopen( path, RTLD_NOW );
++    void *handle = dlopen( path, RTLD_NOW | RTLD_NODELETE );
+     if (!handle) strarray_add( errors, xstrdup( dlerror() ) );
+     return handle;
+ }
+

@@ -1,0 +1,355 @@
+# Draft: ws2_32: Support IP_ECN / IPV6_ECN and implement SIO_TCP_INITIAL_RTO
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12748 state=opened
+# Two missing socket features in ws2_32, with the matching ntdll/afd plumbing.
+
+- Support the IP_ECN / IPV6_ECN socket options. IP_RECVECN / IPV6_RECVECN
+  (value 50) are mapped to IP_RECVTOS / IPV6_RECVTCLASS, and the ECN bits of
+  the received TOS / traffic class are reported in an IP_ECN / IPV6_ECN control
+  message. Previously setsockopt() failed with WSAENOPROTOOPT. The ECN message is
+  currently emitted whenever TOS / traffic class messages are received,
+  regardless of whether the application requested ECN.
+
+- Implement SIO_TCP_INITIAL_RTO. This adds the ioctl and the
+  TCP_INITIAL_RTO_PARAMETERS structure, and maps MaxSynRetransmissions to
+  TCP_SYNCNT on Linux. Linux has no per-socket initial retransmission timeout,
+  so Rtt is currently ignored (a trace message is printed). "No SYN
+  retransmissions" is approximated by a single retransmission, as TCP_SYNCNT
+  does not accept 0. Previously the ioctl was reported as unimplemented, which
+  produced two FIXME messages every time an application used it.
+
+Tests are added to ws2_32:sock for both.
+
+These were found while trying to get the software discussed in the link below
+running under Wine. They are not the only fixes needed; I will submit the
+remaining ones gradually, as separate merge requests split by topic.
+
+Discussion: https://forum.winehq.org/viewtopic.php?t=34939
+--- dlls/ntdll/unix/socket.c
++++ dlls/ntdll/unix/socket.c
+@@ -437,6 +437,11 @@ static int convert_control_headers(struct msghdr *hdr, WSABUF *control)
+                         ptr = fill_control_message( WS_IPPROTO_IP, WS_IP_TOS, ptr, &ctlsize,
+                                                     &tos, sizeof(INT) );
+                         if (!ptr) goto error;
++                        /* IP_RECVECN is mapped to IP_RECVTOS, report the ECN bits as well. */
++                        tos &= 3;
++                        ptr = fill_control_message( WS_IPPROTO_IP, WS_IP_ECN, ptr, &ctlsize,
++                                                    &tos, sizeof(INT) );
++                        if (!ptr) goto error;
+                         break;
+                     }
+ #endif /* IP_TOS */
+@@ -488,9 +493,15 @@ static int convert_control_headers(struct msghdr *hdr, WSABUF *control)
+ #if defined(IPV6_TCLASS)
+                     case IPV6_TCLASS:
+                     {
++                        INT ecn;
+                         ptr = fill_control_message( WS_IPPROTO_IPV6, WS_IPV6_TCLASS, ptr, &ctlsize,
+                                                     CMSG_DATA(cmsg_unix), sizeof(INT) );
+                         if (!ptr) goto error;
++                        /* IPV6_RECVECN is mapped to IPV6_RECVTCLASS, report the ECN bits as well. */
++                        ecn = *(INT *)CMSG_DATA(cmsg_unix) & 3;
++                        ptr = fill_control_message( WS_IPPROTO_IPV6, WS_IPV6_ECN, ptr, &ctlsize,
++                                                    &ecn, sizeof(INT) );
++                        if (!ptr) goto error;
+                         break;
+                     }
+ #endif /* IPV6_TCLASS */
+@@ -2068,6 +2079,46 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+             return STATUS_SUCCESS;
+         }
+ 
++        case IOCTL_AFD_WINE_TCP_INITIAL_RTO:
++        {
++            const TCP_INITIAL_RTO_PARAMETERS *params = in_buffer;
++
++            if (!in_buffer || in_size < sizeof(*params))
++                return STATUS_BUFFER_TOO_SMALL;
++
++            if (get_sock_type( handle ) != SOCK_STREAM)
++                return STATUS_INVALID_PARAMETER;
++
++            if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options )))
++                return status;
++
++            if (params->Rtt != TCP_INITIAL_RTO_UNSPECIFIED_RTT && params->Rtt != TCP_INITIAL_RTO_DEFAULT_RTT)
++                TRACE( "Initial RTO of %u ms is not implemented, ignoring.\n", params->Rtt );
++
++            if (params->MaxSynRetransmissions != TCP_INITIAL_RTO_UNSPECIFIED_MAX_SYN_RETRANSMISSIONS &&
++                params->MaxSynRetransmissions != TCP_INITIAL_RTO_DEFAULT_MAX_SYN_RETRANSMISSIONS)
++            {
++#ifdef TCP_SYNCNT
++                /* Linux does not accept a SYN retransmission count of 0, so "no retransmission"
++                 * is approximated by a single one. */
++                int syncnt = params->MaxSynRetransmissions == TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS ?
++                             1 : min( params->MaxSynRetransmissions, 127 );
++
++                if (setsockopt( fd, IPPROTO_TCP, TCP_SYNCNT, &syncnt, sizeof(syncnt) ) < 0)
++                {
++                    status = sock_errno_to_status( errno );
++                    break;
++                }
++#else
++                TRACE( "SYN retransmission count is not implemented, ignoring.\n" );
++#endif
++            }
++
++            if (needs_close) close( fd );
++            file_complete_async( handle, options, event, apc, apc_user, io, STATUS_SUCCESS, 0 );
++            return STATUS_SUCCESS;
++        }
++
+         case IOCTL_AFD_WINE_GETPEERNAME:
+             if (in_size) FIXME( "unexpected input size %u\n", in_size );
+ 
+
+--- dlls/ws2_32/tests/sock.c
++++ dlls/ws2_32/tests/sock.c
+@@ -5896,6 +5896,59 @@ static void test_fionbio(void)
+     closesocket(s);
+ }
+ 
++static void test_tcp_initial_rto(void)
++{
++    static const TCP_INITIAL_RTO_PARAMETERS tests[] =
++    {
++        {TCP_INITIAL_RTO_UNSPECIFIED_RTT, TCP_INITIAL_RTO_UNSPECIFIED_MAX_SYN_RETRANSMISSIONS},
++        {TCP_INITIAL_RTO_DEFAULT_RTT, TCP_INITIAL_RTO_DEFAULT_MAX_SYN_RETRANSMISSIONS},
++        {TCP_INITIAL_RTO_UNSPECIFIED_RTT, TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS},
++        {500, 2},
++    };
++    struct sockaddr_in addr;
++    SOCKET listener, client, server;
++    int ret, len;
++    DWORD size;
++    unsigned int i;
++
++    listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++    ok(listener != INVALID_SOCKET, "got error %u\n", WSAGetLastError());
++    memset(&addr, 0, sizeof(addr));
++    addr.sin_family = AF_INET;
++    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    ret = bind(listener, (struct sockaddr *)&addr, sizeof(addr));
++    ok(!ret, "got error %u\n", WSAGetLastError());
++    len = sizeof(addr);
++    ret = getsockname(listener, (struct sockaddr *)&addr, &len);
++    ok(!ret, "got error %u\n", WSAGetLastError());
++    ret = listen(listener, 1);
++    ok(!ret, "got error %u\n", WSAGetLastError());
++
++    for (i = 0; i < ARRAY_SIZE(tests); ++i)
++    {
++        winetest_push_context("rtt %u, max retransmissions %u", tests[i].Rtt, tests[i].MaxSynRetransmissions);
++
++        client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++        ok(client != INVALID_SOCKET, "got error %u\n", WSAGetLastError());
++
++        WSASetLastError(0xdeadbeef);
++        size = 0xdeadbeef;
++        ret = WSAIoctl(client, SIO_TCP_INITIAL_RTO, (void *)&tests[i], sizeof(tests[i]), NULL, 0, &size, NULL, NULL);
++        ok(!ret, "got %d, error %u\n", ret, WSAGetLastError());
++
++        ret = connect(client, (struct sockaddr *)&addr, sizeof(addr));
++        ok(!ret, "got error %u\n", WSAGetLastError());
++        server = accept(listener, NULL, NULL);
++        ok(server != INVALID_SOCKET, "got error %u\n", WSAGetLastError());
++
++        closesocket(server);
++        closesocket(client);
++        winetest_pop_context();
++    }
++
++    closesocket(listener);
++}
++
+ static void test_keepalive_vals(void)
+ {
+     OVERLAPPED overlapped = {0}, *overlapped_ptr;
+@@ -13807,7 +13860,7 @@ static void test_sockopt_validity(void)
+         { IP_RECVRTHDR,               WSAEINVAL,       0,          TRUE },
+         { IP_RECVTOS,                 WSAEINVAL                         },
+         { IP_ORIGINAL_ARRIVAL_IF,     WSAEINVAL,       0,          TRUE },
+-        { IP_ECN,                     WSAEINVAL,       0,          TRUE },
++        { IP_ECN,                     WSAEINVAL                         },
+         { IP_PKTINFO_EX,              WSAEINVAL,       0,          TRUE },
+         { IP_WFP_REDIRECT_RECORDS,    WSAEINVAL,       0,          TRUE },
+         { IP_WFP_REDIRECT_CONTEXT,    WSAEINVAL,       0,          TRUE },
+@@ -13842,7 +13895,7 @@ static void test_sockopt_validity(void)
+         { IP_RECVRTHDR,               0,               0,          TRUE },
+         { IP_RECVTOS                                                    },
+         { IP_ORIGINAL_ARRIVAL_IF,     0,               0,          TRUE },
+-        { IP_ECN,                     0,               0,          TRUE },
++        { IP_ECN                                                        },
+         { IP_PKTINFO_EX,              0,               0,          TRUE },
+         { IP_WFP_REDIRECT_RECORDS,    0,               0,          TRUE },
+         { IP_WFP_REDIRECT_CONTEXT,    0,               0,          TRUE },
+@@ -13877,7 +13930,7 @@ static void test_sockopt_validity(void)
+         { IP_RECVRTHDR,               0,               0,          TRUE },
+         { IP_RECVTOS                                                    },
+         { IP_ORIGINAL_ARRIVAL_IF,     0,               0,          TRUE },
+-        { IP_ECN,                     0,               0,          TRUE },
++        { IP_ECN                                                        },
+         { IP_PKTINFO_EX,              0,               0,          TRUE },
+         { IP_WFP_REDIRECT_RECORDS,    0,               0,          TRUE },
+         { IP_WFP_REDIRECT_CONTEXT,    0,               0,          TRUE },
+@@ -13912,7 +13965,7 @@ static void test_sockopt_validity(void)
+         { IPV6_RECVRTHDR,             WSAEINVAL,       0,          TRUE },
+         { IPV6_RECVTCLASS,            WSAEINVAL                         },
+         { IP_ORIGINAL_ARRIVAL_IF,     WSAEINVAL,       0,          TRUE },
+-        { IPV6_ECN,                   WSAEINVAL,       0,          TRUE },
++        { IPV6_ECN,                   WSAEINVAL                         },
+         { IPV6_PKTINFO_EX,            WSAEINVAL,       0,          TRUE },
+         { IPV6_WFP_REDIRECT_RECORDS,  WSAEINVAL,       0,          TRUE },
+         { IPV6_WFP_REDIRECT_CONTEXT,  WSAEINVAL,       0,          TRUE },
+@@ -13947,7 +14000,7 @@ static void test_sockopt_validity(void)
+         { IPV6_RECVRTHDR,             0,               0,          TRUE },
+         { IPV6_RECVTCLASS                                               },
+         { IP_ORIGINAL_ARRIVAL_IF,     0,               0,          TRUE },
+-        { IPV6_ECN,                   0,               0,          TRUE },
++        { IPV6_ECN                                                      },
+         { IPV6_PKTINFO_EX,            0,               0,          TRUE },
+         { IPV6_WFP_REDIRECT_RECORDS,  0,               0,          TRUE },
+         { IPV6_WFP_REDIRECT_CONTEXT,  0,               0,          TRUE },
+@@ -13982,7 +14035,7 @@ static void test_sockopt_validity(void)
+         { IPV6_RECVRTHDR,             0,               0,          TRUE },
+         { IPV6_RECVTCLASS                                               },
+         { IP_ORIGINAL_ARRIVAL_IF,     0,               0,          TRUE },
+-        { IPV6_ECN,                   0,               0,          TRUE },
++        { IPV6_ECN                                                      },
+         { IPV6_PKTINFO_EX,            0,               0,          TRUE },
+         { IPV6_WFP_REDIRECT_RECORDS,  0,               0,          TRUE },
+         { IPV6_WFP_REDIRECT_CONTEXT,  0,               0,          TRUE },
+@@ -15111,6 +15164,7 @@ START_TEST( sock )
+     test_backlog_query();
+     test_get_interface_list();
+     test_keepalive_vals();
++    test_tcp_initial_rto();
+     test_sioRoutingInterfaceQuery();
+     test_sioAddressListChange();
+     test_base_handle();
+
+--- dlls/ws2_32/socket.c
++++ dlls/ws2_32/socket.c
+@@ -442,6 +442,7 @@ static inline const char *debugstr_sockopt(int level, int optname)
+             DEBUG_SOCKOPT(IP_PKTINFO);
+             DEBUG_SOCKOPT(IP_RECEIVE_BROADCAST);
+             DEBUG_SOCKOPT(IP_RECVTOS);
++            DEBUG_SOCKOPT(IP_ECN);
+             DEBUG_SOCKOPT(IP_RECVTTL);
+             DEBUG_SOCKOPT(IP_TOS);
+             DEBUG_SOCKOPT(IP_TTL);
+@@ -460,6 +461,7 @@ static inline const char *debugstr_sockopt(int level, int optname)
+             DEBUG_SOCKOPT(IPV6_MULTICAST_LOOP);
+             DEBUG_SOCKOPT(IPV6_PKTINFO);
+             DEBUG_SOCKOPT(IPV6_RECVTCLASS);
++            DEBUG_SOCKOPT(IPV6_ECN);
+             DEBUG_SOCKOPT(IPV6_UNICAST_HOPS);
+             DEBUG_SOCKOPT(IPV6_V6ONLY);
+             DEBUG_SOCKOPT(IPV6_UNICAST_IF);
+@@ -2150,6 +2152,7 @@ int WINAPI getsockopt( SOCKET s, int level, int optname, char *optval, int *optl
+             return server_getsockopt( s, IOCTL_AFD_WINE_GET_IP_PKTINFO, optval, optlen );
+ 
+         case IP_RECVTOS:
++        case IP_ECN:
+             if (*optlen < sizeof(DWORD) || !optval)
+             {
+                 *optlen = 0;
+@@ -2249,6 +2252,7 @@ int WINAPI getsockopt( SOCKET s, int level, int optname, char *optval, int *optl
+             return server_getsockopt( s, IOCTL_AFD_WINE_GET_IPV6_RECVPKTINFO, optval, optlen );
+ 
+         case IPV6_RECVTCLASS:
++        case IPV6_ECN:
+             if (*optlen < sizeof(DWORD) || !optval)
+             {
+                 if (optlen) *optlen = 0;
+@@ -2329,6 +2333,7 @@ static const char *debugstr_wsaioctl(DWORD code)
+         IOCTL_NAME(SIO_IDEAL_SEND_BACKLOG_QUERY);
+         IOCTL_NAME(SIO_KEEPALIVE_VALS);
+         IOCTL_NAME(SIO_MULTIPOINT_LOOPBACK);
++        IOCTL_NAME(SIO_TCP_INITIAL_RTO);
+         IOCTL_NAME(SIO_MULTICAST_SCOPE);
+         /* IOCTL_NAME(SIO_QUERY_RSS_SCALABILITY_INFO);
+         IOCTL_NAME(SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE); */
+@@ -2708,6 +2713,17 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID
+         return ret ? -1 : 0;
+     }
+ 
++    case SIO_TCP_INITIAL_RTO:
++    {
++        DWORD ret;
++
++        ret = server_ioctl_sock( s, IOCTL_AFD_WINE_TCP_INITIAL_RTO, in_buff, in_size,
++                                 out_buff, out_size, ret_size, overlapped, completion );
++        if (!overlapped || completion) *ret_size = 0;
++        SetLastError( ret );
++        return ret ? -1 : 0;
++    }
++
+     case SIO_ROUTING_INTERFACE_QUERY:
+     {
+         struct sockaddr *daddr = (struct sockaddr *)in_buff;
+@@ -3622,6 +3638,7 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
+             return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_PKTINFO, optval, optlen );
+ 
+         case IP_RECVTOS:
++        case IP_ECN:
+             if (optlen < sizeof(DWORD) || !optval)
+             {
+                 SetLastError( WSAEFAULT );
+@@ -3739,6 +3756,7 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
+             return 0;
+ 
+         case IPV6_RECVTCLASS:
++        case IPV6_ECN:
+             if (optlen < sizeof(DWORD) || !optval)
+             {
+                 SetLastError( WSAEFAULT );
+
+--- include/wine/afd.h
++++ include/wine/afd.h
+@@ -291,6 +291,7 @@ C_ASSERT( sizeof(struct afd_get_events_params) == 56 );
+ #define IOCTL_AFD_WINE_SET_TCP_KEEPCNT                  WINE_AFD_IOC(302)
+ #define IOCTL_AFD_WINE_GET_TCP_KEEPINTVL                WINE_AFD_IOC(303)
+ #define IOCTL_AFD_WINE_SET_TCP_KEEPINTVL                WINE_AFD_IOC(304)
++#define IOCTL_AFD_WINE_TCP_INITIAL_RTO                  WINE_AFD_IOC(305)
+ 
+ struct afd_iovec
+ {
+
+--- include/mstcpip.h
++++ include/mstcpip.h
+@@ -27,6 +27,18 @@ struct tcp_keepalive
+     ULONG keepaliveinterval;
+ };
+ 
++typedef struct _TCP_INITIAL_RTO_PARAMETERS
++{
++    USHORT Rtt;
++    UCHAR MaxSynRetransmissions;
++} TCP_INITIAL_RTO_PARAMETERS, *PTCP_INITIAL_RTO_PARAMETERS;
++
++#define TCP_INITIAL_RTO_UNSPECIFIED_RTT                     ((USHORT)-1)
++#define TCP_INITIAL_RTO_UNSPECIFIED_MAX_SYN_RETRANSMISSIONS ((UCHAR)-1)
++#define TCP_INITIAL_RTO_DEFAULT_RTT                         0
++#define TCP_INITIAL_RTO_DEFAULT_MAX_SYN_RETRANSMISSIONS     0
++#define TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS              ((UCHAR)-2)
++
+ #ifndef USE_WS_PREFIX
+ 
+ #define SIO_RCVALL            _WSAIOW(IOC_VENDOR, 1)
+@@ -40,6 +52,7 @@ struct tcp_keepalive
+ #define SIO_INDEX_MCASTIF     _WSAIOW(IOC_VENDOR, 9)
+ #define SIO_INDEX_ADD_MCAST   _WSAIOW(IOC_VENDOR, 10)
+ #define SIO_INDEX_DEL_MCAST   _WSAIOW(IOC_VENDOR, 11)
++#define SIO_TCP_INITIAL_RTO   _WSAIOW(IOC_VENDOR, 17)
+ 
+ #define RCVALL_OFF             0
+ #define RCVALL_ON              1
+@@ -68,6 +81,7 @@ struct tcp_keepalive
+ #define WS_SIO_INDEX_MCASTIF     _WSAIOW(WS_IOC_VENDOR, 9)
+ #define WS_SIO_INDEX_ADD_MCAST   _WSAIOW(WS_IOC_VENDOR, 10)
+ #define WS_SIO_INDEX_DEL_MCAST   _WSAIOW(WS_IOC_VENDOR, 11)
++#define WS_SIO_TCP_INITIAL_RTO   _WSAIOW(WS_IOC_VENDOR, 17)
+ 
+ #define WS_RCVALL_OFF             0
+ #define WS_RCVALL_ON              1
+

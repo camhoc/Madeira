@@ -1,0 +1,790 @@
+# server: Execute system APCs outside signal handlers.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12645 state=opened
+# System APCs can call functions such as malloc(), free(), and
+pthread_create(). Executing them from SIGUSR1 can re-enter an interrupted
+library operation, causing deadlocks or allocator failures.
+
+Prefer a dedicated native worker, with application threads already
+waiting in the server as a fallback. Introduce SELECT_SYSTEM and
+STATUS_SYSTEM_APC to distinguish these operations from asynchronous I/O
+APCs, which retain signal delivery to preserve their completion timing.
+
+Redistribute undelivered APCs when their executor exits. Once APC shutdown
+starts, reject further system and I/O APCs before cleaning up the queues.
+This prevents cleanup from requeueing work after the final queue drain
+and leaving callers waiting indefinitely.
+
+Keep the worker available until the last application thread exits,
+preserving the process exit code and debug event. Terminate the process
+if its worker disappears unexpectedly, and handle teardown that removes
+the thread issuing the current request.
+
+Also extend cancellation of eligible pending I/O to all thread-death
+paths, including pipe disconnections, rather than only explicit thread
+termination requests. Complete I/O APCs destroyed without a result with
+STATUS_CANCELLED instead of propagating their notification status.
+--- dlls/ntdll/unix/server.c
++++ dlls/ntdll/unix/server.c
+@@ -411,6 +411,9 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
+ 
+         result->type = call->type;
+         status = call->async_io.status;
++        /* FIXME: Async I/O callbacks may run from SIGUSR1. Logging and helpers
++         * such as strerror() are not guaranteed async-signal-safe and may cause
++         * undefined behavior on reentry. */
+         if (user->callback( user, &info, &status ))
+         {
+             result->async_io.status = status;
+@@ -764,7 +767,7 @@ unsigned int server_select( const union select_op *select_op, data_size_t size,
+             }
+             SERVER_END_REQ;
+ 
+-            if (ret != STATUS_KERNEL_APC) break;
++            if (ret != STATUS_KERNEL_APC && ret != STATUS_SYSTEM_APC) break;
+             invoke_system_apc( &reply_data.call, &result, FALSE );
+ 
+             /* don't signal multiple times */
+@@ -776,7 +779,7 @@ unsigned int server_select( const union select_op *select_op, data_size_t size,
+ 
+         ret = wait_select_reply( data->wait_fd, &cookie );
+     }
+-    while (ret == STATUS_USER_APC || ret == STATUS_KERNEL_APC);
++    while (ret == STATUS_USER_APC || ret == STATUS_KERNEL_APC || ret == STATUS_SYSTEM_APC);
+ 
+     if (ret == STATUS_USER_APC) *user_apc = reply_data.call.user;
+     if (reply_size > sizeof(reply_data.call))
+@@ -807,7 +810,7 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
+         abs_timeout -= now.QuadPart;
+     }
+ 
+-    ret = server_select( select_op, size, flags, abs_timeout, NULL, &apc );
++    ret = server_select( select_op, size, flags | SELECT_SYSTEM, abs_timeout, NULL, &apc );
+     if (ret == STATUS_USER_APC) return invoke_user_apc( NULL, &apc, ret );
+ 
+     /* A test on Windows 2000 shows that Windows always yields during
+@@ -858,7 +861,8 @@ NTSTATUS WINAPI NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
+ 
+     if (alertable)
+     {
+-        status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, 0, NULL, &apc );
++        status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE | SELECT_SYSTEM,
++                                0, NULL, &apc );
+         if (status == STATUS_USER_APC) return invoke_user_apc( context, &apc, status );
+     }
+     return signal_set_full_context( context );
+@@ -873,7 +877,8 @@ NTSTATUS WINAPI NtTestAlert(void)
+     struct user_apc apc;
+     NTSTATUS status;
+ 
+-    status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, 0, NULL, &apc );
++    status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE | SELECT_SYSTEM,
++                            0, NULL, &apc );
+     if (status == STATUS_USER_APC) invoke_user_apc( NULL, &apc, STATUS_SUCCESS );
+     return STATUS_SUCCESS;
+ }
+@@ -1731,6 +1736,57 @@ void server_init_process( struct thread_data *data )
+ }
+ 
+ 
++/***********************************************************************
++ *           system_apc_thread
++ */
++static void WINAPI system_apc_thread( void *arg )
++{
++    NTSTATUS status = STATUS_SUCCESS;
++    int fd = (ULONG_PTR)arg;
++    ssize_t ret;
++
++    while ((ret = write( fd, &status, sizeof(status) )) < 0 && errno == EINTR);
++    close( fd );
++    if (ret != sizeof(status))
++        fatal_error( "cannot signal system APC readiness\n" );
++
++    for (;;)
++    {
++        status = server_select( NULL, 0, SELECT_SYSTEM, TIMEOUT_INFINITE, NULL, NULL );
++        if (status)
++            fatal_error( "system APC wait failed, status %x\n", status );
++    }
++}
++
++
++/***********************************************************************
++ *           start_system_apc_thread
++ */
++static void start_system_apc_thread(void)
++{
++    HANDLE thread;
++    NTSTATUS status;
++    int fds[2];
++    ssize_t ret;
++
++    if (server_pipe( fds ) == -1)
++        fatal_error( "cannot create system APC ready pipe\n" );
++    status = PsCreateSystemThread( &thread, SYNCHRONIZE, NULL, NULL, NULL,
++                                  system_apc_thread, (void *)(ULONG_PTR)fds[1] );
++    if (status)
++        fatal_error( "cannot create system APC thread, status %x\n", status );
++
++    /* Wait outside wineserver: the initial Windows thread may be suspended. */
++    while ((ret = read( fds[0], &status, sizeof(status) )) < 0 && errno == EINTR);
++    close( fds[0] );
++    NtClose( thread );
++    if (ret != sizeof(status))
++        fatal_error( "cannot read system APC readiness\n" );
++    if (status)
++        fatal_error( "system APC thread failed to initialize, status %x\n", status );
++}
++
++
+ /***********************************************************************
+  *           server_init_process_done
+  */
+@@ -1756,6 +1812,7 @@ void server_init_process_done(void)
+      * is sent by init_process_done */
+     signal_init_process( data->teb );
+     init_teb_data( data );
++    start_system_apc_thread();
+ 
+     /* Signal the parent process to continue */
+     SERVER_START_REQ( init_process_done )
+@@ -1780,6 +1837,7 @@ void server_init_process_done(void)
+ void server_init_thread( struct thread_data *data )
+ {
+     int reply_pipe;
++    NTSTATUS status;
+     TEB64 *teb64 = get_teb64( data->teb );
+ 
+     data->pthread_id = pthread_self();
+@@ -1795,7 +1853,9 @@ void server_init_thread( struct thread_data *data )
+         req->reply_fd  = reply_pipe;
+         req->wait_fd   = data->wait_fd[1];
+         if (data->teb) req->entry = wine_server_client_ptr( data->start );
+-        wine_server_call( req );
++        req->is_apc_worker = (data->start == system_apc_thread);
++        if ((status = wine_server_call( req )))
++            fatal_error( "init_thread failed, status %x\n", status );
+         data->suspend = reply->suspend;
+     }
+     SERVER_END_REQ;
+
+--- include/wine/server_protocol.h
++++ include/wine/server_protocol.h
+
+--- include/winternl.h
++++ include/winternl.h
+@@ -4133,6 +4133,9 @@ typedef struct _RTL_PROCESS_MODULE_INFORMATION_EX
+ 
+ #ifdef __WINESRC__
+ 
++/* Wine-specific status code: bit 0x20000000; never returned to applications. */
++#define STATUS_SYSTEM_APC        0x20000001
++
+ /* Wine-specific exceptions codes */
+ 
+ #define EXCEPTION_WINE_STUB       0x80000100  /* stub entry point called */
+
+--- server/process.c
++++ server/process.c
+@@ -640,6 +640,9 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+     process->rawinput_device_count = 0;
+     process->rawinput_mouse  = NULL;
+     process->rawinput_kbd    = NULL;
++    process->apc_thread      = NULL;
++    process->apc_shutdown    = 0;
++    list_init( &process->system_apc );
+     memset( &process->image_info, 0, sizeof(process->image_info) );
+     list_init( &process->rawinput_entry );
+     list_init( &process->kernel_object );
+@@ -882,6 +885,9 @@ restart:
+     {
+         if (exit_code) thread->exit_code = exit_code;
+         if (thread == skip) continue;
++        /* Keep the worker available until the last user thread exits. */
++        if (thread == process->apc_thread && !process->apc_shutdown)
++            continue;
+         if (thread->state == TERMINATED) continue;
+         kill_thread( thread, 1 );
+         goto restart;
+@@ -923,6 +929,7 @@ void kill_console_processes( struct thread *renderer, int exit_code )
+ static void process_killed( struct process *process )
+ {
+     assert( list_empty( &process->thread_list ));
++    process->is_terminating = 1;
+     process->end_time = current_time;
+     close_process_desktop( process );
+     process->winstation = 0;
+@@ -968,9 +975,15 @@ void add_process_thread( struct process *process, struct thread *thread )
+ /* remove a thread from a process running threads list */
+ void remove_process_thread( struct process *process, struct thread *thread )
+ {
++    int apc_thread = (thread == process->apc_thread);
++
++    if (apc_thread) process->apc_thread = NULL;
+     assert( process->running_threads > 0 );
+     assert( !list_empty( &process->thread_list ));
+ 
++    /* Keep the last user thread as the sender of the process exit event. */
++    if (!thread->is_system && process->user_threads == 1)
++        terminate_process( process, thread, thread->exit_code );
+     list_remove( &thread->proc_entry );
+     if (!thread->is_system) process->user_threads--;
+ 
+@@ -984,6 +997,9 @@ void remove_process_thread( struct process *process, struct thread *thread )
+     }
+     else if (!thread->is_system) generate_debug_event( thread, DbgExitThreadStateChange, thread );
+ 
++    /* A dead worker must not leave surviving callers waiting for APCs. */
++    if (apc_thread && !process->is_terminating && process->running_threads)
++        terminate_process( process, NULL, thread->exit_code );
+     release_object( thread );
+ }
+ 
+@@ -1473,8 +1489,11 @@ DECL_HANDLER(terminate_process)
+     }
+ 
+     terminate_process( process, current, exit_code );
+-    reply->self = (current->process == process);
+-    if (reply->self) reply->exit_code = current->exit_code;
++    if (current)
++    {
++        reply->self = (current->process == process);
++        if (reply->self) reply->exit_code = current->exit_code;
++    }
+     release_object( process );
+ }
+ 
+
+--- server/process.h
++++ server/process.h
+@@ -90,6 +90,9 @@ struct process
+     struct list          rawinput_entry;  /* entry in the rawinput process list */
+     struct list          kernel_object;   /* list of kernel object pointers */
+     struct pe_image_info image_info;      /* main exe image info */
++    struct thread       *apc_thread;      /* system APC worker, while alive */
++    struct list          system_apc;      /* system APCs awaiting the worker */
++    int                  apc_shutdown;    /* reject work once APC dispatch is stopping */
+ };
+ 
+ /* process functions */
+
+--- server/protocol.def
++++ server/protocol.def
+@@ -1225,6 +1225,7 @@ typedef volatile struct
+     int          wait_fd;      /* fd for blocking calls pipe */
+     client_ptr_t teb;          /* TEB of new thread (in thread address space) */
+     client_ptr_t entry;        /* entry point (in thread address space) */
++    int          is_apc_worker;/* is this the system APC worker? */
+ @REPLY
+     int          suspend;      /* is thread suspended? */
+ @END
+@@ -1505,6 +1506,7 @@ typedef volatile struct
+ #define SELECT_ALERTABLE           1
+ #define SELECT_INTERRUPTIBLE       2
+ #define SELECT_COOPERATIVE_SUSPEND 4
++#define SELECT_SYSTEM              8
+ 
+ 
+ /* Create an event */
+
+--- server/request_handlers.h
++++ server/request_handlers.h
+
+--- server/request_trace.h
++++ server/request_trace.h
+
+--- server/thread.c
++++ server/thread.c
+@@ -98,6 +98,7 @@ static void thread_apc_dump( struct object *obj, int verbose );
+ static struct object *thread_apc_get_sync( struct object *obj );
+ static void thread_apc_destroy( struct object *obj );
+ static void clear_apc_queue( struct list *queue );
++static int queue_apc( struct process *process, struct thread *thread, struct thread_apc *apc );
+ 
+ static const struct object_ops thread_apc_ops =
+ {
+@@ -356,6 +357,7 @@ static inline void init_thread_structure( struct thread *thread )
+     thread->system_regs     = 0;
+     thread->queue           = NULL;
+     thread->wait            = NULL;
++    thread->system_apc      = NULL;
+     thread->error           = 0;
+     thread->req_data        = NULL;
+     thread->req_toread      = 0;
+@@ -384,7 +386,7 @@ static inline void init_thread_structure( struct thread *thread )
+ 
+     list_init( &thread->mutex_list );
+     list_init( &thread->d3dkmt_mutexes );
+-    list_init( &thread->system_apc );
++    list_init( &thread->io_apc );
+     list_init( &thread->user_apc );
+     list_init( &thread->kernel_object );
+ 
+@@ -399,6 +401,19 @@ static inline int is_thread_suspended( struct thread *thread )
+     return !thread->bypass_proc_suspend && thread->process->suspend;
+ }
+ 
++static int is_system_apc_wait( struct thread *thread )
++{
++    if (!thread->wait || !(thread->wait->flags & SELECT_SYSTEM)) return 0;
++    if (thread->state == TERMINATED || is_thread_suspended( thread )) return 0;
++    return thread == thread->process->apc_thread || !thread->is_system;
++}
++
++static int is_io_apc_wait( struct thread *thread )
++{
++    return is_thread_suspended( thread ) ||
++        (thread->wait && (thread->wait->flags & SELECT_INTERRUPTIBLE));
++}
++
+ /* check if address looks valid for a client-side data structure (TEB etc.) */
+ static inline int is_valid_address( client_ptr_t addr )
+ {
+@@ -558,6 +573,8 @@ static struct list *thread_get_kernel_obj_list( struct object *obj )
+ /* used by destroy_thread and kill_thread */
+ static void cleanup_thread( struct thread *thread )
+ {
++    struct thread_apc *apc;
++    struct list *ptr;
+     int i;
+ 
+     cleanup_thread_completion( thread );
+@@ -568,7 +585,30 @@ static void cleanup_thread( struct thread *thread )
+         release_object( thread->context );
+         thread->context = NULL;
+     }
+-    clear_apc_queue( &thread->system_apc );
++    /* Move undelivered I/O APCs to surviving threads, or discard them at shutdown. */
++    while ((ptr = list_head( &thread->io_apc )))
++    {
++        apc = LIST_ENTRY( ptr, struct thread_apc, entry );
++        list_remove( ptr );
++        if (queue_apc( thread->process, NULL, apc ))
++        {
++            release_object( apc );
++            continue;
++        }
++        apc->executed = 1;
++        signal_sync( apc->sync );
++        release_object( apc );
++    }
++    if ((apc = thread->system_apc))
++    {
++        thread->system_apc = NULL;
++        if (!queue_apc( thread->process, NULL, apc ))
++        {
++            apc->executed = 1;
++            signal_sync( apc->sync );
++        }
++        release_object( apc );
++    }
+     clear_apc_queue( &thread->user_apc );
+     free( thread->req_data );
+     free( thread->reply_data );
+@@ -663,7 +703,7 @@ static void thread_apc_destroy( struct object *obj )
+         if (apc->result.type == APC_ASYNC_IO)
+             async_set_result( apc->owner, apc->result.async_io.status, apc->result.async_io.total );
+         else if (apc->call.type == APC_ASYNC_IO)
+-            async_set_result( apc->owner, apc->call.async_io.status, 0 );
++            async_set_result( apc->owner, STATUS_CANCELLED, 0 );
+         release_object( apc->owner );
+     }
+     if (apc->sync) release_object( apc->sync );
+@@ -1133,16 +1173,29 @@ static int check_wait( struct thread *thread )
+ 
+     assert( wait );
+ 
+-    if ((wait->flags & SELECT_INTERRUPTIBLE) && !list_empty( &thread->system_apc ))
++    if ((wait->flags & SELECT_INTERRUPTIBLE) && !list_empty( &thread->io_apc ))
+         return STATUS_KERNEL_APC;
+ 
++    if (is_system_apc_wait( thread ))
++    {
++        if (thread == thread->process->apc_thread && !thread->system_apc &&
++            !thread->process->apc_shutdown && !list_empty( &thread->process->system_apc ))
++        {
++            struct list *ptr = list_head( &thread->process->system_apc );
++
++            thread->system_apc = LIST_ENTRY( ptr, struct thread_apc, entry );
++            list_remove( ptr );
++        }
++        if (thread->system_apc) return STATUS_SYSTEM_APC;
++    }
++
+     if ((wait->flags & SELECT_COOPERATIVE_SUSPEND) && thread->context)
+     {
+         thread->context->cooperative = 1;
+         return STATUS_THREAD_WAS_SUSPENDED;
+     }
+ 
+-    /* Suspended threads may not acquire locks, but they can run system APCs */
++    /* Suspended threads may not acquire locks, but they can run I/O APCs. */
+     if (is_thread_suspended( thread )) return -1;
+ 
+     if (wait->select == SELECT_WAIT_ALL)
+@@ -1174,7 +1227,8 @@ static int send_thread_wakeup( struct thread *thread, client_ptr_t cookie, int s
+ 
+     /* check if we're waking current suspend wait */
+     if (thread->context && thread->suspend_cookie == cookie
+-        && signaled != STATUS_KERNEL_APC && signaled != STATUS_USER_APC)
++        && signaled != STATUS_KERNEL_APC && signaled != STATUS_SYSTEM_APC
++        && signaled != STATUS_USER_APC)
+     {
+         if (!thread->context->regs[CTX_NATIVE].flags && !thread->context->regs[CTX_WOW].flags)
+         {
+@@ -1375,53 +1429,63 @@ void wake_up( struct object *obj, int max )
+     }
+ }
+ 
+-/* return the apc queue to use for a given apc type */
+-static inline struct list *get_apc_queue( struct thread *thread, enum apc_type type )
+-{
+-    switch(type)
+-    {
+-    case APC_NONE:
+-        return NULL;
+-    case APC_USER:
+-        return &thread->user_apc;
+-    default:
+-        return &thread->system_apc;
+-    }
+-}
+-
+-/* check if thread is currently waiting for a (system) apc */
+-static inline int is_in_apc_wait( struct thread *thread )
+-{
+-    return (is_thread_suspended( thread ) || (thread->wait && (thread->wait->flags & SELECT_INTERRUPTIBLE)));
+-}
+-
+-/* queue an existing APC to a given thread */
++/* queue an existing APC according to its type */
+ static int queue_apc( struct process *process, struct thread *thread, struct thread_apc *apc )
+ {
+-    struct list *queue;
++    if (apc->call.type == APC_NONE)
++        return thread && thread->state != TERMINATED;
+ 
+-    if (thread && thread->state == TERMINATED && process)
+-        thread = NULL;
++    if (apc->call.type == APC_USER)
++    {
++        if (!thread || thread->state == TERMINATED) return 0;
++    }
++    else
++    {
++        if (!process) process = thread->process;
++        if (process->apc_shutdown || !process->running_threads) return 0;
++    }
+ 
+-    if (!thread)  /* find a suitable thread inside the process */
++    if (apc->call.type == APC_USER)
++    {
++        /* User APCs stay on their target thread. */
++        if (apc->owner) thread_cancel_user_apc( thread, apc->owner );
++        grab_object( apc );
++        list_add_tail( &thread->user_apc, &apc->entry );
++        if (!list_prev( &thread->user_apc, &apc->entry ))
++        {
++            if (thread->alert_sync) signal_inproc_sync( thread->alert_sync );
++            wake_thread( thread );
++        }
++    }
++    else if (apc->call.type == APC_ASYNC_IO)
+     {
+         struct thread *candidate;
+ 
+-        /* first try to find a waiting thread */
+-        LIST_FOR_EACH_ENTRY( candidate, &process->thread_list, struct thread, proc_entry )
++        /* I/O APCs use their initiator, or a replacement after it terminates. */
++        if (thread && thread->state == TERMINATED) thread = NULL;
++        if (!thread)
+         {
+-            if (candidate->state == TERMINATED) continue;
+-            if (is_in_apc_wait( candidate ))
++            /* First try a thread already waiting for I/O APCs. */
++            LIST_FOR_EACH_ENTRY( candidate, &process->thread_list, struct thread, proc_entry )
+             {
+-                thread = candidate;
+-                break;
++                if (candidate->state == TERMINATED) continue;
++                if (is_io_apc_wait( candidate ))
++                {
++                    thread = candidate;
++                    break;
++                }
+             }
+         }
++        else if (list_empty( &thread->io_apc ) && !is_io_apc_wait( thread ) &&
++                 !send_thread_signal( thread, SIGUSR1 ))
++            return 0;
++
+         if (!thread)
+         {
+-            /* then use the first one that accepts a signal */
++            /* Otherwise use the first thread that accepts a signal. */
+             LIST_FOR_EACH_ENTRY( candidate, &process->thread_list, struct thread, proc_entry )
+             {
++                if (candidate->state == TERMINATED) continue;
+                 if (send_thread_signal( candidate, SIGUSR1 ))
+                 {
+                     thread = candidate;
+@@ -1429,31 +1493,46 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
+                 }
+             }
+         }
+-        if (!thread) return 0;  /* nothing found */
+-        if (!(queue = get_apc_queue( thread, apc->call.type ))) return 1;
++        if (!thread) return 0;
++
++        grab_object( apc );
++        list_add_tail( &thread->io_apc, &apc->entry );
++        if (!list_prev( &thread->io_apc, &apc->entry )) wake_thread( thread );
+     }
+     else
+     {
+-        if (thread->state == TERMINATED) return 0;
+-        if (!(queue = get_apc_queue( thread, apc->call.type ))) return 1;
+-        /* send signal for system APCs if needed */
+-        if (queue == &thread->system_apc && list_empty( queue ) && !is_in_apc_wait( thread ))
++        struct thread *worker = process->apc_thread, *candidate;
++
++        /* System APCs prefer the idle worker, then an available application thread. */
++        grab_object( apc );
++        thread = NULL;
++        if (worker && !worker->system_apc &&
++            list_empty( &worker->io_apc ) && is_system_apc_wait( worker ) &&
++            list_empty( &process->system_apc ))
++            thread = worker;
++        else
++        {
++            LIST_FOR_EACH_ENTRY( candidate, &process->thread_list, struct thread, proc_entry )
++            {
++                if (candidate == worker || !is_system_apc_wait( candidate )) continue;
++                if (candidate->system_apc || !list_empty( &candidate->io_apc ) ||
++                    !list_empty( &candidate->user_apc )) continue;
++                thread = candidate;
++                break;
++            }
++        }
++        if (thread)
+         {
+-            if (!send_thread_signal( thread, SIGUSR1 )) return 0;
++            thread->system_apc = apc;
++            wake_thread( thread );
++        }
++        else
++        {
++            list_add_tail( &process->system_apc, &apc->entry );
++            if (!list_prev( &process->system_apc, &apc->entry ) && worker)
++                wake_thread( worker );
+         }
+-        /* cancel a possible previous APC with the same owner */
+-        if (apc->owner) thread_cancel_apc( thread, apc->owner, apc->call.type );
+-    }
+-
+-    grab_object( apc );
+-    list_add_tail( queue, &apc->entry );
+-    if (!list_prev( queue, &apc->entry ))  /* first one */
+-    {
+-        if (apc->call.type == APC_USER && thread->alert_sync)
+-            signal_inproc_sync( thread->alert_sync );
+-        wake_thread( thread );
+     }
+-
+     return 1;
+ }
+ 
+@@ -1471,13 +1550,12 @@ int thread_queue_apc( struct process *process, struct thread *thread, struct obj
+     return ret;
+ }
+ 
+-/* cancel the async procedure call owned by a specific object */
+-void thread_cancel_apc( struct thread *thread, struct object *owner, enum apc_type type )
++/* cancel a user APC owned by a specific object */
++void thread_cancel_user_apc( struct thread *thread, struct object *owner )
+ {
+     struct thread_apc *apc;
+-    struct list *queue = get_apc_queue( thread, type );
+ 
+-    LIST_FOR_EACH_ENTRY( apc, queue, struct thread_apc, entry )
++    LIST_FOR_EACH_ENTRY( apc, &thread->user_apc, struct thread_apc, entry )
+     {
+         if (apc->owner != owner) continue;
+         list_remove( &apc->entry );
+@@ -1490,22 +1568,6 @@ void thread_cancel_apc( struct thread *thread, struct object *owner, enum apc_ty
+     }
+ }
+ 
+-/* remove the head apc from the queue; the returned object must be released by the caller */
+-static struct thread_apc *thread_dequeue_apc( struct thread *thread, int system )
+-{
+-    struct thread_apc *apc = NULL;
+-    struct list *ptr = list_head( system ? &thread->system_apc : &thread->user_apc );
+-
+-    if (ptr)
+-    {
+-        apc = LIST_ENTRY( ptr, struct thread_apc, entry );
+-        list_remove( ptr );
+-        if (list_empty( &thread->user_apc ) && thread->alert_sync)
+-            reset_inproc_sync( thread->alert_sync );
+-    }
+-    return apc;
+-}
+-
+ /* clear an APC queue, cancelling all the APCs on it */
+ static void clear_apc_queue( struct list *queue )
+ {
+@@ -1601,6 +1663,16 @@ void kill_thread( struct thread *thread, int violent_death )
+     abandon_mutexes( thread );
+     signal_sync( thread->sync );
+     if (violent_death) send_thread_signal( thread, SIGQUIT );
++    if (thread == thread->process->apc_thread || thread->process->running_threads == 1 ||
++        (!thread->is_system && thread->process->user_threads == 1))
++    {
++        struct process *process = thread->process;
++
++        /* Reject new work before cancellations release their async owners. */
++        process->apc_shutdown = 1;
++        clear_apc_queue( &process->system_apc );
++    }
++    cancel_terminating_thread_asyncs( thread );
+     cleanup_thread( thread );
+     remove_process_thread( thread->process, thread );
+     release_object( thread );
+@@ -1771,19 +1843,29 @@ DECL_HANDLER(init_thread)
+ {
+     if (!init_thread( current, req->reply_fd, req->wait_fd )) return;
+ 
+-    if (!is_valid_address(req->teb))
++    if ((current->is_system ? req->teb != 0 : !is_valid_address(req->teb)) ||
++        (req->is_apc_worker && (!current->is_system || current->process->apc_thread)) ||
++        current->process->is_terminating)
+     {
+         set_error( STATUS_INVALID_PARAMETER );
+         return;
+     }
+ 
++    /* Native system threads use the server pipes without Unix signal control. */
++    if (current->is_system)
++    {
++        if (req->is_apc_worker) current->process->apc_thread = current;
++        reply->suspend = (is_thread_suspended( current ) || current->context != NULL);
++        return;
++    }
++
+     current->unix_pid = current->process->unix_pid;
+     current->unix_tid = req->unix_tid;
+     current->teb      = req->teb;
+     current->entry_point = req->entry;
+ 
+     init_thread_context( current );
+-    if (!current->is_system) generate_debug_event( current, DbgCreateThreadStateChange, &req->entry );
++    generate_debug_event( current, DbgCreateThreadStateChange, &req->entry );
+     set_thread_base_priority( current, current->base_priority );
+     set_thread_affinity( current, current->affinity );
+ 
+@@ -1799,8 +1881,11 @@ DECL_HANDLER(terminate_thread)
+     {
+         thread->exit_code = req->exit_code;
+         if (thread != current) kill_thread( thread, 1 );
+-        else reply->self = 1;
+-        cancel_terminating_thread_asyncs( thread );
++        else
++        {
++            reply->self = 1;
++            cancel_terminating_thread_asyncs( thread );
++        }
+         release_object( thread );
+     }
+ }
+@@ -2000,24 +2085,50 @@ DECL_HANDLER(select)
+         signal_sync( apc->sync );
+         close_handle( current->process, req->prev_apc );
+         release_object( apc );
++        if (!current) return;
++    }
++
++    /* Return an assigned APC to the process queue if this select cannot execute it. */
++    if (current->system_apc && !(req->flags & SELECT_SYSTEM))
++    {
++        list_add_tail( &current->process->system_apc, &current->system_apc->entry );
++        current->system_apc = NULL;
++        if (current->process->apc_thread) wake_thread( current->process->apc_thread );
++        if (!current) return;
+     }
+ 
+     reply->signaled = select_on( &select_op, op_size, req->cookie, req->flags, req->timeout );
+ 
+     if (get_error() == STATUS_USER_APC && get_reply_max_size() >= sizeof(union apc_call))
+     {
+-        apc = thread_dequeue_apc( current, 0 );
++        apc = LIST_ENTRY( list_head( &current->user_apc ), struct thread_apc, entry );
++        list_remove( &apc->entry );
++        if (list_empty( &current->user_apc ) && current->alert_sync)
++            reset_inproc_sync( current->alert_sync );
+         set_reply_data( &apc->call, sizeof(apc->call) );
+         release_object( apc );
+     }
+     else if (get_error() == STATUS_KERNEL_APC && get_reply_max_size() >= sizeof(union apc_call))
+     {
+-        apc = thread_dequeue_apc( current, 1 );
+-        if ((reply->apc_handle = alloc_handle( current->process, apc, SYNCHRONIZE, 0 )))
++        apc = LIST_ENTRY( list_head( &current->io_apc ), struct thread_apc, entry );
++        list_remove( &apc->entry );
++        if (!set_reply_data( &apc->call, sizeof(apc->call) ) ||
++            !(reply->apc_handle = alloc_handle( current->process, apc, SYNCHRONIZE, 0 )))
+         {
+-            set_reply_data( &apc->call, sizeof(apc->call) );
++            memset( &apc->result, 0, sizeof(apc->result) );
++            apc->result.type = APC_ASYNC_IO;
++            apc->result.async_io.status = get_error();
++            apc->executed = 1;
++            signal_sync( apc->sync );
+         }
+-        else
++        release_object( apc );  /* release the queue reference */
++    }
++    else if (get_error() == STATUS_SYSTEM_APC && get_reply_max_size() >= sizeof(union apc_call))
++    {
++        apc = current->system_apc;
++        current->system_apc = NULL;
++        if (!set_reply_data( &apc->call, sizeof(apc->call) ) ||
++            !(reply->apc_handle = alloc_handle( current->process, apc, SYNCHRONIZE, 0 )))
+         {
+             apc->executed = 1;
+             signal_sync( apc->sync );
+
+--- server/thread.h
++++ server/thread.h
+@@ -62,7 +62,8 @@ struct thread
+     unsigned int           system_regs;   /* which system regs have been set */
+     struct msg_queue      *queue;         /* message queue */
+     struct thread_wait    *wait;          /* current wait condition if sleeping */
+-    struct list            system_apc;    /* queue of system async procedure calls */
++    struct thread_apc     *system_apc;    /* system APC assigned to this thread */
++    struct list            io_apc;        /* queue of async I/O APCs */
+     struct list            user_apc;      /* queue of user async procedure calls */
+     struct inflight_fd     inflight[MAX_INFLIGHT_FDS];  /* fds currently in flight */
+     unsigned int           error;         /* current error code */
+@@ -125,7 +126,7 @@ extern void remove_queue( struct object *obj, struct wait_queue_entry *entry );
+ extern void kill_thread( struct thread *thread, int violent_death );
+ extern void wake_up( struct object *obj, int max );
+ extern int thread_queue_apc( struct process *process, struct thread *thread, struct object *owner, const union apc_call *call_data );
+-extern void thread_cancel_apc( struct thread *thread, struct object *owner, enum apc_type type );
++extern void thread_cancel_user_apc( struct thread *thread, struct object *owner );
+ extern int thread_add_inflight_fd( struct thread *thread, int client, int server );
+ extern int thread_get_inflight_fd( struct thread *thread, int client );
+ extern struct token *thread_get_impersonation_token( struct thread *thread );
+
+--- server/timer.c
++++ server/timer.c
+@@ -134,7 +134,7 @@ static int cancel_timer( struct timer *timer )
+     }
+     if (timer->thread)
+     {
+-        thread_cancel_apc( timer->thread, &timer->obj, APC_USER );
++        thread_cancel_user_apc( timer->thread, &timer->obj );
+         release_object( timer->thread );
+         timer->thread = NULL;
+     }
+

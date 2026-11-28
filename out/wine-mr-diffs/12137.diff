@@ -1,0 +1,212 @@
+# ntdll decrease CPU overhead
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12137 state=opened
+# Main reference MR: https://gitlab.winehq.org/wine/wine/-/merge_requests/12024
+--- dlls/ntdll/locale.c
++++ dlls/ntdll/locale.c
+@@ -685,21 +685,16 @@ LONG WINAPI RtlCompareUnicodeStrings( const WCHAR *s1, SIZE_T len1, const WCHAR
+ BOOLEAN WINAPI RtlPrefixUnicodeString( const UNICODE_STRING *s1, const UNICODE_STRING *s2,
+                                        BOOLEAN ignore_case )
+ {
+-    unsigned int i;
+-
+     if (s1->Length > s2->Length) return FALSE;
+     if (ignore_case)
+     {
++        unsigned int i;
+         for (i = 0; i < s1->Length / sizeof(WCHAR); i++)
+             if (casemap( nls_info.UpperCaseTable, s1->Buffer[i] ) !=
+                 casemap( nls_info.UpperCaseTable, s2->Buffer[i] )) return FALSE;
++        return TRUE;
+     }
+-    else
+-    {
+-        for (i = 0; i < s1->Length / sizeof(WCHAR); i++)
+-            if (s1->Buffer[i] != s2->Buffer[i]) return FALSE;
+-    }
+-    return TRUE;
++    return !memcmp( s1->Buffer, s2->Buffer, s1->Length );
+ }
+ 
+ 
+
+--- dlls/ntdll/rtlbitmap.c
++++ dlls/ntdll/rtlbitmap.c
+@@ -43,10 +43,6 @@ static const BYTE NTDLL_leastSignificant[16] = {
+   0, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0
+ };
+ 
+-/* Last set bit in a nibble; used for determining most significant bit */
+-static const signed char NTDLL_mostSignificant[16] = {
+-  -1, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3
+-};
+ 
+ static inline ULONG maskbits( ULONG idx )
+ {
+@@ -230,7 +226,21 @@ ULONG WINAPI RtlFindSetBits(PCRTL_BITMAP lpBits, ULONG ulCount, ULONG ulHint)
+ 
+   while (ulPos < ulEnd)
+   {
+-    /* FIXME: This could be made a _lot_ more efficient */
++    if (!lpBits->Buffer[ulPos / 32])
++    {
++      ulPos = (ulPos | 31) + 1;
++      if (ulPos >= ulEnd)
++      {
++        if (ulHint)
++        {
++          ulEnd = ulHint;
++          ulPos = ulHint = 0;
++          continue;
++        }
++        break;
++      }
++    }
++
+     if (RtlAreBitsSet(lpBits, ulPos, ulCount))
+       return ulPos;
+ 
+@@ -277,7 +287,21 @@ ULONG WINAPI RtlFindClearBits(PCRTL_BITMAP lpBits, ULONG ulCount, ULONG ulHint)
+ 
+   while (ulPos < ulEnd)
+   {
+-    /* FIXME: This could be made a _lot_ more efficient */
++    if (lpBits->Buffer[ulPos / 32] == ~0U)
++    {
++      ulPos = (ulPos | 31) + 1;
++      if (ulPos >= ulEnd)
++      {
++        if (ulHint)
++        {
++          ulEnd = ulHint;
++          ulPos = ulHint = 0;
++          continue;
++        }
++        break;
++      }
++    }
++
+     if (RtlAreBitsClear(lpBits, ulPos, ulCount))
+       return ulPos;
+ 
+@@ -387,30 +411,14 @@ ULONG WINAPI RtlNumberOfClearBits(PCRTL_BITMAP lpBits)
+  */
+ CCHAR WINAPI RtlFindMostSignificantBit(ULONGLONG ulLong)
+ {
+-    signed char ret = 32;
+-    DWORD dw;
+-
+-    if (!(dw = (ulLong >> 32)))
+-    {
+-        ret = 0;
+-        dw = (DWORD)ulLong;
+-    }
+-    if (dw & 0xffff0000)
+-    {
+-        dw >>= 16;
+-        ret += 16;
+-    }
+-    if (dw & 0xff00)
+-    {
+-        dw >>= 8;
+-        ret += 8;
+-    }
+-    if (dw & 0xf0)
+-    {
+-        dw >>= 4;
+-        ret += 4;
+-    }
+-    return ret + NTDLL_mostSignificant[dw];
++    unsigned long index;
++#if defined(_WIN64) || __has_builtin(_BitScanReverse64)
++    return _BitScanReverse64( &index, ulLong ) ? (CCHAR)index : -1;
++#else
++    if (_BitScanReverse( &index, (DWORD)(ulLong >> 32) )) return (CCHAR)(index + 32);
++    if (_BitScanReverse( &index, (DWORD)ulLong )) return (CCHAR)index;
++    return -1;
++#endif
+ }
+ 
+ /*************************************************************************
+@@ -423,30 +431,14 @@ CCHAR WINAPI RtlFindMostSignificantBit(ULONGLONG ulLong)
+  */
+ CCHAR WINAPI RtlFindLeastSignificantBit(ULONGLONG ulLong)
+ {
+-    signed char ret = 0;
+-    DWORD dw;
+-
+-    if (!(dw = (DWORD)ulLong))
+-    {
+-        ret = 32;
+-        if (!(dw = ulLong >> 32)) return -1;
+-    }
+-    if (!(dw & 0xffff))
+-    {
+-        dw >>= 16;
+-        ret += 16;
+-    }
+-    if (!(dw & 0xff))
+-    {
+-        dw >>= 8;
+-        ret += 8;
+-    }
+-    if (!(dw & 0x0f))
+-    {
+-        dw >>= 4;
+-        ret += 4;
+-    }
+-    return ret + NTDLL_leastSignificant[dw & 0x0f];
++    unsigned long index;
++#if defined(_WIN64) || __has_builtin(_BitScanForward64)
++    return _BitScanForward64( &index, ulLong ) ? (CCHAR)index : -1;
++#else
++    if (_BitScanForward( &index, (DWORD)ulLong )) return (CCHAR)index;
++    if (_BitScanForward( &index, (DWORD)(ulLong >> 32) )) return (CCHAR)(index + 32);
++    return -1;
++#endif
+ }
+ 
+ /*************************************************************************
+
+--- dlls/ntdll/rtlstr.c
++++ dlls/ntdll/rtlstr.c
+@@ -435,6 +435,7 @@ LONG WINAPI RtlCompareUnicodeString( const UNICODE_STRING *s1, const UNICODE_STR
+ BOOLEAN WINAPI RtlEqualString( const STRING *s1, const STRING *s2, BOOLEAN CaseInsensitive )
+ {
+     if (s1->Length != s2->Length) return FALSE;
++    if (!CaseInsensitive) return !memcmp( s1->Buffer, s2->Buffer, s1->Length );
+     return !RtlCompareString( s1, s2, CaseInsensitive );
+ }
+ 
+@@ -448,6 +449,7 @@ BOOLEAN WINAPI RtlEqualUnicodeString( const UNICODE_STRING *s1, const UNICODE_ST
+                                       BOOLEAN CaseInsensitive )
+ {
+     if (s1->Length != s2->Length) return FALSE;
++    if (!CaseInsensitive) return !memcmp( s1->Buffer, s2->Buffer, s1->Length );
+     return !RtlCompareUnicodeString( s1, s2, CaseInsensitive );
+ }
+ 
+@@ -467,20 +469,15 @@ BOOLEAN WINAPI RtlEqualUnicodeString( const UNICODE_STRING *s1, const UNICODE_ST
+  */
+ BOOLEAN WINAPI RtlPrefixString( const STRING *s1, const STRING *s2, BOOLEAN ignore_case )
+ {
+-    unsigned int i;
+-
+     if (s1->Length > s2->Length) return FALSE;
+     if (ignore_case)
+     {
++        unsigned int i;
+         for (i = 0; i < s1->Length; i++)
+             if (RtlUpperChar(s1->Buffer[i]) != RtlUpperChar(s2->Buffer[i])) return FALSE;
++        return TRUE;
+     }
+-    else
+-    {
+-        for (i = 0; i < s1->Length; i++)
+-            if (s1->Buffer[i] != s2->Buffer[i]) return FALSE;
+-    }
+-    return TRUE;
++    return !memcmp( s1->Buffer, s2->Buffer, s1->Length );
+ }
+ 
+ 
+

@@ -1,0 +1,57 @@
+# kk: vectorize fragment shader outputs before lowering blend
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46829 state=opened
+# Found while running VK-GL-CTS on an Apple M1 Pro. Fragment shaders writing to individual output components (e.g. `layout(location = 0, component = N)`) emit multiple partial `store_output` intrinsics per target, causing `nir_lower_blend` to produce invalid NIR and abort in debug builds.
+
+The first commit prevents `nir_opt_vectorize_io` from merging outputs with different `dual_source_blend_index` values; it is required by the second commit to avoid regressing dual-source blending. The second commit scalarizes outputs, runs CSE to deduplicate zero offset SSA values, and vectorizes fragment outputs before `nir_lower_blend` in KosmicKrisp.
+
+Minimal reproducer (reduced from `dEQP-VK.glsl.440.linkage.varying.component.frag_out.ivec4.as_int_int_int_int`):
+```glsl
+layout(location = 0, component = 0) out int c0;
+layout(location = 0, component = 1) out int c1;
+layout(location = 0, component = 2) out int c2;
+layout(location = 0, component = 3) out int c3;
+
+void main() {
+    c0 = 0;
+    c1 = 1;
+    c2 = 2;
+    c3 = 3;
+}
+```
+
+CTS results (Apple M1 Pro, macOS 27.3, debug build):
+
+| Test suite | Before | After |
+|---|---|---|
+| `dEQP-VK.glsl.440.linkage.varying.component.*` | abort on 2nd test | 68/68 pass |
+| `dEQP-VK.pipeline.monolithic.blend.*` | abort in `dual_source.output_scalarized` | 7,161 pass, 0 fail, 5,069 unsupported |
+| `dEQP-VK.glsl.*` | abort on 2nd test | 20,839 pass, 0 fail |
+| `dEQP-VK.pipeline.monolithic.logic_op.*` | 144 pass, 80 unsupported | 144 pass, 80 unsupported |
+
+Code generated with an LLM, reviewed and tested by me.
+--- src/compiler/nir/nir_opt_vectorize_io.c
++++ src/compiler/nir/nir_opt_vectorize_io.c
+@@ -58,6 +58,9 @@ compare_is_not_vectorizable(nir_intrinsic_instr *a, nir_intrinsic_instr *b)
+    if (sem0.location != sem1.location)
+       return sem0.location > sem1.location ? 1 : -1;
+ 
++   if (sem0.dual_source_blend_index != sem1.dual_source_blend_index)
++      return sem0.dual_source_blend_index > sem1.dual_source_blend_index ? 1 : -1;
++
+    /* The mediump flag isn't mergable. */
+    if (sem0.medium_precision != sem1.medium_precision)
+       return sem0.medium_precision > sem1.medium_precision ? 1 : -1;
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -485,6 +485,9 @@ kk_lower_fs_blend(nir_shader *nir,
+    }
+    /* Fold constant offset srcs for IO. */
+    NIR_PASS(_, nir, nir_opt_constant_folding);
++   NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL, NULL);
++   NIR_PASS(_, nir, nir_opt_cse);
++   NIR_PASS(_, nir, nir_opt_vectorize_io, nir_var_shader_out, false);
+    NIR_PASS(_, nir, nir_lower_blend, &opts);
+ }
+ 
+

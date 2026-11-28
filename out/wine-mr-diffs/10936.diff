@@ -1,0 +1,38 @@
+# sqlite3: Use __sync_synchronize() with clang.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/10936 state=closed
+# libs/sqlite3: Use __sync_synchronize() with clang.
+
+When building sqlite3 for PE with clang, the MSVC_VERSION check may select
+the _ReadWriteBarrier() path. However, _ReadWriteBarrier() is not declared
+in this translation unit, causing the build to fail:
+
+```
+aarch64-w64-mingw32-clang -D__STDC__ -c -o libs/sqlite3/aarch64-windows/sqlite3.o ... -D_UCRT -DSQLITE_ENABLE_RTREE=1 \
+  -DSQLITE_ENABLE_FTS4=1 -DSQLITE_ENABLE_COLUMN_METADATA=1 -DSQLITE_DEBUG=1 -DSQLITE_SYSTEM_MALLOC=1 \
+  -DSQLITE_OMIT_LOCALTIME=1 -DSQLITE_ENABLE_MATH_FUNCTIONS -DSQLITE_ENABLE_PERCENTILE \
+  -DSQLITE_CDECL=__cdecl -DSQLITE_APICALL=__stdcall -DSQLITE_CALLBACK=__stdcall \
+  -DSQLITE_SYSAPI=WINAPI -D__WINE_PE_BUILD -target aarch64-windows -fuse-ld=lld --no-default-config \
+  -fno-strict-aliasing -Wno-microsoft-enum-forward-reference -ffunction-sections \
+  -ffp-exception-behavior=maytrap -gdwarf-4 -g -O2
+
+.../libs/sqlite3/sqlite3.c:30712:3: error: call to undeclared library function '_ReadWriteBarrier' with type 'void (void)'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+  _ReadWriteBarrier();
+  ^
+.../src/libs/sqlite3/sqlite3.c:30712:3: note: include the header <intrin.h> or explicitly provide a declaration for '_ReadWriteBarrier'
+1 error generated.
+```
+
+Clang supports the GCC __sync_synchronize() builtin, so use that path for
+clang as well.
+--- libs/sqlite3/sqlite3.c
++++ libs/sqlite3/sqlite3.c
+@@ -30706,7 +30706,7 @@ static int SQLITE_APICALL winMutexNotheld(sqlite3_mutex *p){
+ SQLITE_PRIVATE void SQLITE_APICALL sqlite3MemoryBarrier(void){
+ #if defined(SQLITE_MEMORY_BARRIER)
+   SQLITE_MEMORY_BARRIER;
+-#elif defined(__GNUC__)
++#elif defined(__GNUC__) || defined(__clang__)
+   __sync_synchronize();
+ #elif MSVC_VERSION>=1400
+   _ReadWriteBarrier();
+

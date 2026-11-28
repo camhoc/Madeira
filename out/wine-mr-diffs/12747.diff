@@ -1,0 +1,196 @@
+# ntdll: Add support for AVX registers on ARM64 wow64.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12747 state=merged
+# 
+--- dlls/ntdll/unix/signal_arm64.c
++++ dlls/ntdll/unix/signal_arm64.c
+@@ -604,7 +604,20 @@ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
+         {
+             memcpy( &wow_frame->FloatSave, &context->FloatSave, sizeof(context->FloatSave) );
+         }
+-        /* FIXME: CONTEXT_I386_XSTATE */
++        if (flags & CONTEXT_I386_XSTATE)
++        {
++            CONTEXT_EX *xctx = (CONTEXT_EX *)(context + 1);
++            CONTEXT_EX *wow_xctx = (CONTEXT_EX *)(wow_frame + 1);
++            XSTATE *xs = (XSTATE *)((char *)xctx + xctx->XState.Offset);
++            XSTATE *wow_xs = (XSTATE *)((char *)wow_xctx + wow_xctx->XState.Offset);
++
++            if (xs->Mask & XSTATE_MASK_AVX)
++            {
++                wow_xs->Mask = XSTATE_MASK_AVX;
++                wow_xs->YmmContext = xs->YmmContext;
++            }
++            else wow_xs->Mask = 0;
++        }
+         break;
+     }
+ 
+@@ -730,7 +743,27 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
+             context->Dr6 = wow_frame->Dr6;
+             context->Dr7 = wow_frame->Dr7;
+         }
+-        /* FIXME: CONTEXT_I386_XSTATE */
++        if (needed_flags & CONTEXT_I386_XSTATE)
++        {
++            CONTEXT_EX *xctx = (CONTEXT_EX *)(context + 1);
++            CONTEXT_EX *wow_xctx = (CONTEXT_EX *)(wow_frame + 1);
++            XSTATE *xs = (XSTATE *)((char *)xctx + xctx->XState.Offset);
++            XSTATE *wow_xs = (XSTATE *)((char *)wow_xctx + wow_xctx->XState.Offset);
++
++            if (xctx->XState.Length < sizeof(XSAVE_AREA_HEADER) || xctx->XState.Length > sizeof(XSTATE))
++                return STATUS_INVALID_PARAMETER;
++
++            xs->Mask &= XSTATE_MASK_AVX;
++            xs->CompactionMask = 0;
++            memset( xs->Reserved, 0, sizeof(xs->Reserved) );
++            if (xs->Mask)
++            {
++                if (xctx->XState.Length < sizeof(XSTATE)) return STATUS_BUFFER_OVERFLOW;
++                if (wow_xs->Mask & XSTATE_MASK_AVX) xs->YmmContext = wow_xs->YmmContext;
++                else memset( &xs->YmmContext, 0, sizeof(xs->YmmContext) );
++            }
++            context->ContextFlags |= CONTEXT_I386_XSTATE;
++        }
+         set_context_exception_reporting_flags( &context->ContextFlags, CONTEXT_SERVICE_ACTIVE );
+         break;
+     }
+@@ -1644,7 +1677,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
+     if ((i386_context = get_cpu_area( data, IMAGE_FILE_MACHINE_I386 )))
+     {
+         XMM_SAVE_AREA32 *fpu = (XMM_SAVE_AREA32 *)i386_context->ExtendedRegisters;
+-        i386_context->ContextFlags = CONTEXT_I386_ALL;
++        i386_context->ContextFlags = CONTEXT_I386_ALL | CONTEXT_I386_XSTATE;
+         i386_context->Eax = (ULONG_PTR)entry;
+         i386_context->Ebx = (arg == peb ? (ULONG_PTR)wow_peb : (ULONG_PTR)arg);
+         i386_context->Esp = get_wow_teb( teb )->Tib.StackBase - 16;
+
+--- dlls/ntdll/unix/signal_i386.c
++++ dlls/ntdll/unix/signal_i386.c
+@@ -2447,7 +2447,11 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
+     context.FloatSave.ControlWord = 0x27f;
+     ((XSAVE_FORMAT *)context.ExtendedRegisters)->ControlWord = 0x27f;
+     ((XSAVE_FORMAT *)context.ExtendedRegisters)->MxCsr = 0x1f80;
+-    if ((ctx = get_cpu_area( data, IMAGE_FILE_MACHINE_I386 ))) *ctx = context;
++    if ((ctx = get_cpu_area( data, IMAGE_FILE_MACHINE_I386 )))
++    {
++        *ctx = context;
++        if (user_shared_data->XState.EnabledFeatures) ctx->ContextFlags |= CONTEXT_XSTATE;
++    }
+ 
+     if (data->suspend)
+     {
+
+--- dlls/ntdll/unix/signal_x86_64.c
++++ dlls/ntdll/unix/signal_x86_64.c
+@@ -2896,6 +2896,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
+     if ((wow_context = get_cpu_area( data, IMAGE_FILE_MACHINE_I386 )))
+     {
+         wow_context->ContextFlags = CONTEXT_I386_ALL;
++        if (user_shared_data->XState.EnabledFeatures) wow_context->ContextFlags |= CONTEXT_I386_XSTATE;
+         wow_context->Eax = (ULONG_PTR)entry;
+         wow_context->Ebx = (arg == peb ? (ULONG_PTR)wow_peb : (ULONG_PTR)arg);
+         wow_context->Esp = get_wow_teb( teb )->Tib.StackBase - 16;
+
+--- dlls/ntdll/unix/thread.c
++++ dlls/ntdll/unix/thread.c
+@@ -1156,7 +1156,10 @@ static SIZE_T get_machine_context_size( USHORT machine )
+ {
+     switch (machine)
+     {
+-    case IMAGE_FILE_MACHINE_I386:  return sizeof(I386_CONTEXT);
++    case IMAGE_FILE_MACHINE_I386:
++        if (!user_shared_data->XState.EnabledFeatures) return sizeof(I386_CONTEXT);
++        return sizeof(I386_CONTEXT) + 32 /* sizeof(CONTEXT_EX) */ + 63 +
++            user_shared_data->XState.Size - sizeof(XSAVE_FORMAT);
+     case IMAGE_FILE_MACHINE_ARMNT: return sizeof(ARM_CONTEXT);
+     case IMAGE_FILE_MACHINE_AMD64: return sizeof(AMD64_CONTEXT);
+     case IMAGE_FILE_MACHINE_ARM64: return sizeof(ARM64_NT_CONTEXT);
+@@ -1226,12 +1229,28 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
+         wow_teb->Tib.StackBase = PtrToUlong( stack.StackBase );
+         wow_teb->Tib.StackLimit = PtrToUlong( stack.StackLimit );
+         wow_teb->DeallocationStack = PtrToUlong( stack.DeallocationStack );
+-        return STATUS_SUCCESS;
+ #else
+         wow_teb->Tib.StackBase = wow_teb->TlsSlots[WOW64_TLS_CPURESERVED] = PtrToUlong( cpu );
+         wow_teb->Tib.StackLimit = PtrToUlong( stack.StackLimit );
+         wow_teb->DeallocationStack = PtrToUlong( stack.DeallocationStack );
+ #endif
++
++        if (main_image_info.Machine == IMAGE_FILE_MACHINE_I386 && user_shared_data->XState.EnabledFeatures)
++        {
++            I386_CONTEXT *ctx = (I386_CONTEXT *)(cpu + 1);
++            CONTEXT_EX *xctx = (CONTEXT_EX *)(ctx + 1);
++            XSAVE_AREA_HEADER *xs = (XSAVE_AREA_HEADER *)(((ULONG_PTR)xctx + 32 + 63) & ~(ULONG_PTR)63);
++
++            xctx->Legacy.Length = sizeof(I386_CONTEXT);
++            xctx->Legacy.Offset = -(LONG)sizeof(I386_CONTEXT);
++            xctx->XState.Length = user_shared_data->XState.Size - sizeof(XSAVE_FORMAT);
++            xctx->XState.Offset = (char *)xs - (char *)xctx;
++            xctx->All.Offset = xctx->Legacy.Offset;
++            xctx->All.Length = sizeof(I386_CONTEXT) + xctx->XState.Offset + xctx->XState.Length;
++        }
++#ifdef _WIN64
++        return STATUS_SUCCESS;
++#endif
+     }
+ 
+ #ifdef __aarch64__
+
+--- dlls/ntdll/process.c
++++ dlls/ntdll/process.c
+@@ -173,24 +173,27 @@ NTSTATUS WINAPI RtlWow64GetCpuAreaInfo( WOW64_CPURESERVED *cpu, ULONG reserved,
+     static const struct { ULONG machine, align, size, offset, flag; } data[] =
+     {
+ #define ENTRY(machine,type,flag) { machine, TYPE_ALIGNMENT(type), sizeof(type), offsetof(type,ContextFlags), flag },
+-        ENTRY( IMAGE_FILE_MACHINE_I386, I386_CONTEXT, CONTEXT_i386 )
++        ENTRY( IMAGE_FILE_MACHINE_I386, I386_CONTEXT, CONTEXT_I386_XSTATE )
+         ENTRY( IMAGE_FILE_MACHINE_AMD64, AMD64_CONTEXT, CONTEXT_AMD64 )
+         ENTRY( IMAGE_FILE_MACHINE_ARMNT, ARM_CONTEXT, CONTEXT_ARM )
+         ENTRY( IMAGE_FILE_MACHINE_ARM64, ARM64_NT_CONTEXT, CONTEXT_ARM64 )
+ #undef ENTRY
+     };
+     unsigned int i;
++    ULONG ext_size;
+ 
+     for (i = 0; i < ARRAY_SIZE(data); i++)
+     {
+ #define ALIGN(ptr,align) ((void *)(((ULONG_PTR)(ptr) + (align) - 1) & ~((ULONG_PTR)(align) - 1)))
+         if (data[i].machine != cpu->Machine) continue;
+         info->Context = ALIGN( cpu + 1, data[i].align );
+-        info->ContextEx = ALIGN( (char *)info->Context + data[i].size, sizeof(void *) );
++        if (RtlGetExtendedContextLength( data[i].flag, &ext_size )) ext_size = data[i].size;
++        info->ContextEx = ALIGN( (char *)info->Context + ext_size, sizeof(void *) );
+         info->ContextFlagsLocation = (char *)info->Context + data[i].offset;
+         info->ContextFlag = data[i].flag;
+         info->CpuReserved = cpu;
+         info->Machine = data[i].machine;
++        info->CpuAreaEnd = (void **)info->ContextEx + 1;
+         return STATUS_SUCCESS;
+ #undef ALIGN
+     }
+
+--- dlls/wow64/syscall.c
++++ dlls/wow64/syscall.c
+@@ -212,6 +212,7 @@ static void __attribute__((used)) call_user_exception_dispatcher( EXCEPTION_RECO
+             I386_CONTEXT ctx = { CONTEXT_I386_ALL };
+             CONTEXT_EX *context_ex, *src_ex = NULL;
+             ULONG esp, flags, context_length;
++            WOW64_CPU_AREA_INFO cpu_area;
+ 
+             C_ASSERT( offsetof(struct exc_stack_layout32, context) == 0x58 );
+ 
+@@ -233,6 +234,13 @@ static void __attribute__((used)) call_user_exception_dispatcher( EXCEPTION_RECO
+                 if ((ctx64->ContextFlags & CONTEXT_AMD64_XSTATE) == CONTEXT_AMD64_XSTATE)
+                     src_ex = (CONTEXT_EX *)(ctx64 + 1);
+             }
++            else if (!RtlWow64GetCpuAreaInfo( NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED], 0, &cpu_area ))
++            {
++                I386_CONTEXT *ctx32 = cpu_area.Context;
++
++                if ((ctx32->ContextFlags & CONTEXT_I386_XSTATE) == CONTEXT_I386_XSTATE)
++                    src_ex = (CONTEXT_EX *)(ctx32 + 1);
++            }
+ 
+             flags = ctx.ContextFlags;
+             if (src_ex) flags |= CONTEXT_I386_XSTATE;
+

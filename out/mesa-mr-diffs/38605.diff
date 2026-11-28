@@ -1,0 +1,238 @@
+# Allow to build Zink without MoltenVK on MacOS
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/38605 state=opened
+# ### What does this MR do and why?
+
+With the new KosmicKrisp "Vulkan-to-Metal" layer, MoltenVK is no more the exclusive solution on Apple.
+
+At the moment it still doesn't work due to the lack of nullDescriptor feature of KHR/EXT robustness2 same for MoltenVK.
+
+But it build and maybe it will come soon @aitor
+--- src/compiler/clc/meson.build
++++ src/compiler/clc/meson.build
+@@ -115,10 +115,16 @@ if _shared_llvm
+   _idep_mesaclc_link_args += cc.get_supported_link_arguments('-fPIC')
+ endif
+ 
++_idep_mesaclc_deps = []
++if host_machine.system() == 'darwin'
++  _idep_mesaclc_deps += cpp.find_library('c++', required : true)
++endif
++
+ idep_mesaclc = declare_dependency(
+   link_with : _libmesaclc,
+   include_directories : include_directories('.'),
+   link_args : _idep_mesaclc_link_args,
++  dependencies : _idep_mesaclc_deps,
+ )
+ 
+ if get_option('mesa-clc') != 'system' and (with_driver_using_cl or \
+
+--- src/gallium/drivers/zink/meson.build
++++ src/gallium/drivers/zink/meson.build
+@@ -1,6 +1,8 @@
+ # Copyright © 2018 Collabora Ltd
+ # SPDX-License-Identifier: MIT
+ 
++fs = import('fs')
++
+ files_libzink = files(
+   'zink_lower_cubemap_to_array.c',
+   'nir_to_spirv/nir_to_spirv.c',
+@@ -58,10 +60,10 @@ zink_nir_algebraic_c = custom_target(
+ 
+ zink_c_args = []
+ inc_zink_vk = []
++zink_have_moltenvk = false
+ 
+ if host_machine.system() == 'darwin'
+-
+-  # MoltenVK options
++  # MoltenVK options - optional, only needed if using MoltenVK instead of KosmicKrisp
+   if with_moltenvk_dir != ''
+     # Vulkan SDK 1.3.250 to 1.3.268 support
+     moltenvk_includes = join_paths(with_moltenvk_dir, 'MoltenVK', 'include')
+@@ -76,14 +78,23 @@ if host_machine.system() == 'darwin'
+         endif
+       endif
+     endif
+-    inc_zink_vk += include_directories(moltenvk_includes)
+-  else
+-    error('moltenvk-dir is required but not set.')
++
++    # Verify the header actually exists and is usable
++    moltenvk_include_dir = include_directories(moltenvk_includes)
++    if cc.has_header('MoltenVK/mvk_vulkan.h', include_directories: moltenvk_include_dir)
++      inc_zink_vk += [moltenvk_include_dir]
++      zink_have_moltenvk = true
++    else
++      warning('MoltenVK headers found but not usable, continuing without MoltenVK support')
++    endif
+   endif
+ 
+   zink_c_args += ['-x','objective-c'] # Put compiler into objective-C mode to allow for MacOS types, like IOSurface and CAMetalLayer
+   zink_c_args += ['-iframework' , 'Foundation']
+ 
++  if zink_have_moltenvk
++    zink_c_args += '-DZINK_HAVE_MOLTENVK'
++  endif
+ endif
+ 
+ libzink = static_library(
+
+--- src/gallium/drivers/zink/zink_instance.py
++++ src/gallium/drivers/zink/zink_instance.py
+@@ -77,11 +77,11 @@ header_code = """
+ 
+ #include <vulkan/vulkan_core.h>
+ 
+-#ifdef __APPLE__
++#ifdef ZINK_HAVE_MOLTENVK
+ #include "MoltenVK/mvk_vulkan.h"
+ // Source of MVK_VERSION
+ #include "MoltenVK/mvk_config.h"
+-#endif /* __APPLE__ */
++#endif
+ 
+ struct pipe_screen;
+ struct zink_screen;
+@@ -147,7 +147,7 @@ zink_create_instance(struct zink_screen *screen, struct zink_instance_info *inst
+    bool have_layer_${layer.pure_name()} = false;
+ %endfor
+ 
+-#if defined(MVK_VERSION)
++#ifdef ZINK_HAVE_MOLTENVK
+    bool have_moltenvk_layer = false;
+ #endif
+ 
+@@ -200,7 +200,7 @@ zink_create_instance(struct zink_screen *screen, struct zink_instance_info *inst
+                      have_layer_${layer.pure_name()} = true;
+                   }
+ %endfor
+-#if defined(MVK_VERSION)
++#ifdef ZINK_HAVE_MOLTENVK
+                   if (!strcmp(layer_props[i].layerName, "MoltenVK")) {
+                      have_moltenvk_layer = true;
+                      layers[num_layers++] = "MoltenVK";
+
+--- src/gallium/drivers/zink/zink_resource.c
++++ src/gallium/drivers/zink/zink_resource.c
+@@ -60,11 +60,11 @@
+ #define DRM_FORMAT_MOD_LINEAR 0
+ #endif
+ 
+-#ifdef __APPLE__
++#ifdef ZINK_HAVE_MOLTENVK
+ #include "MoltenVK/mvk_vulkan.h"
+ // Source of MVK_VERSION
+ #include "MoltenVK/mvk_config.h"
+-#endif /* __APPLE__ */
++#endif
+ 
+ #define ZINK_EXTERNAL_MEMORY_HANDLE 999
+ 
+@@ -379,7 +379,7 @@ check_ici(struct zink_screen *screen, VkImageCreateInfo *ici, uint64_t modifier)
+       image_props = props2.imageFormatProperties;
+       if (screen->info.have_EXT_host_image_copy && ici->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT)
+          optimalDeviceAccess = hic.optimalDeviceAccess;
+-#if defined(MVK_VERSION)
++#ifdef ZINK_HAVE_MOLTENVK
+       // MoltenVK cannot allocate a depth buffer with VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT
+       // As hic.identicalMemoryLayout is set, it is not needed?
+       if (screen->info.have_EXT_host_image_copy && ici->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT && hic.identicalMemoryLayout)
+@@ -2493,7 +2493,7 @@ overwrite:
+    }
+ 
+    if (!res->obj->coherent
+-#if defined(MVK_VERSION)
++#ifdef ZINK_HAVE_MOLTENVK
+       // Work around for MoltenVk limitation specifically on coherent memory
+       // MoltenVk returns blank memory ranges when there should be data present
+       // This is a known limitation of MoltenVK.
+
+--- src/gallium/drivers/zink/zink_screen.c
++++ src/gallium/drivers/zink/zink_screen.c
+@@ -79,14 +79,14 @@ bool zink_tracing = false;
+ #endif
+ #endif
+ 
+-#ifdef __APPLE__
++#ifdef ZINK_HAVE_MOLTENVK
+ #include "MoltenVK/mvk_vulkan.h"
+ // Source of MVK_VERSION
+ #include "MoltenVK/mvk_config.h"
+ #define VK_NO_PROTOTYPES
+ #include "MoltenVK/mvk_deprecated_api.h"
+ #include "MoltenVK/mvk_private_api.h"
+-#endif /* __APPLE__ */
++#endif
+ 
+ #ifdef HAVE_LIBDRM
+ #include "drm-uapi/dma-buf.h"
+@@ -743,7 +743,7 @@ zink_init_screen_caps(struct zink_screen *screen)
+          modes &= ~BITFIELD_BIT(MESA_PRIM_TRIANGLE_FAN);
+       caps->supported_prim_modes = modes;
+    }
+-#if defined(MVK_VERSION)
++#ifdef ZINK_HAVE_MOLTENVK
+    caps->fbfetch = 0;
+ #else
+    caps->fbfetch = screen->info.have_KHR_dynamic_rendering_local_read;
+@@ -2086,7 +2086,7 @@ create_debug(struct zink_screen *screen)
+ static bool
+ zink_internal_setup_moltenvk(struct zink_screen *screen)
+ {
+-#if defined(MVK_VERSION)
++#ifdef ZINK_HAVE_MOLTENVK
+    // MoltenVK only supports VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE in newer Metal versions
+    // disable unless we can get MoltenVK to confirm it is supported
+    screen->have_dynamic_state_vertex_input_binding_stride = false;
+@@ -2130,7 +2130,7 @@ zink_internal_setup_moltenvk(struct zink_screen *screen)
+         screen->have_dynamic_state_vertex_input_binding_stride = metal_features.dynamicVertexStride;
+       }
+    }
+-#endif // MVK_VERSION
++#endif // ZINK_HAVE_MOLTENVK
+ 
+    return true;
+ }
+
+--- src/gallium/targets/dri/meson.build
++++ src/gallium/targets/dri/meson.build
+@@ -37,6 +37,20 @@ else
+   libgallium_name = 'gallium-@0@'.format(meson.project_version())
+ endif
+ 
++gallium_dri_deps = [
++  dep_libdrm, dep_llvm, dep_thread, idep_xmlconfig, idep_mesautil,
++  driver_swrast, driver_r300, driver_r600, driver_radeonsi, driver_nouveau,
++  driver_kmsro, driver_v3d, driver_vc4, driver_freedreno, driver_etnaviv,
++  driver_tegra, driver_i915, driver_svga, driver_virgl,
++  driver_panfrost, driver_iris, driver_lima, driver_zink, driver_d3d12,
++  driver_asahi, driver_crocus, driver_rocket, driver_ethosu
++]
++
++if host_machine.system() == 'darwin'
++  cpp = meson.get_compiler('cpp')
++  gallium_dri_deps += cpp.find_library('c++', required : true)
++endif
++
+ libgallium_dri = shared_library(
+   libgallium_name,
+   files('dri_target.c'),
+@@ -53,14 +67,7 @@ libgallium_dri = shared_library(
+     libswkmsdri, gallium_dri_link_with
+   ],
+   link_whole : [libdri, gallium_dri_link_whole],
+-  dependencies : [
+-    dep_libdrm, dep_llvm, dep_thread, idep_xmlconfig, idep_mesautil,
+-    driver_swrast, driver_r300, driver_r600, driver_radeonsi, driver_nouveau,
+-    driver_kmsro, driver_v3d, driver_vc4, driver_freedreno, driver_etnaviv,
+-    driver_tegra, driver_i915, driver_svga, driver_virgl,
+-    driver_panfrost, driver_iris, driver_lima, driver_zink, driver_d3d12,
+-    driver_asahi, driver_crocus, driver_rocket, driver_ethosu
+-  ],
++  dependencies : gallium_dri_deps,
+   install : true,
+   name_suffix : libname_suffix,
+ )
+

@@ -1,0 +1,145 @@
+# ntdll/kernelbase: fix VEH/misaligned stack related crashes with copy protection software.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11069 state=closed
+# These patches aim to fix crashes and hardlocks when running software that uses
+a exception handler as a control flow stub, which also happens to violate
+stack alignment.
+
+The software register a VEH which calls a procedure that destroys stack alignment
+and restores a pre-saved context before returning. This VEH also calls OpenThread
+with a misaligned stack, causing GCC/Clang's movaps to fault and recurse through the
+VEH until signal stack is exhausted.
+
+Additionally the software installs hw breakpoints on KSHARED_USER_DATA. Wine's
+signal handlers access the same addresses triggering recursive SIGTRAP dispatches
+which crashes via `virtual_setup_exception()`'s nested exception check.
+
+Although all 3 patches are required together for the software in question
+to function, the HWBKPT signal fix and the VEH clobber fix Wine issues
+that may affect other software. I am the least certain about the viability
+of `OpenThread`'s handrolled ASM version. If the assembly implementation is
+not acceptable applying `__attribute__((optimize("no-tree-vectorize")))` would
+also prevent movaps emission. OpenThread is a small function that does not
+meaningfully benefit from SIMD acceleration so the performance effect should
+be negligible.
+
+Discussed on #winehackers prior to submission.
+--- dlls/kernelbase/thread.c
++++ dlls/kernelbase/thread.c
+@@ -397,6 +397,65 @@ LANGID WINAPI DECLSPEC_HOTPATCH GetThreadUILanguage(void)
+ /***********************************************************************
+  *	     OpenThread   (kernelbase.@)
+  */
++#if defined(__WINE_PE_BUILD) && defined(__x86_64__) && !defined(__arm64ec__)
++/*
++ * Some copy protection software calls OpenThread() with a misaligned stack. 
++ *
++ * GCC emits movaps when it can prove 16-byte alignment, but with the broken
++ * stack setup (rsp+0x60) is 8 byte aligned and causes a fault. MSVC never emits
++ * movaps regardless of provable alignment so this passes on Windows.
++ *
++ * Provide a handrolled asm implementation that forces alignment
++ * unconditionally.
++ */
++__ASM_GLOBAL_FUNC( OpenThread,
++                   ".byte 0x48\n\t" /* hotpatch prolog */
++                   "pushq %rbp\n\t"
++                   __ASM_SEH(".seh_pushreg %rbp\n\t")
++                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
++                   __ASM_CFI(".cfi_rel_offset %rbp,0\n\t")
++                   "movq %rsp,%rbp\n\t"
++                   __ASM_SEH(".seh_setframe %rbp,0\n\t")
++                   __ASM_CFI(".cfi_def_cfa_register %rbp\n\t")
++                   __ASM_SEH(".seh_endprologue\n\t")
++                   "subq $0x80,%rsp\n\t"
++                   "andq $~15,%rsp\n\t"
++                   "movl %ecx,%r10d\n\t"             /* access */
++                   "movl %r8d,%eax\n\t"              /* id */
++                   "movq $0,0x28(%rsp)\n\t"          /* handle */
++                   "movq $0,0x30(%rsp)\n\t"          /* cid.UniqueProcess */
++                   "movq %rax,0x38(%rsp)\n\t"        /* cid.UniqueThread */
++                   "movl $0x30,0x40(%rsp)\n\t"       /* attr.Length */
++                   "movq $0,0x48(%rsp)\n\t"          /* attr.RootDirectory */
++                   "movq $0,0x50(%rsp)\n\t"          /* attr.ObjectName */
++                   "testl %edx,%edx\n\t"
++                   "setne %al\n\t"
++                   "movzbl %al,%eax\n\t"
++                   "addl %eax,%eax\n\t"
++                   "movl %eax,0x58(%rsp)\n\t"        /* attr.Attributes */
++                   "movq $0,0x60(%rsp)\n\t"          /* attr.SecurityDescriptor */
++                   "movq $0,0x68(%rsp)\n\t"          /* attr.SecurityQualityOfService */
++                   "leaq 0x28(%rsp),%rcx\n\t"
++                   "movl %r10d,%edx\n\t"
++                   "leaq 0x40(%rsp),%r8\n\t"
++                   "leaq 0x30(%rsp),%r9\n\t"
++                   "call *__imp_NtOpenThread(%rip)\n\t"
++                   "testl %eax,%eax\n\t"
++                   "jne 1f\n\t"
++                   "movq 0x28(%rsp),%rax\n\t"
++                   "jmp 2f\n\t"
++                   "1:\tmovl %eax,%ecx\n\t"
++                   "call *__imp_RtlNtStatusToDosError(%rip)\n\t"
++                   "movl %eax,%edx\n\t"
++                   "movq %gs:0x30,%rax\n\t"
++                   "movl %edx,0x68(%rax)\n\t"
++                   "xorl %eax,%eax\n\t"
++                   "2:\tleaq 0(%rbp),%rsp\n\t"
++                   __ASM_CFI(".cfi_def_cfa_register %rsp\n\t")
++                   "popq %rbp\n\t"
++                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
++                   "ret" )
++#else
+ HANDLE WINAPI DECLSPEC_HOTPATCH OpenThread( DWORD access, BOOL inherit, DWORD id )
+ {
+     HANDLE handle;
+@@ -410,6 +469,7 @@ HANDLE WINAPI DECLSPEC_HOTPATCH OpenThread( DWORD access, BOOL inherit, DWORD id
+     if (!set_ntstatus( NtOpenThread( &handle, access, &attr, &cid ))) handle = 0;
+     return handle;
+ }
++#endif
+ 
+ 
+ /* callback for QueueUserAPC */
+
+--- dlls/ntdll/unix/signal_x86_64.c
++++ dlls/ntdll/unix/signal_x86_64.c
+@@ -2149,9 +2149,11 @@ static BOOL handle_syscall_trap( struct thread_data *data, ucontext_t *sigcontex
+         R10_sig( sigcontext ) = RCX_sig( sigcontext );
+         fixup_frame_fpu_state( frame, sigcontext );
+     }
+-    else if (siginfo->si_code == 4 /* TRAP_HWBKPT */ && is_inside_syscall( data, RSP_sig(sigcontext) ))
++    else if (siginfo->si_code == 4 /* TRAP_HWBKPT */ &&
++             (is_inside_syscall( data, RSP_sig(sigcontext) ) || 
++              is_inside_signal_stack( data, (void *)RSP_sig(sigcontext) )))
+     {
+-        TRACE_(seh)( "ignoring HWBKPT in syscall rip=%p\n", (void *)RIP_sig(sigcontext) );
++        TRACE_(seh)( "ignoring HWBKPT in syscall/signal stack rip=%p\n", (void *)RIP_sig(sigcontext) );
+         return TRUE;
+     }
+     else return FALSE;
+@@ -2369,7 +2371,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     struct thread_data *data = init_handler( sigcontext );
+     struct xcontext context;
+     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(sigcontext) };
+-
++    
+     if (handle_syscall_trap( data, sigcontext, siginfo )) return;
+ 
+     save_context( data, &context, sigcontext );
+
+--- dlls/ntdll/exception.c
++++ dlls/ntdll/exception.c
+@@ -173,6 +173,13 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
+         TRACE( "calling handler at %p code=%lx flags=%lx\n",
+                func, rec->ExceptionCode, rec->ExceptionFlags );
+         ret = func( &except_ptrs );
++
++#if defined(__WINE_PE_BUILD) && defined(__x86_64__) && !defined(__arm64ec__)
++        /*
++         * Some VEH callbacks restore nonvolatile registers before returning.
++         */
++        __asm__ __volatile__( "" ::: "rbx", "rsi", "rdi", "rbp", "r12", "r13", "r14", "r15", "memory" );
++#endif
+         TRACE( "handler at %p returned %lx\n", func, ret );
+ 
+         RtlEnterCriticalSection( &vectored_handlers_section );
+

@@ -1,0 +1,195 @@
+# winewayland: Keep undecorated popups owned by a fullscreen window as subsurfaces.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12754 state=opened
+# Old DirectDraw games such as Diablo show their menus in undecorated `WS_POPUP` windows owned by their fullscreen main window. Each of them became a separate fullscreen `xdg_toplevel`, fighting with its owner over focus and stacking. This keeps such popups unmanaged, so that they are attached as subsurfaces of their owner, and makes pointer locking and mouse input work while one of these subsurfaces is the foreground window.
+
+### How to reproduce
+
+Diablo (1996, DirectDraw, 640x480) on winewayland. Its main window is a fullscreen `WS_POPUP`, and its menus and dialogs are undecorated `WS_POPUP` windows owned by that main window. The game hides the cursor and clips it while they are shown.
+
+Before this, starting the game and opening a menu shows:
+
+- each menu becomes its own fullscreen `xdg_toplevel`, which competes with the main window for focus and stacking;
+- mouse clicks go to the main window instead of the menu under the cursor;
+- the pointer lock never activates while a menu is the foreground window, so relative motion is turned off and the cursor stops moving.
+
+### Tested on
+
+- [labwc 0.20.3](https://github.com/labwc/labwc), one 3840x2160 output at scale 2, Intel UHD 630.
+- Games: Diablo, StarCraft, Warcraft II.
+- Not tested on any other compositor.
+- Not tested in a Wine virtual desktop.
+
+The testing was done on a branch that also contains !12751, !12755 and one further winewayland commit that is not part of this MR (see below).
+
+### Known limitation
+
+Subsurfaces are composited by the compositor, so nothing invalidates the owner when a popup subsurface is hidden. Diablo draws its dialogs into the main window's DirectDraw surface and relies on a `WM_PAINT` for the uncovered area, so a closed dialog can leave a stale image behind. I have a fix for that, but it makes the owner behave like pre-Windows 8 (non-composited) Windows, so I left it out of this MR.
+--- dlls/winewayland.drv/wayland_pointer.c
++++ dlls/winewayland.drv/wayland_pointer.c
+@@ -122,6 +122,22 @@ static HWND wayland_pointer_get_focused_hwnd(void)
+     return hwnd;
+ }
+ 
++/* While the pointer is locked, the cursor moves independently of the
++ * Wayland pointer focus, and may be over another window (e.g. an owned
++ * popup) than the focused one. Let the server find the window under the
++ * cursor then, instead of restricting the input to the focused window. */
++static HWND wayland_pointer_get_input_hwnd(HWND hwnd)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    BOOL relative_mode;
++
++    pthread_mutex_lock(&pointer->mutex);
++    relative_mode = pointer->relative_mode;
++    pthread_mutex_unlock(&pointer->mutex);
++
++    return relative_mode ? NULL : hwnd;
++}
++
+ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+ {
+     INPUT input = {0};
+@@ -267,7 +283,7 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
+ 
+     TRACE("hwnd=%p button=%#x state=%u\n", hwnd, button, state);
+ 
+-    NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
++    NtUserSendHardwareInput(wayland_pointer_get_input_hwnd(hwnd), SEND_HWMSG_RAWINPUT, &input, 0);
+ }
+ 
+ static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
+@@ -316,7 +332,7 @@ static void pointer_handle_axis_value120(void *data, struct wl_pointer *wl_point
+ 
+     TRACE("hwnd=%p axis=%u value120=%d\n", hwnd, axis, value120);
+ 
+-    NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, 0);
++    NtUserSendHardwareInput(wayland_pointer_get_input_hwnd(hwnd), SEND_HWMSG_RAWINPUT, &input, 0);
+ }
+ 
+ static void pointer_handle_axis_discrete(void *data, struct wl_pointer *wl_pointer,
+@@ -398,7 +414,7 @@ static void relative_pointer_v1_relative_motion(void *private,
+           hwnd, wl_fixed_to_double(dx), wl_fixed_to_double(dy), input.mi.dx, input.mi.dy,
+           wl_fixed_to_double(dx_unaccel), wl_fixed_to_double(dy_unaccel), raw_pos.x, raw_pos.y);
+ 
+-    NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &input, (LPARAM)&raw);
++    NtUserSendHardwareInput(wayland_pointer_get_input_hwnd(hwnd), SEND_HWMSG_RAWINPUT, &input, (LPARAM)&raw);
+ }
+ 
+ static const struct zwp_relative_pointer_v1_listener relative_pointer_v1_listener =
+@@ -1004,6 +1020,48 @@ BOOL WAYLAND_SetCursorPos(INT x, INT y)
+     return TRUE;
+ }
+ 
++/* Returns the window of the toplevel Wayland surface that the surface of
++ * hwnd is (possibly indirectly) a subsurface of, or hwnd itself. */
++static HWND wayland_surface_root_hwnd(HWND hwnd)
++{
++    struct wayland_win_data *data;
++
++    while ((data = wayland_win_data_get(hwnd)))
++    {
++        HWND owner = NULL;
++
++        if (data->wayland_surface &&
++            data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
++            owner = data->wayland_surface->owner_hwnd;
++        wayland_win_data_release(data);
++        if (!owner) break;
++        hwnd = owner;
++    }
++
++    return hwnd;
++}
++
++/* Returns the window whose surface should get the pointer constraint for
++ * the foreground window. A constraint only activates while its surface has
++ * the pointer focus, so when the foreground window is part of a tree of
++ * subsurfaces (e.g. an owned popup), use the surface of the tree that has
++ * the focus, or the toplevel surface of the tree otherwise. */
++static HWND wayland_pointer_get_constraint_hwnd(HWND hwnd)
++{
++    HWND root = wayland_surface_root_hwnd(hwnd);
++    HWND focused = wayland_pointer_get_focused_hwnd();
++
++    if (focused && wayland_surface_root_hwnd(focused) == root) hwnd = focused;
++    else hwnd = root;
++
++    /* WAYLAND_ClipCursor uses the wl_surface of this window without holding
++     * its win data lock, which is only safe for a window of the current
++     * thread. Fall back to the foreground window otherwise. */
++    if (NtUserGetWindowThread(hwnd, NULL) != GetCurrentThreadId())
++        return NtUserGetForegroundWindow();
++    return hwnd;
++}
++
+ /***********************************************************************
+  *	     WAYLAND_ClipCursor
+  */
+@@ -1020,7 +1078,7 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
+     TRACE("clip=%s reset=%d\n", wine_dbgstr_rect(clip), reset);
+ 
+     NtUserGetCursorPos(&cursor_pos);
+-    hwnd = NtUserGetForegroundWindow();
++    hwnd = wayland_pointer_get_constraint_hwnd(NtUserGetForegroundWindow());
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+     if ((surface = data->wayland_surface))
+@@ -1071,9 +1129,9 @@ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset)
+         pthread_mutex_lock(&pointer->mutex);
+     }
+ 
+-   /* Since we are running in the context of the foreground thread we know
+-    * that the wl_surface of the foreground HWND will not be invalidated,
+-    * so we can access it without having the win data lock. */
++   /* Since we are running in the context of the foreground thread, and
++    * hwnd belongs to it, we know that the wl_surface of hwnd will not be
++    * invalidated, so we can access it without having the win data lock. */
+     wayland_pointer_update_constraint(wl_surface,
+                                       (clip && wl_surface) ? &confine_rect : NULL,
+                                       FALSE);
+
+--- dlls/winewayland.drv/window.c
++++ dlls/winewayland.drv/window.c
+@@ -364,6 +364,28 @@ static inline HWND get_active_window(void)
+     return NtUserGetGUIThreadInfo(GetCurrentThreadId(), &info) ? info.hwndActive : 0;
+ }
+ 
++/* Checks whether the first managed window in the owner chain of hwnd is
++ * fullscreen. Popups may be owned by other unmanaged popups, e.g. nested
++ * dialogs, which are themselves attached to that window. */
++static BOOL is_owned_by_fullscreen(HWND hwnd)
++{
++    HWND owner = hwnd;
++    struct wayland_win_data *data;
++
++    while ((owner = NtUserGetWindowRelative(owner, GW_OWNER)))
++    {
++        BOOL managed, fullscreen;
++
++        if (!(data = wayland_win_data_get(owner))) return FALSE;
++        managed = data->managed;
++        fullscreen = data->is_fullscreen;
++        wayland_win_data_release(data);
++        if (managed) return fullscreen;
++    }
++
++    return FALSE;
++}
++
+ /***********************************************************************
+  *		is_window_managed
+  *
+@@ -376,6 +398,12 @@ static BOOL is_window_managed(HWND hwnd, UINT swp_flags, BOOL fullscreen)
+     /* child windows are not managed */
+     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
++    /* Undecorated popups owned by a fullscreen window (e.g. the menus of
++     * old DirectDraw games) stay attached to their owner, instead of
++     * becoming separate, competing fullscreen toplevels. */
++    if ((style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION && !(style & WS_THICKFRAME) &&
++        is_owned_by_fullscreen(hwnd))
++        return FALSE;
+     /* activated windows are managed */
+     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
+     if (hwnd == get_active_window()) return TRUE;
+

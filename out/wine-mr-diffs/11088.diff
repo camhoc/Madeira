@@ -1,0 +1,57 @@
+# bcrypt/tests: Avoid crash when BCryptSecretAgreement fails in test_ECDH_alg.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11088 state=closed
+# The test pattern page shows a bcrypt crash. I could reproduce it with a Debian Bookworm VM.
+
+It shows before the crash the error:
+```
+GnuTLS error: An unknown public key algorithm was encountered.
+bcrypt.c:3332: Test failed: L"ECDH_P256": got 0xc00000e5
+```
+
+The crashes can be avoid by initializing the handles `secret` and `key2` to NULL.
+
+[Test pattern page bcrypt:bcrypt](https://test.winehq.org/data/patterns.html#bcrypt:bcrypt)
+
+[Testbot run with this patch](https://testbot.winehq.org/JobDetails.pl?Key=163281)
+
+<details>
+<summary>Backtrace of segfault</summary>
+
+```
+Thread 1 "bcrypt_test.exe" received signal SIGSEGV, Segmentation fault.
+0x00006ffffd9a73dd in get_object (handle=handle@entry=0xc40009d7b41de826, magic=magic@entry=1396920916) at dlls/bcrypt/bcrypt_main.c:282
+282             return obj;
+(gdb) bt
+#0  get_object (handle=handle@entry=0xc40009d7b41de826, magic=magic@entry=1396920916) at dlls/bcrypt/bcrypt_main.c:282
+#1  get_secret_object (handle=0xc40009d7b41de826) at dlls/bcrypt/bcrypt_main.c:311
+#2  BCryptDestroySecret (handle=0xc40009d7b41de826) at dlls/bcrypt/bcrypt_main.c:2696
+#3  test_ECDH_alg (t=0xfffffffc0) at dlls/bcrypt/tests/bcrypt.c:3381
+#4  test_ECDH () at dlls/bcrypt/tests/bcrypt.c:3525
+#5  func_bcrypt () at dlls/bcrypt/tests/bcrypt.c:4921
+#6  run_test (name=name@entry=0x7ffffe33c23f "bcrypt") at include/wine/test.h:780
+#7  main (argc=<optimized out>, argv=<optimized out>) at include/wine/test.h:900
+(gdb)
+```
+
+</details>
+--- dlls/bcrypt/tests/bcrypt.c
++++ dlls/bcrypt/tests/bcrypt.c
+@@ -3254,7 +3254,7 @@ static void test_ECDH_alg(const struct ecdh_test *t)
+     BCRYPT_ECCKEY_BLOB *ecckey;
+     BCRYPT_ALG_HANDLE alg;
+     BCRYPT_KEY_HANDLE key, privkey, pubkey;
+-    BCRYPT_SECRET_HANDLE secret;
++    BCRYPT_SECRET_HANDLE secret = NULL;
+     NTSTATUS status;
+     ULONG size;
+ 
+@@ -3513,7 +3513,7 @@ static void test_ECDH(void)
+         },
+     };
+     BCRYPT_ALG_HANDLE alg;
+-    BCRYPT_KEY_HANDLE key, key2;
++    BCRYPT_KEY_HANDLE key, key2 = NULL;
+     BCRYPT_ECCKEY_BLOB *blob;
+     NTSTATUS status;
+     ULONG strength, size, i;
+

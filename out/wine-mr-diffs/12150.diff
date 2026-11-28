@@ -1,0 +1,5706 @@
+# libs: Import FFmpeg 9.0.2.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12150 state=opened
+# It introduces some build-time generated code, which we could generate by hand and commit the generated files, as they are relatively small, but I think it'd be nicer for makedep to be able to run some custom rules like implemented here. (That would be also useful if we ever want to integrate Mesa, as in https://gitlab.winehq.org/wine/wine/-/merge_requests/10531)
+
+This also keeps arm64ec yuv2rgb with its previous implementation, and forks libswscale/aarch64/swscale_unscaled.c into the arm64ec subfolder, as I was unable to port the new aarch64 implementation. It seems to be using even more registers and I don't know arm64ec enough to be confident with the changes I make. The generated code (ops_asmgen.c, generating ops_lookup.gen.c and ops_neon.gen.S) also seems incompatible and would need to be reimplemented with less registers.
+--- libs/ffmpeg/libavcodec/get_bits.h
++++ libs/ffmpeg/libavcodec/get_bits.h
+@@ -572,71 +572,65 @@ static inline const uint8_t *align_get_bits(GetBitContext *s)
+  */
+ #define GET_VLC(code, name, gb, table, bits, max_depth)         \
+     do {                                                        \
+-        int n, nb_bits;                                         \
+-        unsigned int index;                                     \
++        unsigned idx_ = SHOW_UBITS(name, gb, bits);             \
++        code          = table[idx_].sym;                        \
++        int        n_ = table[idx_].len;                        \
+                                                                 \
+-        index = SHOW_UBITS(name, gb, bits);                     \
+-        code  = table[index].sym;                               \
+-        n     = table[index].len;                               \
+-                                                                \
+-        if (max_depth > 1 && n < 0) {                           \
++        if (max_depth > 1 && n_ < 0) {                          \
+             LAST_SKIP_BITS(name, gb, bits);                     \
+             UPDATE_CACHE(name, gb);                             \
+                                                                 \
+-            nb_bits = -n;                                       \
++            int nb__bits = -n_;                                 \
+                                                                 \
+-            index = SHOW_UBITS(name, gb, nb_bits) + code;       \
+-            code  = table[index].sym;                           \
+-            n     = table[index].len;                           \
+-            if (max_depth > 2 && n < 0) {                       \
+-                LAST_SKIP_BITS(name, gb, nb_bits);              \
++            idx_ = SHOW_UBITS(name, gb, nb__bits) + code;       \
++            code = table[idx_].sym;                             \
++            n_   = table[idx_].len;                             \
++            if (max_depth > 2 && n_ < 0) {                      \
++                LAST_SKIP_BITS(name, gb, nb__bits);             \
+                 UPDATE_CACHE(name, gb);                         \
+                                                                 \
+-                nb_bits = -n;                                   \
++                nb__bits = -n_;                                 \
+                                                                 \
+-                index = SHOW_UBITS(name, gb, nb_bits) + code;   \
+-                code  = table[index].sym;                       \
+-                n     = table[index].len;                       \
++                idx_ = SHOW_UBITS(name, gb, nb__bits) + code;   \
++                code = table[idx_].sym;                         \
++                n_   = table[idx_].len;                         \
+             }                                                   \
+         }                                                       \
+-        SKIP_BITS(name, gb, n);                                 \
++        SKIP_BITS(name, gb, n_);                                \
+     } while (0)
+ 
+ #define GET_RL_VLC(level, run, name, gb, table, bits,  \
+                    max_depth, need_update)                      \
+     do {                                                        \
+-        int n, nb_bits;                                         \
+-        unsigned int index;                                     \
+-                                                                \
+-        index = SHOW_UBITS(name, gb, bits);                     \
+-        level = table[index].level;                             \
+-        n     = table[index].len8;                              \
++        unsigned idx_ = SHOW_UBITS(name, gb, bits);             \
++        level         = table[idx_].level;                      \
++        int        n_ = table[idx_].len8;                       \
+                                                                 \
+-        if (max_depth > 1 && n < 0) {                           \
++        if (max_depth > 1 && n_ < 0) {                          \
+             SKIP_BITS(name, gb, bits);                          \
+             if (need_update) {                                  \
+                 UPDATE_CACHE(name, gb);                         \
+             }                                                   \
+                                                                 \
+-            nb_bits = -n;                                       \
++            int nb__bits = -n_;                                 \
+                                                                 \
+-            index = SHOW_UBITS(name, gb, nb_bits) + level;      \
+-            level = table[index].level;                         \
+-            n     = table[index].len8;                          \
+-            if (max_depth > 2 && n < 0) {                       \
+-                LAST_SKIP_BITS(name, gb, nb_bits);              \
++            idx_  = SHOW_UBITS(name, gb, nb__bits) + level;     \
++            level = table[idx_].level;                          \
++            n_    = table[idx_].len8;                           \
++            if (max_depth > 2 && n_ < 0) {                      \
++                LAST_SKIP_BITS(name, gb, nb__bits);             \
+                 if (need_update) {                              \
+                     UPDATE_CACHE(name, gb);                     \
+                 }                                               \
+-                nb_bits = -n;                                   \
++                nb__bits = -n_;                                 \
+                                                                 \
+-                index = SHOW_UBITS(name, gb, nb_bits) + level;  \
+-                level = table[index].level;                     \
+-                n     = table[index].len8;                      \
++                idx_  = SHOW_UBITS(name, gb, nb__bits) + level; \
++                level = table[idx_].level;                      \
++                n_    = table[idx_].len8;                       \
+             }                                                   \
+         }                                                       \
+-        run = table[index].run;                                 \
+-        SKIP_BITS(name, gb, n);                                 \
++        run = table[idx_].run;                                  \
++        SKIP_BITS(name, gb, n_);                                \
+     } while (0)
+ 
+ /**
+
+--- libs/ffmpeg/libavfilter/allfilters.c
++++ libs/ffmpeg/libavfilter/allfilters.c
+
+--- libs/ffmpeg/libavfilter/audio.c
++++ libs/ffmpeg/libavfilter/audio.c
+@@ -0,0 +1,120 @@
++/*
++ * Copyright (c) Stefano Sabatini | stefasab at gmail.com
++ * Copyright (c) S.N. Hemanth Meenakshisundaram | smeenaks at ucsd.edu
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "libavutil/avassert.h"
++#include "libavutil/channel_layout.h"
++#include "libavutil/common.h"
++#include "libavutil/cpu.h"
++#include "libavutil/eval.h"
++
++#include "audio.h"
++#include "avfilter.h"
++#include "avfilter_internal.h"
++#include "filters.h"
++#include "framepool.h"
++
++const AVFilterPad ff_audio_default_filterpad[1] = {
++    {
++        .name = "default",
++        .type = AVMEDIA_TYPE_AUDIO,
++    }
++};
++
++AVFrame *ff_null_get_audio_buffer(AVFilterLink *link, int nb_samples)
++{
++    return ff_get_audio_buffer(link->dst->outputs[0], nb_samples);
++}
++
++AVFrame *ff_default_get_audio_buffer(AVFilterLink *link, int nb_samples)
++{
++    AVFrame *frame = NULL;
++    FilterLinkInternal *const li = ff_link_internal(link);
++    int channels = link->ch_layout.nb_channels;
++    int align = av_cpu_max_align();
++
++    if (ff_frame_pool_audio_reinit(&li->frame_pool, channels, nb_samples,
++                                   link->format, align) < 0)
++        return NULL;
++
++    frame = ff_frame_pool_get(&li->frame_pool);
++    if (!frame)
++        return NULL;
++
++    frame->nb_samples = nb_samples;
++    if (link->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC &&
++        av_channel_layout_copy(&frame->ch_layout, &link->ch_layout) < 0) {
++        av_frame_free(&frame);
++        return NULL;
++    }
++    frame->sample_rate = link->sample_rate;
++
++    av_samples_set_silence(frame->extended_data, 0, nb_samples, channels, link->format);
++
++    return frame;
++}
++
++AVFrame *ff_get_audio_buffer(AVFilterLink *link, int nb_samples)
++{
++    AVFrame *ret = NULL;
++
++    if (link->dstpad->get_buffer.audio)
++        ret = link->dstpad->get_buffer.audio(link, nb_samples);
++
++    if (!ret)
++        ret = ff_default_get_audio_buffer(link, nb_samples);
++
++    return ret;
++}
++
++int ff_parse_sample_rate(int *ret, const char *arg, void *log_ctx)
++{
++    char *tail;
++    double srate = av_strtod(arg, &tail);
++    if (*tail || srate < 1 || (int)srate != srate || srate > INT_MAX) {
++        av_log(log_ctx, AV_LOG_ERROR, "Invalid sample rate '%s'\n", arg);
++        return AVERROR(EINVAL);
++    }
++    *ret = srate;
++    return 0;
++}
++
++int ff_parse_channel_layout(AVChannelLayout *ret, int *nret, const char *arg,
++                            void *log_ctx)
++{
++    AVChannelLayout chlayout = { 0 };
++    int res;
++
++    res = av_channel_layout_from_string(&chlayout, arg);
++    if (res < 0) {
++        av_log(log_ctx, AV_LOG_ERROR, "Invalid channel layout '%s'\n", arg);
++        return AVERROR(EINVAL);
++    }
++
++    if (chlayout.order == AV_CHANNEL_ORDER_UNSPEC && !nret) {
++        av_log(log_ctx, AV_LOG_ERROR, "Unknown channel layout '%s' is not supported.\n", arg);
++        return AVERROR(EINVAL);
++    }
++    *ret = chlayout;
++    if (nret)
++        *nret = chlayout.nb_channels;
++
++    return 0;
++}
+
+--- libs/ffmpeg/libavfilter/audio.h
++++ libs/ffmpeg/libavfilter/audio.h
+@@ -0,0 +1,75 @@
++/*
++ * Copyright (c) Stefano Sabatini | stefasab at gmail.com
++ * Copyright (c) S.N. Hemanth Meenakshisundaram | smeenaks at ucsd.edu
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_AUDIO_H
++#define AVFILTER_AUDIO_H
++
++#include "avfilter.h"
++#include "filters.h"
++
++/**
++ * An AVFilterPad array whose only entry has name "default"
++ * and is of type AVMEDIA_TYPE_AUDIO.
++ */
++extern const AVFilterPad ff_audio_default_filterpad[1];
++
++/** default handler for get_audio_buffer() for audio inputs */
++AVFrame *ff_default_get_audio_buffer(AVFilterLink *link, int nb_samples);
++
++/** get_audio_buffer() handler for filters which simply pass audio along */
++AVFrame *ff_null_get_audio_buffer(AVFilterLink *link, int nb_samples);
++
++/**
++ * Request an audio samples buffer with a specific set of permissions.
++ *
++ * @param link           the output link to the filter from which the buffer will
++ *                       be requested
++ * @param nb_samples     the number of samples per channel
++ * @return               on success an AVFrame owned by the caller, NULL on error
++ */
++AVFrame *ff_get_audio_buffer(AVFilterLink *link, int nb_samples);
++
++/**
++ * Parse a sample rate.
++ *
++ * @param ret unsigned integer pointer to where the value should be written
++ * @param arg string to parse
++ * @param log_ctx log context
++ * @return >= 0 in case of success, a negative AVERROR code on error
++ */
++av_warn_unused_result
++int ff_parse_sample_rate(int *ret, const char *arg, void *log_ctx);
++
++/**
++ * Parse a channel layout or a corresponding integer representation.
++ *
++ * @param ret 64bit integer pointer to where the value should be written.
++ * @param nret integer pointer to the number of channels;
++ *             if not NULL, then unknown channel layouts are accepted
++ * @param arg string to parse
++ * @param log_ctx log context
++ * @return >= 0 in case of success, a negative AVERROR code on error
++ */
++av_warn_unused_result
++int ff_parse_channel_layout(AVChannelLayout *ret, int *nret, const char *arg,
++                            void *log_ctx);
++
++#endif /* AVFILTER_AUDIO_H */
+
+--- libs/ffmpeg/libavfilter/avfilter.c
++++ libs/ffmpeg/libavfilter/avfilter.c
+
+--- libs/ffmpeg/libavfilter/avfilter.h
++++ libs/ffmpeg/libavfilter/avfilter.h
+
+--- libs/ffmpeg/libavfilter/avfilter_internal.h
++++ libs/ffmpeg/libavfilter/avfilter_internal.h
+@@ -0,0 +1,229 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * APIs internal to the generic filter(graph) layer.
++ *
++ * MUST NOT be included by individual filters.
++ */
++
++#ifndef AVFILTER_AVFILTER_INTERNAL_H
++#define AVFILTER_AVFILTER_INTERNAL_H
++
++#include <stdint.h>
++
++#include "avfilter.h"
++#include "filters.h"
++#include "framepool.h"
++#include "framequeue.h"
++
++typedef struct FilterLinkInternal {
++    FilterLink l;
++
++    /**
++     * Pool of frames used for allocations.
++     */
++    FFFramePool frame_pool;
++
++    /**
++     * Queue of frames waiting to be filtered.
++     */
++    FFFrameQueue fifo;
++
++    /**
++     * If set, the source filter can not generate a frame as is.
++     * The goal is to avoid repeatedly calling the request_frame() method on
++     * the same link.
++     */
++    int frame_blocked_in;
++
++    /**
++     * Link input status.
++     * If not zero, all attempts of filter_frame will fail with the
++     * corresponding code.
++     */
++    int status_in;
++
++    /**
++     * Timestamp of the input status change.
++     */
++    int64_t status_in_pts;
++
++    /**
++     * Link output status.
++     * If not zero, all attempts of request_frame will fail with the
++     * corresponding code.
++     */
++    int status_out;
++
++    /**
++     * True if a frame is currently wanted on the output of this filter.
++     * Set when ff_request_frame() is called by the output,
++     * cleared when a frame is filtered.
++     */
++    int frame_wanted_out;
++
++    /**
++     * Index in the age array.
++     */
++    int age_index;
++
++    /** stage of the initialization of the link properties (dimensions, etc) */
++    enum {
++        AVLINK_UNINIT = 0,      ///< not started
++        AVLINK_STARTINIT,       ///< started, but incomplete
++        AVLINK_INIT             ///< complete
++    } init_state;
++} FilterLinkInternal;
++
++static inline FilterLinkInternal *ff_link_internal(AVFilterLink *link)
++{
++    return (FilterLinkInternal*)link;
++}
++
++typedef struct FFFilterContext {
++    /**
++     * The public AVFilterContext. See avfilter.h for it.
++     */
++    AVFilterContext p;
++
++    avfilter_execute_func *execute;
++
++    // AV_CLASS_STATE_FLAG_*
++    unsigned state_flags;
++
++    /**
++     * Ready status of the filter.
++     * A non-0 value means that the filter needs activating;
++     * a higher value suggests a more urgent activation.
++     */
++    unsigned ready;
++
++    /// parsed expression
++    struct AVExpr *enable;
++    /// variable values for the enable expression
++    double *var_values;
++
++    struct AVFilterCommand *command_queue;
++} FFFilterContext;
++
++static inline FFFilterContext *fffilterctx(AVFilterContext *ctx)
++{
++    return (FFFilterContext*)ctx;
++}
++
++typedef struct AVFilterCommand {
++    double time;                ///< time expressed in seconds
++    char *command;              ///< command
++    char *arg;                  ///< optional argument for the command
++    int flags;
++    struct AVFilterCommand *next;
++} AVFilterCommand;
++
++typedef struct FFFilterGraph {
++    /**
++     * The public AVFilterGraph. See avfilter.h for it.
++     */
++    AVFilterGraph p;
++
++    struct FilterLinkInternal **sink_links;
++    int sink_links_count;
++
++    unsigned disable_auto_convert;
++
++    void *thread;
++    avfilter_execute_func *thread_execute;
++    FFFrameQueueGlobal frame_queues;
++} FFFilterGraph;
++
++static inline FFFilterGraph *fffiltergraph(AVFilterGraph *graph)
++{
++    return (FFFilterGraph*)graph;
++}
++
++/**
++ * Update the position of a link in the age heap.
++ */
++void ff_avfilter_graph_update_heap(AVFilterGraph *graph,
++                                   struct FilterLinkInternal *li);
++
++/**
++ * Allocate a new filter context and return it.
++ *
++ * @param filter what filter to create an instance of
++ * @param inst_name name to give to the new filter context
++ *
++ * @return newly created filter context or NULL on failure
++ */
++AVFilterContext *ff_filter_alloc(const AVFilter *filter, const char *inst_name);
++
++/**
++ * Remove a filter from a graph;
++ */
++void ff_filter_graph_remove_filter(AVFilterGraph *graph, AVFilterContext *filter);
++
++int ff_filter_activate(AVFilterContext *filter);
++
++/**
++ * Parse filter options into a dictionary.
++ *
++ * @param logctx context for logging
++ * @param priv_class a filter's private class for shorthand options or NULL
++ * @param options dictionary to store parsed options in
++ * @param args options string to parse
++ *
++ * @return a non-negative number on success, a negative error code on failure
++ */
++int ff_filter_opt_parse(void *logctx, const AVClass *priv_class,
++                        AVDictionary **options, const char *args);
++
++int ff_graph_thread_init(FFFilterGraph *graph);
++
++void ff_graph_thread_free(FFFilterGraph *graph);
++
++/**
++ * Negotiate the media format, dimensions, etc of all inputs to a filter.
++ *
++ * @param filter the filter to negotiate the properties for its inputs
++ * @return       zero on successful negotiation
++ */
++int ff_filter_config_links(AVFilterContext *filter);
++
++/* misc trace functions */
++
++#define FF_TPRINTF_START(ctx, func) ff_tlog(NULL, "%-16s: ", #func)
++
++#ifdef TRACE
++void ff_tlog_link(void *ctx, AVFilterLink *link, int end);
++#else
++#define ff_tlog_link(ctx, link, end) do { } while(0)
++#endif
++
++/**
++ * Run one round of processing on a filter graph.
++ */
++int ff_filter_graph_run_once(AVFilterGraph *graph);
++
++/**
++ * Process the commands queued in the link up to the time of the frame.
++ * Commands will trigger the process_command() callback.
++ * @return  >= 0 or AVERROR code.
++ */
++int ff_inlink_process_commands(AVFilterLink *link, const AVFrame *frame);
++
++#endif /* AVFILTER_AVFILTER_INTERNAL_H */
+
+--- libs/ffmpeg/libavfilter/avfiltergraph.c
++++ libs/ffmpeg/libavfilter/avfiltergraph.c
+
+--- libs/ffmpeg/libavfilter/buffersink.c
++++ libs/ffmpeg/libavfilter/buffersink.c
+@@ -0,0 +1,414 @@
++/*
++ * Copyright (c) 2011 Stefano Sabatini
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * buffer sink
++ */
++
++#include "libavutil/avassert.h"
++#include "libavutil/avstring.h"
++#include "libavutil/channel_layout.h"
++#include "libavutil/common.h"
++#include "libavutil/internal.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++
++#include "audio.h"
++#include "avfilter.h"
++#include "avfilter_internal.h"
++#include "buffersink.h"
++#include "filters.h"
++#include "formats.h"
++#include "framequeue.h"
++#include "video.h"
++
++typedef struct BufferSinkContext {
++    const AVClass *class;
++    unsigned warning_limit;
++    unsigned frame_size;
++
++    /* only used for video */
++    enum AVPixelFormat *pixel_formats;
++    unsigned         nb_pixel_formats;
++
++    int                *colorspaces;
++    unsigned         nb_colorspaces;
++
++    int                *colorranges;
++    unsigned         nb_colorranges;
++
++    int                *alphamodes;
++    unsigned         nb_alphamodes;
++
++    /* only used for audio */
++    enum AVSampleFormat *sample_formats;
++    unsigned          nb_sample_formats;
++
++    int                 *samplerates;
++    unsigned          nb_samplerates;
++
++    AVChannelLayout     *channel_layouts;
++    unsigned          nb_channel_layouts;
++
++    AVFrame *peeked_frame;
++} BufferSinkContext;
++
++int attribute_align_arg av_buffersink_get_frame(AVFilterContext *ctx, AVFrame *frame)
++{
++    return av_buffersink_get_frame_flags(ctx, frame, 0);
++}
++
++static int return_or_keep_frame(BufferSinkContext *buf, AVFrame *out, AVFrame *in, int flags)
++{
++    if ((flags & AV_BUFFERSINK_FLAG_PEEK)) {
++        buf->peeked_frame = in;
++        return out ? av_frame_ref(out, in) : 0;
++    } else {
++        av_assert1(out);
++        buf->peeked_frame = NULL;
++        av_frame_move_ref(out, in);
++        av_frame_free(&in);
++        return 0;
++    }
++}
++
++static int get_frame_internal(AVFilterContext *ctx, AVFrame *frame, int flags, int samples)
++{
++    BufferSinkContext *buf = ctx->priv;
++    AVFilterLink *inlink = ctx->inputs[0];
++    FilterLinkInternal *li = ff_link_internal(inlink);
++    int status, ret;
++    AVFrame *cur_frame;
++    int64_t pts;
++    int buffersrc_empty = 0;
++
++    if (buf->peeked_frame)
++        return return_or_keep_frame(buf, frame, buf->peeked_frame, flags);
++
++    while (1) {
++        ret = samples ? ff_inlink_consume_samples(inlink, samples, samples, &cur_frame) :
++                        ff_inlink_consume_frame(inlink, &cur_frame);
++        if (ret < 0) {
++            return ret;
++        } else if (ret) {
++            /* TODO return the frame instead of copying it */
++            return return_or_keep_frame(buf, frame, cur_frame, flags);
++        } else if (ff_inlink_acknowledge_status(inlink, &status, &pts)) {
++            return status;
++        } else if ((flags & AV_BUFFERSINK_FLAG_NO_REQUEST)) {
++            return AVERROR(EAGAIN);
++        } else if (li->frame_wanted_out) {
++            ret = ff_filter_graph_run_once(ctx->graph);
++            if (ret == FFERROR_BUFFERSRC_EMPTY) {
++                buffersrc_empty = 1;
++            } else if (ret == AVERROR(EAGAIN)) {
++                if (buffersrc_empty)
++                    return ret;
++                ff_inlink_request_frame(inlink);
++            } else if (ret < 0) {
++                return ret;
++            }
++        } else {
++            ff_inlink_request_frame(inlink);
++        }
++    }
++}
++
++int attribute_align_arg av_buffersink_get_frame_flags(AVFilterContext *ctx, AVFrame *frame, int flags)
++{
++    return get_frame_internal(ctx, frame, flags,
++                              ff_filter_link(ctx->inputs[0])->min_samples);
++}
++
++int attribute_align_arg av_buffersink_get_samples(AVFilterContext *ctx,
++                                                  AVFrame *frame, int nb_samples)
++{
++    return get_frame_internal(ctx, frame, 0, nb_samples);
++}
++
++static av_cold int common_init(AVFilterContext *ctx)
++{
++    BufferSinkContext *buf = ctx->priv;
++
++    buf->warning_limit = 100;
++    return 0;
++}
++
++#define TERMINATE_ARRAY(arr, val)                                                   \
++    if (s->arr) {                                                                   \
++        void *tmp = av_realloc_array(s->arr, s->nb_ ## arr + 1, sizeof(*s->arr));   \
++        if (!tmp)                                                                   \
++            return AVERROR(ENOMEM);                                                 \
++        s->arr = tmp;                                                               \
++        s->arr[s->nb_ ## arr] = val;                                                \
++    }
++
++static int init_video(AVFilterContext *ctx)
++{
++    BufferSinkContext *s = ctx->priv;
++
++    TERMINATE_ARRAY(pixel_formats, AV_PIX_FMT_NONE);
++    TERMINATE_ARRAY(colorranges, -1);
++    TERMINATE_ARRAY(colorspaces, -1);
++    TERMINATE_ARRAY(alphamodes, -1);
++
++    return common_init(ctx);
++}
++
++static int init_audio(AVFilterContext *ctx)
++{
++    BufferSinkContext *s = ctx->priv;
++
++    TERMINATE_ARRAY(sample_formats, AV_SAMPLE_FMT_NONE);
++    TERMINATE_ARRAY(samplerates, -1);
++    TERMINATE_ARRAY(channel_layouts, (AVChannelLayout){ .nb_channels = 0 });
++
++    return common_init(ctx);
++}
++
++#undef TERMINATE_ARRAY
++
++static void uninit(AVFilterContext *ctx)
++{
++    BufferSinkContext *buf = ctx->priv;
++
++    av_frame_free(&buf->peeked_frame);
++}
++
++static int activate(AVFilterContext *ctx)
++{
++    BufferSinkContext *buf = ctx->priv;
++    FilterLinkInternal * const li = ff_link_internal(ctx->inputs[0]);
++
++    if (buf->warning_limit &&
++        ff_framequeue_queued_frames(&li->fifo) >= buf->warning_limit) {
++        av_log(ctx, AV_LOG_WARNING,
++               "%d buffers queued in %s, something may be wrong.\n",
++               buf->warning_limit,
++               (char *)av_x_if_null(ctx->name, ctx->filter->name));
++        buf->warning_limit *= 10;
++    }
++
++    /* The frame is queued, the rest is up to get_frame_internal */
++    return 0;
++}
++
++static int config_input_audio(AVFilterLink *inlink)
++{
++    BufferSinkContext *buf = inlink->dst->priv;
++    FilterLink *l = ff_filter_link(inlink);
++
++    l->min_samples = l->max_samples = buf->frame_size;
++
++    return 0;
++}
++
++void av_buffersink_set_frame_size(AVFilterContext *ctx, unsigned frame_size)
++{
++    BufferSinkContext *buf = ctx->priv;
++    buf->frame_size = frame_size;
++
++    if (ctx->inputs && ctx->inputs[0]) {
++        FilterLink *l = ff_filter_link(ctx->inputs[0]);
++        l->min_samples = l->max_samples = buf->frame_size;
++    }
++}
++
++#define MAKE_AVFILTERLINK_ACCESSOR(type, field) \
++type av_buffersink_get_##field(const AVFilterContext *ctx) { \
++    av_assert0(fffilter(ctx->filter)->activate == activate); \
++    return ctx->inputs[0]->field; \
++}
++
++MAKE_AVFILTERLINK_ACCESSOR(enum AVMediaType , type               )
++MAKE_AVFILTERLINK_ACCESSOR(AVRational       , time_base          )
++MAKE_AVFILTERLINK_ACCESSOR(int              , format             )
++
++MAKE_AVFILTERLINK_ACCESSOR(int              , w                  )
++MAKE_AVFILTERLINK_ACCESSOR(int              , h                  )
++MAKE_AVFILTERLINK_ACCESSOR(AVRational       , sample_aspect_ratio)
++MAKE_AVFILTERLINK_ACCESSOR(enum AVColorSpace, colorspace)
++MAKE_AVFILTERLINK_ACCESSOR(enum AVColorRange, color_range)
++MAKE_AVFILTERLINK_ACCESSOR(enum AVAlphaMode , alpha_mode)
++
++MAKE_AVFILTERLINK_ACCESSOR(int              , sample_rate        )
++
++AVRational av_buffersink_get_frame_rate(const AVFilterContext *ctx)
++{
++    FilterLink *l = ff_filter_link(ctx->inputs[0]);
++    av_assert0(fffilter(ctx->filter)->activate == activate);
++    return l->frame_rate;
++}
++
++AVBufferRef* av_buffersink_get_hw_frames_ctx(const AVFilterContext *ctx)
++{
++    FilterLink *l = ff_filter_link(ctx->inputs[0]);
++    av_assert0(fffilter(ctx->filter)->activate == activate);
++    return l->hw_frames_ctx;
++}
++
++int av_buffersink_get_channels(const AVFilterContext *ctx)
++{
++    av_assert0(fffilter(ctx->filter)->activate == activate);
++    return ctx->inputs[0]->ch_layout.nb_channels;
++}
++
++int av_buffersink_get_ch_layout(const AVFilterContext *ctx, AVChannelLayout *out)
++{
++    AVChannelLayout ch_layout = { 0 };
++    int ret;
++
++    av_assert0(fffilter(ctx->filter)->activate == activate);
++    ret = av_channel_layout_copy(&ch_layout, &ctx->inputs[0]->ch_layout);
++    if (ret < 0)
++        return ret;
++    *out = ch_layout;
++    return 0;
++}
++
++const AVFrameSideData *const *av_buffersink_get_side_data(const AVFilterContext *ctx,
++                                                          int *nb_side_data)
++{
++    av_assert0(fffilter(ctx->filter)->activate == activate);
++    *nb_side_data = ctx->inputs[0]->nb_side_data;
++    return (const AVFrameSideData *const *)ctx->inputs[0]->side_data;
++}
++
++static int vsink_query_formats(const AVFilterContext *ctx,
++                               AVFilterFormatsConfig **cfg_in,
++                               AVFilterFormatsConfig **cfg_out)
++{
++    const BufferSinkContext *buf = ctx->priv;
++    int ret;
++
++    if (buf->nb_pixel_formats) {
++        ret = ff_set_pixel_formats_from_list2(ctx, cfg_in, cfg_out, buf->pixel_formats);
++        if (ret < 0)
++            return ret;
++    }
++    if (buf->nb_colorspaces) {
++        ret = ff_set_common_color_spaces_from_list2(ctx, cfg_in, cfg_out, buf->colorspaces);
++        if (ret < 0)
++            return ret;
++    }
++    if (buf->nb_colorranges) {
++        ret = ff_set_common_color_ranges_from_list2(ctx, cfg_in, cfg_out, buf->colorranges);
++        if (ret < 0)
++            return ret;
++    }
++    if (buf->nb_alphamodes) {
++        ret = ff_set_common_alpha_modes_from_list2(ctx, cfg_in, cfg_out, buf->alphamodes);
++        if (ret < 0)
++            return ret;
++    }
++
++    return 0;
++}
++
++static int asink_query_formats(const AVFilterContext *ctx,
++                               AVFilterFormatsConfig **cfg_in,
++                               AVFilterFormatsConfig **cfg_out)
++{
++    const BufferSinkContext *buf = ctx->priv;
++    int ret;
++
++    if (buf->nb_sample_formats) {
++        ret = ff_set_sample_formats_from_list2(ctx, cfg_in, cfg_out, buf->sample_formats);
++        if (ret < 0)
++            return ret;
++    }
++    if (buf->nb_samplerates) {
++        ret = ff_set_common_samplerates_from_list2(ctx, cfg_in, cfg_out, buf->samplerates);
++        if (ret < 0)
++            return ret;
++    }
++    if (buf->nb_channel_layouts) {
++        ret = ff_set_common_channel_layouts_from_list2(ctx, cfg_in, cfg_out, buf->channel_layouts);
++        if (ret < 0)
++            return ret;
++    }
++
++    return 0;
++}
++
++#define OFFSET(x) offsetof(BufferSinkContext, x)
++#define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
++static const AVOption buffersink_options[] = {
++    { "pixel_formats",  "array of supported pixel formats", OFFSET(pixel_formats),
++        AV_OPT_TYPE_PIXEL_FMT | AV_OPT_TYPE_FLAG_ARRAY, .max = INT_MAX, .flags = FLAGS },
++    { "colorspaces",    "array of supported color spaces",  OFFSET(colorspaces),
++        AV_OPT_TYPE_INT | AV_OPT_TYPE_FLAG_ARRAY, .max = INT_MAX, .flags = FLAGS },
++    { "colorranges",    "array of supported color ranges",  OFFSET(colorranges),
++        AV_OPT_TYPE_INT | AV_OPT_TYPE_FLAG_ARRAY, .max = INT_MAX, .flags = FLAGS },
++    { "alphamodes",     "array of supported color ranges",  OFFSET(alphamodes),
++        AV_OPT_TYPE_INT | AV_OPT_TYPE_FLAG_ARRAY, .max = INT_MAX, .flags = FLAGS },
++
++    { NULL },
++};
++#undef FLAGS
++#define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_AUDIO_PARAM
++static const AVOption abuffersink_options[] = {
++    { "sample_formats",  "array of supported sample formats", OFFSET(sample_formats),
++        AV_OPT_TYPE_SAMPLE_FMT | AV_OPT_TYPE_FLAG_ARRAY, .max = INT_MAX, .flags = FLAGS },
++    { "samplerates",    "array of supported sample formats", OFFSET(samplerates),
++        AV_OPT_TYPE_INT | AV_OPT_TYPE_FLAG_ARRAY, .max = INT_MAX, .flags = FLAGS },
++    { "channel_layouts", "array of supported channel layouts", OFFSET(channel_layouts),
++        AV_OPT_TYPE_CHLAYOUT | AV_OPT_TYPE_FLAG_ARRAY, .flags = FLAGS },
++    { NULL },
++};
++#undef FLAGS
++
++AVFILTER_DEFINE_CLASS(buffersink);
++AVFILTER_DEFINE_CLASS(abuffersink);
++
++const FFFilter ff_vsink_buffer = {
++    .p.name        = "buffersink",
++    .p.description = NULL_IF_CONFIG_SMALL("Buffer video frames, and make them available to the end of the filter graph."),
++    .p.priv_class  = &buffersink_class,
++    .p.outputs     = NULL,
++    .priv_size     = sizeof(BufferSinkContext),
++    .init          = init_video,
++    .uninit        = uninit,
++    .activate      = activate,
++    FILTER_INPUTS(ff_video_default_filterpad),
++    FILTER_QUERY_FUNC2(vsink_query_formats),
++};
++
++static const AVFilterPad inputs_audio[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_AUDIO,
++        .config_props = config_input_audio,
++    },
++};
++
++const FFFilter ff_asink_abuffer = {
++    .p.name        = "abuffersink",
++    .p.description = NULL_IF_CONFIG_SMALL("Buffer audio frames, and make them available to the end of the filter graph."),
++    .p.priv_class  = &abuffersink_class,
++    .p.outputs     = NULL,
++    .priv_size     = sizeof(BufferSinkContext),
++    .init          = init_audio,
++    .uninit        = uninit,
++    .activate      = activate,
++    FILTER_INPUTS(inputs_audio),
++    FILTER_QUERY_FUNC2(asink_query_formats),
++};
+
+--- libs/ffmpeg/libavfilter/buffersink.h
++++ libs/ffmpeg/libavfilter/buffersink.h
+@@ -0,0 +1,172 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_BUFFERSINK_H
++#define AVFILTER_BUFFERSINK_H
++
++/**
++ * @file
++ * @ingroup lavfi_buffersink
++ * memory buffer sink API for audio and video
++ */
++
++#include "avfilter.h"
++
++/**
++ * @defgroup lavfi_buffersink Buffer sink API
++ * @ingroup lavfi
++ * @{
++ *
++ * The buffersink and abuffersink filters are there to connect filter graphs
++ * to applications. They have a single input, connected to the graph, and no
++ * output. Frames must be extracted using av_buffersink_get_frame() or
++ * av_buffersink_get_samples().
++ *
++ * The format negotiated by the graph during configuration can be obtained
++ * using the accessor functions:
++ * - av_buffersink_get_time_base(),
++ * - av_buffersink_get_format(),
++ * - av_buffersink_get_frame_rate(),
++ * - av_buffersink_get_w(),
++ * - av_buffersink_get_h(),
++ * - av_buffersink_get_sample_aspect_ratio(),
++ * - av_buffersink_get_channels(),
++ * - av_buffersink_get_ch_layout(),
++ * - av_buffersink_get_sample_rate().
++ * - av_buffersink_get_side_data().
++ *
++ * The layout returned by av_buffersink_get_ch_layout() must de uninitialized
++ * by the caller.
++ *
++ * The format can be constrained by setting options, using av_opt_set() and
++ * related functions with the AV_OPT_SEARCH_CHILDREN flag.
++ *  - pixel_formats (array of pixel formats),
++ *  - colorspaces (array of int),
++ *  - colorranges (array of int),
++ *  - alphamodes (array of int),
++ *  - sample_formats (array of sample formats),
++ *  - samplerates (array of int),
++ *  - channel_layouts (array of channel layouts)
++ * If an option is not set, all corresponding formats are accepted.
++ */
++
++/**
++ * Get a frame with filtered data from sink and put it in frame.
++ *
++ * @param ctx    pointer to a buffersink or abuffersink filter context.
++ * @param frame  pointer to an allocated frame that will be filled with data.
++ *               The data must be freed using av_frame_unref() / av_frame_free()
++ * @param flags  a combination of AV_BUFFERSINK_FLAG_* flags
++ *
++ * @return  >= 0 in for success, a negative AVERROR code for failure.
++ */
++int av_buffersink_get_frame_flags(AVFilterContext *ctx, AVFrame *frame, int flags);
++
++/**
++ * Tell av_buffersink_get_buffer_ref() to read video/samples buffer
++ * reference, but not remove it from the buffer. This is useful if you
++ * need only to read a video/samples buffer, without to fetch it.
++ */
++#define AV_BUFFERSINK_FLAG_PEEK 1
++
++/**
++ * Tell av_buffersink_get_buffer_ref() not to request a frame from its input.
++ * If a frame is already buffered, it is read (and removed from the buffer),
++ * but if no frame is present, return AVERROR(EAGAIN).
++ */
++#define AV_BUFFERSINK_FLAG_NO_REQUEST 2
++
++/**
++ * Set the frame size for an audio buffer sink.
++ *
++ * All calls to av_buffersink_get_buffer_ref will return a buffer with
++ * exactly the specified number of samples, or AVERROR(EAGAIN) if there is
++ * not enough. The last buffer at EOF will be padded with 0.
++ */
++void av_buffersink_set_frame_size(AVFilterContext *ctx, unsigned frame_size);
++
++/**
++ * @defgroup lavfi_buffersink_accessors Buffer sink accessors
++ * Get the properties of the stream
++ * @{
++ */
++
++enum AVMediaType av_buffersink_get_type                (const AVFilterContext *ctx);
++AVRational       av_buffersink_get_time_base           (const AVFilterContext *ctx);
++int              av_buffersink_get_format              (const AVFilterContext *ctx);
++
++AVRational       av_buffersink_get_frame_rate          (const AVFilterContext *ctx);
++int              av_buffersink_get_w                   (const AVFilterContext *ctx);
++int              av_buffersink_get_h                   (const AVFilterContext *ctx);
++AVRational       av_buffersink_get_sample_aspect_ratio (const AVFilterContext *ctx);
++enum AVColorSpace av_buffersink_get_colorspace         (const AVFilterContext *ctx);
++enum AVColorRange av_buffersink_get_color_range        (const AVFilterContext *ctx);
++enum AVAlphaMode  av_buffersink_get_alpha_mode         (const AVFilterContext *ctx);
++
++int              av_buffersink_get_channels            (const AVFilterContext *ctx);
++int              av_buffersink_get_ch_layout           (const AVFilterContext *ctx,
++                                                        AVChannelLayout *ch_layout);
++int              av_buffersink_get_sample_rate         (const AVFilterContext *ctx);
++
++AVBufferRef *    av_buffersink_get_hw_frames_ctx       (const AVFilterContext *ctx);
++
++const AVFrameSideData *const *av_buffersink_get_side_data(const AVFilterContext *ctx,
++                                                          int *nb_side_data);
++
++/** @} */
++
++/**
++ * Get a frame with filtered data from sink and put it in frame.
++ *
++ * @param ctx pointer to a context of a buffersink or abuffersink AVFilter.
++ * @param frame pointer to an allocated frame that will be filled with data.
++ *              The data must be freed using av_frame_unref() / av_frame_free()
++ *
++ * @return
++ *         - >= 0 if a frame was successfully returned.
++ *         - AVERROR(EAGAIN) if no frames are available at this point; more
++ *           input frames must be added to the filtergraph to get more output.
++ *         - AVERROR_EOF if there will be no more output frames on this sink.
++ *         - A different negative AVERROR code in other failure cases.
++ */
++int av_buffersink_get_frame(AVFilterContext *ctx, AVFrame *frame);
++
++/**
++ * Same as av_buffersink_get_frame(), but with the ability to specify the number
++ * of samples read. This function is less efficient than
++ * av_buffersink_get_frame(), because it copies the data around.
++ *
++ * @param ctx pointer to a context of the abuffersink AVFilter.
++ * @param frame pointer to an allocated frame that will be filled with data.
++ *              The data must be freed using av_frame_unref() / av_frame_free()
++ *              frame will contain exactly nb_samples audio samples, except at
++ *              the end of stream, when it can contain less than nb_samples.
++ *
++ * @return The return codes have the same meaning as for
++ *         av_buffersink_get_frame().
++ *
++ * @warning do not mix this function with av_buffersink_get_frame(). Use only one or
++ * the other with a single sink, not both.
++ */
++int av_buffersink_get_samples(AVFilterContext *ctx, AVFrame *frame, int nb_samples);
++
++/**
++ * @}
++ */
++
++#endif /* AVFILTER_BUFFERSINK_H */
+
+--- libs/ffmpeg/libavfilter/buffersrc.c
++++ libs/ffmpeg/libavfilter/buffersrc.c
+
+--- libs/ffmpeg/libavfilter/buffersrc.h
++++ libs/ffmpeg/libavfilter/buffersrc.h
+@@ -0,0 +1,231 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_BUFFERSRC_H
++#define AVFILTER_BUFFERSRC_H
++
++/**
++ * @file
++ * @ingroup lavfi_buffersrc
++ * Memory buffer source API.
++ */
++
++#include "avfilter.h"
++
++/**
++ * @defgroup lavfi_buffersrc Buffer source API
++ * @ingroup lavfi
++ * @{
++ */
++
++enum {
++
++    /**
++     * Do not check for format changes.
++     */
++    AV_BUFFERSRC_FLAG_NO_CHECK_FORMAT = 1 << 0,
++
++    /**
++     * Immediately push the frame to the output.
++     */
++    AV_BUFFERSRC_FLAG_PUSH = 1 << 2,
++
++    /**
++     * Keep a reference to the frame.
++     * If the frame if reference-counted, create a new reference; otherwise
++     * copy the frame data.
++     */
++    AV_BUFFERSRC_FLAG_KEEP_REF = 1 << 3,
++
++};
++
++/**
++ * Get the number of failed requests.
++ *
++ * A failed request is when the request_frame method is called while no
++ * frame is present in the buffer.
++ * The number is reset when a frame is added.
++ */
++unsigned av_buffersrc_get_nb_failed_requests(AVFilterContext *buffer_src);
++
++/**
++ * This structure contains the parameters describing the frames that will be
++ * passed to this filter.
++ *
++ * It should be allocated with av_buffersrc_parameters_alloc() and freed with
++ * av_free(). All the allocated fields in it remain owned by the caller.
++ */
++typedef struct AVBufferSrcParameters {
++    /**
++     * video: the pixel format, value corresponds to enum AVPixelFormat
++     * audio: the sample format, value corresponds to enum AVSampleFormat
++     */
++    int format;
++    /**
++     * The timebase to be used for the timestamps on the input frames.
++     */
++    AVRational time_base;
++
++    /**
++     * Video only, the display dimensions of the input frames.
++     */
++    int width, height;
++
++    /**
++     * Video only, the sample (pixel) aspect ratio.
++     */
++    AVRational sample_aspect_ratio;
++
++    /**
++     * Video only, the frame rate of the input video. This field must only be
++     * set to a non-zero value if input stream has a known constant framerate
++     * and should be left at its initial value if the framerate is variable or
++     * unknown.
++     */
++    AVRational frame_rate;
++
++    /**
++     * Video with a hwaccel pixel format only. This should be a reference to an
++     * AVHWFramesContext instance describing the input frames.
++     */
++    AVBufferRef *hw_frames_ctx;
++
++    /**
++     * Audio only, the audio sampling rate in samples per second.
++     */
++    int sample_rate;
++
++    /**
++     * Audio only, the audio channel layout
++     */
++    AVChannelLayout ch_layout;
++
++    /**
++     * Video only, the YUV colorspace and range.
++     */
++    enum AVColorSpace color_space;
++    enum AVColorRange color_range;
++
++    AVFrameSideData **side_data;
++    int nb_side_data;
++
++    /**
++     * Video only, the alpha mode.
++     */
++    enum AVAlphaMode alpha_mode;
++} AVBufferSrcParameters;
++
++/**
++ * Allocate a new AVBufferSrcParameters instance. It should be freed by the
++ * caller with av_free().
++ */
++AVBufferSrcParameters *av_buffersrc_parameters_alloc(void);
++
++/**
++ * Initialize the buffersrc or abuffersrc filter with the provided parameters.
++ * This function may be called multiple times, the later calls override the
++ * previous ones. Some of the parameters may also be set through AVOptions, then
++ * whatever method is used last takes precedence.
++ *
++ * @param ctx an instance of the buffersrc or abuffersrc filter
++ * @param param the stream parameters. The frames later passed to this filter
++ *              must conform to those parameters. All the allocated fields in
++ *              param remain owned by the caller, libavfilter will make internal
++ *              copies or references when necessary.
++ * @return 0 on success, a negative AVERROR code on failure.
++ */
++int av_buffersrc_parameters_set(AVFilterContext *ctx, AVBufferSrcParameters *param);
++
++/**
++ * Add a frame to the buffer source.
++ *
++ * @param ctx   an instance of the buffersrc filter
++ * @param frame frame to be added. If the frame is reference counted, this
++ * function will make a new reference to it. Otherwise the frame data will be
++ * copied.
++ *
++ * @return 0 on success, a negative AVERROR on error
++ *
++ * This function is equivalent to av_buffersrc_add_frame_flags() with the
++ * AV_BUFFERSRC_FLAG_KEEP_REF flag.
++ */
++av_warn_unused_result
++int av_buffersrc_write_frame(AVFilterContext *ctx, const AVFrame *frame);
++
++/**
++ * Add a frame to the buffer source.
++ *
++ * @param ctx   an instance of the buffersrc filter
++ * @param frame frame to be added. If the frame is reference counted, this
++ * function will take ownership of the reference(s) and reset the frame.
++ * Otherwise the frame data will be copied. If this function returns an error,
++ * the input frame is not touched.
++ *
++ * @return 0 on success, a negative AVERROR on error.
++ *
++ * @note the difference between this function and av_buffersrc_write_frame() is
++ * that av_buffersrc_write_frame() creates a new reference to the input frame,
++ * while this function takes ownership of the reference passed to it.
++ *
++ * This function is equivalent to av_buffersrc_add_frame_flags() without the
++ * AV_BUFFERSRC_FLAG_KEEP_REF flag.
++ */
++av_warn_unused_result
++int av_buffersrc_add_frame(AVFilterContext *ctx, AVFrame *frame);
++
++/**
++ * Add a frame to the buffer source.
++ *
++ * By default, if the frame is reference-counted, this function will take
++ * ownership of the reference(s) and reset the frame. This can be controlled
++ * using the flags.
++ *
++ * If this function returns an error, the input frame is not touched.
++ *
++ * @param buffer_src  pointer to a buffer source context
++ * @param frame       a frame, or NULL to mark EOF
++ * @param flags       a combination of AV_BUFFERSRC_FLAG_*
++ * @return            >= 0 in case of success, a negative AVERROR code
++ *                    in case of failure
++ */
++av_warn_unused_result
++int av_buffersrc_add_frame_flags(AVFilterContext *buffer_src,
++                                 AVFrame *frame, int flags);
++
++/**
++ * Close the buffer source after EOF.
++ *
++ * This is similar to passing NULL to av_buffersrc_add_frame_flags()
++ * except it takes the timestamp of the EOF, i.e. the timestamp of the end
++ * of the last frame.
++ */
++int av_buffersrc_close(AVFilterContext *ctx, int64_t pts, unsigned flags);
++
++/**
++ * Returns 0 or a negative AVERROR code. Currently, this will only ever
++ * return AVERROR(EOF), to indicate that the buffer source has been closed,
++ * either as a result of av_buffersrc_close(), or because the downstream
++ * filter is no longer accepting new data.
++ */
++int av_buffersrc_get_status(AVFilterContext *ctx);
++
++/**
++ * @}
++ */
++
++#endif /* AVFILTER_BUFFERSRC_H */
+
+--- libs/ffmpeg/libavfilter/ccfifo.c
++++ libs/ffmpeg/libavfilter/ccfifo.c
+@@ -0,0 +1,195 @@
++/*
++ * CEA-708 Closed Captioning FIFO
++ * Copyright (c) 2023 LTN Global Communications
++ *
++ * Author: Devin Heitmueller <dheitmueller@ltnglobal.com>
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "ccfifo.h"
++#include "libavutil/fifo.h"
++
++#define MAX_CC_ELEMENTS 128
++
++struct cc_lookup {
++    int num;
++    int den;
++    int cc_count;
++    int num_608;
++};
++
++const static struct cc_lookup cc_lookup_vals[] = {
++    { 15, 1, 40, 4 },
++    { 24, 1, 25, 3 },
++    { 24000, 1001, 25, 3 },
++    { 30, 1, 20, 2 },
++    { 30000, 1001, 20, 2},
++    { 60, 1, 10, 1 },
++    { 60000, 1001, 10, 1},
++};
++
++void ff_ccfifo_uninit(CCFifo *ccf)
++{
++    av_fifo_freep2(&ccf->cc_608_fifo);
++    av_fifo_freep2(&ccf->cc_708_fifo);
++    memset(ccf, 0, sizeof(*ccf));
++}
++
++int ff_ccfifo_init(CCFifo *ccf, AVRational framerate, void *log_ctx)
++{
++    int i;
++
++    memset(ccf, 0, sizeof(*ccf));
++    ccf->log_ctx = log_ctx;
++    ccf->framerate = framerate;
++
++    if (!(ccf->cc_708_fifo = av_fifo_alloc2(MAX_CC_ELEMENTS, CC_BYTES_PER_ENTRY, 0)))
++        goto error;
++
++    if (!(ccf->cc_608_fifo = av_fifo_alloc2(MAX_CC_ELEMENTS, CC_BYTES_PER_ENTRY, 0)))
++        goto error;
++
++    /* Based on the target FPS, figure out the expected cc_count and number of
++       608 tuples per packet.  See ANSI/CTA-708-E Sec 4.3.6.1. */
++    for (i = 0; i < FF_ARRAY_ELEMS(cc_lookup_vals); i++) {
++        if (framerate.num == cc_lookup_vals[i].num &&
++            framerate.den == cc_lookup_vals[i].den) {
++            ccf->expected_cc_count = cc_lookup_vals[i].cc_count;
++            ccf->expected_608 = cc_lookup_vals[i].num_608;
++            break;
++        }
++    }
++
++    if (ccf->expected_608 == 0) {
++        /* We didn't find an output frame we support.  We'll let the call succeed
++           and the FIFO to be allocated, but the extract/inject functions will simply
++           leave everything the way it is */
++        ccf->passthrough = 1;
++    }
++
++    return 0;
++
++error:
++    ff_ccfifo_uninit(ccf);
++    return AVERROR(ENOMEM);
++}
++
++int ff_ccfifo_injectbytes(CCFifo *ccf, uint8_t *cc_data, size_t len)
++{
++    int cc_608_tuples = 0;
++    int cc_708_tuples = 0;
++    int cc_filled = 0;
++
++    if (ccf->passthrough) {
++        return 0;
++    }
++
++    if (len < ff_ccfifo_getoutputsize(ccf)) {
++        return AVERROR(EINVAL);
++    }
++
++    /* Insert any available data from the 608 FIFO */
++    if (ccf->expected_608 <= av_fifo_can_read(ccf->cc_608_fifo))
++        cc_608_tuples = ccf->expected_608;
++    else
++        cc_608_tuples = av_fifo_can_read(ccf->cc_608_fifo);
++    av_fifo_read(ccf->cc_608_fifo, cc_data, cc_608_tuples);
++    cc_filled += cc_608_tuples;
++
++    /* Insert any available data from the 708 FIFO */
++    if ((ccf->expected_cc_count - cc_filled) <= av_fifo_can_read(ccf->cc_708_fifo))
++        cc_708_tuples = ccf->expected_cc_count - cc_filled;
++    else
++        cc_708_tuples = av_fifo_can_read(ccf->cc_708_fifo);
++    av_fifo_read(ccf->cc_708_fifo, &cc_data[cc_filled * CC_BYTES_PER_ENTRY], cc_708_tuples);
++    cc_filled += cc_708_tuples;
++
++    /* Insert 708 padding into any remaining fields */
++    while (cc_filled < ccf->expected_cc_count) {
++        cc_data[cc_filled * CC_BYTES_PER_ENTRY]     = 0xfa;
++        cc_data[cc_filled * CC_BYTES_PER_ENTRY + 1] = 0x00;
++        cc_data[cc_filled * CC_BYTES_PER_ENTRY + 2] = 0x00;
++        cc_filled++;
++    }
++
++    return 0;
++}
++
++int ff_ccfifo_inject(CCFifo *ccf, AVFrame *frame)
++{
++    AVFrameSideData *sd;
++    int ret;
++
++    if (ccf->passthrough == 1 || ccf->cc_detected == 0)
++        return 0;
++
++    sd = av_frame_new_side_data(frame, AV_FRAME_DATA_A53_CC,
++                                ff_ccfifo_getoutputsize(ccf));
++    if (sd) {
++        ret = ff_ccfifo_injectbytes(ccf, sd->data, sd->size);
++        if (ret < 0) {
++            av_frame_remove_side_data(frame, AV_FRAME_DATA_A53_CC);
++            return ret;
++        }
++    }
++
++    return 0;
++}
++
++int ff_ccfifo_extractbytes(CCFifo *ccf, uint8_t *cc_bytes, size_t len)
++{
++    int cc_count = len / CC_BYTES_PER_ENTRY;
++
++    if (ccf->passthrough == 1) {
++        av_log_once(ccf->log_ctx, AV_LOG_WARNING, AV_LOG_DEBUG, &ccf->passthrough_warning,
++                    "cc_fifo cannot transcode captions fps=%d/%d\n",
++                    ccf->framerate.num, ccf->framerate.den);
++        return 0;
++    }
++
++    ccf->cc_detected = 1;
++
++    for (int i = 0; i < cc_count; i++) {
++        /* See ANSI/CTA-708-E Sec 4.3, Table 3 */
++        uint8_t cc_valid = (cc_bytes[CC_BYTES_PER_ENTRY*i] & 0x04) >> 2;
++        uint8_t cc_type = cc_bytes[CC_BYTES_PER_ENTRY*i] & 0x03;
++        if (cc_type == 0x00 || cc_type == 0x01) {
++            av_fifo_write(ccf->cc_608_fifo, &cc_bytes[CC_BYTES_PER_ENTRY*i], 1);
++        } else if (cc_valid && (cc_type == 0x02 || cc_type == 0x03)) {
++            av_fifo_write(ccf->cc_708_fifo, &cc_bytes[CC_BYTES_PER_ENTRY*i], 1);
++        }
++    }
++    return 0;
++}
++
++/* Read the A53 side data, discard padding, and put 608/708 into
++   queues so we can ensure they get into the output frames at
++   the correct rate... */
++int ff_ccfifo_extract(CCFifo *ccf, AVFrame *frame)
++{
++    AVFrameSideData *side_data = av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC);
++    if (side_data) {
++        ff_ccfifo_extractbytes(ccf, side_data->data, side_data->size);
++
++        /* Remove the side data, as we will re-create it on the
++           output as needed */
++        if (!ccf->passthrough)
++            av_frame_remove_side_data(frame, AV_FRAME_DATA_A53_CC);
++    }
++    return 0;
++}
+
+--- libs/ffmpeg/libavfilter/ccfifo.h
++++ libs/ffmpeg/libavfilter/ccfifo.h
+@@ -0,0 +1,129 @@
++/*
++ * CEA-708 Closed Captioning FIFO
++ * Copyright (c) 2023 LTN Global Communications
++ *
++ * Author: Devin Heitmueller <dheitmueller@ltnglobal.com>
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * CC FIFO Buffer
++ */
++
++#ifndef AVFILTER_CCFIFO_H
++#define AVFILTER_CCFIFO_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include "libavutil/frame.h"
++#include "libavutil/rational.h"
++
++#define CC_BYTES_PER_ENTRY 3
++
++typedef struct CCFifo {
++    struct AVFifo *cc_608_fifo;
++    struct AVFifo *cc_708_fifo;
++    AVRational framerate;
++    int expected_cc_count;
++    int expected_608;
++    int cc_detected;
++    int passthrough;
++    int passthrough_warning;
++    void *log_ctx;
++} CCFifo;
++
++/**
++ * Initialize a CCFifo.
++ *
++ * @param framerate   output framerate
++ * @param log_ctx     used for any av_log() calls
++ * @return            Zero on success, or negative AVERROR code on failure.
++ */
++int ff_ccfifo_init(CCFifo *ccf, AVRational framerate, void *log_ctx);
++
++/**
++ * Free all memory allocated in a CCFifo and clear the context.
++ *
++ * @param ccf Pointer to the CCFifo which should be uninitialized
++ */
++void ff_ccfifo_uninit(CCFifo *ccf);
++
++/**
++ * Extract CC data from an AVFrame
++ *
++ * Extract CC bytes from the AVFrame, insert them into our queue, and
++ * remove the side data from the AVFrame.  The side data is removed
++ * as it will be re-inserted at the appropriate rate later in the
++ * filter.
++ *
++ * @param af          CCFifo to write to
++ * @param frame       AVFrame with the video frame to operate on
++ * @return            Zero on success, or negative AVERROR
++ *                    code on failure.
++ */
++int ff_ccfifo_extract(CCFifo *ccf, AVFrame *frame);
++
++/**
++ *Just like ff_ccfifo_extract(), but takes the raw bytes instead of an AVFrame
++ */
++int ff_ccfifo_extractbytes(CCFifo *ccf, uint8_t *data, size_t len);
++
++/**
++ * Provide the size in bytes of an output buffer to allocate
++ *
++ * Ask for how many bytes the output will contain, so the caller can allocate
++ * an appropriately sized buffer and pass it to ff_ccfifo_injectbytes()
++ *
++ */
++static inline int ff_ccfifo_getoutputsize(const CCFifo *ccf)
++{
++    return ccf->expected_cc_count * CC_BYTES_PER_ENTRY;
++}
++
++
++/**
++ * Insert CC data from the FIFO into an AVFrame (as side data)
++ *
++ * Dequeue the appropriate number of CC tuples based on the
++ * frame rate, and insert them into the AVFrame
++ *
++ * @param af          CCFifo to read from
++ * @param frame       AVFrame with the video frame to operate on
++ * @return            Zero on success, or negative AVERROR
++ *                    code on failure.
++ */
++int ff_ccfifo_inject(CCFifo *ccf, AVFrame *frame);
++
++/**
++ * Just like ff_ccfifo_inject(), but takes the raw bytes to insert the CC data
++ * int rather than an AVFrame
++ */
++int ff_ccfifo_injectbytes(CCFifo *ccf, uint8_t *data, size_t len);
++
++/**
++ * Returns 1 if captions have been found as a prior call
++ * to ff_ccfifo_extract() or ff_ccfifo_extractbytes()
++ */
++static inline int ff_ccfifo_ccdetected(const CCFifo *ccf)
++{
++    return ccf->cc_detected;
++}
++
++#endif /* AVFILTER_CCFIFO_H */
+
+--- libs/ffmpeg/libavfilter/colorspace.c
++++ libs/ffmpeg/libavfilter/colorspace.c
+@@ -0,0 +1,193 @@
++/*
++ * Copyright (c) 2016 Ronald S. Bultje <rsbultje@gmail.com>
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "libavutil/frame.h"
++#include "libavutil/mastering_display_metadata.h"
++#include "libavutil/pixdesc.h"
++
++#include "colorspace.h"
++
++
++void ff_matrix_invert_3x3(const double in[3][3], double out[3][3])
++{
++    double m00 = in[0][0], m01 = in[0][1], m02 = in[0][2],
++           m10 = in[1][0], m11 = in[1][1], m12 = in[1][2],
++           m20 = in[2][0], m21 = in[2][1], m22 = in[2][2];
++    int i, j;
++    double det;
++
++    out[0][0] =  (m11 * m22 - m21 * m12);
++    out[0][1] = -(m01 * m22 - m21 * m02);
++    out[0][2] =  (m01 * m12 - m11 * m02);
++    out[1][0] = -(m10 * m22 - m20 * m12);
++    out[1][1] =  (m00 * m22 - m20 * m02);
++    out[1][2] = -(m00 * m12 - m10 * m02);
++    out[2][0] =  (m10 * m21 - m20 * m11);
++    out[2][1] = -(m00 * m21 - m20 * m01);
++    out[2][2] =  (m00 * m11 - m10 * m01);
++
++    det = m00 * out[0][0] + m10 * out[0][1] + m20 * out[0][2];
++    det = 1.0 / det;
++
++    for (i = 0; i < 3; i++) {
++        for (j = 0; j < 3; j++)
++            out[i][j] *= det;
++    }
++}
++
++void ff_matrix_mul_3x3(double dst[3][3],
++               const double src1[3][3], const double src2[3][3])
++{
++    int m, n;
++
++    for (m = 0; m < 3; m++)
++        for (n = 0; n < 3; n++)
++            dst[m][n] = src2[m][0] * src1[0][n] +
++                        src2[m][1] * src1[1][n] +
++                        src2[m][2] * src1[2][n];
++}
++
++void ff_matrix_mul_3x3_vec(double dst[3], const double vec[3], const double mat[3][3])
++{
++    int m;
++
++    for (m = 0; m < 3; m++)
++        dst[m] = vec[0] * mat[m][0] +
++                 vec[1] * mat[m][1] +
++                 vec[2] * mat[m][2];
++}
++
++/*
++ * see e.g. http://www.brucelindbloom.com/index.html?Eqn_RGB_XYZ_Matrix.html
++ */
++void ff_fill_rgb2xyz_table(const AVPrimaryCoefficients *coeffs,
++                           const AVWhitepointCoefficients *wp,
++                           double rgb2xyz[3][3])
++{
++    double i[3][3], sr, sg, sb, zw;
++    double xr = av_q2d(coeffs->r.x), yr = av_q2d(coeffs->r.y);
++    double xg = av_q2d(coeffs->g.x), yg = av_q2d(coeffs->g.y);
++    double xb = av_q2d(coeffs->b.x), yb = av_q2d(coeffs->b.y);
++    double xw = av_q2d(wp->x), yw = av_q2d(wp->y);
++
++    rgb2xyz[0][0] = xr / yr;
++    rgb2xyz[0][1] = xg / yg;
++    rgb2xyz[0][2] = xb / yb;
++    rgb2xyz[1][0] = rgb2xyz[1][1] = rgb2xyz[1][2] = 1.0;
++    rgb2xyz[2][0] = (1.0 - xr - yr) / yr;
++    rgb2xyz[2][1] = (1.0 - xg - yg) / yg;
++    rgb2xyz[2][2] = (1.0 - xb - yb) / yb;
++    ff_matrix_invert_3x3(rgb2xyz, i);
++    zw = 1.0 - xw - yw;
++    sr = i[0][0] * xw + i[0][1] * yw + i[0][2] * zw;
++    sg = i[1][0] * xw + i[1][1] * yw + i[1][2] * zw;
++    sb = i[2][0] * xw + i[2][1] * yw + i[2][2] * zw;
++    rgb2xyz[0][0] *= sr;
++    rgb2xyz[0][1] *= sg;
++    rgb2xyz[0][2] *= sb;
++    rgb2xyz[1][0] *= sr;
++    rgb2xyz[1][1] *= sg;
++    rgb2xyz[1][2] *= sb;
++    rgb2xyz[2][0] *= sr;
++    rgb2xyz[2][1] *= sg;
++    rgb2xyz[2][2] *= sb;
++}
++static const double ycgco_matrix[3][3] =
++{
++    {  0.25, 0.5,  0.25 },
++    { -0.25, 0.5, -0.25 },
++    {  0.5,  0,   -0.5  },
++};
++
++static const double gbr_matrix[3][3] =
++{
++    { 0,    1,   0   },
++    { 0,   -0.5, 0.5 },
++    { 0.5, -0.5, 0   },
++};
++
++void ff_fill_rgb2yuv_table(const AVLumaCoefficients *coeffs,
++                           double rgb2yuv[3][3])
++{
++    double bscale, rscale;
++    double cr = av_q2d(coeffs->cr), cg = av_q2d(coeffs->cg), cb = av_q2d(coeffs->cb);
++
++    // special ycgco matrix
++    if (cr == 0.25 && cg == 0.5 && cb == 0.25) {
++        memcpy(rgb2yuv, ycgco_matrix, sizeof(double) * 9);
++        return;
++    } else if (cr == 1 && cg == 1 && cb == 1) {
++        memcpy(rgb2yuv, gbr_matrix, sizeof(double) * 9);
++        return;
++    }
++
++    rgb2yuv[0][0] = cr;
++    rgb2yuv[0][1] = cg;
++    rgb2yuv[0][2] = cb;
++    bscale = 0.5 / (cb - 1.0);
++    rscale = 0.5 / (cr - 1.0);
++    rgb2yuv[1][0] = bscale * cr;
++    rgb2yuv[1][1] = bscale * cg;
++    rgb2yuv[1][2] = 0.5;
++    rgb2yuv[2][0] = 0.5;
++    rgb2yuv[2][1] = rscale * cg;
++    rgb2yuv[2][2] = rscale * cb;
++}
++
++double ff_determine_signal_peak(AVFrame *in)
++{
++    AVFrameSideData *sd = av_frame_get_side_data(in, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++    double peak = 0;
++
++    if (sd) {
++        AVContentLightMetadata *clm = (AVContentLightMetadata *)sd->data;
++        peak = clm->MaxCLL / REFERENCE_WHITE;
++    }
++
++    sd = av_frame_get_side_data(in, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++    if (!peak && sd) {
++        AVMasteringDisplayMetadata *metadata = (AVMasteringDisplayMetadata *)sd->data;
++        if (metadata->has_luminance)
++            peak = av_q2d(metadata->max_luminance) / REFERENCE_WHITE;
++    }
++
++    // For untagged source, use peak of 10000 if SMPTE ST.2084
++    // otherwise assume HLG with reference display peak 1000.
++    if (!peak)
++        peak = in->color_trc == AVCOL_TRC_SMPTE2084 ? 100.0f : 10.0f;
++
++    return peak;
++}
++
++void ff_update_hdr_metadata(AVFrame *in, double peak)
++{
++    AVFrameSideData *sd = av_frame_get_side_data(in, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++
++    if (sd) {
++        AVContentLightMetadata *clm = (AVContentLightMetadata *)sd->data;
++        clm->MaxCLL = (unsigned)(peak * REFERENCE_WHITE);
++    }
++
++    sd = av_frame_get_side_data(in, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++    if (sd) {
++        AVMasteringDisplayMetadata *metadata = (AVMasteringDisplayMetadata *)sd->data;
++        if (metadata->has_luminance)
++            metadata->max_luminance = av_d2q(peak * REFERENCE_WHITE, 10000);
++    }
++}
+
+--- libs/ffmpeg/libavfilter/colorspace.h
++++ libs/ffmpeg/libavfilter/colorspace.h
+@@ -0,0 +1,41 @@
++/*
++ * Copyright (c) 2016 Ronald S. Bultje <rsbultje@gmail.com>
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_COLORSPACE_H
++#define AVFILTER_COLORSPACE_H
++
++#include "libavutil/csp.h"
++#include "libavutil/frame.h"
++#include "libavutil/pixfmt.h"
++
++#define REFERENCE_WHITE 100.0f
++
++void ff_matrix_invert_3x3(const double in[3][3], double out[3][3]);
++void ff_matrix_mul_3x3(double dst[3][3],
++               const double src1[3][3], const double src2[3][3]);
++void ff_matrix_mul_3x3_vec(double dst[3], const double vec[3], const double mat[3][3]);
++void ff_fill_rgb2xyz_table(const AVPrimaryCoefficients *coeffs,
++                           const AVWhitepointCoefficients *wp,
++                           double rgb2xyz[3][3]);
++void ff_fill_rgb2yuv_table(const AVLumaCoefficients *coeffs,
++                           double rgb2yuv[3][3]);
++double ff_determine_signal_peak(AVFrame *in);
++void ff_update_hdr_metadata(AVFrame *in, double peak);
++
++#endif
+
+--- libs/ffmpeg/libavfilter/drawutils.c
++++ libs/ffmpeg/libavfilter/drawutils.c
+
+--- libs/ffmpeg/libavfilter/drawutils.h
++++ libs/ffmpeg/libavfilter/drawutils.h
+@@ -0,0 +1,175 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_DRAWUTILS_H
++#define AVFILTER_DRAWUTILS_H
++
++/**
++ * @file
++ * misc drawing utilities
++ */
++
++#include <stdint.h>
++#include "avfilter.h"
++#include "libavutil/pixfmt.h"
++
++int ff_fill_rgba_map(uint8_t *rgba_map, enum AVPixelFormat pix_fmt);
++int ff_fill_ayuv_map(uint8_t *ayuv_map, enum AVPixelFormat pix_fmt);
++
++#define MAX_PLANES 4
++
++typedef struct FFDrawContext {
++    const struct AVPixFmtDescriptor *desc;
++    enum AVPixelFormat format;
++    unsigned nb_planes;
++    int pixelstep[MAX_PLANES]; /*< offset between pixels */
++    uint8_t hsub[MAX_PLANES];  /*< horizontal subsampling */
++    uint8_t vsub[MAX_PLANES];  /*< vertical subsampling */
++    uint8_t hsub_max;
++    uint8_t vsub_max;
++    enum AVColorRange range;
++    unsigned flags;
++    enum AVColorSpace csp;
++    enum AVAlphaMode alpha;
++    double rgb2yuv[3][3];
++} FFDrawContext;
++
++typedef struct FFDrawColor {
++    uint8_t rgba[4];
++    union {
++        uint32_t u32[4];
++        uint16_t u16[8];
++        uint8_t  u8[16];
++    } comp[MAX_PLANES];
++} FFDrawColor;
++
++/**
++  * Process alpha pixel component.
++  */
++#define FF_DRAW_PROCESS_ALPHA 1
++
++/**
++ * Init a draw context.
++ *
++ * Only a limited number of pixel formats are supported, if format is not
++ * supported the function will return an error.
++ * @param format  pixel format of the frames that will be drawn onto
++ * @param csp     color space of the frames that will be drawn onto,
++ *                defaulting to BT601 or RGB depending on the specified format
++ *                when AVCOL_SPC_UNSPECIFIED is passed.
++ * @param range   sample value range of the frames that will be drawn onto,
++ *                defaulting to TV-range unless using a legacy J format
++ *                when AVCOL_RANGE_UNSPECIFIED is passed.
++ * @param flags   combination of FF_DRAW_* flags.
++ * @return        0 for success, < 0 for error
++ */
++int ff_draw_init2(FFDrawContext *draw, enum AVPixelFormat format, enum AVColorSpace csp,
++                  enum AVColorRange range, enum AVAlphaMode alpha, unsigned flags);
++
++/**
++ * Init a draw context, taking the format, colorspace and range from the given
++ * filter link.
++ */
++int ff_draw_init_from_link(FFDrawContext *draw, const AVFilterLink *link,
++                           unsigned flags);
++
++/*
++ * Legacy wrapper for ff_draw_init2.
++ */
++int ff_draw_init(FFDrawContext *draw, enum AVPixelFormat format, unsigned flags);
++
++
++
++/**
++ * Prepare a color. The rgba value passed is always 8-bit full-range in the RGB space
++ * corresponding to the space set at initialization.
++ */
++void ff_draw_color(FFDrawContext *draw, FFDrawColor *color, const uint8_t rgba[4]);
++
++/**
++ * Copy a rectangle from an image to another.
++ *
++ * The coordinates must be as even as the subsampling requires.
++ */
++void ff_copy_rectangle2(FFDrawContext *draw,
++                        uint8_t *dst[], int dst_linesize[],
++                        uint8_t *src[], int src_linesize[],
++                        int dst_x, int dst_y, int src_x, int src_y,
++                        int w, int h);
++
++/**
++ * Fill a rectangle with an uniform color.
++ *
++ * The coordinates must be as even as the subsampling requires.
++ * The color needs to be inited with ff_draw_color.
++ */
++void ff_fill_rectangle(FFDrawContext *draw, FFDrawColor *color,
++                       uint8_t *dst[], int dst_linesize[],
++                       int dst_x, int dst_y, int w, int h);
++
++/**
++ * Blend a rectangle with an uniform color.
++ */
++void ff_blend_rectangle(FFDrawContext *draw, FFDrawColor *color,
++                        uint8_t *dst[], int dst_linesize[],
++                        int dst_w, int dst_h,
++                        int x0, int y0, int w, int h);
++
++/**
++ * Blend an alpha mask with an uniform color.
++ *
++ * @param draw           draw context
++ * @param color          color for the overlay;
++ * @param dst            destination image
++ * @param dst_linesize   line stride of the destination
++ * @param dst_w          width of the destination image
++ * @param dst_h          height of the destination image
++ * @param mask           mask
++ * @param mask_linesize  line stride of the mask
++ * @param mask_w         width of the mask
++ * @param mask_h         height of the mask
++ * @param l2depth        log2 of depth of the mask (0 for 1bpp, 3 for 8bpp)
++ * @param endianness     bit order of the mask (0: MSB to the left)
++ * @param x0             horizontal position of the overlay
++ * @param y0             vertical position of the overlay
++ */
++void ff_blend_mask(FFDrawContext *draw, FFDrawColor *color,
++                   uint8_t *dst[], int dst_linesize[], int dst_w, int dst_h,
++                   const uint8_t *mask, int mask_linesize, int mask_w, int mask_h,
++                   int l2depth, unsigned endianness, int x0, int y0);
++
++/**
++ * Round a dimension according to subsampling.
++ *
++ * @param draw       draw context
++ * @param sub_dir    0 for horizontal, 1 for vertical
++ * @param round_dir  0 nearest, -1 round down, +1 round up
++ * @param value      value to round
++ * @return  the rounded value
++ */
++int ff_draw_round_to_sub(FFDrawContext *draw, int sub_dir, int round_dir,
++                         int value);
++
++/**
++ * Return the list of pixel formats supported by the draw functions.
++ *
++ * The flags are the same as ff_draw_init, i.e., none currently.
++ */
++AVFilterFormats *ff_draw_supported_pixel_formats(unsigned flags);
++
++#endif /* AVFILTER_DRAWUTILS_H */
+
+--- libs/ffmpeg/libavfilter/file_open.c
++++ libs/ffmpeg/libavfilter/file_open.c
+@@ -0,0 +1 @@
++#include "libavutil/file_open.c"
+
+--- libs/ffmpeg/libavfilter/filter_list.c
++++ libs/ffmpeg/libavfilter/filter_list.c
+@@ -0,0 +1,10 @@
++#if 0
++#pragma makedep header
++#endif
++
++static const FFFilter * const filter_list[] = {
++    &ff_asrc_abuffer,
++    &ff_vsrc_buffer,
++    &ff_asink_abuffer,
++    &ff_vsink_buffer,
++    NULL };
+
+--- libs/ffmpeg/libavfilter/filters.h
++++ libs/ffmpeg/libavfilter/filters.h
+
+--- libs/ffmpeg/libavfilter/formats.c
++++ libs/ffmpeg/libavfilter/formats.c
+
+--- libs/ffmpeg/libavfilter/formats.h
++++ libs/ffmpeg/libavfilter/formats.h
+
+--- libs/ffmpeg/libavfilter/framepool.c
++++ libs/ffmpeg/libavfilter/framepool.c
+@@ -0,0 +1,261 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * Copyright (c) 2015 Matthieu Bouron <matthieu.bouron stupeflix.com>
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "framepool.h"
++#include "libavutil/avassert.h"
++#include "libavutil/avutil.h"
++#include "libavutil/buffer.h"
++#include "libavutil/frame.h"
++#include "libavutil/imgutils.h"
++#include "libavutil/imgutils_internal.h"
++#include "libavutil/mem.h"
++#include "libavutil/pixfmt.h"
++
++static av_cold int frame_pool_video_init(int width, int height,
++                                         enum AVPixelFormat format,
++                                         int align, FFFramePool *pool)
++{
++    int ret;
++
++    *pool = (FFFramePool) {
++        .type = AVMEDIA_TYPE_VIDEO,
++        .width = width,
++        .height = height,
++        .pix_fmt = format,
++        .align = align,
++    };
++
++    if ((ret = av_image_check_size2(width, height, INT64_MAX, format, 0, NULL)) < 0)
++        goto fail;
++
++    ret = av_image_fill_linesizes(pool->linesize, pool->pix_fmt,
++                                  FFALIGN(pool->width, align));
++    if (ret < 0)
++        goto fail;
++
++    for (int i = 0; i < 4 && pool->linesize[i]; i++)
++        pool->linesize[i] = FFALIGN(pool->linesize[i], pool->align);
++
++    ptrdiff_t linesizes[4];
++    for (int i = 0; i < 4; i++)
++        linesizes[i] = pool->linesize[i];
++
++    size_t sizes[4];
++    ret = av_image_fill_plane_sizes(sizes, pool->pix_fmt,
++                                    FFALIGN(pool->height, align),
++                                    linesizes);
++    if (ret < 0)
++        goto fail;
++
++    for (int i = 0; i < 4 && sizes[i]; i++) {
++        if (sizes[i] > SIZE_MAX - align)
++            goto fail;
++        pool->pools[i] = av_buffer_pool_init(sizes[i] + align,
++                                             CONFIG_MEMORY_POISONING
++                                                 ? NULL
++                                                 : av_buffer_allocz);
++        if (!pool->pools[i]) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
++    }
++
++    return 0;
++
++fail:
++    ff_frame_pool_uninit(pool);
++    return ret;
++}
++
++static av_cold int frame_pool_audio_init(int channels, int nb_samples,
++                                         enum AVSampleFormat format,
++                                         int align, FFFramePool *pool)
++{
++    int ret;
++
++    int planar = av_sample_fmt_is_planar(format);
++
++    *pool = (FFFramePool) {
++        .type = AVMEDIA_TYPE_AUDIO,
++        .planes = planar ? channels : 1,
++        .channels = channels,
++        .nb_samples = nb_samples,
++        .sample_fmt = format,
++        .align = align,
++    };
++
++    ret = av_samples_get_buffer_size(&pool->linesize[0], channels,
++                                     nb_samples, format, 0);
++    if (ret < 0)
++        goto fail;
++
++    if (pool->linesize[0] > SIZE_MAX - align) {
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++
++    pool->pools[0] = av_buffer_pool_init(pool->linesize[0] + align,
++                                         av_buffer_allocz);
++    if (!pool->pools[0]) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++
++    return 0;
++
++fail:
++    ff_frame_pool_uninit(pool);
++    return ret;
++}
++
++AVFrame *ff_frame_pool_get(FFFramePool *pool)
++{
++    const AVPixFmtDescriptor *desc;
++
++    AVFrame *frame = av_frame_alloc();
++    if (!frame)
++        return NULL;
++
++    switch(pool->type) {
++    case AVMEDIA_TYPE_VIDEO:
++        desc = av_pix_fmt_desc_get(pool->pix_fmt);
++        if (!desc)
++            goto fail;
++
++        frame->width = pool->width;
++        frame->height = pool->height;
++        frame->format = pool->pix_fmt;
++
++        for (int i = 0; i < 4; i++) {
++            frame->linesize[i] = pool->linesize[i];
++            if (!pool->pools[i])
++                break;
++
++            frame->buf[i] = av_buffer_pool_get(pool->pools[i]);
++            if (!frame->buf[i])
++                goto fail;
++
++            frame->data[i] = (uint8_t *)FFALIGN((uintptr_t)frame->buf[i]->data, pool->align);
++        }
++
++        if (desc->flags & AV_PIX_FMT_FLAG_PAL) {
++            enum AVPixelFormat format = pool->pix_fmt;
++            if (format == AV_PIX_FMT_PAL8)
++                format = AV_PIX_FMT_BGR8;
++
++            av_assert0(frame->data[1] != NULL);
++            if (avpriv_set_systematic_pal2((uint32_t *)frame->data[1], format) < 0)
++                goto fail;
++        }
++
++        frame->extended_data = frame->data;
++        break;
++    case AVMEDIA_TYPE_AUDIO:
++        frame->nb_samples = pool->nb_samples;
++        frame->ch_layout.nb_channels = pool->channels;
++        frame->format = pool->sample_fmt;
++        frame->linesize[0] = pool->linesize[0];
++
++        if (pool->planes > AV_NUM_DATA_POINTERS) {
++            frame->extended_data = av_calloc(pool->planes,
++                                             sizeof(*frame->extended_data));
++            frame->nb_extended_buf = pool->planes - AV_NUM_DATA_POINTERS;
++            frame->extended_buf  = av_calloc(frame->nb_extended_buf,
++                                             sizeof(*frame->extended_buf));
++            if (!frame->extended_data || !frame->extended_buf)
++                goto fail;
++        } else {
++            frame->extended_data = frame->data;
++            av_assert0(frame->nb_extended_buf == 0);
++        }
++
++        for (int i = 0; i < FFMIN(pool->planes, AV_NUM_DATA_POINTERS); i++) {
++            frame->buf[i] = av_buffer_pool_get(pool->pools[0]);
++            if (!frame->buf[i])
++                goto fail;
++            frame->extended_data[i] = frame->data[i] =
++                (uint8_t *)FFALIGN((uintptr_t)frame->buf[i]->data, pool->align);
++        }
++        for (int i = 0; i < frame->nb_extended_buf; i++) {
++            frame->extended_buf[i] = av_buffer_pool_get(pool->pools[0]);
++            if (!frame->extended_buf[i])
++                goto fail;
++            frame->extended_data[i + AV_NUM_DATA_POINTERS] =
++                (uint8_t *)FFALIGN((uintptr_t)frame->extended_buf[i]->data, pool->align);
++        }
++
++        break;
++    default:
++        av_unreachable("only audio and video frame pools exist");
++    }
++
++    return frame;
++fail:
++    av_frame_free(&frame);
++    return NULL;
++}
++
++av_cold void ff_frame_pool_uninit(FFFramePool *pool)
++{
++    for (int i = 0; i < 4; i++)
++        av_buffer_pool_uninit(&pool->pools[i]);
++
++    memset(pool, 0, sizeof(*pool));
++}
++
++int ff_frame_pool_video_reinit(FFFramePool *pool,
++                               int width,
++                               int height,
++                               enum AVPixelFormat format,
++                               int align)
++{
++    if (pool->type == AVMEDIA_TYPE_VIDEO &&
++        pool->pix_fmt == format &&
++        FFALIGN(pool->width,  pool->align) == FFALIGN(width,  align) &&
++        FFALIGN(pool->height, pool->align) == FFALIGN(height, align) &&
++        pool->align == align)
++    {
++        pool->width = width;
++        pool->height = height;
++        return 0;
++    }
++
++    ff_frame_pool_uninit(pool);
++    return frame_pool_video_init(width, height, format, align, pool);
++}
++
++int ff_frame_pool_audio_reinit(FFFramePool *pool,
++                               int channels,
++                               int nb_samples,
++                               enum AVSampleFormat format,
++                               int align)
++{
++    if (pool->type == AVMEDIA_TYPE_AUDIO &&
++        pool->sample_fmt == format &&
++        pool->channels == channels &&
++        pool->nb_samples == nb_samples &&
++        pool->align == align)
++    {
++        return 0;
++    }
++
++    ff_frame_pool_uninit(pool);
++    return frame_pool_audio_init(channels, nb_samples, format, align, pool);
++}
+
+--- libs/ffmpeg/libavfilter/framepool.h
++++ libs/ffmpeg/libavfilter/framepool.h
+@@ -0,0 +1,109 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * Copyright (c) 2015 Matthieu Bouron <matthieu.bouron stupeflix.com>
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_FRAMEPOOL_H
++#define AVFILTER_FRAMEPOOL_H
++
++#include "libavutil/buffer.h"
++#include "libavutil/frame.h"
++#include "libavutil/internal.h"
++
++/**
++ * Frame pool. This structure must be initialized with
++ * ff_frame_pool_{video,audio}_reinit() and freed with ff_frame_pool_uninit().
++ */
++typedef struct FFFramePool {
++
++    enum AVMediaType type;
++    union {
++        enum AVPixelFormat pix_fmt;
++        enum AVSampleFormat sample_fmt;
++    };
++
++    /* video */
++    int width;
++    int height;
++
++    /* audio */
++    int planes;
++    int channels;
++    int nb_samples;
++
++    /* common */
++    int align;
++    int linesize[4];
++    AVBufferPool *pools[4]; /* for audio, only pools[0] is used */
++
++} FFFramePool;
++
++/**
++ * Recreate the video frame pool if its current configuration differs from the
++ * provided configuration. If initialization fails, the old pool is kept
++ * unchanged.
++ *
++ * @param pool pointer to the frame pool to be (re)initialized
++ * @param width width of each frame in this pool
++ * @param height height of each frame in this pool
++ * @param format format of each frame in this pool
++ * @param align buffers alignment of each frame in this pool
++ * @return 0 on success, a negative AVERROR otherwise.
++ */
++int ff_frame_pool_video_reinit(FFFramePool *pool,
++                               int width,
++                               int height,
++                               enum AVPixelFormat format,
++                               int align);
++
++/**
++ * Recreate the audio frame pool if its current configuration differs from the
++ * provided configuration. If initialization fails, the old pool is kept
++ * unchanged.
++ *
++ * @param pool pointer to the frame pool to be (re)initialized
++ * @param channels channels of each frame in this pool
++ * @param nb_samples number of samples of each frame in this pool
++ * @param format format of each frame in this pool
++ * @param align buffers alignment of each frame in this pool
++ * @return 0 on success, a negative AVERROR otherwise.
++ */
++int ff_frame_pool_audio_reinit(FFFramePool *pool,
++                               int channels,
++                               int nb_samples,
++                               enum AVSampleFormat format,
++                               int align);
++
++/**
++ * Deallocate the frame pool. It is safe to call this function while
++ * some of the allocated frame are still in use.
++ *
++ * @param pool pointer to the frame pool to be uninitialized
++ */
++void ff_frame_pool_uninit(FFFramePool *pool);
++
++/**
++ * Allocate a new AVFrame, reusing old buffers from the pool when available.
++ * This function may be called simultaneously from multiple threads.
++ *
++ * @return a new AVFrame on success, NULL on error.
++ */
++AVFrame *ff_frame_pool_get(FFFramePool *pool);
++
++
++#endif /* AVFILTER_FRAMEPOOL_H */
+
+--- libs/ffmpeg/libavfilter/framequeue.c
++++ libs/ffmpeg/libavfilter/framequeue.c
+@@ -0,0 +1,159 @@
++/*
++ * Generic frame queue
++ * Copyright (c) 2016 Nicolas George
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public License
++ * as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "libavutil/avassert.h"
++#include "libavutil/mem.h"
++#include "framequeue.h"
++
++static inline FFFrameBucket *bucket(FFFrameQueue *fq, size_t idx)
++{
++    return &fq->queue[(fq->tail + idx) & (fq->allocated - 1)];
++}
++
++void ff_framequeue_global_init(FFFrameQueueGlobal *fqg)
++{
++    fqg->max_queued = SIZE_MAX;
++    fqg->queued = 0;
++}
++
++static void check_consistency(FFFrameQueue *fq)
++{
++#if defined(ASSERT_LEVEL) && ASSERT_LEVEL >= 2
++    uint64_t nb_samples = 0;
++    size_t i;
++
++    av_assert0(fq->queued == fq->total_frames_head - fq->total_frames_tail);
++    for (i = 0; i < fq->queued; i++)
++        nb_samples += bucket(fq, i)->frame->nb_samples;
++    av_assert0(nb_samples == fq->total_samples_head - fq->total_samples_tail);
++#endif
++}
++
++void ff_framequeue_init(FFFrameQueue *fq, FFFrameQueueGlobal *fqg)
++{
++    fq->queue = &fq->first_bucket;
++    fq->allocated = 1;
++    fq->global = fqg;
++}
++
++void ff_framequeue_free(FFFrameQueue *fq)
++{
++    while (fq->queued) {
++        AVFrame *frame = ff_framequeue_take(fq);
++        av_frame_free(&frame);
++    }
++    if (fq->queue != &fq->first_bucket)
++        av_freep(&fq->queue);
++}
++
++int ff_framequeue_add(FFFrameQueue *fq, AVFrame *frame)
++{
++    FFFrameBucket *b;
++
++    check_consistency(fq);
++    if (fq->global->queued >= fq->global->max_queued)
++        return AVERROR(ENOMEM);
++    if (fq->queued == fq->allocated) {
++        if (fq->allocated == 1) {
++            size_t na = 8;
++            FFFrameBucket *nq = av_realloc_array(NULL, na, sizeof(*nq));
++            if (!nq)
++                return AVERROR(ENOMEM);
++            nq[0] = fq->queue[0];
++            fq->queue = nq;
++            fq->allocated = na;
++        } else {
++            size_t na = fq->allocated << 1;
++            FFFrameBucket *nq = av_realloc_array(fq->queue, na, sizeof(*nq));
++            if (!nq)
++                return AVERROR(ENOMEM);
++            if (fq->tail)
++                memmove(nq + fq->allocated, nq, fq->tail * sizeof(*nq));
++            fq->queue = nq;
++            fq->allocated = na;
++        }
++    }
++    b = bucket(fq, fq->queued);
++    b->frame = frame;
++    fq->queued++;
++    fq->global->queued++;
++    fq->total_frames_head++;
++    fq->total_samples_head += frame->nb_samples;
++    check_consistency(fq);
++    return 0;
++}
++
++AVFrame *ff_framequeue_take(FFFrameQueue *fq)
++{
++    FFFrameBucket *b;
++
++    check_consistency(fq);
++    av_assert1(fq->queued);
++    b = bucket(fq, 0);
++    fq->queued--;
++    fq->global->queued--;
++    fq->tail++;
++    fq->tail &= fq->allocated - 1;
++    fq->total_frames_tail++;
++    fq->total_samples_tail += b->frame->nb_samples;
++    fq->samples_skipped = 0;
++    check_consistency(fq);
++    return b->frame;
++}
++
++AVFrame *ff_framequeue_peek(FFFrameQueue *fq, size_t idx)
++{
++    FFFrameBucket *b;
++
++    check_consistency(fq);
++    av_assert1(idx < fq->queued);
++    b = bucket(fq, idx);
++    check_consistency(fq);
++    return b->frame;
++}
++
++void ff_framequeue_skip_samples(FFFrameQueue *fq, size_t samples, AVRational time_base)
++{
++    FFFrameBucket *b;
++    size_t bytes;
++    int planar, planes, i;
++
++    check_consistency(fq);
++    av_assert1(fq->queued);
++    b = bucket(fq, 0);
++    av_assert1(samples < b->frame->nb_samples);
++    planar = av_sample_fmt_is_planar(b->frame->format);
++    planes = planar ? b->frame->ch_layout.nb_channels : 1;
++    bytes = samples * av_get_bytes_per_sample(b->frame->format);
++    if (!planar)
++        bytes *= b->frame->ch_layout.nb_channels;
++    if (b->frame->pts != AV_NOPTS_VALUE)
++        b->frame->pts += av_rescale_q(samples, av_make_q(1, b->frame->sample_rate), time_base);
++    b->frame->nb_samples -= samples;
++    b->frame->linesize[0] -= bytes;
++    for (i = 0; i < planes; i++)
++        b->frame->extended_data[i] += bytes;
++    for (i = 0; i < planes && i < AV_NUM_DATA_POINTERS; i++)
++        b->frame->data[i] = b->frame->extended_data[i];
++    fq->total_samples_tail += samples;
++    fq->samples_skipped = 1;
++    ff_framequeue_update_peeked(fq, 0);
++}
+
+--- libs/ffmpeg/libavfilter/framequeue.h
++++ libs/ffmpeg/libavfilter/framequeue.h
+@@ -0,0 +1,190 @@
++/*
++ * Generic frame queue
++ * Copyright (c) 2016 Nicolas George
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public License
++ * as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with FFmpeg; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_FRAMEQUEUE_H
++#define AVFILTER_FRAMEQUEUE_H
++
++/**
++ * FFFrameQueue: simple AVFrame queue API
++ *
++ * Note: this API is not thread-safe. Concurrent access to the same queue
++ * must be protected by a mutex or any synchronization mechanism.
++ */
++
++#include "libavutil/frame.h"
++
++typedef struct FFFrameBucket {
++    AVFrame *frame;
++} FFFrameBucket;
++
++/**
++ * Structure to hold global options and statistics for frame queues.
++ *
++ * This structure is intended to allow implementing global control of the
++ * frame queues, including memory consumption caps.
++ */
++typedef struct FFFrameQueueGlobal {
++
++    /**
++     * Maximum number of allowed frames in the queues combined.
++     */
++    size_t max_queued;
++
++    /**
++     * Total number of queued frames in the queues combined.
++     */
++    size_t queued;
++} FFFrameQueueGlobal;
++
++/**
++ * Queue of AVFrame pointers.
++ */
++typedef struct FFFrameQueue {
++
++    /**
++     * Pointer to the global frame queue struct holding statistics and limits
++     */
++    FFFrameQueueGlobal *global;
++
++    /**
++     * Array of allocated buckets, used as a circular buffer.
++     */
++    FFFrameBucket *queue;
++
++    /**
++     * Size of the array of buckets.
++     */
++    size_t allocated;
++
++    /**
++     * Tail of the queue.
++     * It is the index in the array of the next frame to take.
++     */
++    size_t tail;
++
++    /**
++     * Number of currently queued frames.
++     */
++    size_t queued;
++
++    /**
++     * Pre-allocated bucket for queues of size 1.
++     */
++    FFFrameBucket first_bucket;
++
++    /**
++     * Total number of frames entered in the queue.
++     */
++    uint64_t total_frames_head;
++
++    /**
++     * Total number of frames dequeued from the queue.
++     * queued = total_frames_head - total_frames_tail
++     */
++    uint64_t total_frames_tail;
++
++    /**
++     * Total number of samples entered in the queue.
++     */
++    uint64_t total_samples_head;
++
++    /**
++     * Total number of samples dequeued from the queue.
++     * queued_samples = total_samples_head - total_samples_tail
++     */
++    uint64_t total_samples_tail;
++
++    /**
++     * Indicate that samples are skipped
++     */
++    int samples_skipped;
++
++} FFFrameQueue;
++
++/**
++ * Init a global structure.
++ */
++void ff_framequeue_global_init(FFFrameQueueGlobal *fqg);
++
++/**
++ * Init a frame queue and attach it to a global structure.
++ */
++void ff_framequeue_init(FFFrameQueue *fq, FFFrameQueueGlobal *fqg);
++
++/**
++ * Free the queue and all queued frames.
++ */
++void ff_framequeue_free(FFFrameQueue *fq);
++
++/**
++ * Add a frame.
++ * @return  >=0 or an AVERROR code.
++ */
++int ff_framequeue_add(FFFrameQueue *fq, AVFrame *frame);
++
++/**
++ * Take the first frame in the queue.
++ * Must not be used with empty queues.
++ */
++AVFrame *ff_framequeue_take(FFFrameQueue *fq);
++
++/**
++ * Access a frame in the queue, without removing it.
++ * The first frame is numbered 0; the designated frame must exist.
++ */
++AVFrame *ff_framequeue_peek(FFFrameQueue *fq, size_t idx);
++
++/**
++ * Get the number of queued frames.
++ */
++static inline size_t ff_framequeue_queued_frames(const FFFrameQueue *fq)
++{
++    return fq->queued;
++}
++
++/**
++ * Get the number of queued samples.
++ */
++static inline uint64_t ff_framequeue_queued_samples(const FFFrameQueue *fq)
++{
++    return fq->total_samples_head - fq->total_samples_tail;
++}
++
++/**
++ * Update the statistics after a frame accessed using ff_framequeue_peek()
++ * was modified.
++ * Currently used only as a marker.
++ */
++static inline void ff_framequeue_update_peeked(FFFrameQueue *fq, size_t idx)
++{
++}
++
++/**
++ * Skip samples from the first frame in the queue.
++ *
++ * This function must be used when the first frame was accessed using
++ * ff_framequeue_peek() and samples were consumed from it.
++ * It adapts the data pointers and timestamps of the head frame to account
++ * for the skipped samples.
++ */
++void ff_framequeue_skip_samples(FFFrameQueue *fq, size_t samples, AVRational time_base);
++
++#endif /* AVFILTER_FRAMEQUEUE_H */
+
+--- libs/ffmpeg/libavfilter/graphdump.c
++++ libs/ffmpeg/libavfilter/graphdump.c
+@@ -0,0 +1,169 @@
++/*
++ * Filter graphs to bad ASCII-art
++ * Copyright (c) 2012 Nicolas George
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <string.h>
++
++#include "libavutil/channel_layout.h"
++#include "libavutil/bprint.h"
++#include "libavutil/mem.h"
++#include "libavutil/pixdesc.h"
++#include "avfilter.h"
++#include "filters.h"
++
++static int print_link_prop(AVBPrint *buf, AVFilterLink *link)
++{
++    const char *format;
++    AVBPrint dummy_buffer;
++
++    if (!buf) {
++        buf = &dummy_buffer;
++        av_bprint_init(buf, 0, AV_BPRINT_SIZE_COUNT_ONLY);
++    }
++    switch (link->type) {
++        case AVMEDIA_TYPE_VIDEO:
++            format = av_x_if_null(av_get_pix_fmt_name(link->format), "?");
++            av_bprintf(buf, "[%dx%d %d:%d %s]", link->w, link->h,
++                    link->sample_aspect_ratio.num,
++                    link->sample_aspect_ratio.den,
++                    format);
++            break;
++
++        case AVMEDIA_TYPE_AUDIO:
++            format = av_x_if_null(av_get_sample_fmt_name(link->format), "?");
++            av_bprintf(buf, "[%dHz %s:",
++                       (int)link->sample_rate, format);
++            av_channel_layout_describe_bprint(&link->ch_layout, buf);
++            av_bprint_chars(buf, ']', 1);
++            break;
++
++        default:
++            av_bprintf(buf, "?");
++            break;
++    }
++    return buf->len;
++}
++
++static void avfilter_graph_dump_to_buf(AVBPrint *buf, AVFilterGraph *graph)
++{
++    unsigned i, j, x, e;
++
++    for (i = 0; i < graph->nb_filters; i++) {
++        AVFilterContext *filter = graph->filters[i];
++        unsigned max_src_name = 0, max_dst_name = 0;
++        unsigned max_in_name  = 0, max_out_name = 0;
++        unsigned max_in_fmt   = 0, max_out_fmt  = 0;
++        unsigned width, height, in_indent;
++        unsigned lname = strlen(filter->name);
++        unsigned ltype = strlen(filter->filter->name);
++
++        for (j = 0; j < filter->nb_inputs; j++) {
++            AVFilterLink *l = filter->inputs[j];
++            unsigned ln = strlen(l->src->name) + 1 + strlen(l->srcpad->name);
++            max_src_name = FFMAX(max_src_name, ln);
++            max_in_name = FFMAX(max_in_name, strlen(l->dstpad->name));
++            max_in_fmt = FFMAX(max_in_fmt, print_link_prop(NULL, l));
++        }
++        for (j = 0; j < filter->nb_outputs; j++) {
++            AVFilterLink *l = filter->outputs[j];
++            unsigned ln = strlen(l->dst->name) + 1 + strlen(l->dstpad->name);
++            max_dst_name = FFMAX(max_dst_name, ln);
++            max_out_name = FFMAX(max_out_name, strlen(l->srcpad->name));
++            max_out_fmt = FFMAX(max_out_fmt, print_link_prop(NULL, l));
++        }
++        in_indent = max_src_name + max_in_name + max_in_fmt;
++        in_indent += in_indent ? 4 : 0;
++        width = FFMAX(lname + 2, ltype + 4);
++        height = FFMAX3(2, filter->nb_inputs, filter->nb_outputs);
++        av_bprint_chars(buf, ' ', in_indent);
++        av_bprintf(buf, "+");
++        av_bprint_chars(buf, '-', width);
++        av_bprintf(buf, "+\n");
++        for (j = 0; j < height; j++) {
++            unsigned in_no  = j - (height - filter->nb_inputs ) / 2;
++            unsigned out_no = j - (height - filter->nb_outputs) / 2;
++
++            /* Input link */
++            if (in_no < filter->nb_inputs) {
++                AVFilterLink *l = filter->inputs[in_no];
++                e = buf->len + max_src_name + 2;
++                av_bprintf(buf, "%s:%s", l->src->name, l->srcpad->name);
++                av_bprint_chars(buf, '-', e - buf->len);
++                e = buf->len + max_in_fmt + 2 +
++                    max_in_name - strlen(l->dstpad->name);
++                print_link_prop(buf, l);
++                av_bprint_chars(buf, '-', e - buf->len);
++                av_bprintf(buf, "%s", l->dstpad->name);
++            } else {
++                av_bprint_chars(buf, ' ', in_indent);
++            }
++
++            /* Filter */
++            av_bprintf(buf, "|");
++            if (j == (height - 2) / 2) {
++                x = (width - lname) / 2;
++                av_bprintf(buf, "%*s%-*s", x, "", width - x, filter->name);
++            } else if (j == (height - 2) / 2 + 1) {
++                x = (width - ltype - 2) / 2;
++                av_bprintf(buf, "%*s(%s)%*s", x, "", filter->filter->name,
++                        width - ltype - 2 - x, "");
++            } else {
++                av_bprint_chars(buf, ' ', width);
++            }
++            av_bprintf(buf, "|");
++
++            /* Output link */
++            if (out_no < filter->nb_outputs) {
++                AVFilterLink *l = filter->outputs[out_no];
++                unsigned ln = strlen(l->dst->name) + 1 +
++                              strlen(l->dstpad->name);
++                e = buf->len + max_out_name + 2;
++                av_bprintf(buf, "%s", l->srcpad->name);
++                av_bprint_chars(buf, '-', e - buf->len);
++                e = buf->len + max_out_fmt + 2 +
++                    max_dst_name - ln;
++                print_link_prop(buf, l);
++                av_bprint_chars(buf, '-', e - buf->len);
++                av_bprintf(buf, "%s:%s", l->dst->name, l->dstpad->name);
++            }
++            av_bprintf(buf, "\n");
++        }
++        av_bprint_chars(buf, ' ', in_indent);
++        av_bprintf(buf, "+");
++        av_bprint_chars(buf, '-', width);
++        av_bprintf(buf, "+\n");
++        av_bprintf(buf, "\n");
++    }
++}
++
++char *avfilter_graph_dump(AVFilterGraph *graph, const char *options)
++{
++    AVBPrint buf;
++    char *dump = NULL;
++
++    av_bprint_init(&buf, 0, AV_BPRINT_SIZE_COUNT_ONLY);
++    avfilter_graph_dump_to_buf(&buf, graph);
++    dump = av_malloc(buf.len + 1);
++    if (!dump)
++        return NULL;
++    av_bprint_init_for_buffer(&buf, dump, buf.len + 1);
++    avfilter_graph_dump_to_buf(&buf, graph);
++    return dump;
++}
+
+--- libs/ffmpeg/libavfilter/graphparser.c
++++ libs/ffmpeg/libavfilter/graphparser.c
+
+--- libs/ffmpeg/libavfilter/pthread.c
++++ libs/ffmpeg/libavfilter/pthread.c
+@@ -0,0 +1,115 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * Libavfilter multithreading support
++ */
++
++#include <stddef.h>
++
++#include "libavutil/error.h"
++#include "libavutil/macros.h"
++#include "libavutil/mem.h"
++#include "libavutil/slicethread.h"
++
++#include "avfilter.h"
++#include "avfilter_internal.h"
++
++typedef struct ThreadContext {
++    AVFilterGraph *graph;
++    AVSliceThread *thread;
++    avfilter_action_func *func;
++
++    /* per-execute parameters */
++    AVFilterContext *ctx;
++    void *arg;
++    int   *rets;
++} ThreadContext;
++
++static void worker_func(void *priv, int jobnr, int threadnr, int nb_jobs, int nb_threads)
++{
++    ThreadContext *c = priv;
++    int ret = c->func(c->ctx, c->arg, jobnr, nb_jobs);
++    if (c->rets)
++        c->rets[jobnr] = ret;
++}
++
++static void slice_thread_uninit(ThreadContext *c)
++{
++    avpriv_slicethread_free(&c->thread);
++}
++
++static int thread_execute(AVFilterContext *ctx, avfilter_action_func *func,
++                          void *arg, int *ret, int nb_jobs)
++{
++    ThreadContext *c = fffiltergraph(ctx->graph)->thread;
++
++    if (nb_jobs <= 0)
++        return 0;
++    c->ctx         = ctx;
++    c->arg         = arg;
++    c->func        = func;
++    c->rets        = ret;
++
++    avpriv_slicethread_execute(c->thread, nb_jobs, 0);
++    return 0;
++}
++
++static int thread_init_internal(ThreadContext *c, int nb_threads)
++{
++    nb_threads = avpriv_slicethread_create(&c->thread, c, worker_func, NULL, nb_threads);
++    if (nb_threads <= 1)
++        avpriv_slicethread_free(&c->thread);
++    return FFMAX(nb_threads, 1);
++}
++
++int ff_graph_thread_init(FFFilterGraph *graphi)
++{
++    AVFilterGraph *graph = &graphi->p;
++    int ret;
++
++    if (graph->nb_threads == 1) {
++        graph->thread_type = 0;
++        return 0;
++    }
++
++    graphi->thread = av_mallocz(sizeof(ThreadContext));
++    if (!graphi->thread)
++        return AVERROR(ENOMEM);
++
++    ret = thread_init_internal(graphi->thread, graph->nb_threads);
++    if (ret <= 1) {
++        av_freep(&graphi->thread);
++        graph->thread_type = 0;
++        graph->nb_threads  = 1;
++        return (ret < 0) ? ret : 0;
++    }
++    graph->nb_threads = ret;
++
++    graphi->thread_execute = thread_execute;
++
++    return 0;
++}
++
++void ff_graph_thread_free(FFFilterGraph *graph)
++{
++    if (graph->thread)
++        slice_thread_uninit(graph->thread);
++    av_freep(&graph->thread);
++}
+
+--- libs/ffmpeg/libavfilter/version.c
++++ libs/ffmpeg/libavfilter/version.c
+@@ -0,0 +1,45 @@
++/*
++ * Version functions.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <assert.h>
++
++#include "config.h"
++#include "avfilter.h"
++#include "version.h"
++
++#include "libavutil/ffversion.h"
++const char av_filter_ffversion[] = "FFmpeg version " FFMPEG_VERSION;
++
++unsigned avfilter_version(void)
++{
++    static_assert(LIBAVFILTER_VERSION_MICRO >= 100, "micro version starts at 100");
++    return LIBAVFILTER_VERSION_INT;
++}
++
++const char *avfilter_configuration(void)
++{
++    return FFMPEG_CONFIGURATION;
++}
++
++const char *avfilter_license(void)
++{
++#define LICENSE_PREFIX "libavfilter license: "
++    return &LICENSE_PREFIX FFMPEG_LICENSE[sizeof(LICENSE_PREFIX) - 1];
++}
+
+--- libs/ffmpeg/libavfilter/version.h
++++ libs/ffmpeg/libavfilter/version.h
+@@ -0,0 +1,48 @@
++/*
++ * Version macros.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_VERSION_H
++#define AVFILTER_VERSION_H
++
++/**
++ * @file
++ * @ingroup lavfi
++ * Libavfilter version macros
++ */
++
++#include "libavutil/version.h"
++
++#include "version_major.h"
++
++#define LIBAVFILTER_VERSION_MINOR   1
++#define LIBAVFILTER_VERSION_MICRO 102
++
++
++#define LIBAVFILTER_VERSION_INT AV_VERSION_INT(LIBAVFILTER_VERSION_MAJOR, \
++                                               LIBAVFILTER_VERSION_MINOR, \
++                                               LIBAVFILTER_VERSION_MICRO)
++#define LIBAVFILTER_VERSION     AV_VERSION(LIBAVFILTER_VERSION_MAJOR,   \
++                                           LIBAVFILTER_VERSION_MINOR,   \
++                                           LIBAVFILTER_VERSION_MICRO)
++#define LIBAVFILTER_BUILD       LIBAVFILTER_VERSION_INT
++
++#define LIBAVFILTER_IDENT       "Lavfi" AV_STRINGIFY(LIBAVFILTER_VERSION)
++
++#endif /* AVFILTER_VERSION_H */
+
+--- libs/ffmpeg/libavfilter/version_major.h
++++ libs/ffmpeg/libavfilter/version_major.h
+@@ -0,0 +1,38 @@
++/*
++ * Version macros.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_VERSION_MAJOR_H
++#define AVFILTER_VERSION_MAJOR_H
++
++/**
++ * @file
++ * @ingroup lavfi
++ * Libavfilter version macros
++ */
++
++#define LIBAVFILTER_VERSION_MAJOR  12
++
++/**
++ * FF_API_* defines may be placed below to indicate public API that will be
++ * dropped at a future version bump. The defines themselves are not part of
++ * the public API and may change, break or disappear at any time.
++ */
++
++#endif /* AVFILTER_VERSION_MAJOR_H */
+
+--- libs/ffmpeg/libavfilter/video.c
++++ libs/ffmpeg/libavfilter/video.c
+@@ -0,0 +1,102 @@
++/*
++ * Copyright 2007 Bobby Bingham
++ * Copyright Stefano Sabatini <stefasab gmail com>
++ * Copyright Vitor Sessak <vitor1001 gmail com>
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <string.h>
++#include <stdio.h>
++
++#include "libavutil/buffer.h"
++#include "libavutil/cpu.h"
++#include "libavutil/hwcontext.h"
++#include "libavutil/pixfmt.h"
++
++#include "avfilter.h"
++#include "avfilter_internal.h"
++#include "filters.h"
++#include "framepool.h"
++#include "video.h"
++
++const AVFilterPad ff_video_default_filterpad[1] = {
++    {
++        .name = "default",
++        .type = AVMEDIA_TYPE_VIDEO,
++    }
++};
++
++AVFrame *ff_null_get_video_buffer(AVFilterLink *link, int w, int h)
++{
++    return ff_get_video_buffer(link->dst->outputs[0], w, h);
++}
++
++AVFrame *ff_default_get_video_buffer2(AVFilterLink *link, int w, int h, int align)
++{
++    FilterLinkInternal *const li = ff_link_internal(link);
++    AVFrame *frame = NULL;
++
++    if (li->l.hw_frames_ctx &&
++        ((AVHWFramesContext*)li->l.hw_frames_ctx->data)->format == link->format) {
++        int ret;
++        frame = av_frame_alloc();
++
++        if (!frame)
++            return NULL;
++
++        ret = av_hwframe_get_buffer(li->l.hw_frames_ctx, frame, 0);
++        if (ret < 0)
++            av_frame_free(&frame);
++
++        return frame;
++    }
++
++    if (ff_frame_pool_video_reinit(&li->frame_pool, w, h, link->format, align) < 0)
++        return NULL;
++
++    frame = ff_frame_pool_get(&li->frame_pool);
++    if (!frame)
++        return NULL;
++
++    frame->sample_aspect_ratio = link->sample_aspect_ratio;
++    frame->colorspace  = link->colorspace;
++    frame->color_range = link->color_range;
++    frame->alpha_mode  = link->alpha_mode;
++
++    return frame;
++}
++
++AVFrame *ff_default_get_video_buffer(AVFilterLink *link, int w, int h)
++{
++    return ff_default_get_video_buffer2(link, w, h, av_cpu_max_align());
++}
++
++AVFrame *ff_get_video_buffer(AVFilterLink *link, int w, int h)
++{
++    AVFrame *ret = NULL;
++
++    FF_TPRINTF_START(NULL, get_video_buffer); ff_tlog_link(NULL, link, 1);
++
++    if (link->dstpad->get_buffer.video)
++        ret = link->dstpad->get_buffer.video(link, w, h);
++
++    if (!ret)
++        ret = ff_default_get_video_buffer(link, w, h);
++
++    return ret;
++}
+
+--- libs/ffmpeg/libavfilter/video.h
++++ libs/ffmpeg/libavfilter/video.h
+@@ -0,0 +1,59 @@
++/*
++ * Copyright (c) 2007 Bobby Bingham
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_VIDEO_H
++#define AVFILTER_VIDEO_H
++
++#include "avfilter.h"
++#include "filters.h"
++
++/**
++ * An AVFilterPad array whose only entry has name "default"
++ * and is of type AVMEDIA_TYPE_VIDEO.
++ */
++extern const AVFilterPad ff_video_default_filterpad[1];
++
++AVFrame *ff_default_get_video_buffer(AVFilterLink *link, int w, int h);
++AVFrame *ff_default_get_video_buffer2(AVFilterLink *link, int w, int h, int align);
++AVFrame *ff_null_get_video_buffer(AVFilterLink *link, int w, int h);
++
++/**
++ * Request a picture buffer with a specific set of permissions.
++ *
++ * @param link  the output link to the filter from which the buffer will
++ *              be requested
++ * @param w     the minimum width of the buffer to allocate
++ * @param h     the minimum height of the buffer to allocate
++ * @return      on success, an AVFrame owned by the caller, NULL on error
++ */
++AVFrame *ff_get_video_buffer(AVFilterLink *link, int w, int h);
++
++/**
++ * Returns true if a pixel format is "regular YUV", which includes all pixel
++ * formats that are affected by YUV colorspace negotiation.
++ */
++int ff_fmt_is_regular_yuv(enum AVPixelFormat fmt);
++
++/**
++ * Returns true if a YUV pixel format is forced full range (i.e. YUVJ).
++ */
++int ff_fmt_is_forced_full_range(enum AVPixelFormat fmt);
++
++#endif /* AVFILTER_VIDEO_H */
+
+--- libs/ffmpeg/libavutil/aarch64/asm.S
++++ libs/ffmpeg/libavutil/aarch64/asm.S
+@@ -68,6 +68,22 @@
+ #define DISABLE_I8MM
+ #endif
+ 
++#if HAVE_AS_ARCHEXT_AES_DIRECTIVE
++#define ENABLE_PMULL  .arch_extension aes
++#define DISABLE_PMULL .arch_extension noaes
++#else
++#define ENABLE_PMULL
++#define DISABLE_PMULL
++#endif
++
++#if HAVE_AS_ARCHEXT_SHA3_DIRECTIVE
++#define ENABLE_EOR3  .arch_extension sha3
++#define DISABLE_EOR3 .arch_extension nosha3
++#else
++#define ENABLE_EOR3
++#define DISABLE_EOR3
++#endif
++
+ #if HAVE_AS_ARCHEXT_SVE_DIRECTIVE
+ #define ENABLE_SVE  .arch_extension sve
+ #define DISABLE_SVE .arch_extension nosve
+@@ -109,6 +125,8 @@
+ #endif
+ 
+ DISABLE_ARM_CRC
++DISABLE_PMULL
++DISABLE_EOR3
+ DISABLE_DOTPROD
+ DISABLE_I8MM
+ DISABLE_SVE
+@@ -117,26 +135,6 @@ DISABLE_SME
+ DISABLE_SME_I16I64
+ DISABLE_SME2
+ 
+-#if HAVE_SME
+-.macro sme_entry
+-        stp             x29, x30, [sp, #-80]!
+-        mov             x29, sp
+-        stp             d8, d9, [sp, #16]
+-        stp             d10, d11, [sp, #32]
+-        stp             d12, d13, [sp, #48]
+-        stp             d14, d15, [sp, #64]
+-        smstart
+-.endm
+-
+-.macro sme_exit
+-        smstop
+-        ldp             d8, d9, [sp, #16]
+-        ldp             d10, d11, [sp, #32]
+-        ldp             d12, d13, [sp, #48]
+-        ldp             d14, d15, [sp, #64]
+-        ldp             x29, x30, [sp], #80
+-.endm
+-#endif
+ 
+ /* Support macros for
+  *   - Armv8.3-A Pointer Authentication and
+@@ -207,16 +205,18 @@ DISABLE_SME2
+  *
+  * References:
+  * - "ELF for the Arm® 64-bit Architecture"
+- *   https: *github.com/ARM-software/abi-aa/blob/master/aaelf64/aaelf64.rst
++ *   https://github.com/ARM-software/abi-aa/blob/master/aaelf64/aaelf64.rst
+  * - "Providing protection for complex software"
+  *   https://developer.arm.com/architectures/learn-the-architecture/providing-protection-for-complex-software
+  */
+ #if defined(__ARM_FEATURE_BTI_DEFAULT) && (__ARM_FEATURE_BTI_DEFAULT == 1)
+ #   define GNU_PROPERTY_AARCH64_BTI (1 << 0)   // Has BTI
+-#   define AARCH64_VALID_CALL_TARGET hint #34  // BTI 'c'
+-#   define AARCH64_VALID_JUMP_TARGET hint #38  // BTI 'j'
++#   define AARCH64_VALID_JUMP_CALL_TARGET hint #38  // BTI 'jc'
++#   define AARCH64_VALID_CALL_TARGET      hint #34  // BTI 'c'
++#   define AARCH64_VALID_JUMP_TARGET      hint #38  // BTI 'j'
+ #else
+ #   define GNU_PROPERTY_AARCH64_BTI 0          // No BTI
++#   define AARCH64_VALID_JUMP_CALL_TARGET
+ #   define AARCH64_VALID_CALL_TARGET
+ #   define AARCH64_VALID_JUMP_TARGET
+ #endif
+@@ -263,7 +263,7 @@ DISABLE_SME2
+ #endif
+ 
+ #ifdef __arm64ec__
+-.macro  function name, export=0, align=4
++.macro  function name, export=0, jumpable=0, align=4
+     .macro endfunc
+         .purgem endfunc
+     .endm
+@@ -278,7 +278,7 @@ DISABLE_SME2
+     .endif
+ .endm
+ #else
+-.macro  function name, export=0, align=4
++.macro  function name, export=0, jumpable=0, align=4
+     .macro endfunc
+ ELF     .size   \name, . - \name
+ FUNC    .endfunc
+@@ -291,7 +291,11 @@ FUNC    .endfunc
+ ELF     .type   EXTERN_ASM\name, %function
+ FUNC    .func   EXTERN_ASM\name
+ EXTERN_ASM\name:
++    .if \jumpable
++        AARCH64_VALID_JUMP_TARGET
++    .else
+         AARCH64_VALID_CALL_TARGET
++    .endif
+     .else
+ ELF     .type   \name, %function
+ FUNC    .func   \name
+@@ -359,3 +363,26 @@ ELF     .size   \name, . - \name
+ 
+ #define x18 do_not_use_x18
+ #define w18 do_not_use_w18
++
++#if HAVE_SME
++.macro sme_entry
++        AARCH64_SIGN_LINK_REGISTER
++        stp             x29, x30, [sp, #-80]!
++        mov             x29, sp
++        stp             d8,  d9,  [sp, #16]
++        stp             d10, d11, [sp, #32]
++        stp             d12, d13, [sp, #48]
++        stp             d14, d15, [sp, #64]
++        smstart
++.endm
++
++.macro sme_exit
++        smstop
++        ldp             d8,  d9,  [sp, #16]
++        ldp             d10, d11, [sp, #32]
++        ldp             d12, d13, [sp, #48]
++        ldp             d14, d15, [sp, #64]
++        ldp             x29, x30, [sp], #80
++        AARCH64_VALIDATE_LINK_REGISTER
++.endm
++#endif
+
+--- libs/ffmpeg/libavutil/aarch64/cpu.c
++++ libs/ffmpeg/libavutil/aarch64/cpu.c
+@@ -24,7 +24,9 @@
+ #include <stdint.h>
+ #include <sys/auxv.h>
+ 
++#define HWCAP_AARCH64_PMULL   (1 << 4)
+ #define HWCAP_AARCH64_CRC32   (1 << 7)
++#define HWCAP_AARCH64_SHA3    (1 << 17)
+ #define HWCAP_AARCH64_ASIMDDP (1 << 20)
+ #define HWCAP_AARCH64_SVE     (1 << 22)
+ #define HWCAP2_AARCH64_SVE2   (1 << 1)
+@@ -40,6 +42,10 @@ static int detect_flags(void)
+     unsigned long hwcap = ff_getauxval(AT_HWCAP);
+     unsigned long hwcap2 = ff_getauxval(AT_HWCAP2);
+ 
++    if (hwcap & HWCAP_AARCH64_PMULL)
++        flags |= AV_CPU_FLAG_PMULL;
++    if (hwcap & HWCAP_AARCH64_SHA3)
++        flags |= AV_CPU_FLAG_EOR3;
+     if (hwcap & HWCAP_AARCH64_CRC32)
+         flags |= AV_CPU_FLAG_ARM_CRC;
+     if (hwcap & HWCAP_AARCH64_ASIMDDP)
+@@ -85,6 +91,10 @@ static int detect_flags(void)
+         flags |= AV_CPU_FLAG_SME_I16I64;
+     if (have_feature("hw.optional.armv8_crc32"))
+         flags |= AV_CPU_FLAG_ARM_CRC;
++    if (have_feature("hw.optional.arm.FEAT_PMULL"))
++        flags |= AV_CPU_FLAG_PMULL;
++    if (have_feature("hw.optional.armv8_2_sha3"))
++        flags |= AV_CPU_FLAG_EOR3;
+     if (have_feature("hw.optional.arm.FEAT_SME2"))
+         flags |= AV_CPU_FLAG_SME2;
+ 
+@@ -115,6 +125,10 @@ static int detect_flags(void)
+             flags |= AV_CPU_FLAG_DOTPROD;
+         if (ID_AA64ISAR0_CRC32(isar0) >= ID_AA64ISAR0_CRC32_BASE)
+             flags |= AV_CPU_FLAG_ARM_CRC;
++        if (ID_AA64ISAR0_AES(isar0) >= ID_AA64ISAR0_AES_PMULL)
++            flags |= AV_CPU_FLAG_PMULL;
++        if (ID_AA64ISAR0_SHA3(isar0) >= ID_AA64ISAR0_SHA3_IMPL)
++            flags |= AV_CPU_FLAG_EOR3;
+     }
+ 
+     mib[0] = CTL_MACHDEP;
+@@ -141,6 +155,14 @@ static int detect_flags(void)
+     if (IsProcessorFeaturePresent(PF_ARM_V8_CRC32_INSTRUCTIONS_AVAILABLE))
+         flags |= AV_CPU_FLAG_ARM_CRC;
+ #endif
++#ifdef PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE
++    if (IsProcessorFeaturePresent(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE))
++        flags |= AV_CPU_FLAG_PMULL;
++#endif
++#ifdef PF_ARM_SHA3_INSTRUCTIONS_AVAILABLE
++    if (IsProcessorFeaturePresent(PF_ARM_SHA3_INSTRUCTIONS_AVAILABLE))
++        flags |= AV_CPU_FLAG_EOR3;
++#endif
+ #ifdef PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE
+     if (IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE))
+         flags |= AV_CPU_FLAG_DOTPROD;
+@@ -203,6 +225,12 @@ int ff_get_cpu_flags_aarch64(void)
+ #ifdef __ARM_FEATURE_CRC32
+     flags |= AV_CPU_FLAG_ARM_CRC;
+ #endif
++#ifdef __ARM_FEATURE_AES
++    flags |= AV_CPU_FLAG_PMULL;
++#endif
++#ifdef __ARM_FEATURE_SHA3
++    flags |= AV_CPU_FLAG_EOR3;
++#endif
+ #ifdef __ARM_FEATURE_SME_I16I64
+     flags |= AV_CPU_FLAG_SME_I16I64;
+ #endif
+
+--- libs/ffmpeg/libavutil/aarch64/cpu.h
++++ libs/ffmpeg/libavutil/aarch64/cpu.h
+@@ -22,10 +22,12 @@
+ #include "libavutil/cpu.h"
+ #include "libavutil/cpu_internal.h"
+ 
+-#define have_armv8(flags) CPUEXT(flags, ARMV8)
+-#define have_neon(flags) CPUEXT(flags, NEON)
+-#define have_vfp(flags)  CPUEXT(flags, VFP)
++#define have_armv8(flags)   CPUEXT(flags, ARMV8)
++#define have_neon(flags)    CPUEXT(flags, NEON)
++#define have_vfp(flags)     CPUEXT(flags, VFP)
+ #define have_arm_crc(flags) CPUEXT(flags, ARM_CRC)
++#define have_pmull(flags)   CPUEXT(flags, PMULL)
++#define have_eor3(flags)    CPUEXT(flags, EOR3)
+ #define have_dotprod(flags) CPUEXT(flags, DOTPROD)
+ #define have_i8mm(flags)    CPUEXT(flags, I8MM)
+ #define have_sve(flags)     CPUEXT(flags, SVE)
+
+--- libs/ffmpeg/libavutil/aarch64/crc.S
++++ libs/ffmpeg/libavutil/aarch64/crc.S
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (c) 2025 Zhao Zhili <quinkblack@foxmail.com>
++ * Copyright (c) 2026 Shreesh Adiga <16567adigashreesh@gmail.com>
+  *
+  * This file is part of FFmpeg.
+  *
+@@ -67,3 +68,267 @@ endfunc
+ 
+ DISABLE_ARM_CRC
+ #endif
++
++#if HAVE_PMULL && HAVE_EOR3
++ENABLE_PMULL
++ENABLE_EOR3
++
++const reverse_shuffle, align=4
++        .byte  15, 14, 13, 12
++        .byte  11, 10,  9,  8
++        .byte   7,  6,  5,  4
++        .byte   3,  2,  1,  0
++endconst
++
++const partial_bytes_shuf_tab, align=4
++        .byte  255, 254, 253, 252
++        .byte  251, 250, 249, 248
++        .byte  247, 246, 245, 244
++        .byte  243, 242, 241, 240
++        .byte   0,  1,  2,  3
++        .byte   4,  5,  6,  7
++        .byte   8,  9, 10, 11
++        .byte  12, 13, 14, 15
++endconst
++
++// performs Vfold = pmull(Vfold, Vconst) xor pmull2(Vfold, Vconst) xor Vdata
++.macro FOLD_SINGLE Vfold, Vconst, Vdata, Vtemp
++        pmull           \Vtemp\().1q, \Vconst\().1d, \Vfold\().1d
++        pmull2          \Vfold\().1q, \Vconst\().2d, \Vfold\().2d
++        eor3            \Vfold\().16b, \Vfold\().16b, \Vdata\().16b, \Vtemp\().16b
++.endm
++
++// assume Vfold is v16 and v0 is filled with 0
++// uses v17 as temp
++.macro FOLD_128_TO_64 le, Vconst
++.if ! \le
++        fmov            d17, d16
++        pmull2          v16.1q, v16.2d, \Vconst\().2d
++        ext             v17.16b, v0.16b, v17.16b, #12
++        eor             v16.16b, v17.16b, v16.16b
++        ext             \Vconst\().16b, \Vconst\().16b, \Vconst\().16b, #8
++        pmull2          v17.1q, \Vconst\().2d, v16.2d
++        eor             v16.16b, v16.16b, v17.16b
++.else
++        ext             v17.16b, v16.16b, v0.16b, #8
++        pmull           v16.1q, v16.1d, \Vconst\().1d
++        eor             v16.16b, v16.16b, v17.16b
++        ext             v17.16b, v0.16b, v16.16b, #12
++        ext             \Vconst\().16b, \Vconst\().16b, \Vconst\().16b, #8
++        pmull           v17.1q, \Vconst\().1d, v17.1d
++        eor             v16.16b, v16.16b, v17.16b
++.endif
++.endm
++
++// assume Vfold is v16 and v0 is filled with 0
++// uses v17 as temp
++.macro FOLD_64_TO_32 le, Vconst
++.if ! \le
++        pmull           v17.1q, v16.1d, \Vconst\().1d
++        pmull2          v17.1q, v17.2d, \Vconst\().2d
++        eor             v16.16b, v16.16b, v17.16b
++        fmov            w0, s16
++        rev             w0, w0
++.else
++        mov             v16.s[0], wzr
++        pmull           v17.1q, v16.1d, \Vconst\().1d
++        eor             v17.16b, v17.16b, v16.16b
++        ext             \Vconst\().16b, \Vconst\().16b, \Vconst\().16b, #8
++        pmull           v17.1q, v17.1d, \Vconst\().1d
++        eor             v16.16b, v16.16b, v17.16b
++        mov             w0, v16.s[2]
++.endif
++.endm
++
++#define CTX_OFFSET 4
++
++// ff_crc[_le]_neon_pmull(const AVCRC *ctx, uint32_t crc, const uint8_t *buffer, size_t length)
++// x0 - ctx; pre-computed fold constants, see crc_init_aarch64 for details on the structure.
++// x1 - crc initial value
++// x2 - buffer pointer
++// x3 - length of buffer
++//
++// Additional registers used:
++// x10 - buffer + length; points to end of buffer
++// x11-x15 used as temp registers as needed
++//
++// v0 - zero register to perform vector shift during reduction using EXT
++// v1 - crc input from x1
++// v2 - holds the reverse shuffle values 15, 14 ... 0 to reverse vector using TBL
++// v3 - holds the constant values used in PMULL/PMULL2 loaded via x0 ctx
++// v4-v7 - used as temp for PMULL/PMULL2 output
++// v16 - holds the primary fold register later reduced to 32 bits
++// Registers v16-v19 are used in parallel 4x fold loop
++// Registers v20-23 are used to load the 4 next data chunks
++// Registers v17-v21 are used as temp elsewhere
++.macro crc_fn_template le
++.if \le
++function ff_crc_le_neon_pmull, export=1
++.else
++function ff_crc_neon_pmull, export=1
++        movrel          x9, reverse_shuffle
++        ldr             q2, [x9]
++.endif
++        add             x10, x2, x3
++        movi            v0.2d, #0
++        mov             v1.16b, v0.16b
++        mov             v1.s[0], w1
++        cmp             x3, #64
++        b.lo            8f // less than 64 bytes
++        ld1             {v16.16b-v19.16b}, [x2], #64
++        eor             v16.16b, v16.16b, v1.16b
++.if ! \le
++        tbl             v16.16b, { v16.16b }, v2.16b
++        tbl             v17.16b, { v17.16b }, v2.16b
++        tbl             v18.16b, { v18.16b }, v2.16b
++        tbl             v19.16b, { v19.16b }, v2.16b
++.endif
++        sub             x11, x10, x2
++        cmp             x11, #64
++        b.lo            2f // reduce 4x to 1x
++        ldr             q3, [x0, #(CTX_OFFSET + 0)]
++
++1: // fold 4x loop
++        ld1             {v20.16b-v23.16b}, [x2], #64
++.if ! \le
++        tbl             v20.16b, { v20.16b }, v2.16b
++        tbl             v21.16b, { v21.16b }, v2.16b
++        tbl             v22.16b, { v22.16b }, v2.16b
++        tbl             v23.16b, { v23.16b }, v2.16b
++.endif
++        pmull           v4.1q, v16.1d, v3.1d
++        pmull           v5.1q, v17.1d, v3.1d
++        pmull           v6.1q, v18.1d, v3.1d
++        pmull           v7.1q, v19.1d, v3.1d
++        pmull2          v16.1q, v16.2d, v3.2d
++        pmull2          v17.1q, v17.2d, v3.2d
++        pmull2          v18.1q, v18.2d, v3.2d
++        pmull2          v19.1q, v19.2d, v3.2d
++        eor3            v16.16b, v16.16b, v4.16b, v20.16b
++        eor3            v17.16b, v17.16b, v5.16b, v21.16b
++        eor3            v18.16b, v18.16b, v6.16b, v22.16b
++        eor3            v19.16b, v19.16b, v7.16b, v23.16b
++        sub             x11, x10, x2
++        cmp             x11, #64
++        b.hs            1b // fold 4x loop
++
++2: // reduce 4x to 1x
++        ldr             q3, [x0, #(CTX_OFFSET + 16)]
++        FOLD_SINGLE     v16, v3, v17, v4
++        FOLD_SINGLE     v16, v3, v18, v4
++        FOLD_SINGLE     v16, v3, v19, v4
++
++3: // fold 1x pre
++        sub             x11, x10, x2
++        cmp             x11, #16
++        b.lo            5f // partial_block
++
++4: // fold 1x loop
++        ldr             q17, [x2], #16
++.if ! \le
++        tbl             v17.16b, { v17.16b }, v2.16b
++.endif
++        FOLD_SINGLE     v16, v3, v17, v4
++        sub             x11, x10, x2
++        cmp             x11, #16
++        b.hs            4b // fold 1x loop
++
++5: // partial_block
++        cmp             x10, x2
++        b.eq            6f // reduce 128 to 64
++        ldr             q17, [x10, #-16]
++        movrel          x1, partial_bytes_shuf_tab
++        ldr             q18, [x1, x11]
++.if ! \le
++        tbl             v16.16b, { v16.16b }, v2.16b
++.endif
++        mvn             v19.16b, v18.16b
++        tbl             v20.16b, { v16.16b }, v19.16b
++        cmge            v21.16b, v18.16b, #0
++        bsl             v21.16b, v17.16b, v20.16b
++        tbl             v16.16b, { v16.16b }, v18.16b
++.if ! \le
++        tbl             v16.16b, { v16.16b }, v2.16b
++        tbl             v21.16b, { v21.16b }, v2.16b
++.endif
++        FOLD_SINGLE     v16, v3, v21, v4
++
++6: // reduce 128 to 64
++        ldr             q3, [x0, #(CTX_OFFSET + 32)]
++        FOLD_128_TO_64  \le, v3
++
++7: // reduce 64 to 32
++        ldr             q3, [x0, #(CTX_OFFSET + 48)]
++        FOLD_64_TO_32   \le, v3
++        ret
++
++8: // less than 64 bytes
++        cmp             x3, #16
++        b.lo            9f // less than 16 bytes
++        ldr             q16, [x2], #16
++        eor             v16.16b, v16.16b, v1.16b
++.if ! \le
++        tbl             v16.16b, { v16.16b }, v2.16b
++.endif
++        ldr             q3, [x0, #(CTX_OFFSET + 16)]
++        b               3b // fold 1x pre
++
++9: // less than 16 bytes
++        movrel          x15, partial_bytes_shuf_tab
++        add             x15, x15, x3
++        str             q0, [sp, #-16]!
++        add             x9, sp, x3
++        // memcpy 0 to 15 bytes from src to stack and load it to v16 with zero extension
++        tbz             x3, #3, 10f
++        ldr             x11, [x2]
++        ldr             x12, [x10, #-8]
++        str             x11, [sp]
++        str             x12, [x9, #-8]
++        b               12f
++10:
++        tbz             x3, #2, 11f
++        ldr             w11, [x2]
++        ldr             w12, [x10, #-4]
++        str             w11, [sp]
++        str             w12, [x9, #-4]
++        b               12f
++11:
++        cbz             x3, 12f
++        lsr             x11, x3, #1
++        ldrb            w12, [x2]
++        ldrb            w14, [x10, #-1]
++        ldrb            w13, [x2, x11]
++        strb            w12, [sp]
++        strb            w13, [sp, x11]
++        strb            w14, [x9, #-1]
++12:
++        ldr             q16, [sp], #16
++        eor             v16.16b, v16.16b, v1.16b
++        cmp             x3, #5
++        b.lo            13f // less than 5 bytes
++        ldr             q17, [x15]
++        tbl             v16.16b, { v16.16b }, v17.16b
++.if ! \le
++        tbl             v16.16b, { v16.16b }, v2.16b
++.endif
++        b               6b // reduce 128 to 64
++
++13: // less than 5 bytes
++.if ! \le
++        ldr             q17, [x15, #12]
++        tbl             v16.16b, { v16.16b }, v17.16b
++        rev64           v16.16b, v16.16b
++.else
++        ldr             q17, [x15, #8]
++        tbl             v16.16b, { v16.16b }, v17.16b
++.endif
++        b               7b // reduce 64 to 32
++endfunc
++.endm
++
++crc_fn_template 0
++crc_fn_template 1
++
++DISABLE_PMULL
++DISABLE_EOR3
++#endif
+
+--- libs/ffmpeg/libavutil/aarch64/crc.h
++++ libs/ffmpeg/libavutil/aarch64/crc.h
+@@ -29,26 +29,165 @@
+ #include "libavutil/avassert.h"
+ #include "libavutil/cpu.h"
+ #include "libavutil/crc.h"
++#include "libavutil/intreadwrite.h"
+ 
++#if HAVE_ARM_CRC
+ FF_VISIBILITY_PUSH_HIDDEN
+ uint32_t ff_crc32_aarch64(const AVCRC *ctx, uint32_t crc, const uint8_t *buffer,
+                           size_t length);
+ FF_VISIBILITY_POP_HIDDEN
++#endif
++
++#if HAVE_PMULL && HAVE_EOR3
++#include "libavutil/crc_internal.h"
++
++FF_VISIBILITY_PUSH_HIDDEN
++uint32_t ff_crc_neon_pmull(const AVCRC *ctx, uint32_t crc, const uint8_t *buffer,
++                           size_t length);
++uint32_t ff_crc_le_neon_pmull(const AVCRC *ctx, uint32_t crc, const uint8_t *buffer,
++                              size_t length);
++FF_VISIBILITY_POP_HIDDEN
++
++enum {
++    CRC_C    = 0,
++    PMULL_BE,
++    PMULL_LE,
++};
++
++static const AVCRC crc_table_pmull[AV_CRC_MAX][17] = {
++    [AV_CRC_8_ATM] = {
++        PMULL_BE,
++        0xbc000000, 0x0, 0x32000000, 0x0,
++        0x94000000, 0x0, 0xc4000000, 0x0,
++        0x62000000, 0x0, 0x79000000, 0x0,
++        0x07156a16, 0x1, 0x07000000, 0x1,
++    },
++    [AV_CRC_8_EBU] = {
++        PMULL_BE,
++        0xf3000000, 0x0, 0xb5000000, 0x0,
++        0x0d000000, 0x0, 0xfc000000, 0x0,
++        0x6a000000, 0x0, 0x65000000, 0x0,
++        0x1c4b8192, 0x1, 0x1d000000, 0x1,
++    },
++    [AV_CRC_16_ANSI] = {
++        PMULL_BE,
++        0x807d0000, 0x0, 0xf9e30000, 0x0,
++        0xff830000, 0x0, 0xf9130000, 0x0,
++        0x807b0000, 0x0, 0x86630000, 0x0,
++        0xfffbffe7, 0x1, 0x80050000, 0x1,
++    },
++    [AV_CRC_16_CCITT] = {
++        PMULL_BE,
++        0x59b00000, 0x0, 0x60190000, 0x0,
++        0x45630000, 0x0, 0xd5f60000, 0x0,
++        0xaa510000, 0x0, 0xeb230000, 0x0,
++        0x11303471, 0x1, 0x10210000, 0x1,
++    },
++    [AV_CRC_24_IEEE] = {
++        PMULL_BE,
++        0x467d2400, 0x0, 0x1f428700, 0x0,
++        0x64e4d700, 0x0, 0x2c8c9d00, 0x0,
++        0xd9fe8c00, 0x0, 0xfd7e0c00, 0x0,
++        0xf845fe24, 0x1, 0x864cfb00, 0x1,
++    },
++    [AV_CRC_32_IEEE] = {
++        PMULL_BE,
++        0xe6228b11, 0x0, 0x8833794c, 0x0,
++        0xe8a45605, 0x0, 0xc5b9cd4c, 0x0,
++        0x490d678d, 0x0, 0xf200aa66, 0x0,
++        0x04d101df, 0x1, 0x04c11db7, 0x1,
++    },
++    [AV_CRC_32_IEEE_LE] = {
++        PMULL_LE,
++        0x54442bd4, 0x1, 0xc6e41596, 0x1,
++        0x751997d0, 0x1, 0xccaa009e, 0x0,
++        0xccaa009e, 0x0, 0x63cd6124, 0x1,
++        0xf7011640, 0x1, 0xdb710641, 0x1,
++    },
++    [AV_CRC_16_ANSI_LE] = {
++        PMULL_LE,
++        0x1b0c2, 0x0, 0x0000bffa, 0x0,
++        0x1d0c2, 0x0, 0x00018cc2, 0x0,
++        0x00018cc2, 0x0, 0x1bc02, 0x0,
++        0xcfffbffe, 0x1, 0x14003, 0x0,
++    },
++};
++
++
++static inline void crc_init_aarch64(AVCRC *ctx, int le, int bits, uint32_t poly, int ctx_size)
++{
++    uint64_t poly_;
++    if (le) {
++        // convert the reversed representation to regular form
++        poly = reverse(poly, bits) >> 1;
++    }
++    // convert to 32 degree polynomial
++    poly_ = ((uint64_t)poly) << (32 - bits);
++
++    uint64_t div;
++    uint8_t *dst = (uint8_t*)(ctx + 1);
++    if (le) {
++        ctx[0] = PMULL_LE;
++        AV_WN64(dst +  0, xnmodp(4 * 128 + 32, poly_, 32, &div, le));
++        AV_WN64(dst +  8, xnmodp(4 * 128 - 32, poly_, 32, &div, le));
++        uint64_t tmp = xnmodp(128 - 32, poly_, 32, &div, le);
++        AV_WN64(dst + 16, xnmodp(128 + 32, poly_, 32, &div, le));
++        AV_WN64(dst + 24, tmp);
++        AV_WN64(dst + 32, tmp);
++        AV_WN64(dst + 40, xnmodp(64, poly_, 32, &div, le));
++        AV_WN64(dst + 48, div);
++        AV_WN64(dst + 56, reverse(poly_ | (1ULL << 32), 32));
++    } else {
++        ctx[0] = PMULL_BE;
++        AV_WN64(dst +  0, xnmodp(4 * 128, poly_, 32, &div, le));
++        AV_WN64(dst +  8, xnmodp(4 * 128 + 64, poly_, 32, &div, le));
++        AV_WN64(dst + 16, xnmodp(128, poly_, 32, &div, le));
++        AV_WN64(dst + 24, xnmodp(128 + 64, poly_, 32, &div, le));
++        AV_WN64(dst + 32, xnmodp(64, poly_, 32, &div, le));
++        AV_WN64(dst + 48, div);
++        AV_WN64(dst + 40, xnmodp(96, poly_, 32, &div, le));
++        AV_WN64(dst + 56, poly_ | (1ULL << 32));
++    }
++}
++#endif
++
++static inline av_cold int ff_crc_init_aarch64(AVCRC *ctx, int le, int bits, uint32_t poly, int ctx_size)
++{
++#if HAVE_PMULL && HAVE_EOR3
++    int cpu_flags = av_get_cpu_flags();
++
++    if (have_pmull(cpu_flags) && have_eor3(cpu_flags)) {
++        crc_init_aarch64(ctx, le, bits, poly, ctx_size);
++        return 1;
++    }
++#endif
++    return 0;
++}
+ 
+ static inline uint32_t ff_crc_aarch64(const AVCRC *ctx, uint32_t crc,
+                                       const uint8_t *buffer, size_t length)
+ {
++    switch (ctx[0]) {
++#if HAVE_PMULL && HAVE_EOR3
++    case PMULL_BE: return ff_crc_neon_pmull(ctx, crc, buffer, length);
++    case PMULL_LE: return ff_crc_le_neon_pmull(ctx, crc, buffer, length);
++#endif
+ #if HAVE_ARM_CRC
+-    av_assert2(ctx[0] == AV_CRC_32_IEEE_LE + 1);
+-    return ff_crc32_aarch64(ctx, crc, buffer, length);
+-#else
+-    av_unreachable("AARCH64 has only AV_CRC_32_IEEE_LE arch-specific CRC code");
+-    return 0;
++    case (AV_CRC_32_IEEE_LE + 1): return ff_crc32_aarch64(ctx, crc, buffer, length);
+ #endif
++    default: av_unreachable("AARCH64 has PMULL_LE, PMULL_BE and AV_CRC_32_IEEE_LE arch-specific CRC code");
++    }
++    return 0;
+ }
+ 
+ static inline const AVCRC *ff_crc_get_table_aarch64(AVCRCId crc_id)
+ {
++    int cpu_flags = av_get_cpu_flags();
++#if HAVE_PMULL && HAVE_EOR3
++    if (have_pmull(cpu_flags) && have_eor3(cpu_flags)) {
++        return crc_table_pmull[crc_id];
++    }
++#endif
+ #if HAVE_ARM_CRC
+     static const AVCRC crc32_ieee_le_ctx[] = {
+         AV_CRC_32_IEEE_LE + 1
+@@ -57,7 +196,6 @@ static inline const AVCRC *ff_crc_get_table_aarch64(AVCRCId crc_id)
+     if (crc_id != AV_CRC_32_IEEE_LE)
+         return NULL;
+ 
+-    int cpu_flags = av_get_cpu_flags();
+     if (have_arm_crc(cpu_flags)) {
+         return crc32_ieee_le_ctx;
+     }
+
+--- libs/ffmpeg/libavutil/aarch64/float_dsp_neon.S
++++ libs/ffmpeg/libavutil/aarch64/float_dsp_neon.S
+@@ -178,25 +178,58 @@ function ff_vector_fmul_reverse_neon, export=1
+ endfunc
+ 
+ function ff_butterflies_float_neon, export=1
+-1:      ld1             {v0.4s}, [x0]
++        subs            w2,  w2,  #8
++        b.lt            2f
++1:      ldp             q0,  q1,  [x0]
++        ldp             q2,  q3,  [x1]
++        subs            w2,  w2,  #8
++        fadd            v4.4s,   v0.4s,  v2.4s
++        fadd            v5.4s,   v1.4s,  v3.4s
++        fsub            v0.4s,   v0.4s,  v2.4s
++        fsub            v1.4s,   v1.4s,  v3.4s
++        st1             {v4.4s,  v5.4s}, [x0], #32
++        st1             {v0.4s,  v1.4s}, [x1], #32
++        b.ge            1b
++2:      tbz             w2,  #2,  3f
++        ld1             {v0.4s}, [x0]
+         ld1             {v1.4s}, [x1]
+-        subs            w2,  w2,  #4
+         fsub            v2.4s,   v0.4s,  v1.4s
+         fadd            v3.4s,   v0.4s,  v1.4s
+-        st1             {v2.4s}, [x1],   #16
+-        st1             {v3.4s}, [x0],   #16
+-        b.gt            1b
+-        ret
++        st1             {v2.4s}, [x1]
++        st1             {v3.4s}, [x0]
++3:      ret
+ endfunc
+ 
+ function ff_scalarproduct_float_neon, export=1
+-        movi            v2.4s,  #0
+-1:      ld1             {v0.4s}, [x0],   #16
+-        ld1             {v1.4s}, [x1],   #16
+-        subs            w2,      w2,     #4
+-        fmla            v2.4s,   v0.4s,  v1.4s
+-        b.gt            1b
+-        faddp           v0.4s,   v2.4s,  v2.4s
+-        faddp           s0,      v0.2s
++        // 16 elements per iteration; w3 = len / 16.
++        lsr             w3, w2, #4
++        movi            v2.4s, #0
++        movi            v3.4s, #0
++        movi            v4.4s, #0
++        movi            v5.4s, #0
++        cbz             w3, 2f
++1:      ld1             {v16.4s, v17.4s}, [x0], #32
++        ld1             {v20.4s, v21.4s}, [x1], #32
++        ld1             {v18.4s, v19.4s}, [x0], #32
++        ld1             {v22.4s, v23.4s}, [x1], #32
++        subs            w3, w3, #1
++        fmla            v2.4s, v16.4s, v20.4s
++        fmla            v3.4s, v17.4s, v21.4s
++        fmla            v4.4s, v18.4s, v22.4s
++        fmla            v5.4s, v19.4s, v23.4s
++        b.ne            1b
++2:      // len is a multiple of 4
++        and             w2, w2, #12
++        cbz             w2, 4f
++3:      ld1             {v0.4s}, [x0], #16
++        ld1             {v1.4s}, [x1], #16
++        subs            w2, w2, #4
++        fmla            v2.4s, v0.4s, v1.4s
++        b.ne            3b
++4:      fadd            v2.4s, v2.4s, v3.4s
++        fadd            v4.4s, v4.4s, v5.4s
++        fadd            v2.4s, v2.4s, v4.4s
++        faddp           v0.4s, v2.4s, v2.4s
++        faddp           s0, v0.2s
+         ret
+ endfunc
+
+--- libs/ffmpeg/libavutil/aarch64/tx_float_neon.S
++++ libs/ffmpeg/libavutil/aarch64/tx_float_neon.S
+@@ -917,6 +917,7 @@ FFT32_FN ns_float, 1
+ 
+ .macro SR_TRANSFORM_DEF len, next=0
+ \len:
++        AARCH64_SIGN_LINK_REGISTER
+         stp             x20, x30, [sp, #-16]!
+         mov             w20, #(\len/4)
+         mov             x5, #((\len*4) - (\len/1))
+@@ -926,6 +927,7 @@ FFT32_FN ns_float, 1
+         add             x1, x1, x5
+         bl              32b
+         ldp             x20, x30, [sp], #16
++        AARCH64_VALIDATE_LINK_REGISTER
+         ldr             w5, =(\len*6 + \len/2)
+         sub             x1, x1, x5
+ 
+@@ -1061,6 +1063,7 @@ function ff_tx_fft_sr_\name\()_neon, export=1
+         b.gt            128f
+         ret
+ 128:
++        AARCH64_SIGN_LINK_REGISTER
+         stp             x20, x30, [sp, #-16]!
+         mov             w20, #32
+         add             x1, x1, #16*32
+@@ -1068,6 +1071,7 @@ function ff_tx_fft_sr_\name\()_neon, export=1
+         add             x1, x1, #8*32
+         bl              32b
+         ldp             x20, x30, [sp], #16
++        AARCH64_VALIDATE_LINK_REGISTER
+         sub             x1, x1, #24*32
+ 
+         SETUP_SR_RECOMB 128, x7, x8, x9
+@@ -1081,6 +1085,7 @@ function ff_tx_fft_sr_\name\()_neon, export=1
+         b.gt            256f
+         ret
+ 256:
++        AARCH64_SIGN_LINK_REGISTER
+         stp             x20, x30, [sp, #-16]!
+         mov             w20, #64
+         add             x1, x1, #32*32
+@@ -1088,6 +1093,7 @@ function ff_tx_fft_sr_\name\()_neon, export=1
+         add             x1, x1, #16*32
+         bl              32b
+         ldp             x20, x30, [sp], #16
++        AARCH64_VALIDATE_LINK_REGISTER
+         sub             x1, x1, #48*32
+ 
+         SETUP_SR_RECOMB 256, x7, x8, x9
+@@ -1102,6 +1108,7 @@ function ff_tx_fft_sr_\name\()_neon, export=1
+         b.gt            512f
+         ret
+ 512:
++        AARCH64_SIGN_LINK_REGISTER
+         stp             x20, x30, [sp, #-16]!
+         mov             w20, #128
+         add             x1, x1, #64*32
+@@ -1109,6 +1116,7 @@ function ff_tx_fft_sr_\name\()_neon, export=1
+         add             x1, x1, #32*32
+         bl              32b
+         ldp             x20, x30, [sp], #16
++        AARCH64_VALIDATE_LINK_REGISTER
+         sub             x1, x1, #96*32
+ 
+         SETUP_SR_RECOMB 512, x7, x8, x9
+@@ -1128,6 +1136,7 @@ function ff_tx_fft_sr_\name\()_neon, export=1
+ 
+         ret
+ 1024:
++        AARCH64_SIGN_LINK_REGISTER
+         stp             x20, x30, [sp, #-16]!
+         mov             w20, #256
+         add             x1, x1, #96*32
+@@ -1135,6 +1144,7 @@ function ff_tx_fft_sr_\name\()_neon, export=1
+         add             x1, x1, #64*32
+         bl              32b
+         ldp             x20, x30, [sp], #16
++        AARCH64_VALIDATE_LINK_REGISTER
+         mov             x5, #192*32
+         sub             x1, x1, x5
+ 
+
+--- libs/ffmpeg/libavutil/arm/asm.S
++++ libs/ffmpeg/libavutil/arm/asm.S
+@@ -142,8 +142,8 @@ ELF     .size   \name, . - \name
+ 
+ #if !HAVE_ARMV6T2_EXTERNAL
+ .macro  movw    rd, val
+-        mov     \rd, \val &  255
+-        orr     \rd, \val & ~255
++        mov             \rd, \val &  255
++        orr             \rd, \val & ~255
+ .endm
+ #endif
+ 
+
+--- libs/ffmpeg/libavutil/x86/asm.h
++++ libs/ffmpeg/libavutil/x86/asm.h
+@@ -71,7 +71,7 @@ typedef int32_t x86_reg;
+ typedef int x86_reg;
+ #endif
+ 
+-#define HAVE_7REGS (ARCH_X86_64 || (HAVE_EBX_AVAILABLE && HAVE_EBP_AVAILABLE))
++#define HAVE_7REGS (ARCH_X86_64 || HAVE_X86_32_7REGS)
+ #define HAVE_6REGS (ARCH_X86_64 || (HAVE_EBX_AVAILABLE || HAVE_EBP_AVAILABLE))
+ 
+ #if ARCH_X86_64 && defined(PIC)
+
+--- libs/ffmpeg/libavutil/x86/crc.h
++++ libs/ffmpeg/libavutil/x86/crc.h
+@@ -28,10 +28,11 @@
+ #include "libavutil/cpu.h"
+ #include "libavutil/crc.h"
+ #include "libavutil/intreadwrite.h"
+-#include "libavutil/reverse.h"
+ #include "libavutil/x86/cpu.h"
+ 
+ #if HAVE_CLMUL_EXTERNAL
++#include "libavutil/crc_internal.h"
++
+ FF_VISIBILITY_PUSH_HIDDEN
+ uint32_t ff_crc_clmul(const AVCRC *ctx, uint32_t crc,
+                       const uint8_t *buffer, size_t length);
+@@ -104,47 +105,6 @@ static const AVCRC crc_table_clmul[AV_CRC_MAX][17] = {
+     },
+ };
+ 
+-static uint64_t reverse(uint64_t p, unsigned int deg)
+-{
+-    uint64_t ret = 0;
+-    int i;
+-    for (i = 0; i < (deg / 8); i += 1) {
+-        ret = (ret << 8) | (ff_reverse[p & 0xff]);
+-        p >>= 8;
+-    }
+-    int rem = (deg + 1) - 8 * i;
+-    ret = (ret << rem) | (ff_reverse[p & 0xff] >> (8 - rem));
+-    return ret;
+-}
+-
+-static uint64_t xnmodp(unsigned n, uint64_t poly, unsigned deg, uint64_t *div, int bitreverse)
+-{
+-    uint64_t mod, mask, high;
+-
+-    if (n < deg) {
+-        *div = 0;
+-        return poly;
+-    }
+-    mask = ((uint64_t)1 << deg) - 1;
+-    poly &= mask;
+-    mod = poly;
+-    *div = 1;
+-    deg--;
+-    while (--n > deg) {
+-        high = (mod >> deg) & 1;
+-        *div = (*div << 1) | high;
+-        mod <<= 1;
+-        if (high)
+-            mod ^= poly;
+-    }
+-    uint64_t ret = mod & mask;
+-    if (bitreverse) {
+-        *div = reverse(*div, deg) << 1;
+-        return reverse(ret, deg) << 1;
+-    }
+-    return ret;
+-}
+-
+ static inline void crc_init_x86(AVCRC *ctx, int le, int bits, uint32_t poly, int ctx_size)
+ {
+     uint64_t poly_;
+
+--- libs/ffmpeg/libavutil/x86/tx_float.asm
++++ libs/ffmpeg/libavutil/x86/tx_float.asm
+@@ -1874,6 +1874,8 @@ cglobal fft_pfa_15xM_float, 4, 14, 16, 320, ctx, out, in, stride, len, lut, buf,
+     mov lutq, [ctxq + AVTXContext.map]              ; load subtransform's map
+     movsxd lenq, dword [ctxq + AVTXContext.len]     ; load subtransform's length
+ 
++    vzeroupper
++
+ .dim2:
+     call tgt5q                                      ; call the FFT
+     lea inq,  [inq  + lenq*8]
+
+--- libs/ffmpeg/libavutil/x86/x86util.asm
++++ libs/ffmpeg/libavutil/x86/x86util.asm
+@@ -23,12 +23,19 @@
+ ;* Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ ;******************************************************************************
+ 
++;; config tweaks for Wine build
+ %pragma makedep header
+ 
++%define HAVE_X86_SSE2AVX 1
++
+ %define private_prefix ff
+ %define public_prefix  avpriv
+ %define cpuflags_mmxext cpuflags_mmx2
+ 
++%if HAVE_X86_SSE2AVX
++%define FORCE_VEX_ENCODING 1
++%endif
++
+ %include "libavutil/x86/x86inc.asm"
+ 
+ ; expands to [base],...,[base+7*stride]
+@@ -1024,3 +1031,15 @@
+     pxor  %1, %2
+ %endif
+ %endmacro
++
++; NASM panics when emitting CodeView debug info for an empty translation unit.
++; GNU binutils `strip` and some other tools such as older MSVC linker also fail
++; on such files. Emit a dummy byte in a section with IMAGE_SCN_LNK_REMOVE flag
++; to work around these issues. Sections like that are dropped by the linker.
++%ifidn __OUTPUT_FORMAT__,win64
++    section .x86util info
++        db 0
++%elifidn __OUTPUT_FORMAT__,win32
++    section .x86util info
++        db 0
++%endif
+
+--- libs/ffmpeg/libavutil/aes.c
++++ libs/ffmpeg/libavutil/aes.c
+@@ -123,7 +123,7 @@ static inline void mix(av_aes_block state[2], uint32_t multbl[][256], int s1, in
+     state[0].u32[3] = mix_core(multbl, src[3][0], src[s1 - 1][1], src[1][2], src[s3 - 1][3]);
+ }
+ 
+-static inline void aes_crypt(AVAES *a, int s, const uint8_t *sbox,
++static inline void aes_crypt(AVAES *a, int s, const uint8_t *sbox_arg,
+                          uint32_t multbl[][256])
+ {
+     int r;
+@@ -133,7 +133,7 @@ static inline void aes_crypt(AVAES *a, int s, const uint8_t *sbox,
+         addkey(&a->state[1], &a->state[0], &a->round_key[r]);
+     }
+ 
+-    subshift(&a->state[0], s, sbox);
++    subshift(&a->state[0], s, sbox_arg);
+ }
+ 
+ static void aes_encrypt(AVAES *a, uint8_t *dst, const uint8_t *src,
+@@ -176,12 +176,12 @@ void av_aes_crypt(AVAES *a, uint8_t *dst, const uint8_t *src,
+ 
+ static void init_multbl2(uint32_t tbl[][256], const int c[4],
+                          const uint8_t *log8, const uint8_t *alog8,
+-                         const uint8_t *sbox)
++                         const uint8_t *sbox_arg)
+ {
+     int i;
+ 
+     for (i = 0; i < 256; i++) {
+-        int x = sbox[i];
++        int x = sbox_arg[i];
+         if (x) {
+             int k, l, m, n;
+             x = log8[x];
+@@ -237,7 +237,7 @@ int av_aes_init(AVAES *a, const uint8_t *key, int key_bits, int decrypt)
+ 
+     a->rounds = rounds;
+     a->crypt = decrypt ? aes_decrypt : aes_encrypt;
+-#if ARCH_X86 && HAVE_X86ASM
++#if ARCH_X86 && HAVE_X86ASM && HAVE_AESNI_EXTERNAL
+     ff_init_aes_x86(a, decrypt);
+ #endif
+ 
+
+--- libs/ffmpeg/libavutil/ambient_viewing_environment.c
++++ libs/ffmpeg/libavutil/ambient_viewing_environment.c
+@@ -32,14 +32,15 @@ AVAmbientViewingEnvironment *av_ambient_viewing_environment_alloc(size_t *size)
+ {
+     AVAmbientViewingEnvironment *env =
+         av_mallocz(sizeof(AVAmbientViewingEnvironment));
++
++    if (size)
++        *size = env ? sizeof(*env) : 0;
++
+     if (!env)
+         return NULL;
+ 
+     get_defaults(env);
+ 
+-     if (size)
+-        *size = sizeof(*env);
+-
+     return env;
+ }
+ 
+
+--- libs/ffmpeg/libavutil/attributes.h
++++ libs/ffmpeg/libavutil/attributes.h
+@@ -59,6 +59,14 @@
+ #    define AV_HAS_STD_ATTRIBUTE(x) 0
+ #endif
+ 
++#if AV_HAS_STD_ATTRIBUTE(fallthrough)
++#    define av_fallthrough [[fallthrough]]
++#elif AV_HAS_ATTRIBUTE(fallthrough)
++#    define av_fallthrough __attribute__((fallthrough))
++#else
++#    define av_fallthrough do {} while(0)
++#endif
++
+ #ifndef av_always_inline
+ #if AV_GCC_VERSION_AT_LEAST(3,1) || defined(__clang__)
+ #    define av_always_inline __attribute__((always_inline)) inline
+@@ -111,7 +119,7 @@
+ #    define av_cold
+ #endif
+ 
+-#if AV_GCC_VERSION_AT_LEAST(4,1) && !defined(__llvm__)
++#if (AV_GCC_VERSION_AT_LEAST(4,1) && !defined(__clang__ )) || AV_HAS_ATTRIBUTE(flatten)
+ #    define av_flatten __attribute__((flatten))
+ #else
+ #    define av_flatten
+
+--- libs/ffmpeg/libavutil/avsscanf.c
++++ libs/ffmpeg/libavutil/avsscanf.c
+@@ -828,6 +828,7 @@ static int ff_vfscanf(FFFILE *f, const char *fmt, va_list ap)
+         switch (t) {
+             case 'c':
+                 if (width < 1) width = 1;
++                break;
+             case '[':
+                 break;
+             case 'n':
+
+--- libs/ffmpeg/libavutil/avutil.h
++++ libs/ffmpeg/libavutil/avutil.h
+@@ -313,30 +313,6 @@ static inline void *av_x_if_null(const void *p, const void *x)
+     return (void *)(intptr_t)(p ? p : x);
+ }
+ 
+-#if FF_API_OPT_INT_LIST
+-/**
+- * Compute the length of an integer list.
+- *
+- * @param elsize  size in bytes of each list element (only 1, 2, 4 or 8)
+- * @param term    list terminator (usually 0 or -1)
+- * @param list    pointer to the list
+- * @return  length of the list, in elements, not counting the terminator
+- */
+-attribute_deprecated
+-unsigned av_int_list_length_for_size(unsigned elsize,
+-                                     const void *list, uint64_t term) av_pure;
+-
+-/**
+- * Compute the length of an integer list.
+- *
+- * @param term  list terminator (usually 0 or -1)
+- * @param list  pointer to the list
+- * @return  length of the list, in elements, not counting the terminator
+- */
+-#define av_int_list_length(list, term) \
+-    av_int_list_length_for_size(sizeof(*(list)), list, term)
+-#endif
+-
+ /**
+  * Return the fractional representation of the internal time base.
+  */
+
+--- libs/ffmpeg/libavutil/channel_layout.c
++++ libs/ffmpeg/libavutil/channel_layout.c
+@@ -32,6 +32,7 @@
+ #include "bprint.h"
+ #include "common.h"
+ #include "error.h"
++#include "attributes.h"
+ #include "macros.h"
+ #include "mem.h"
+ #include "opt.h"
+@@ -271,7 +272,7 @@ static int parse_channel_list(AVChannelLayout *ch_layout, const char *str)
+ 
+     while (*str) {
+         char *channel, *chname;
+-        int ret = av_opt_get_key_value(&str, "@", "+", AV_OPT_FLAG_IMPLICIT_KEY, &channel, &chname);
++        ret = av_opt_get_key_value(&str, "@", "+", AV_OPT_FLAG_IMPLICIT_KEY, &channel, &chname);
+         if (ret < 0) {
+             av_freep(&map);
+             return ret;
+@@ -345,7 +346,7 @@ int av_channel_layout_from_string(AVChannelLayout *channel_layout,
+         channel_layout->nb_channels = (order + 1) * (order + 1);
+ 
+         if (*endptr) {
+-            int ret = av_channel_layout_from_string(&extra, endptr + 1);
++            ret = av_channel_layout_from_string(&extra, endptr + 1);
+             if (ret < 0)
+                 return ret;
+             if (extra.nb_channels >= INT_MAX - channel_layout->nb_channels) {
+@@ -608,7 +609,7 @@ int av_channel_layout_describe_bprint(const AVChannelLayout *channel_layout,
+                 av_bprintf(bp, "%s", channel_layout_map[i].name);
+                 return 0;
+             }
+-        // fall-through
++        av_fallthrough;
+     case AV_CHANNEL_ORDER_CUSTOM:
+         if (channel_layout->order == AV_CHANNEL_ORDER_CUSTOM) {
+             int64_t mask;
+@@ -639,7 +640,7 @@ int av_channel_layout_describe_bprint(const AVChannelLayout *channel_layout,
+             av_bprintf(bp, ")");
+             return 0;
+         }
+-        // fall-through
++        av_fallthrough;
+     case AV_CHANNEL_ORDER_UNSPEC:
+         av_bprintf(bp, "%d channels", channel_layout->nb_channels);
+         return 0;
+@@ -687,12 +688,13 @@ av_channel_layout_channel_from_index(const AVChannelLayout *channel_layout,
+             return AV_CHAN_AMBISONIC_BASE + idx;
+         idx -= ambi_channels;
+         }
+-    // fall-through
++        av_fallthrough;
+     case AV_CHANNEL_ORDER_NATIVE:
+         for (i = 0; i < 64; i++) {
+             if ((1ULL << i) & channel_layout->u.mask && !idx--)
+                 return i;
+         }
++        av_fallthrough;
+     default:
+         return AV_CHAN_NONE;
+     }
+@@ -768,7 +770,7 @@ int av_channel_layout_index_from_string(const AVChannelLayout *channel_layout,
+                 (ch == AV_CHAN_NONE || ch == channel_layout->u.map[i].id))
+                 return i;
+         }
+-        // fall-through
++        av_fallthrough;
+     case AV_CHANNEL_ORDER_AMBISONIC:
+     case AV_CHANNEL_ORDER_NATIVE:
+         ch = av_channel_from_string(str);
+@@ -953,10 +955,10 @@ int av_channel_layout_retype(AVChannelLayout *channel_layout, enum AVChannelOrde
+         if (channel_layout->order == AV_CHANNEL_ORDER_CUSTOM) {
+             int64_t mask;
+             int nb_channels = channel_layout->nb_channels;
+-            int order = av_channel_layout_ambisonic_order(channel_layout);
+-            if (order < 0)
++            int amb_order = av_channel_layout_ambisonic_order(channel_layout);
++            if (amb_order < 0)
+                 return AVERROR(ENOSYS);
+-            mask = masked_description(channel_layout, (order + 1) * (order + 1));
++            mask = masked_description(channel_layout, (amb_order + 1) * (amb_order + 1));
+             if (mask < 0)
+                 return AVERROR(ENOSYS);
+             lossy = has_channel_names(channel_layout);
+
+--- libs/ffmpeg/libavutil/common.h
++++ libs/ffmpeg/libavutil/common.h
+@@ -297,17 +297,6 @@ static av_always_inline av_const unsigned av_zero_extend_c(unsigned a, unsigned
+     return a & ((1U << p) - 1);
+ }
+ 
+-#if FF_API_MOD_UINTP2
+-#ifndef av_mod_uintp2
+-#   define av_mod_uintp2 av_mod_uintp2_c
+-#endif
+-attribute_deprecated
+-static av_always_inline av_const unsigned av_mod_uintp2_c(unsigned a, unsigned p)
+-{
+-    return av_zero_extend_c(a, p);
+-}
+-#endif
+-
+ /**
+  * Add two signed 32-bit values with saturation.
+  *
+
+--- libs/ffmpeg/libavutil/cpu.c
++++ libs/ffmpeg/libavutil/cpu.c
+@@ -190,8 +190,9 @@ int av_parse_cpu_caps(unsigned *flags, const char *s)
+         { "sme",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_CPU_FLAG_SME      },    .unit = "flags" },
+         { "crc",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_CPU_FLAG_ARM_CRC  },    .unit = "flags" },
+         { "sme_i16i64", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_CPU_FLAG_SME_I16I64 },    .unit = "flags" },
+-
+         { "sme2",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_CPU_FLAG_SME2     },    .unit = "flags" },
++        { "pmull",    NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_CPU_FLAG_PMULL    },    .unit = "flags" },
++        { "eor3",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_CPU_FLAG_EOR3     },    .unit = "flags" },
+ #elif ARCH_MIPS
+         { "mmi",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_CPU_FLAG_MMI      },    .unit = "flags" },
+         { "msa",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_CPU_FLAG_MSA      },    .unit = "flags" },
+
+--- libs/ffmpeg/libavutil/cpu.h
++++ libs/ffmpeg/libavutil/cpu.h
+@@ -82,6 +82,8 @@
+ #define AV_CPU_FLAG_SME2         (1 <<14)
+ #define AV_CPU_FLAG_SME_I16I64   (1 <<15)
+ #define AV_CPU_FLAG_SETEND       (1 <<16)
++#define AV_CPU_FLAG_PMULL        (1 <<17)
++#define AV_CPU_FLAG_EOR3         (1 <<18)
+ 
+ #define AV_CPU_FLAG_MMI          (1 << 0)
+ #define AV_CPU_FLAG_MSA          (1 << 1)
+@@ -92,18 +94,11 @@
+ 
+ // RISC-V extensions
+ #define AV_CPU_FLAG_RVI          (1 << 0) ///< I (full GPR bank)
+-#if FF_API_RISCV_FD_ZBA
+-#define AV_CPU_FLAG_RVF          (1 << 1) ///< F (single precision FP)
+-#define AV_CPU_FLAG_RVD          (1 << 2) ///< D (double precision FP)
+-#endif
+ #define AV_CPU_FLAG_RVV_I32      (1 << 3) ///< Vectors of 8/16/32-bit int's */
+ #define AV_CPU_FLAG_RVV_F32      (1 << 4) ///< Vectors of float's */
+ #define AV_CPU_FLAG_RVV_I64      (1 << 5) ///< Vectors of 64-bit int's */
+ #define AV_CPU_FLAG_RVV_F64      (1 << 6) ///< Vectors of double's
+ #define AV_CPU_FLAG_RVB_BASIC    (1 << 7) ///< Basic bit-manipulations
+-#if FF_API_RISCV_FD_ZBA
+-#define AV_CPU_FLAG_RVB_ADDR     (1 << 8) ///< Address bit-manipulations
+-#endif
+ #define AV_CPU_FLAG_RV_ZVBB      (1 << 9) ///< Vector basic bit-manipulations
+ #define AV_CPU_FLAG_RV_MISALIGNED (1 <<10) ///< Fast misaligned accesses
+ #define AV_CPU_FLAG_RVB          (1 <<11) ///< B (bit manipulations)
+
+--- libs/ffmpeg/libavutil/crc.c
++++ libs/ffmpeg/libavutil/crc.c
+@@ -357,6 +357,10 @@ int av_crc_init(AVCRC *ctx, int le, int bits, uint32_t poly, int ctx_size)
+     int done = ff_crc_init_x86(ctx, le, bits, poly, ctx_size);
+     if (done)
+         return 0;
++#elif ARCH_AARCH64
++    int done = ff_crc_init_aarch64(ctx, le, bits, poly, ctx_size);
++    if (done)
++        return 0;
+ #endif
+ 
+     for (i = 0; i < 256; i++) {
+
+--- libs/ffmpeg/libavutil/crc_internal.h
++++ libs/ffmpeg/libavutil/crc_internal.h
+@@ -0,0 +1,66 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVUTIL_CRC_INTERNAL_H
++#define AVUTIL_CRC_INTERNAL_H
++
++#include <stdint.h>
++#include "libavutil/reverse.h"
++
++static uint64_t reverse(uint64_t p, unsigned int deg)
++{
++    uint64_t ret = 0;
++    int i;
++    for (i = 0; i < (deg / 8); i += 1) {
++        ret = (ret << 8) | (ff_reverse[p & 0xff]);
++        p >>= 8;
++    }
++    int rem = (deg + 1) - 8 * i;
++    ret = (ret << rem) | (ff_reverse[p & 0xff] >> (8 - rem));
++    return ret;
++}
++
++static uint64_t xnmodp(unsigned n, uint64_t poly, unsigned deg, uint64_t *div, int bitreverse)
++{
++    uint64_t mod, mask, high;
++
++    if (n < deg) {
++        *div = 0;
++        return poly;
++    }
++    mask = ((uint64_t)1 << deg) - 1;
++    poly &= mask;
++    mod = poly;
++    *div = 1;
++    deg--;
++    while (--n > deg) {
++        high = (mod >> deg) & 1;
++        *div = (*div << 1) | high;
++        mod <<= 1;
++        if (high)
++            mod ^= poly;
++    }
++    uint64_t ret = mod & mask;
++    if (bitreverse) {
++        *div = reverse(*div, deg) << 1;
++        return reverse(ret, deg) << 1;
++    }
++    return ret;
++}
++
++#endif /* AVUTIL_CRC_INTERNAL_H */
+
+--- libs/ffmpeg/libavutil/dovi_meta.c
++++ libs/ffmpeg/libavutil/dovi_meta.c
+@@ -27,11 +27,9 @@ AVDOVIDecoderConfigurationRecord *av_dovi_alloc(size_t *size)
+ {
+     AVDOVIDecoderConfigurationRecord *dovi =
+         av_mallocz(sizeof(AVDOVIDecoderConfigurationRecord));
+-    if (!dovi)
+-        return NULL;
+ 
+-     if (size)
+-        *size = sizeof(*dovi);
++    if (size)
++        *size = dovi ? sizeof(*dovi) : 0;
+ 
+     return dovi;
+ }
+@@ -47,11 +45,12 @@ typedef struct AVDOVIMetadataInternal {
+ AVDOVIMetadata *av_dovi_metadata_alloc(size_t *size)
+ {
+     AVDOVIMetadataInternal *dovi = av_mallocz(sizeof(AVDOVIMetadataInternal));
+-    if (!dovi)
+-        return NULL;
+ 
+     if (size)
+-        *size = sizeof(*dovi);
++        *size = dovi ? sizeof(*dovi) : 0;
++
++    if (!dovi)
++        return NULL;
+ 
+     dovi->metadata = (struct AVDOVIMetadata) {
+         .header_offset      = offsetof(AVDOVIMetadataInternal, header),
+
+--- libs/ffmpeg/libavutil/emms.h
++++ libs/ffmpeg/libavutil/emms.h
+@@ -28,8 +28,6 @@
+ 
+ #if ARCH_X86
+ 
+-void avpriv_emms_asm(void);
+-
+ #if HAVE_MMX_INLINE
+ #ifndef __MMX__
+ #include "libavutil/cpu.h"
+@@ -80,7 +78,8 @@ static inline void ff_assert0_fpu(const char *file, int line_number)
+ #   include <mmintrin.h>
+ #   define emms_c _mm_empty
+ #elif HAVE_MMX_EXTERNAL
+-#   define emms_c avpriv_emms_asm
++void ff_emms_asm(void);
++#   define emms_c ff_emms_asm
+ #endif /* HAVE_MMX_INLINE */
+ 
+ #endif /* ARCH_X86 */
+
+--- libs/ffmpeg/libavutil/encryption_info.c
++++ libs/ffmpeg/libavutil/encryption_info.c
+@@ -181,6 +181,9 @@ AVEncryptionInitInfo *av_encryption_init_info_alloc(
+     AVEncryptionInitInfo *info;
+     uint32_t i;
+ 
++    if (num_key_ids && !key_id_size)
++        return NULL;
++
+     info = av_mallocz(sizeof(*info));
+     if (!info)
+         return NULL;
+
+--- libs/ffmpeg/libavutil/eval.c
++++ libs/ffmpeg/libavutil/eval.c
+@@ -201,8 +201,8 @@ static double eval_expr(Parser *p, AVExpr *e)
+         case e_func0:  return e->value * e->func0(eval_expr(p, e->param[0]));
+         case e_func1:  return e->value * e->func1(p->opaque, eval_expr(p, e->param[0]));
+         case e_func2:  return e->value * e->func2(p->opaque, eval_expr(p, e->param[0]), eval_expr(p, e->param[1]));
+-        case e_squish: return 1/(1+exp(4*eval_expr(p, e->param[0])));
+-        case e_gauss: { double d = eval_expr(p, e->param[0]); return exp(-d*d/2)/sqrt(2*M_PI); }
++        case e_squish: return e->value/(1+exp(4*eval_expr(p, e->param[0])));
++        case e_gauss: { double d = eval_expr(p, e->param[0]); return e->value * exp(-d*d/2)/sqrt(2*M_PI); }
+         case e_ld:     return e->value * p->var[av_clip(eval_expr(p, e->param[0]), 0, VARS-1)];
+         case e_isnan:  return e->value * !!isnan(eval_expr(p, e->param[0]));
+         case e_isinf:  return e->value * !!isinf(eval_expr(p, e->param[0]));
+@@ -233,13 +233,13 @@ static double eval_expr(Parser *p, AVExpr *e)
+             double v0 = eval_expr(p, e->param[0]);
+             double v1 = eval_expr(p, e->param[1]);
+             double f  = eval_expr(p, e->param[2]);
+-            return v0 + (v1 - v0) * f;
++            return e->value * (v0 + (v1 - v0) * f);
+         }
+         case e_print: {
+             double x = eval_expr(p, e->param[0]);
+             int level = e->param[1] ? av_clip(eval_expr(p, e->param[1]), INT_MIN, INT_MAX) : AV_LOG_INFO;
+             av_log(p, level, "%f\n", x);
+-            return x;
++            return e->value * x;
+         }
+ 
+ #define COMPUTE_NEXT_RANDOM()                                        \
+
+--- libs/ffmpeg/libavutil/film_grain_params.c
++++ libs/ffmpeg/libavutil/film_grain_params.c
+@@ -25,7 +25,7 @@ AVFilmGrainParams *av_film_grain_params_alloc(size_t *size)
+     AVFilmGrainParams *params = av_mallocz(sizeof(AVFilmGrainParams));
+ 
+     if (size)
+-        *size = sizeof(*params);
++        *size = params ? sizeof(*params) : 0;
+ 
+     return params;
+ }
+
+--- libs/ffmpeg/libavutil/frame.h
++++ libs/ffmpeg/libavutil/frame.h
+@@ -256,10 +256,49 @@ enum AVFrameSideDataType {
+     AV_FRAME_DATA_3D_REFERENCE_DISPLAYS,
+ 
+     /**
+-     * Extensible image file format metadata. The payload is a buffer containing
+-     * EXIF metadata, starting with either 49 49 2a 00, or 4d 4d 00 2a.
++     * Exchangeable image file format metadata. The payload is a buffer containing
++     * EXIF metadata, starting with either 49 49 2a 00, or 4d 4d 00 2a. These four
++     * bytes signify the endianness, and occur as the first part of the TIFF header.
+      */
+-     AV_FRAME_DATA_EXIF,
++    AV_FRAME_DATA_EXIF,
++
++    /**
++     * HDR dynamic metadata associated with a video frame. The payload is
++     * an AVDynamicHDRSmpte2094App5 type and contains information for color
++     * volume transform as specified in the SMPTE 2094-50 standard.
++     */
++    AV_FRAME_DATA_DYNAMIC_HDR_SMPTE_2094_APP5,
++
++    /**
++     * IAMF Mix Gain Parameter Data associated with the audio frame. This metadata
++     * is in the form of the AVIAMFParamDefinition struct and contains information
++     * defined in sections 3.6.1 and 3.8.1 of the Immersive Audio Model and
++     * Formats standard.
++     */
++    AV_FRAME_DATA_IAMF_MIX_GAIN_PARAM,
++
++    /**
++    * IAMF Demixing Info Parameter Data associated with the audio frame. This
++    * metadata is in the form of the AVIAMFParamDefinition struct and contains
++    * information defined in sections 3.6.1 and 3.8.2 of the Immersive Audio Model
++    * and Formats standard.
++    */
++    AV_FRAME_DATA_IAMF_DEMIXING_INFO_PARAM,
++
++    /**
++    * IAMF Recon Gain Info Parameter Data associated with the audio frame. This
++    * metadata is in the form of the AVIAMFParamDefinition struct and contains
++    * information defined in sections 3.6.1 and 3.8.3 of the Immersive Audio Model
++    * and Formats standard.
++    */
++    AV_FRAME_DATA_IAMF_RECON_GAIN_INFO_PARAM,
++
++    /**
++     * Color information from a RAW camera codecs, needed to correctly process
++     * the video data. The payload is an AVRawColorParams struct defined in
++     * libavutil/raw_color_params.h.
++     */
++    AV_FRAME_DATA_RAW_COLOR_PARAMS,
+ };
+ 
+ enum AVActiveFormatDescription {
+
+--- libs/ffmpeg/libavutil/hdr_dynamic_metadata.c
++++ libs/ffmpeg/libavutil/hdr_dynamic_metadata.c
+@@ -36,11 +36,9 @@ static const int32_t saturation_weight_den = 8;
+ AVDynamicHDRPlus *av_dynamic_hdr_plus_alloc(size_t *size)
+ {
+     AVDynamicHDRPlus *hdr_plus = av_mallocz(sizeof(AVDynamicHDRPlus));
+-    if (!hdr_plus)
+-        return NULL;
+ 
+     if (size)
+-        *size = sizeof(*hdr_plus);
++        *size = hdr_plus ? sizeof(*hdr_plus) : 0;
+ 
+     return hdr_plus;
+ }
+@@ -395,3 +393,314 @@ int av_dynamic_hdr_plus_to_t35(const AVDynamicHDRPlus *s, uint8_t **data, size_t
+         *size = size_bytes;
+     return 0;
+ }
++
++AVDynamicHDRSmpte2094App5 *av_dynamic_hdr_smpte2094_app5_alloc(size_t *size)
++{
++    AVDynamicHDRSmpte2094App5 *smpte2094_app5 = av_mallocz(sizeof(AVDynamicHDRSmpte2094App5));
++
++    if (size)
++        *size = smpte2094_app5 ? sizeof(*smpte2094_app5) : 0;
++
++    return smpte2094_app5;
++}
++
++AVDynamicHDRSmpte2094App5 *av_dynamic_hdr_smpte2094_app5_create_side_data(AVFrame *frame)
++{
++    AVFrameSideData *side_data = av_frame_new_side_data(frame,
++                                                        AV_FRAME_DATA_DYNAMIC_HDR_SMPTE_2094_APP5,
++                                                        sizeof(AVDynamicHDRSmpte2094App5));
++    if (!side_data)
++        return NULL;
++
++    memset(side_data->data, 0, sizeof(AVDynamicHDRSmpte2094App5));
++
++    return (AVDynamicHDRSmpte2094App5 *)side_data->data;
++}
++
++#define GET_BITS_OR_FAIL(var, n)        \
++    do {                                \
++        if (get_bits_left(gb) < n) {    \
++            ret = AVERROR_INVALIDDATA;  \
++            goto end;                   \
++        }                               \
++        var = get_bits(gb, n);          \
++    } while (0)
++
++int av_dynamic_hdr_smpte2094_app5_from_t35(AVDynamicHDRSmpte2094App5 *s, const uint8_t *data,
++                                           size_t size)
++{
++    GetBitContext gbc, *gb = &gbc;
++    int ret, reserved_zero;
++    size_t padded_size = size + AV_INPUT_BUFFER_PADDING_SIZE;
++
++    if (!s)
++        return AVERROR(EINVAL);
++
++    uint8_t *padded_data = av_mallocz(padded_size);
++    if (!padded_data)
++        return AVERROR(ENOMEM);
++
++    memcpy(padded_data, data, size);
++    ret = init_get_bits8(gb, padded_data, size);
++    if (ret < 0)
++        goto end;
++
++    // Table C.1
++    GET_BITS_OR_FAIL(s->application_version, 3);
++    GET_BITS_OR_FAIL(s->minimum_application_version, 3);
++    GET_BITS_OR_FAIL(reserved_zero, 2);
++    if (reserved_zero) {
++        ret = AVERROR_INVALIDDATA;
++        goto end;
++    }
++
++    // Table C.2
++    GET_BITS_OR_FAIL(s->has_custom_hdr_reference_white_flag, 1);
++    GET_BITS_OR_FAIL(s->has_adaptive_tone_map_flag, 1);
++    GET_BITS_OR_FAIL(reserved_zero, 6);
++    if (reserved_zero) {
++        ret = AVERROR_INVALIDDATA;
++        goto end;
++    }
++    if (s->has_custom_hdr_reference_white_flag)
++        GET_BITS_OR_FAIL(s->hdr_reference_white, 16);
++    if (!s->has_adaptive_tone_map_flag) {
++        ret = 0;
++        goto end;
++    }
++
++    // Table C.3
++    GET_BITS_OR_FAIL(s->baseline_hdr_headroom, 16);
++    GET_BITS_OR_FAIL(s->use_reference_white_tone_mapping_flag, 1);
++    if (s->use_reference_white_tone_mapping_flag) {
++        GET_BITS_OR_FAIL(reserved_zero, 7);
++        ret = reserved_zero ? AVERROR_INVALIDDATA : 0;
++        goto end;
++    }
++    GET_BITS_OR_FAIL(s->num_alternate_images, 3);
++    if (s->num_alternate_images > 4) {
++        ret = AVERROR_INVALIDDATA;
++        goto end;
++    }
++    GET_BITS_OR_FAIL(s->gain_application_space_chromaticities_flag, 2);
++    GET_BITS_OR_FAIL(s->has_common_component_mix_params_flag, 1);
++    GET_BITS_OR_FAIL(s->has_common_curve_params_flag, 1);
++    if (s->gain_application_space_chromaticities_flag == 3)
++        for (int r = 0; r < 8; r++)
++            GET_BITS_OR_FAIL(s->gain_application_space_chromaticities[r], 16);
++
++    for (int a = 0; a < s->num_alternate_images; a++) {
++        GET_BITS_OR_FAIL(s->alternate_hdr_headrooms[a], 16);
++
++        // Table C.4
++        if (!a || !s->has_common_component_mix_params_flag) {
++            GET_BITS_OR_FAIL(s->component_mixing_type[a], 2);
++            if (s->component_mixing_type[a] != 3) {
++                GET_BITS_OR_FAIL(reserved_zero, 6);
++                if (reserved_zero) {
++                    ret = AVERROR_INVALIDDATA;
++                    goto end;
++                }
++            } else {
++                for (int k = 0; k < 6; k++)
++                    GET_BITS_OR_FAIL(s->has_component_mixing_coefficient_flag[a][k], 1);
++                for (int k = 0; k < 6; k++) {
++                    if (s->has_component_mixing_coefficient_flag[a][k]) {
++                        GET_BITS_OR_FAIL(s->component_mixing_coefficient[a][k], 16);
++                    } else {
++                        s->component_mixing_coefficient[a][k] = 0;
++                    }
++                }
++            }
++        } else {
++            s->component_mixing_type[a] = s->component_mixing_type[0];
++            if (s->component_mixing_type[a] == 3) {
++                for (int k = 0; k < 6; k++) {
++                    s->has_component_mixing_coefficient_flag[a][k] =
++                            s->has_component_mixing_coefficient_flag[0][k];
++                    s->component_mixing_coefficient[a][k] = s->component_mixing_coefficient[0][k];
++                }
++            }
++        }
++
++        // Table C.5
++        if (!a || !s->has_common_curve_params_flag) {
++            GET_BITS_OR_FAIL(s->gain_curve_num_control_points_minus_1[a], 5);
++            if (s->gain_curve_num_control_points_minus_1[a] > 31) {
++                ret = AVERROR_INVALIDDATA;
++                goto end;
++            }
++            GET_BITS_OR_FAIL(s->gain_curve_use_pchip_slope_flag[a], 1);
++            GET_BITS_OR_FAIL(reserved_zero, 2);
++            if (reserved_zero) {
++                ret = AVERROR_INVALIDDATA;
++                goto end;
++            }
++            for (int c = 0; c <= s->gain_curve_num_control_points_minus_1[a]; c++) {
++                GET_BITS_OR_FAIL(s->gain_curve_control_points_x[a][c], 16);
++            }
++        } else {
++            s->gain_curve_num_control_points_minus_1[a] =
++                    s->gain_curve_num_control_points_minus_1[0];
++            s->gain_curve_use_pchip_slope_flag[a] = s->gain_curve_use_pchip_slope_flag[0];
++            for (int c = 0; c <= s->gain_curve_num_control_points_minus_1[a]; c++) {
++                s->gain_curve_control_points_x[a][c] = s->gain_curve_control_points_x[0][c];
++            }
++        }
++        for (int c = 0; c <= s->gain_curve_num_control_points_minus_1[a]; c++)
++            GET_BITS_OR_FAIL(s->gain_curve_control_points_y[a][c], 16);
++        if (!s->gain_curve_use_pchip_slope_flag[a]) {
++            for (int c = 0; c <= s->gain_curve_num_control_points_minus_1[a]; c++)
++                GET_BITS_OR_FAIL(s->gain_curve_control_points_theta[a][c], 16);
++        }
++    }
++    ret = 0;
++end:
++    av_free(padded_data);
++    return ret;
++}
++
++int av_dynamic_hdr_smpte2094_app5_to_t35(const AVDynamicHDRSmpte2094App5 *s, uint8_t **data,
++                                         size_t *size)
++{
++    uint8_t *buf;
++    size_t size_bytes, size_bits;
++    PutBitContext pbc, *pb = &pbc;
++
++    if (!s)
++        return AVERROR(EINVAL);
++    if ((!data || *data) && !size)
++       return AVERROR(EINVAL);
++
++    if (s->application_version >= 8 || s->minimum_application_version >= 3)
++        return AVERROR_INVALIDDATA;
++    size_bits = 0;
++    size_bits += 3 + 3 + 2;
++    size_bits += 1 + 1 + 6;
++    if (s->has_custom_hdr_reference_white_flag)
++        size_bits += 16;
++    if (s->has_adaptive_tone_map_flag) {
++        size_bits += 16 + 1;
++        if (s->use_reference_white_tone_mapping_flag) {
++            size_bits += 7;
++        } else {
++            size_bits += 3 + 2 + 1 + 1;
++            if (s->gain_application_space_chromaticities_flag == 3)
++                size_bits += 16 * 8;
++            if (s->num_alternate_images > 4)
++                return AVERROR_INVALIDDATA;
++            for (int a = 0; a < s->num_alternate_images; a++) {
++                size_bits += 16;
++                if (!a || !s->has_common_component_mix_params_flag) {
++                    size_bits += 2;
++                    if (s->component_mixing_type[a] != 3) {
++                        size_bits += 6;
++                    } else {
++                        size_bits += 6;
++                        for (int k = 0; k < 6; k++)
++                          if (s->has_component_mixing_coefficient_flag[a][k])
++                            size_bits += 16;
++                    }
++                }
++                if (!a || !s->has_common_curve_params_flag) {
++                    size_bits += 5 + 1 + 2;
++                    if (s->gain_curve_num_control_points_minus_1[a] > 31)
++                        return AVERROR_INVALIDDATA;
++                    size_bits += 16 * (s->gain_curve_num_control_points_minus_1[a] + 1);
++                }
++                size_bits += 16 * (s->gain_curve_num_control_points_minus_1[a] + 1);
++                if (!s->gain_curve_use_pchip_slope_flag[a])
++                    size_bits += 16 * (s->gain_curve_num_control_points_minus_1[a] + 1);
++            }
++        }
++    }
++    if (size_bits % 8)
++      return AVERROR_INVALIDDATA;
++    size_bytes = size_bits >> 3;
++
++    if (!data) {
++        *size = size_bytes;
++        return 0;
++    } else if (*data) {
++        if (*size < size_bytes)
++            return AVERROR_BUFFER_TOO_SMALL;
++        buf = *data;
++    } else {
++        buf = av_malloc(size_bytes);
++        if (!buf)
++            return AVERROR(ENOMEM);
++    }
++
++    init_put_bits(pb, buf, size_bytes);
++
++    // Table C.1
++    put_bits(pb, 3, s->application_version);
++    put_bits(pb, 3, s->minimum_application_version);
++    put_bits(pb, 2, 0); // reserved_zero
++
++    // Table C.2
++    put_bits(pb, 1, s->has_custom_hdr_reference_white_flag);
++    put_bits(pb, 1, s->has_adaptive_tone_map_flag);
++    put_bits(pb, 6, 0); // reserved_zero
++
++    if (s->has_custom_hdr_reference_white_flag)
++        put_bits(pb, 16, s->hdr_reference_white);
++
++    if (s->has_adaptive_tone_map_flag) {
++        // Table C.3
++        put_bits(pb, 16, s->baseline_hdr_headroom);
++        put_bits(pb, 1, s->use_reference_white_tone_mapping_flag);
++        if (s->use_reference_white_tone_mapping_flag) {
++            put_bits(pb, 7, 0); // reserved_zero
++        } else {
++            put_bits(pb, 3, s->num_alternate_images);
++            put_bits(pb, 2, s->gain_application_space_chromaticities_flag);
++            put_bits(pb, 1, s->has_common_component_mix_params_flag);
++            put_bits(pb, 1, s->has_common_curve_params_flag);
++
++            if (s->gain_application_space_chromaticities_flag == 3)
++                for (int r = 0; r < 8; r++)
++                    put_bits(pb, 16, s->gain_application_space_chromaticities[r]);
++
++            for (int a = 0; a < s->num_alternate_images; a++) {
++                put_bits(pb, 16, s->alternate_hdr_headrooms[a]);
++
++                // Table C.4
++                if (!a || !s->has_common_component_mix_params_flag) {
++                    put_bits(pb, 2, s->component_mixing_type[a]);
++                    if (s->component_mixing_type[a] != 3) {
++                        put_bits(pb, 6, 0); // reserved_zero
++                    } else {
++                        for (int k = 0; k < 6; k++)
++                            put_bits(pb, 1, s->has_component_mixing_coefficient_flag[a][k]);
++                        for (int k = 0; k < 6; k++)
++                            if (s->has_component_mixing_coefficient_flag[a][k])
++                                put_bits(pb, 16, s->component_mixing_coefficient[a][k]);
++                    }
++                }
++
++                // Table C.5
++                if (!a || !s->has_common_curve_params_flag) {
++                    put_bits(pb, 5, s->gain_curve_num_control_points_minus_1[a]);
++                    put_bits(pb, 1, s->gain_curve_use_pchip_slope_flag[a]);
++                    put_bits(pb, 2, 0); // reserved_zero
++                    for (int c = 0; c <= s->gain_curve_num_control_points_minus_1[a]; c++)
++                        put_bits(pb, 16, s->gain_curve_control_points_x[a][c]);
++                }
++                for (int c = 0; c <= s->gain_curve_num_control_points_minus_1[a]; c++)
++                    put_bits(pb, 16, s->gain_curve_control_points_y[a][c]);
++                if (!s->gain_curve_use_pchip_slope_flag[a]) {
++                    for (int c = 0; c <= s->gain_curve_num_control_points_minus_1[a]; c++)
++                        put_bits(pb, 16, s->gain_curve_control_points_theta[a][c]);
++                }
++            }
++        }
++    }
++
++    flush_put_bits(pb);
++
++    *data = buf;
++    if (size)
++        *size = size_bytes;
++    return 0;
++}
+
+--- libs/ffmpeg/libavutil/hdr_dynamic_metadata.h
++++ libs/ffmpeg/libavutil/hdr_dynamic_metadata.h
+
+--- libs/ffmpeg/libavutil/hdr_dynamic_vivid_metadata.c
++++ libs/ffmpeg/libavutil/hdr_dynamic_vivid_metadata.c
+
+--- libs/ffmpeg/libavutil/int128.h
++++ libs/ffmpeg/libavutil/int128.h
+
+--- libs/ffmpeg/libavutil/internal.h
++++ libs/ffmpeg/libavutil/internal.h
+
+--- libs/ffmpeg/libavutil/mastering_display_metadata.c
++++ libs/ffmpeg/libavutil/mastering_display_metadata.c
+
+--- libs/ffmpeg/libavutil/opt.c
++++ libs/ffmpeg/libavutil/opt.c
+
+--- libs/ffmpeg/libavutil/opt.h
++++ libs/ffmpeg/libavutil/opt.h
+
+--- libs/ffmpeg/libavutil/pixdesc.c
++++ libs/ffmpeg/libavutil/pixdesc.c
+
+--- libs/ffmpeg/libavutil/pixelutils.c
++++ libs/ffmpeg/libavutil/pixelutils.c
+
+--- libs/ffmpeg/libavutil/rational.c
++++ libs/ffmpeg/libavutil/rational.c
+
+--- libs/ffmpeg/libavutil/raw_color_params.c
++++ libs/ffmpeg/libavutil/raw_color_params.c
+
+--- libs/ffmpeg/libavutil/raw_color_params.h
++++ libs/ffmpeg/libavutil/raw_color_params.h
+
+--- libs/ffmpeg/libavutil/side_data.c
++++ libs/ffmpeg/libavutil/side_data.c
+
+--- libs/ffmpeg/libavutil/slicethread.c
++++ libs/ffmpeg/libavutil/slicethread.c
+
+--- libs/ffmpeg/libavutil/spherical.c
++++ libs/ffmpeg/libavutil/spherical.c
+
+--- libs/ffmpeg/libavutil/stereo3d.c
++++ libs/ffmpeg/libavutil/stereo3d.c
+
+--- libs/ffmpeg/libavutil/utils.c
++++ libs/ffmpeg/libavutil/utils.c
+
+--- libs/ffmpeg/libavutil/version.h
++++ libs/ffmpeg/libavutil/version.h
+
+--- libs/ffmpeg/libavutil/xga_font_data.c
++++ libs/ffmpeg/libavutil/xga_font_data.c
+
+--- libs/ffmpeg/libavutil/xga_font_data.h
++++ libs/ffmpeg/libavutil/xga_font_data.h
+
+--- libs/ffmpeg/libswresample/aarch64/audio_convert_neon.S
++++ libs/ffmpeg/libswresample/aarch64/audio_convert_neon.S
+
+--- libs/ffmpeg/libswresample/arm/resample.S
++++ libs/ffmpeg/libswresample/arm/resample.S
+
+--- libs/ffmpeg/libswresample/arm64ec/audio_convert_neon.S
++++ libs/ffmpeg/libswresample/arm64ec/audio_convert_neon.S
+
+--- libs/ffmpeg/libswresample/x86/audio_convert.asm
++++ libs/ffmpeg/libswresample/x86/audio_convert.asm
+
+--- libs/ffmpeg/libswresample/x86/rematrix.asm
++++ libs/ffmpeg/libswresample/x86/rematrix.asm
+
+--- libs/ffmpeg/libswresample/x86/resample.asm
++++ libs/ffmpeg/libswresample/x86/resample.asm
+
+--- libs/ffmpeg/libswresample/version.h
++++ libs/ffmpeg/libswresample/version.h
+
+--- libs/ffmpeg/libswresample/version_major.h
++++ libs/ffmpeg/libswresample/version_major.h
+
+--- libs/ffmpeg/libswscale/aarch64/ops.c
++++ libs/ffmpeg/libswscale/aarch64/ops.c
+
+--- libs/ffmpeg/libswscale/aarch64/ops_asmgen.c
++++ libs/ffmpeg/libswscale/aarch64/ops_asmgen.c
+
+--- libs/ffmpeg/libswscale/aarch64/ops_entries.c
++++ libs/ffmpeg/libswscale/aarch64/ops_entries.c
+
+--- libs/ffmpeg/libswscale/aarch64/ops_impl.c
++++ libs/ffmpeg/libswscale/aarch64/ops_impl.c
+
+--- libs/ffmpeg/libswscale/aarch64/ops_impl.h
++++ libs/ffmpeg/libswscale/aarch64/ops_impl.h
+
+--- libs/ffmpeg/libswscale/aarch64/ops_impl_conv.c
++++ libs/ffmpeg/libswscale/aarch64/ops_impl_conv.c
+
+--- libs/ffmpeg/libswscale/aarch64/ops_lookup.h
++++ libs/ffmpeg/libswscale/aarch64/ops_lookup.h
+
+--- libs/ffmpeg/libswscale/aarch64/rasm.c
++++ libs/ffmpeg/libswscale/aarch64/rasm.c
+
+--- libs/ffmpeg/libswscale/aarch64/rasm.h
++++ libs/ffmpeg/libswscale/aarch64/rasm.h
+
+--- libs/ffmpeg/libswscale/aarch64/rasm_print.c
++++ libs/ffmpeg/libswscale/aarch64/rasm_print.c
+
+--- libs/ffmpeg/libswscale/aarch64/rgb2rgb_neon.S
++++ libs/ffmpeg/libswscale/aarch64/rgb2rgb_neon.S
+
+--- libs/ffmpeg/libswscale/aarch64/swscale_unscaled.c
++++ libs/ffmpeg/libswscale/aarch64/swscale_unscaled.c
+
+--- libs/ffmpeg/libswscale/aarch64/yuv2rgb_neon.S
++++ libs/ffmpeg/libswscale/aarch64/yuv2rgb_neon.S
+
+--- libs/ffmpeg/libswscale/arm/hscale.S
++++ libs/ffmpeg/libswscale/arm/hscale.S
+
+--- libs/ffmpeg/libswscale/arm/output.S
++++ libs/ffmpeg/libswscale/arm/output.S
+
+--- libs/ffmpeg/libswscale/arm/yuv2rgb_neon.S
++++ libs/ffmpeg/libswscale/arm/yuv2rgb_neon.S
+
+--- libs/ffmpeg/libswscale/arm64ec/rgb2rgb_neon.S
++++ libs/ffmpeg/libswscale/arm64ec/rgb2rgb_neon.S
+
+--- libs/ffmpeg/libswscale/arm64ec/swscale_unscaled.c
++++ libs/ffmpeg/libswscale/arm64ec/swscale_unscaled.c
+
+--- libs/ffmpeg/libswscale/x86/hscale_fast_bilinear_simd.c
++++ libs/ffmpeg/libswscale/x86/hscale_fast_bilinear_simd.c
+
+--- libs/ffmpeg/libswscale/x86/ops.c
++++ libs/ffmpeg/libswscale/x86/ops.c
+
+--- libs/ffmpeg/libswscale/x86/ops_common.asm
++++ libs/ffmpeg/libswscale/x86/ops_common.asm
+
+--- libs/ffmpeg/libswscale/x86/ops_float.asm
++++ libs/ffmpeg/libswscale/x86/ops_float.asm
+
+--- libs/ffmpeg/libswscale/x86/ops_include.asm
++++ libs/ffmpeg/libswscale/x86/ops_include.asm
+
+--- libs/ffmpeg/libswscale/x86/ops_int.asm
++++ libs/ffmpeg/libswscale/x86/ops_int.asm
+
+--- libs/ffmpeg/libswscale/x86/output.asm
++++ libs/ffmpeg/libswscale/x86/output.asm
+
+--- libs/ffmpeg/libswscale/x86/rgb_2_rgb.asm
++++ libs/ffmpeg/libswscale/x86/rgb_2_rgb.asm
+
+--- libs/ffmpeg/libswscale/x86/scale.asm
++++ libs/ffmpeg/libswscale/x86/scale.asm
+
+--- libs/ffmpeg/libswscale/x86/swscale.c
++++ libs/ffmpeg/libswscale/x86/swscale.c
+
+--- libs/ffmpeg/libswscale/x86/swscale_template.c
++++ libs/ffmpeg/libswscale/x86/swscale_template.c
+
+--- libs/ffmpeg/libswscale/x86/uops_macros.asm.h
++++ libs/ffmpeg/libswscale/x86/uops_macros.asm.h
+
+--- libs/ffmpeg/libswscale/x86/yuv2rgb.c
++++ libs/ffmpeg/libswscale/x86/yuv2rgb.c
+
+--- libs/ffmpeg/libswscale/x86/yuv2yuvX.asm
++++ libs/ffmpeg/libswscale/x86/yuv2yuvX.asm
+
+--- libs/ffmpeg/libswscale/cms.c
++++ libs/ffmpeg/libswscale/cms.c
+
+--- libs/ffmpeg/libswscale/filters.c
++++ libs/ffmpeg/libswscale/filters.c
+
+--- libs/ffmpeg/libswscale/filters.h
++++ libs/ffmpeg/libswscale/filters.h
+
+--- libs/ffmpeg/libswscale/format.c
++++ libs/ffmpeg/libswscale/format.c
+
+--- libs/ffmpeg/libswscale/format.h
++++ libs/ffmpeg/libswscale/format.h
+
+--- libs/ffmpeg/libswscale/graph.c
++++ libs/ffmpeg/libswscale/graph.c
+
+--- libs/ffmpeg/libswscale/graph.h
++++ libs/ffmpeg/libswscale/graph.h
+
+--- libs/ffmpeg/libswscale/hscale_fast_bilinear.c
++++ libs/ffmpeg/libswscale/hscale_fast_bilinear.c
+
+--- libs/ffmpeg/libswscale/input.c
++++ libs/ffmpeg/libswscale/input.c
+
+--- libs/ffmpeg/libswscale/lut3d.c
++++ libs/ffmpeg/libswscale/lut3d.c
+
+--- libs/ffmpeg/libswscale/lut3d.h
++++ libs/ffmpeg/libswscale/lut3d.h
+
+--- libs/ffmpeg/libswscale/ops.c
++++ libs/ffmpeg/libswscale/ops.c
+
+--- libs/ffmpeg/libswscale/ops.h
++++ libs/ffmpeg/libswscale/ops.h
+
+--- libs/ffmpeg/libswscale/ops_backend.c
++++ libs/ffmpeg/libswscale/ops_backend.c
+
+--- libs/ffmpeg/libswscale/ops_chain.c
++++ libs/ffmpeg/libswscale/ops_chain.c
+
+--- libs/ffmpeg/libswscale/ops_chain.h
++++ libs/ffmpeg/libswscale/ops_chain.h
+
+--- libs/ffmpeg/libswscale/ops_dispatch.c
++++ libs/ffmpeg/libswscale/ops_dispatch.c
+
+--- libs/ffmpeg/libswscale/ops_dispatch.h
++++ libs/ffmpeg/libswscale/ops_dispatch.h
+
+--- libs/ffmpeg/libswscale/ops_internal.h
++++ libs/ffmpeg/libswscale/ops_internal.h
+
+--- libs/ffmpeg/libswscale/ops_memcpy.c
++++ libs/ffmpeg/libswscale/ops_memcpy.c
+
+--- libs/ffmpeg/libswscale/ops_optimizer.c
++++ libs/ffmpeg/libswscale/ops_optimizer.c
+
+--- libs/ffmpeg/libswscale/ops_tmpl_common.c
++++ libs/ffmpeg/libswscale/ops_tmpl_common.c
+
+--- libs/ffmpeg/libswscale/ops_tmpl_float.c
++++ libs/ffmpeg/libswscale/ops_tmpl_float.c
+
+--- libs/ffmpeg/libswscale/ops_tmpl_int.c
++++ libs/ffmpeg/libswscale/ops_tmpl_int.c
+
+--- libs/ffmpeg/libswscale/options.c
++++ libs/ffmpeg/libswscale/options.c
+
+--- libs/ffmpeg/libswscale/output.c
++++ libs/ffmpeg/libswscale/output.c
+
+--- libs/ffmpeg/libswscale/rational64.c
++++ libs/ffmpeg/libswscale/rational64.c
+
+--- libs/ffmpeg/libswscale/rational64.h
++++ libs/ffmpeg/libswscale/rational64.h
+
+--- libs/ffmpeg/libswscale/rgb2rgb_template.c
++++ libs/ffmpeg/libswscale/rgb2rgb_template.c
+
+--- libs/ffmpeg/libswscale/swscale.c
++++ libs/ffmpeg/libswscale/swscale.c
+
+--- libs/ffmpeg/libswscale/swscale.h
++++ libs/ffmpeg/libswscale/swscale.h
+
+--- libs/ffmpeg/libswscale/swscale_internal.h
++++ libs/ffmpeg/libswscale/swscale_internal.h
+
+--- libs/ffmpeg/libswscale/swscale_unscaled.c
++++ libs/ffmpeg/libswscale/swscale_unscaled.c
+
+--- libs/ffmpeg/libswscale/uops.c
++++ libs/ffmpeg/libswscale/uops.c
+
+--- libs/ffmpeg/libswscale/uops.h
++++ libs/ffmpeg/libswscale/uops.h
+
+--- libs/ffmpeg/libswscale/uops_backend.c
++++ libs/ffmpeg/libswscale/uops_backend.c
+
+--- libs/ffmpeg/libswscale/uops_macros.h
++++ libs/ffmpeg/libswscale/uops_macros.h
+
+--- libs/ffmpeg/libswscale/uops_tmpl.c
++++ libs/ffmpeg/libswscale/uops_tmpl.c
+
+--- libs/ffmpeg/libswscale/ops_backend.h
++++ libs/ffmpeg/libswscale/uops_tmpl.h
+
+--- libs/ffmpeg/libswscale/utils.c
++++ libs/ffmpeg/libswscale/utils.c
+
+--- libs/ffmpeg/libswscale/version.h
++++ libs/ffmpeg/libswscale/version.h
+
+--- libs/ffmpeg/libswscale/version_major.h
++++ libs/ffmpeg/libswscale/version_major.h
+
+--- libs/ffmpeg/libswscale/yuv2rgb.c
++++ libs/ffmpeg/libswscale/yuv2rgb.c
+
+--- libs/ffmpeg/Makefile.in
++++ libs/ffmpeg/Makefile.in
+
+--- libs/ffmpeg/VERSION
++++ libs/ffmpeg/VERSION
+
+--- libs/ffmpeg/config.h
++++ libs/ffmpeg/config.h
+
+--- libs/ffmpeg/config_components.h
++++ libs/ffmpeg/config_components.h
+
+--- tools/makedep.c
++++ tools/makedep.c
+

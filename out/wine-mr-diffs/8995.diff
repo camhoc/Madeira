@@ -1,0 +1,179 @@
+# ntdll/kernelbase: Add accurate node count feature to prevent memory access violations initializing multiple physical nodes as a single logical one on multi-node systems
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/8995 state=closed
+# A much cleaner result (written by hand) that we can reuse where needed later (_i.e._ `GetNumaProcessorNode` which also crashes with [a similar MAV](https://gist.github.com/wasertech/f894ce8d6250e72a01a861c0e4eb6064) on multi-node systems). 
+
+Took me a while to understand where I should put everything, not even sure I got it right. Let me know. 
+
+I thought I was going to need `FileNumaNodeInformation` but turns out it's not really needed. I can remove it if you want.
+
+This is what I see when I try to get a node count read:
+```log
+0024:fixme:ntdll:init_numa_info node affinity; using node 0.
+GetNumaHighestNodeNumber: 1
+```
+
+I only see this fixme if I try to access `FILE_NUMA_NODE_INFORMATION`. I would really prefer such a behavior for our compatibility layer on any multi-node system.
+
+A big thanks to @besentv and @zfigura for their invaluable feedback on this.
+--- dlls/kernel32/tests/process.c
++++ dlls/kernel32/tests/process.c
+@@ -79,6 +79,7 @@ static BOOL   (WINAPI *pQueryInformationJobObject)(HANDLE job, JOBOBJECTINFOCLAS
+ static BOOL   (WINAPI *pSetInformationJobObject)(HANDLE job, JOBOBJECTINFOCLASS class, LPVOID info, DWORD len);
+ static HANDLE (WINAPI *pCreateIoCompletionPort)(HANDLE file, HANDLE existing_port, ULONG_PTR key, DWORD threads);
+ static BOOL   (WINAPI *pGetNumaProcessorNode)(UCHAR, PUCHAR);
++static BOOL   (WINAPI *pGetNumaHighestNodeNumber)(PULONG);
+ static NTSTATUS (WINAPI *pNtQueryInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+ static NTSTATUS (WINAPI *pNtQueryInformationThread)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
+ static NTSTATUS (WINAPI *pNtQuerySystemInformationEx)(SYSTEM_INFORMATION_CLASS, void*, ULONG, void*, ULONG, ULONG*);
+@@ -269,6 +270,7 @@ static BOOL init(void)
+     pSetInformationJobObject = (void *)GetProcAddress(hkernel32, "SetInformationJobObject");
+     pCreateIoCompletionPort = (void *)GetProcAddress(hkernel32, "CreateIoCompletionPort");
+     pGetNumaProcessorNode = (void *)GetProcAddress(hkernel32, "GetNumaProcessorNode");
++    pGetNumaHighestNodeNumber = (void *)GetProcAddress(hkernel32, "GetNumaHighestNodeNumber");
+     pWTSGetActiveConsoleSessionId = (void *)GetProcAddress(hkernel32, "WTSGetActiveConsoleSessionId");
+     pCreateToolhelp32Snapshot = (void *)GetProcAddress(hkernel32, "CreateToolhelp32Snapshot");
+     pProcess32First = (void *)GetProcAddress(hkernel32, "Process32First");
+@@ -4087,6 +4089,24 @@ static void test_GetNumaProcessorNode(void)
+     }
+ }
+ 
++static void test_GetNumaHighestNodeNumber(void)
++{
++    BOOL could_find_nodes;
++    ULONG node_count;
++
++    if (!pGetNumaHighestNodeNumber)
++    {
++        win_skip("GetNumaHighestNodeNumber is missing\n");
++        return;
++    }
++
++    node_count = 0xFF;
++    could_find_nodes = pGetNumaHighestNodeNumber(&node_count);
++    ok(could_find_nodes, "GetNumaHighestNodeNumber returned %d\n", could_find_nodes);
++    ok(node_count <= 64 && node_count != 0xFF,
++       "GetNumaHighestNodeNumber returned invalid node %lu\n", node_count);
++}
++
+ static void test_session_info(void)
+ {
+     DWORD session_id, active_session;
+@@ -5697,6 +5717,7 @@ START_TEST(process)
+     test_services_exe();
+     test_startupinfo();
+     test_GetProcessInformation();
++    test_GetNumaHighestNodeNumber();
+ 
+     /* things that can be tested:
+      *  lookup:         check the way program to be executed is searched
+
+--- dlls/kernelbase/memory.c
++++ dlls/kernelbase/memory.c
+@@ -1582,8 +1582,17 @@ BOOL WINAPI SetProcessDefaultCpuSets(HANDLE process, const ULONG *cpu_set_ids, U
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH GetNumaHighestNodeNumber( ULONG *node )
+ {
+-    FIXME( "semi-stub: %p\n", node );
+-    *node = 0;
++    FILE_NUMA_NODE_INFORMATION ni;
++
++    if (!node) { SetLastError( ERROR_INVALID_PARAMETER ); return FALSE; }
++
++    if (
++        !set_ntstatus( NtQuerySystemInformationEx( SystemNumaProcessorMap,
++            NULL, 0, &ni, sizeof(ni), NULL ))
++        )
++        return FALSE;
++
++    *node = ni.HighestNodeNumber;
+     return TRUE;
+ }
+ 
+
+--- dlls/ntdll/unix/file.c
++++ dlls/ntdll/unix/file.c
+@@ -4583,7 +4583,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
+         0,                                             /* FileIdGlobalTxDirectoryInformation */
+         0,                                             /* FileIsRemoteDeviceInformation */
+         0,                                             /* FileAttributeCacheInformation */
+-        0,                                             /* FileNumaNodeInformation */
++        sizeof(FILE_NUMA_NODE_INFORMATION),            /* FileNumaNodeInformation */
+         0,                                             /* FileStandardLinkInformation */
+         0,                                             /* FileRemoteProtocolInformation */
+         0,                                             /* FileRenameInformationBypassAccessCheck */
+
+--- dlls/ntdll/unix/system.c
++++ dlls/ntdll/unix/system.c
+@@ -1404,6 +1404,37 @@ static void init_logical_proc_info(void)
+     init_tsc_frequency();
+ }
+ 
++NTSTATUS init_numa_info(FILE_NUMA_NODE_INFORMATION *info)
++{
++    unsigned int i;
++
++    if (!info) { return STATUS_INVALID_PARAMETER; }
++    if (pthread_once(&logical_proc_init_once, init_logical_proc_info) != STATUS_SUCCESS) 
++        { return STATUS_UNSUCCESSFUL; }
++    
++    info->HighestNodeNumber = 0;
++    info->NodeNumber = 0;
++    info->Reserved = 0;
++
++    if (logical_proc_info_len > STATUS_SUCCESS && !logical_proc_info)
++        { return STATUS_UNSUCCESSFUL; }
++
++    for (i = 0; i < logical_proc_info_len; ++i)
++    {
++        if (logical_proc_info[i].Relationship == RelationNumaNode)
++        {
++            if (logical_proc_info[i].NumaNode.NodeNumber > info->HighestNodeNumber)
++                info->HighestNodeNumber = logical_proc_info[i].NumaNode.NodeNumber;
++        }
++    }
++
++    info->NodeNumber = 0;
++    if (info->HighestNodeNumber > info->NodeNumber)
++        { FIXME( "node affinity; using only node %u.\n", info->NodeNumber ); }
++    
++    return STATUS_SUCCESS;
++}
++
+ /******************************************************************
+  *		init_cpu_info
+  *
+@@ -3885,6 +3916,17 @@ NTSTATUS WINAPI NtQuerySystemInformationEx( SYSTEM_INFORMATION_CLASS class,
+         break;
+     }
+ 
++    case SystemNumaProcessorMap:
++    {
++        FILE_NUMA_NODE_INFORMATION *numa_info = info;
++
++        len = sizeof(FILE_NUMA_NODE_INFORMATION);
++        if (size < len) { ret = STATUS_BUFFER_TOO_SMALL; break; }
++        if (!info) { ret = STATUS_ACCESS_VIOLATION; break; }
++        ret = init_numa_info(numa_info);
++        break;
++    }
++
+     default:
+         FIXME( "(0x%08x,%p,%u,%p,%u,%p) stub\n", class, query, query_len, info, size, ret_size );
+         break;
+
+--- include/winternl.h
++++ include/winternl.h
+@@ -1790,6 +1790,12 @@ typedef struct _FILE_STAT_INFORMATION {
+     ULONG EffectiveAccess;
+ } FILE_STAT_INFORMATION, *PFILE_STAT_INFORMATION;
+ 
++typedef struct _FILE_NUMA_NODE_INFORMATION {
++    ULONG HighestNodeNumber;
++    ULONG NodeNumber;
++    ULONG Reserved;
++} FILE_NUMA_NODE_INFORMATION, *PFILE_NUMA_NODE_INFORMATION;
++
+ typedef struct _FILE_IO_COMPLETION_NOTIFICATION_INFORMATION {
+     ULONG Flags;
+ } FILE_IO_COMPLETION_NOTIFICATION_INFORMATION, *PFILE_IO_COMPLETION_NOTIFICATION_INFORMATION;
+

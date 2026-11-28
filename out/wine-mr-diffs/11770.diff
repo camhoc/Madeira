@@ -1,0 +1,144 @@
+# ntdll: Make RtlCopySid() return NTSTATUS instead of BOOLEAN.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11770 state=closed
+# Windows documents RtlCopySid() as returning NTSTATUS, with
+STATUS_SUCCESS (0) on success. Wine's implementation returns BOOLEAN,
+with TRUE (1) on success and FALSE (0) on failure -- the opposite
+truthiness of the documented contract. A caller written against the
+real API and checking the result the normal NTSTATUS way (NT_SUCCESS()
+or a bare "if (!status)") reads Wine's success as a failure.
+
+Change the return type to NTSTATUS, and the two failure paths to
+STATUS_INVALID_PARAMETER / STATUS_BUFFER_TOO_SMALL. Of the five
+in-tree callers, four (in sec.c itself) already ignore the return
+value; the fifth, kernelbase's CopySid(), forwards it directly to its
+own BOOL-returning caller and is updated with set_ntstatus() to keep
+that contract intact, matching the pattern already used for the other
+Rtl*Sid wrappers in that file.
+--- dlls/advapi32/tests/security.c
++++ dlls/advapi32/tests/security.c
+@@ -188,6 +188,28 @@ static void test_group_equal(HANDLE Handle, PSID expected, int line)
+     free(queriedSD);
+ }
+ 
++static void test_CopySid(void)
++{
++    SID_IDENTIFIER_AUTHORITY nt_auth = { SECURITY_NT_AUTHORITY };
++    char src_buffer[SECURITY_MAX_SID_SIZE], dst_buffer[SECURITY_MAX_SID_SIZE];
++    PSID src = (PSID)src_buffer, dst = (PSID)dst_buffer;
++    BOOL ret;
++
++    ret = InitializeSid(src, &nt_auth, 1);
++    ok(ret, "InitializeSid failed with error %ld\n", GetLastError());
++    *GetSidSubAuthority(src, 0) = SECURITY_LOCAL_SYSTEM_RID;
++
++    SetLastError(0xdeadbeef);
++    ret = CopySid(GetLengthSid(src), dst, src);
++    ok(ret, "CopySid failed with error %ld\n", GetLastError());
++    ok(EqualSid(src, dst), "SIDs are not equal %s != %s\n", debugstr_sid(src), debugstr_sid(dst));
++
++    SetLastError(0xdeadbeef);
++    ret = CopySid(GetLengthSid(src) - 1, dst, src);
++    ok(!ret, "CopySid succeeded\n");
++    ok(GetLastError() == ERROR_INSUFFICIENT_BUFFER, "got error %ld\n", GetLastError());
++}
++
+ static void test_ConvertStringSidToSid(void)
+ {
+     struct sidRef refs[] = {
+@@ -8743,6 +8765,7 @@ START_TEST(security)
+         return;
+     }
+     test_kernel_objects_security();
++    test_CopySid();
+     test_ConvertStringSidToSid();
+     test_trustee();
+     test_allocateLuid();
+
+--- dlls/kernelbase/security.c
++++ dlls/kernelbase/security.c
+@@ -228,7 +228,7 @@ BOOL WINAPI AllocateLocallyUniqueId( PLUID luid )
+  */
+ BOOL WINAPI CopySid( DWORD len, PSID dest, PSID source )
+ {
+-    return RtlCopySid( len, dest, source );
++    return set_ntstatus( RtlCopySid( len, dest, source ));
+ }
+ 
+ /******************************************************************************
+
+--- dlls/ntdll/tests/rtl.c
++++ dlls/ntdll/tests/rtl.c
+@@ -3788,6 +3788,25 @@ static void test_RtlInitializeSid(void)
+     ok(status == STATUS_INVALID_PARAMETER, "Unexpected status %#lx.\n", status);
+ }
+ 
++static void test_RtlCopySid(void)
++{
++    SID_IDENTIFIER_AUTHORITY sid_ident = { SECURITY_NT_AUTHORITY };
++    char src_buffer[SECURITY_MAX_SID_SIZE], dst_buffer[SECURITY_MAX_SID_SIZE];
++    PSID src = (PSID)&src_buffer, dst = (PSID)&dst_buffer;
++    NTSTATUS status;
++
++    status = RtlInitializeSid(src, &sid_ident, 1);
++    ok(!status, "Unexpected status %#lx.\n", status);
++    *RtlSubAuthoritySid(src, 0) = SECURITY_LOCAL_SYSTEM_RID;
++
++    status = RtlCopySid(RtlLengthSid(src), dst, src);
++    ok(!status, "Unexpected status %#lx.\n", status);
++    ok(!memcmp(src, dst, RtlLengthSid(src)), "Copied SID doesn't match.\n");
++
++    status = RtlCopySid(RtlLengthSid(src) - 1, dst, src);
++    ok(status == STATUS_BUFFER_TOO_SMALL, "Unexpected status %#lx.\n", status);
++}
++
+ static void test_RtlValidSecurityDescriptor(void)
+ {
+     SECURITY_DESCRIPTOR *sd;
+@@ -5589,6 +5608,7 @@ START_TEST(rtl)
+     test_RtlCreateHeap();
+     test_RtlFirstFreeAce();
+     test_RtlInitializeSid();
++    test_RtlCopySid();
+     test_RtlValidSecurityDescriptor();
+     test_RtlFindExportedRoutineByName();
+     test_RtlGetDeviceFamilyInfoEnum();
+
+--- dlls/ntdll/sec.c
++++ dlls/ntdll/sec.c
+@@ -383,17 +383,16 @@ LPBYTE WINAPI RtlSubAuthorityCountSid(PSID pSid)
+ /**************************************************************************
+  *                 RtlCopySid				[NTDLL.@]
+  */
+-BOOLEAN WINAPI RtlCopySid( DWORD nDestinationSidLength, PSID pDestinationSid, PSID pSourceSid )
++NTSTATUS WINAPI RtlCopySid( DWORD nDestinationSidLength, PSID pDestinationSid, PSID pSourceSid )
+ {
+-	if (!pSourceSid || !RtlValidSid(pSourceSid) ||
+-	    (nDestinationSidLength < RtlLengthSid(pSourceSid)))
+-          return FALSE;
++	if (!pSourceSid || !RtlValidSid(pSourceSid)) return STATUS_INVALID_PARAMETER;
+ 
+-	if (nDestinationSidLength < (((SID*)pSourceSid)->SubAuthorityCount*4+8))
+-	  return FALSE;
++	if (nDestinationSidLength < RtlLengthSid(pSourceSid) ||
++	    nDestinationSidLength < (((SID*)pSourceSid)->SubAuthorityCount*4+8))
++	  return STATUS_BUFFER_TOO_SMALL;
+ 
+ 	memmove(pDestinationSid, pSourceSid, ((SID*)pSourceSid)->SubAuthorityCount*4+8);
+-	return TRUE;
++	return STATUS_SUCCESS;
+ }
+ /******************************************************************************
+  * RtlValidSid [NTDLL.@]
+
+--- include/winternl.h
++++ include/winternl.h
+@@ -5084,7 +5084,7 @@ NTSYSAPI NTSTATUS  WINAPI RtlCopyExtendedContext(CONTEXT_EX*,ULONG,CONTEXT_EX*);
+ NTSYSAPI void      WINAPI RtlCopyLuid(PLUID,const LUID*);
+ NTSYSAPI void      WINAPI RtlCopyLuidAndAttributesArray(ULONG,const LUID_AND_ATTRIBUTES*,PLUID_AND_ATTRIBUTES);
+ NTSYSAPI NTSTATUS  WINAPI RtlCopySecurityDescriptor(PSECURITY_DESCRIPTOR,PSECURITY_DESCRIPTOR);
+-NTSYSAPI BOOLEAN   WINAPI RtlCopySid(DWORD,PSID,PSID);
++NTSYSAPI NTSTATUS  WINAPI RtlCopySid(DWORD,PSID,PSID);
+ NTSYSAPI void      WINAPI RtlCopyUnicodeString(UNICODE_STRING*,const UNICODE_STRING*);
+ NTSYSAPI NTSTATUS  WINAPI RtlCreateAcl(PACL,DWORD,DWORD);
+ NTSYSAPI NTSTATUS  WINAPI RtlCreateActivationContext(struct _ACTIVATION_CONTEXT **,const void*);
+

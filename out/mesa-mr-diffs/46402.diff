@@ -1,0 +1,46 @@
+# kk: Lower fpow to exp2(log2(a) * b)
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46402 state=opened
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+kk: Lower fpow to exp2(log2(a) * b)
+
+Shaders that preserve inf and NaN get pow as Metal's precise::pow, which is several times slower than precise::exp2 and precise::log2. Vulkan defines the precision of pow as inherited from exp2(y * log2(x)), so set lower_fpow and let NIR emit that form.
+
+Special values follow the lowered expression: pow(0, 0), pow(inf, 0), pow(NaN, 0), pow(1, inf) and pow(x, y) with x < 0 return NaN. These are outside pow's defined domain or covered by the inherited precision.
+
+In Enshrouded (through Wine), average frame rate goes from 30.3 to 32.2 FPS (+6.3% over three paired runs) and the 1% low improves by about 20%.
+
+Testing (Apple M5 Pro, macOS 27.2): dEQP-VK glsl.builtin.precision.pow (fp32 and fp16) passes, and there are no regressions on a 4,496 case shader math list and a 79,312 case list against main.
+```
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -530,6 +530,8 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
+       alu_funclike_precise(ctx, instr, "fmod");
+       break;
+    case nir_op_fpow:
++      /* lower_fpow removes fpow in nir_opt_algebraic; this only handles an
++       * fpow created after the last algebraic pass. */
+       alu_funclike_precise(ctx, instr, "pow");
+       break;
+    case nir_op_fround_even:
+
+--- src/kosmickrisp/compiler/nir_to_msl.h
++++ src/kosmickrisp/compiler/nir_to_msl.h
+@@ -109,6 +109,13 @@ static const nir_shader_compiler_options kk_nir_options = {
+    .lower_insert_word = true,
+    .lower_insert_byte = true,
+    .lower_fmod = true,
++   /* Metal's precise::pow is several times slower than precise::exp2 and
++    * precise::log2. Vulkan defines the precision of pow as inherited from
++    * exp2(y * log2(x)), so lower it to that. Special values follow the same
++    * expression, so pow(0, 0), pow(inf, 0), pow(NaN, 0), pow(1, inf) and
++    * pow(x, y) with x < 0 return NaN.
++    */
++   .lower_fpow = true,
+    .discard_is_demote = true,
+    .lower_device_index_to_zero = true,
+    .lower_pack_64_2x32_split = true,
+

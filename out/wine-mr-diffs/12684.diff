@@ -1,0 +1,99 @@
+# winemac: Handle keyboard auto repeats on the server side.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12684 state=merged
+# This gets rid of an old workaround for a mismatch between macOS and Windows behavior (the `allowKeyRepeats` state) and also now correctly synthesizes system key repeats that Cocoa does not generate.
+--- dlls/winemac.drv/cocoa_window.h
++++ dlls/winemac.drv/cocoa_window.h
+@@ -74,8 +74,6 @@ @interface WineWindow : NSPanel <NSWindowDelegate>
+ 
+     NSTimeInterval lastDockIconSnapshot;
+ 
+-    BOOL allowKeyRepeats;
+-
+     BOOL ignore_windowDeminiaturize;
+     BOOL ignore_windowResize;
+     BOOL fakingClose;
+
+--- dlls/winemac.drv/cocoa_window.m
++++ dlls/winemac.drv/cocoa_window.m
+@@ -174,6 +174,24 @@ static inline NSUInteger adjusted_modifiers_for_settings(NSUInteger modifiers)
+     return new_modifiers;
+ }
+ 
++static void update_key_repeat(void)
++{
++    static NSTimeInterval last_delay = -1, last_interval = -1;
++    NSTimeInterval delay = [NSEvent keyRepeatDelay];
++    NSTimeInterval interval = [NSEvent keyRepeatInterval];
++    int spi_delay, spi_speed;
++
++    if (delay == last_delay && interval == last_interval) return;
++    last_delay = delay;
++    last_interval = interval;
++    spi_delay = MIN(3, MAX(0, delay * 4 - 0.5));
++    spi_speed = MIN(31, MAX(0, 0.4 / interval - 0.5));
++
++    NtUserSystemParametersInfo(SPI_SETKEYBOARDDELAY, spi_delay, NULL, 0);
++    NtUserSystemParametersInfo(SPI_SETKEYBOARDSPEED, spi_speed, NULL, 0);
++    NtUserCallOneParam(delay > 0, NtUserCallOneParam_SetKeyboardAutoRepeat);
++}
++
+ static inline BOOL stage_manager_enabled(void)
+ {
+     /* There is no documented way to determine if Stage Manager is enabled,
+@@ -1959,6 +1977,8 @@ - (void) postKey:(uint16_t)keyCode
+         CGEventRef cgevent;
+         WineApplicationController* controller = [WineApplicationController sharedController];
+ 
++        if (pressed) update_key_repeat();
++
+         event = macdrv_create_event(pressed ? KEY_PRESS : KEY_RELEASE, self);
+         event->key.keycode   = keyCode;
+         event->key.modifiers = modifiers;
+@@ -2533,15 +2553,8 @@ - (void) setMask:(CGRect)rect
+      */
+     - (void) keyDown:(NSEvent *)theEvent
+     {
+-        if ([theEvent isARepeat])
+-        {
+-            if (!allowKeyRepeats)
+-                return;
+-        }
+-        else
+-            allowKeyRepeats = YES;
+-
+-        [self postKeyEvent:theEvent];
++        if (![theEvent isARepeat])
++            [self postKeyEvent:theEvent];
+     }
+ 
+     - (void) flagsChanged:(NSEvent *)theEvent
+@@ -2579,9 +2592,6 @@ - (void) flagsChanged:(NSEvent *)theEvent
+             {
+                 BOOL pressed = (modifierFlags & modifiers[i].mask) != 0;
+ 
+-                if (pressed)
+-                    allowKeyRepeats = NO;
+-
+                 if (i == last_changed)
+                     lastModifierFlags = modifierFlags;
+                 else
+
+--- server/queue.c
++++ server/queue.c
+@@ -198,6 +198,7 @@ static unsigned int cursor_history_latest;
+ 
+ static void queue_hardware_message( struct desktop *desktop, struct message *msg, int always_queue );
+ static void free_message( struct message *msg );
++static void stop_key_repeat( struct desktop *desktop );
+ 
+ /* set the caret window in a given thread input, requires write lock on the thread input shared member */
+ static void set_caret_window( struct thread_input *input, input_shm_t *shared, user_handle_t win )
+@@ -654,6 +655,7 @@ static void set_foreground_input( struct desktop *desktop, struct process *proce
+     old_input_shm = desktop->foreground_input ? desktop->foreground_input->shared : &dummy_obj.shm.input;
+ 
+     set_clip_rectangle( desktop, NULL, SET_CURSOR_NOCLIP, 1 );
++    stop_key_repeat( desktop );
+     desktop->foreground_input = input;
+     desktop->foreground_pid = process->id;
+ 
+

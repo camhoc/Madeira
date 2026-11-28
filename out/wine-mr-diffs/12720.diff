@@ -1,0 +1,723 @@
+# Fix C++ interface code from dcomp.idl and dwrite*.idl.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12720 state=closed
+# This MR tackles several issues for C++ generated code when handling
+dcomp.idl and dwrite\_*.idl (mostly dwrite_3.idl).
+
+Note: native SDK doesn't use .idl files for these interfaces, but
+interface definition directly embedded in C/C++ through dedicated
+extension.
+AFAICT, gcc/g++ doesn't support it.
+
+The issues mainly cope with some interface requires overloaded
+method declarations that standard IDL doesn't support.
+
+I opted for extending widl to support these, and left other
+solutions aside:
+- adding interface (in the MS way) support to gcc/g++/mingw,
+- replacing the Wine .idl files with properly generated .h
+  files; either done by hand (I don't feel like it), or
+  get the help of a tool to do it (adapting widl comes to
+  mind).
+
+List of issues addressed by this MR:
+1/ as regular .idl doesn't support overloaded methods in interfaces,
+   and as C wouldn't support the unique name of overloaded methods
+   in various places (struct fields, macros definitions, functions...),
+   current Wine .idl is written with adding suffixes to overloaded methods
+   to generate unique names
+   => the generated C++ interface (struct with pure virtual) uses the
+      suffixed methods names, breaking callers using the expected overloaded
+      method name.
+
+2/ if interface A inherits from interface B, and both A and B define a method
+   of same name 'f', yet with different signature, default C++ inheritance
+   rules don't let B::f be visible directly from A. It has to be explicitely
+   introduced into A scope.
+   [native SDK has explicit 'using B::f;' in the interface definition;
+    Wine .idl doesn't]
+   => the B::f method is not callable from A (compilation error)
+
+3/ vtable layout. MS compiler doesn't always layout the vtable entries
+   in the order where the virtual methods have been declared in C++ struct/class.
+   Basically, all overloaded methods of name XX are grouped together at the
+   declaration index of the first one, yet with reversing their order of declaration.
+   [as of to
+--- include/dcomp.idl
++++ include/dcomp.idl
+
+--- include/dwrite_3.idl
++++ include/dwrite_3.idl
+@@ -372,37 +372,40 @@ interface IDWriteFontSet : IUnknown
+         [out] UINT32 *index,
+         [out] BOOL *exists
+     );
+-    HRESULT GetPropertyValues__(
++    HRESULT GetPropertyValues(
++        [in] UINT32 index,
+         [in] DWRITE_FONT_PROPERTY_ID id,
+-        [out] IDWriteStringList **values
++        [out] BOOL *exists,
++        [out] IDWriteLocalizedStrings **values
+     );
+-    HRESULT GetPropertyValues_(
++    [method_name("GetPropertyValues_")]
++    HRESULT GetPropertyValues(
+         [in] DWRITE_FONT_PROPERTY_ID id,
+         [in] WCHAR const *preferred_locales,
+         [out] IDWriteStringList **values
+     );
++    [method_name("GetPropertyValues__")]
+     HRESULT GetPropertyValues(
+-        [in] UINT32 index,
+         [in] DWRITE_FONT_PROPERTY_ID id,
+-        [out] BOOL *exists,
+-        [out] IDWriteLocalizedStrings **values
++        [out] IDWriteStringList **values
+     );
+     HRESULT GetPropertyOccurrenceCount(
+         [in] DWRITE_FONT_PROPERTY const *property,
+         [out] UINT32 *count
+     );
+-    HRESULT GetMatchingFonts_(
++    HRESULT GetMatchingFonts(
++        [in] DWRITE_FONT_PROPERTY const *props,
++        [in] UINT32 count,
++        [out] IDWriteFontSet **fontset
++    );
++    [method_name("GetMatchingFonts_")]
++    HRESULT GetMatchingFonts(
+         [in] WCHAR const *family,
+         [in] DWRITE_FONT_WEIGHT weight,
+         [in] DWRITE_FONT_STRETCH stretch,
+         [in] DWRITE_FONT_STYLE style,
+         [out] IDWriteFontSet **fontset
+     );
+-    HRESULT GetMatchingFonts(
+-        [in] DWRITE_FONT_PROPERTY const *props,
+-        [in] UINT32 count,
+-        [out] IDWriteFontSet **fontset
+-    );
+ }
+ 
+ [
+@@ -472,46 +475,50 @@ interface IDWriteFontSet1 : IDWriteFontSet
+     HRESULT GetFirstFontResources(
+         [out] IDWriteFontSet1 **fontset
+     );
+-    HRESULT GetFilteredFonts__(
+-        [in] UINT32 const *indices,
+-        [in] UINT32 num_indices,
++    HRESULT GetFilteredFonts(
++        [in] DWRITE_FONT_PROPERTY const *props,
++        [in] UINT32 num_properties,
++        [in] BOOL select_any_property,
+         [out] IDWriteFontSet1 **fontset
+     );
+-    HRESULT GetFilteredFonts_(
++    [method_name("GetFilteredFonts_")]
++    HRESULT GetFilteredFonts(
+         [in] DWRITE_FONT_AXIS_RANGE const *axis_ranges,
+         [in] UINT32 num_ranges,
+         [in] BOOL select_any_range,
+         [out] IDWriteFontSet1 **fontset
+     );
++    [method_name("GetFilteredFonts__")]
+     HRESULT GetFilteredFonts(
+-        [in] DWRITE_FONT_PROPERTY const *props,
+-        [in] UINT32 num_properties,
+-        [in] BOOL select_any_property,
++        [in] UINT32 const *indices,
++        [in] UINT32 num_indices,
+         [out] IDWriteFontSet1 **fontset
+     );
+-    HRESULT GetFilteredFontIndices_(
+-        [in] DWRITE_FONT_AXIS_RANGE const *ranges,
+-        [in] UINT32 num_ranges,
++    HRESULT GetFilteredFontIndices(
++        [in] DWRITE_FONT_PROPERTY const *props,
++        [in] UINT32 num_properties,
+         [in] BOOL select_any_range,
+         [out] UINT32 *indices,
+         [in] UINT32 num_indices,
+         [out] UINT32 *actual_num_indices
+     );
++    [method_name("GetFilteredFontIndices_")]
+     HRESULT GetFilteredFontIndices(
+-        [in] DWRITE_FONT_PROPERTY const *props,
+-        [in] UINT32 num_properties,
++        [in] DWRITE_FONT_AXIS_RANGE const *ranges,
++        [in] UINT32 num_ranges,
+         [in] BOOL select_any_range,
+         [out] UINT32 *indices,
+         [in] UINT32 num_indices,
+         [out] UINT32 *actual_num_indices
+     );
+-    HRESULT GetFontAxisRanges_(
+-        [in] UINT32 font_index,
++    HRESULT GetFontAxisRanges(
+         [out] DWRITE_FONT_AXIS_RANGE *axis_ranges,
+         [in] UINT32 num_ranges,
+         [out] UINT32 *actual_num_ranges
+     );
++    [method_name("GetFontAxisRanges_")]
+     HRESULT GetFontAxisRanges(
++        [in] UINT32 font_index,
+         [out] DWRITE_FONT_AXIS_RANGE *axis_ranges,
+         [in] UINT32 num_ranges,
+         [out] UINT32 *actual_num_ranges
+@@ -998,14 +1005,13 @@ interface IDWriteGdiInterop1 : IDWriteGdiInterop
+         [out] IDWriteFont **font
+     );
+ 
+-    /* GetFontSignature() methods are listed in reversed order to make
+-       resulting vtable order compatible. */
+-    HRESULT GetFontSignature_(
+-        [in] IDWriteFontFace *fontface,
++    HRESULT GetFontSignature(
++        [in] IDWriteFont *font,
+         [out] FONTSIGNATURE *fontsig
+     );
++    [method_name("GetFontSignature_")]
+     HRESULT GetFontSignature(
+-        [in] IDWriteFont *font,
++        [in] IDWriteFontFace *fontface,
+         [out] FONTSIGNATURE *fontsig
+     );
+     HRESULT GetMatchingFontsByLOGFONT(
+@@ -1022,13 +1028,14 @@ interface IDWriteGdiInterop1 : IDWriteGdiInterop
+ ]
+ interface IDWriteFontSetBuilder : IUnknown
+ {
+-    HRESULT AddFontFaceReference_(
++    HRESULT AddFontFaceReference(
++        [in] IDWriteFontFaceReference *ref);
++    [method_name("AddFontFaceReference_")]
++    HRESULT AddFontFaceReference(
+         [in] IDWriteFontFaceReference *ref,
+         [in] DWRITE_FONT_PROPERTY const *props,
+         [in] UINT32 prop_count
+     );
+-    HRESULT AddFontFaceReference(
+-        [in] IDWriteFontFaceReference *ref);
+     HRESULT AddFontSet(
+         [in] IDWriteFontSet *fontset
+     );
+@@ -1100,17 +1107,16 @@ interface IDWriteFactory3 : IDWriteFactory2
+         [in] DWRITE_GRID_FIT_MODE gridfit_mode,
+         [out] IDWriteRenderingParams3 **params
+     );
+-    /* CreateFontFaceReference methods are listed in reversed order to make
+-       resulting vtable order compatible. */
+-    HRESULT CreateFontFaceReference_(
+-        [in] IDWriteFontFile *file,
++    HRESULT CreateFontFaceReference(
++        [in] WCHAR const *path,
++        [in] FILETIME const *writetime,
+         [in] UINT32 index,
+         [in] DWRITE_FONT_SIMULATIONS simulations,
+         [out] IDWriteFontFaceReference **reference
+     );
++    [method_name("CreateFontFaceReference_")]
+     HRESULT CreateFontFaceReference(
+-        [in] WCHAR const *path,
+-        [in] FILETIME const *writetime,
++        [in] IDWriteFontFile *file,
+         [in] UINT32 index,
+         [in] DWRITE_FONT_SIMULATIONS simulations,
+         [out] IDWriteFontFaceReference **reference
+@@ -1155,13 +1161,14 @@ typedef struct DWRITE_GLYPH_IMAGE_DATA
+ ]
+ interface IDWriteFontFace4 : IDWriteFontFace3
+ {
+-    HRESULT GetGlyphImageFormats_(
++    DWRITE_GLYPH_IMAGE_FORMATS GetGlyphImageFormats();
++    [method_name("GetGlyphImageFormats_")]
++    HRESULT GetGlyphImageFormats(
+         [in] UINT16 glyph,
+         [in] UINT32 ppem_first,
+         [in] UINT32 ppem_last,
+         [out] DWRITE_GLYPH_IMAGE_FORMATS *formats
+     );
+-    DWRITE_GLYPH_IMAGE_FORMATS GetGlyphImageFormats();
+     HRESULT GetGlyphImageData(
+         [in] UINT16 glyph,
+         [in] UINT32 ppem,
+@@ -1319,16 +1326,17 @@ interface IDWriteFactory4 : IDWriteFactory3
+         [in] UINT32 palette,
+         [out] IDWriteColorGlyphRunEnumerator1 **layers
+     );
+-    HRESULT ComputeGlyphOrigins_(
++    HRESULT ComputeGlyphOrigins(
+         [in] DWRITE_GLYPH_RUN const *run,
++        [in] DWRITE_MEASURING_MODE measuring_mode,
+         [in] D2D1_POINT_2F baseline_origin,
++        [in] DWRITE_MATRIX const *transform,
+         [out] D2D1_POINT_2F *origins
+     );
++    [method_name("ComputeGlyphOrigins_")]
+     HRESULT ComputeGlyphOrigins(
+         [in] DWRITE_GLYPH_RUN const *run,
+-        [in] DWRITE_MEASURING_MODE measuring_mode,
+         [in] D2D1_POINT_2F baseline_origin,
+-        [in] DWRITE_MATRIX const *transform,
+         [out] D2D1_POINT_2F *origins
+     );
+ }
+
+--- tools/widl/attribute.c
++++ tools/widl/attribute.c
+@@ -209,6 +209,7 @@ struct allowed_attr allowed_attr[] =
+     /* ATTR_MARSHALING_BEHAVIOR */ { 0, 0, 0,  0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, "marshaling_behavior" },
+     /* ATTR_MAYBE */               { 0, 0, 0,  0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "maybe" },
+     /* ATTR_MESSAGE */             { 0, 0, 0,  0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "message" },
++    /* ATTR_METHOD_NAME */         { 0, 0, 0,  0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "methodname" },
+     /* ATTR_NOCODE */              { 0, 1, 0,  1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "nocode" },
+     /* ATTR_NONBROWSABLE */        { 0, 0, 0,  0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "nonbrowsable" },
+     /* ATTR_NONCREATABLE */        { 0, 0, 0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, "noncreatable" },
+
+--- tools/widl/header.c
++++ tools/widl/header.c
+@@ -120,22 +120,37 @@ static void write_namespace_end(FILE *header, struct namespace *namespace)
+     write_namespace_end(header, namespace->parent);
+ }
+ 
+-const char *get_name(const var_t *v)
++static const char *get_name_internal(const var_t *v, const char *name)
+ {
+     static char *buffer;
+     free( buffer );
+     if (is_attr( v->attrs, ATTR_EVENTADD ))
+-        return buffer = strmake( "add_%s", v->name );
++        return buffer = strmake( "add_%s", name );
+     if (is_attr( v->attrs, ATTR_EVENTREMOVE ))
+-        return buffer = strmake( "remove_%s", v->name );
++        return buffer = strmake( "remove_%s", name );
+     if (is_attr( v->attrs, ATTR_PROPGET ))
+-        return buffer = strmake( "get_%s", v->name );
++        return buffer = strmake( "get_%s", name );
+     if (is_attr( v->attrs, ATTR_PROPPUT ))
+-        return buffer = strmake( "put_%s", v->name );
++        return buffer = strmake( "put_%s", name );
+     if (is_attr( v->attrs, ATTR_PROPPUTREF ))
+-        return buffer = strmake( "putref_%s", v->name );
++        return buffer = strmake( "putref_%s", name );
+     buffer = NULL;
+-    return v->name;
++    return name;
++}
++
++const char *get_name(const var_t *v)
++{
++    return get_name_internal(v, v->name);
++}
++
++static const char *get_c_method_name(const var_t *v)
++{
++    const char *name;
++
++    name = get_attrp(v->attrs, ATTR_METHOD_NAME);
++    if (!name)
++        name = v->name;
++    return get_name_internal(v, name);
+ }
+ 
+ static void write_type_definition_left( FILE *h, const decl_spec_t *ds, enum name_type name_type, bool write_callconv );
+@@ -816,6 +831,121 @@ int has_out_arg_or_return(const var_t *func)
+ }
+ 
+ 
++struct method_iterator
++{
++    statement_list_t *stmts_list;
++    const statement_t *stmt;
++    unsigned int count, pos;
++    const statement_t **methods;
++};
++
++bool method_iterator_next(struct method_iterator *mthiter)
++{
++    if (mthiter->methods)
++    {
++        if (mthiter->pos >= mthiter->count)
++        {
++            mthiter->stmt = NULL;
++            return false;
++        }
++        mthiter->stmt = mthiter->methods[mthiter->pos++];
++        return true;
++    }
++    if (!mthiter->stmt) return false;
++    for (;;)
++    {
++        mthiter->stmt = LIST_ENTRY((mthiter->stmt)->entry.next, statement_t, entry);
++        if (&mthiter->stmt->entry == mthiter->stmts_list) break;
++        if (mthiter->stmt->type == STMT_DECLARATION && mthiter->stmt->u.var->declspec.stgclass == STG_NONE &&
++            type_get_type_detect_alias(mthiter->stmt->u.var->declspec.type) == TYPE_FUNCTION)
++            return true;
++    }
++    mthiter->stmt = NULL;
++    return false;
++}
++
++void method_iterator_reset(struct method_iterator *mthiter)
++{
++    if (mthiter->methods)
++        mthiter->pos = 0;
++    else if (mthiter->stmts_list)
++        mthiter->stmt = LIST_ENTRY(mthiter->stmts_list, statement_t, entry);
++    else
++        mthiter->stmt = NULL;
++}
++
++void method_iterator_init(struct method_iterator *mthiter, const type_t *iface, bool msvc_order)
++{
++    mthiter->stmts_list = type_iface_get_stmts(iface);
++    mthiter->count = 0;
++    mthiter->pos = 0;
++    mthiter->methods = 0;
++    if (msvc_order)
++    {
++        const statement_t *stmt1, *stmt2;
++        const var_t *func1, *func2;
++        char func1_name[256];
++        unsigned int count = 0;
++        bool has_overloaded = false;
++
++        STATEMENTS_FOR_EACH_FUNC(stmt1, type_iface_get_stmts(iface))
++        {
++            count++;
++            if (has_overloaded) continue;
++
++            func1 = stmt1->u.var;
++            strcpy(func1_name, get_name(func1));
++
++            STATEMENTS_FOR_EACH_FUNC(stmt2, type_iface_get_stmts(iface))
++            {
++                if (stmt2 == stmt1) break;
++                func2 = stmt2->u.var;
++
++                if (!strcmp(func1_name, get_name(func2)))
++                {
++                    if (!get_attrp(func1->attrs, ATTR_METHOD_NAME))
++                        warning_at(&func1->where, "Suspicious overloaded methods without method_name\n");
++
++                    has_overloaded = true;
++                    break;
++                }
++            }
++        }
++        if (has_overloaded && count)
++        {
++            unsigned int i, j;
++            mthiter->count = count;
++            mthiter->methods = xmalloc(count * sizeof(mthiter->methods[0]));
++
++            i = 0;
++            STATEMENTS_FOR_EACH_FUNC(stmt1, type_iface_get_stmts(iface))
++            {
++                func1 = stmt1->u.var;
++                strcpy(func1_name, get_name(func1));
++
++                for (j = 0; j < i; j++)
++                    if (!strcmp(func1_name, get_name(mthiter->methods[j]->u.var))) break;
++
++                if (j < i)
++                {
++                    memmove(&mthiter->methods[j + 1], &mthiter->methods[j], (i - j) * sizeof(mthiter->methods[0]));
++                    mthiter->methods[j] = stmt1;
++                }
++                else
++                    mthiter->methods[i] = stmt1;
++                i++;
++            }
++            assert(i == count);
++        }
++    }
++    method_iterator_reset(mthiter);
++}
++
++void method_iterator_dispose(struct method_iterator *mthiter)
++{
++    free(mthiter->methods);
++}
++
+ /********** INTERFACES **********/
+ 
+ int is_object(const type_t *iface)
+@@ -838,7 +968,7 @@ const var_t *is_callas(const attr_list_t *a)
+   return get_attrp(a, ATTR_CALLAS);
+ }
+ 
+-static int is_inherited_method(const type_t *iface, const var_t *func)
++static const type_t *is_inherited_method(const type_t *iface, const var_t *func)
+ {
+   while ((iface = type_iface_get_inherit(iface)))
+   {
+@@ -852,12 +982,12 @@ static int is_inherited_method(const type_t *iface, const var_t *func)
+          char inherit_name[256];
+          /* compare full name including property prefix */
+          strcpy(inherit_name, get_name(funccmp));
+-         if (!strcmp(inherit_name, get_name(func))) return 1;
++         if (!strcmp(inherit_name, get_name(func))) return iface;
+       }
+     }
+   }
+ 
+-  return 0;
++  return NULL;
+ }
+ 
+ static int is_override_method(const type_t *iface, const type_t *child, const var_t *func)
+@@ -876,8 +1006,8 @@ static int is_override_method(const type_t *iface, const type_t *child, const va
+       {
+          char inherit_name[256];
+          /* compare full name including property prefix */
+-         strcpy(inherit_name, get_name(funccmp));
+-         if (!strcmp(inherit_name, get_name(func))) return 1;
++         strcpy(inherit_name, get_c_method_name(funccmp));
++         if (!strcmp(inherit_name, get_c_method_name(func))) return 1;
+       }
+     }
+   }
+@@ -900,21 +1030,22 @@ static char *get_vtbl_entry_name(const type_t *iface, const var_t *func)
+   if (is_inherited_method(iface, func))
+     snprintf(buff, sizeof(buff), "%s_%s", iface->name, get_name(func));
+   else
+-    snprintf(buff, sizeof(buff), "%s", get_name(func));
++    snprintf(buff, sizeof(buff), "%s", get_c_method_name(func));
+   return buff;
+ }
+ 
+ static void write_method_macro(FILE *header, const type_t *iface, const type_t *child, const char *name)
+ {
+-  const statement_t *stmt;
++  struct method_iterator mthiter;
+   int first_iface = 1;
+ 
+   if (type_iface_get_inherit(iface))
+     write_method_macro(header, type_iface_get_inherit(iface), child, name);
+ 
+-  STATEMENTS_FOR_EACH_FUNC(stmt, type_iface_get_stmts(iface))
++  method_iterator_init(&mthiter, iface, true);
++  while (method_iterator_next(&mthiter))
+   {
+-    const var_t *func = stmt->u.var;
++    const var_t *func = mthiter.stmt->u.var;
+ 
+     if (first_iface)
+     {
+@@ -928,7 +1059,7 @@ static void write_method_macro(FILE *header, const type_t *iface, const type_t *
+     if (!is_callas(func->attrs)) {
+       const var_t *arg;
+ 
+-      fprintf(header, "#define %s_%s(This", name, get_name(func));
++      fprintf(header, "#define %s_%s(This", name, get_c_method_name(func));
+       if (type_function_get_args(func->declspec.type))
+           LIST_FOR_EACH_ENTRY( arg, type_function_get_args(func->declspec.type), const var_t, entry )
+               fprintf(header, ",%s", arg->name);
+@@ -947,6 +1078,7 @@ static void write_method_macro(FILE *header, const type_t *iface, const type_t *
+       fprintf(header, ")\n");
+     }
+   }
++  method_iterator_dispose(&mthiter);
+ }
+ 
+ void write_args(FILE *h, const var_list_t *args, const char *name, int method, int do_indent, enum name_type name_type)
+@@ -1008,13 +1140,49 @@ void write_args(FILE *h, const var_list_t *args, const char *name, int method, i
+   if (do_indent) indentation--;
+ }
+ 
+-static void write_cpp_method_def(FILE *header, const type_t *iface)
++static bool is_current_first_overloaded_method(struct method_iterator *mthiter)
+ {
+-  const statement_t *stmt;
++    char func_name[256];
++    const var_t *func = mthiter->stmt->u.var;
++    bool is_first = true;
+ 
+-  STATEMENTS_FOR_EACH_FUNC(stmt, type_iface_get_stmts(iface))
++    strcpy(func_name, get_name(func));
++    /* as we're re-using the current iterator, be sure to return at the same position */
++    method_iterator_reset(mthiter);
++    while (method_iterator_next(mthiter))
++    {
++        const var_t *other_func = mthiter->stmt->u.var;
++        if (func == other_func) return is_first;
++        if (!is_callas(other_func->attrs) && !strcmp(func_name, get_name(other_func)))
++            is_first = false;
++    }
++    assert(0);
++}
++
++static void write_cpp_using(FILE *header, const type_t *iface, struct method_iterator *mthiter)
++{
++    while (method_iterator_next(mthiter))
++    {
++        const var_t *func = mthiter->stmt->u.var;
++        if (is_callas(func->attrs)) continue;
++
++        if (is_current_first_overloaded_method(mthiter))
++        {
++            const type_t *inh_from = iface;
++            while ((inh_from = is_inherited_method(inh_from, func)))
++            {
++                indent(header, 0);
++                fprintf(header, "using %s::%s;\n", inh_from->name, get_name(func));
++            }
++        }
++    }
++}
++
++static void write_cpp_method_def_internal(FILE *header, const type_t *iface, struct method_iterator *mthiter)
++{
++  while (method_iterator_next(mthiter))
+   {
+-    const var_t *func = stmt->u.var;
++    const var_t *func = mthiter->stmt->u.var;
+     if (!is_callas(func->attrs)) {
+       const decl_spec_t *ret = type_function_get_ret(func->declspec.type);
+       const char *callconv = get_attrp(func->declspec.type->attrs, ATTR_CALLCONV);
+@@ -1079,17 +1247,47 @@ static void write_cpp_method_def(FILE *header, const type_t *iface)
+   }
+ }
+ 
++static void write_cpp_method_def(FILE *header, const type_t *iface)
++{
++    struct method_iterator mthiter;
++
++    method_iterator_init(&mthiter, iface, true);
++    if (mthiter.methods)
++    {
++        /* there's one overloaded virtual, so msvc (and clang with ms extensions turned on)
++         * will reorder the methods wrt. their declaration in the generated vtable.
++         * So for the other cases (C++ in non clang cases, and C bindings, reorder the methods
++         * to match what native compiler would do.
++         */
++        fprintf(header, "#if !(defined(__clang__) && defined(_MSC_EXTENSIONS)) && !defined(_MSC_VER)\n");
++        write_cpp_method_def_internal(header, iface, &mthiter);
++        fprintf(header, "#else\n");
++        method_iterator_dispose(&mthiter);
++        method_iterator_init(&mthiter, iface, false);
++        write_cpp_method_def_internal(header, iface, &mthiter);
++        fprintf(header, "#endif\n");
++    }
++    else
++    {
++        write_cpp_method_def_internal(header, iface, &mthiter);
++    }
++    method_iterator_reset(&mthiter);
++    write_cpp_using(header, iface, &mthiter);
++    method_iterator_dispose(&mthiter);
++}
++
+ static void write_inline_wrappers(FILE *header, const type_t *iface, const type_t *child, const char *name)
+ {
+-  const statement_t *stmt;
++  struct method_iterator mthiter;
+   int first_iface = 1;
+ 
+   if (type_iface_get_inherit(iface))
+     write_inline_wrappers(header, type_iface_get_inherit(iface), child, name);
+ 
+-  STATEMENTS_FOR_EACH_FUNC(stmt, type_iface_get_stmts(iface))
++  method_iterator_init(&mthiter, iface, true);
++  while (method_iterator_next(&mthiter))
+   {
+-    const var_t *func = stmt->u.var;
++    const var_t *func = mthiter.stmt->u.var;
+ 
+     if (first_iface)
+     {
+@@ -1105,7 +1303,7 @@ static void write_inline_wrappers(FILE *header, const type_t *iface, const type_
+ 
+       fprintf(header, "static inline ");
+       write_type_decl_left(header, type_function_get_ret(func->declspec.type));
+-      fprintf(header, " %s_%s(", name, get_name(func));
++      fprintf(header, " %s_%s(", name, get_c_method_name(func));
+       write_args(header, type_function_get_args(func->declspec.type), name, 1, FALSE, NAME_C);
+       fprintf(header, ") {\n");
+       ++indentation;
+@@ -1129,19 +1327,21 @@ static void write_inline_wrappers(FILE *header, const type_t *iface, const type_
+       fprintf(header, "}\n");
+     }
+   }
++  method_iterator_dispose(&mthiter);
+ }
+ 
+ static void do_write_c_method_def(FILE *header, const type_t *iface, const char *name)
+ {
+-  const statement_t *stmt;
++  struct method_iterator mthiter;
+   int first_iface = 1;
+ 
+   if (type_iface_get_inherit(iface))
+     do_write_c_method_def(header, type_iface_get_inherit(iface), name);
+ 
+-  STATEMENTS_FOR_EACH_FUNC(stmt, type_iface_get_stmts(iface))
++  method_iterator_init(&mthiter, iface, true);
++  while (method_iterator_next(&mthiter))
+   {
+-    const var_t *func = stmt->u.var;
++    const var_t *func = mthiter.stmt->u.var;
+     if (first_iface) {
+       indent(header, 0);
+       fprintf(header, "/*** %s methods ***/\n", iface->name);
+@@ -1157,7 +1357,7 @@ static void do_write_c_method_def(FILE *header, const type_t *iface, const char
+       if (is_inherited_method(iface, func))
+         fprintf(header, " (%s *%s_%s)(\n", callconv, iface->name, func->name);
+       else
+-        fprintf(header, " (%s *%s)(\n", callconv, get_name(func));
++        fprintf(header, " (%s *%s)(\n", callconv, get_c_method_name(func));
+       ++indentation;
+       indent(header, 0);
+       fprintf(header, "%s *This", name);
+@@ -1176,6 +1376,7 @@ static void do_write_c_method_def(FILE *header, const type_t *iface, const char
+       fprintf(header, "\n");
+     }
+   }
++  method_iterator_dispose(&mthiter);
+ }
+ 
+ static void write_c_method_def(FILE *header, const type_t *iface)
+
+--- tools/widl/parser.l
++++ tools/widl/parser.l
+@@ -314,6 +314,7 @@ static void winrt_enable(void)
+     marshaling_behavior                         { return token_winrt( tMARSHALINGBEHAVIOR, yytext, yylval ); }
+     maybe                                       { return tMAYBE; }
+     message                                     { return tMESSAGE; }
++    method_name                                 { return tMETHOD_NAME; }
+     mta                                         { return tMTA; }
+     neutral                                     { return tNEUTRAL; }
+     nocode                                      { return tNOCODE; }
+
+--- tools/widl/parser.y
++++ tools/widl/parser.y
+@@ -290,6 +290,7 @@ PARSER_LTYPE pop_import(void);
+ %token tVOID
+ %token tWCHAR tWIREMARSHAL
+ %token tAPARTMENT tNEUTRAL tSINGLE tFREE tBOTH
++%token tMETHOD_NAME
+ 
+ %type <attr> access_attr
+ %type <attr> attribute acf_attribute
+@@ -720,6 +721,7 @@ attribute
+                                                 { $$ = attr_int( @$, ATTR_MARSHALING_BEHAVIOR, $3 ); }
+         | tMAYBE                                { $$ = attr_int( @$, ATTR_MAYBE, 0 ); }
+         | tMESSAGE                              { $$ = attr_int( @$, ATTR_MESSAGE, 0 ); }
++        | tMETHOD_NAME '(' aSTRING ')'          { $$ = attr_ptr( @$, ATTR_METHOD_NAME, $3 ); }
+         | tNOCODE                               { $$ = attr_int( @$, ATTR_NOCODE, 0 ); }
+         | tNONBROWSABLE                         { $$ = attr_int( @$, ATTR_NONBROWSABLE, 0 ); }
+         | tNONCREATABLE                         { $$ = attr_int( @$, ATTR_NONCREATABLE, 0 ); }
+
+--- tools/widl/widltypes.h
++++ tools/widl/widltypes.h
+@@ -139,6 +139,7 @@ enum attr_type
+     ATTR_MARSHALING_BEHAVIOR,
+     ATTR_MAYBE,
+     ATTR_MESSAGE,
++    ATTR_METHOD_NAME,
+     ATTR_NOCODE,
+     ATTR_NONBROWSABLE,
+     ATTR_NONCREATABLE,
+

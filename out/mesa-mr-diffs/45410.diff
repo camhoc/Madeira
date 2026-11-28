@@ -1,0 +1,237 @@
+# kk: Support native sampler LOD bias on M5+
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45410 state=merged
+# ### What does this MR do and why?
+
+```
+kk: Support native sampler LOD bias on M5+
+
+For pre-compiled shaders, we still lower unconditionally. To handle this,
+the bias value passed in through the descriptor is zeroed when the native
+bias value is used.
+```
+--- src/kosmickrisp/bridge/stubs/mtl_sampler.c
++++ src/kosmickrisp/bridge/stubs/mtl_sampler.c
+@@ -59,6 +59,12 @@ mtl_sampler_descriptor_set_compare_function(mtl_sampler_descriptor *descriptor,
+ {
+ }
+ 
++void
++mtl_sampler_descriptor_set_lod_bias(mtl_sampler_descriptor *descriptor,
++                                    float lod_bias)
++{
++}
++
+ void
+ mtl_sampler_descriptor_set_reduction_mode(mtl_sampler_descriptor *descriptor,
+                                           enum mtl_sampler_reduction_mode mode)
+
+--- src/kosmickrisp/bridge/mtl_sampler.h
++++ src/kosmickrisp/bridge/mtl_sampler.h
+@@ -39,7 +39,8 @@ mtl_sampler_descriptor_set_max_anisotropy(mtl_sampler_descriptor *descriptor,
+ void
+ mtl_sampler_descriptor_set_compare_function(mtl_sampler_descriptor *descriptor,
+                                             enum mtl_compare_function function);
+-
++void mtl_sampler_descriptor_set_lod_bias(mtl_sampler_descriptor *descriptor,
++                                         float lod_bias);
+ void
+ mtl_sampler_descriptor_set_reduction_mode(mtl_sampler_descriptor *descriptor,
+                                           enum mtl_sampler_reduction_mode mode);
+
+--- src/kosmickrisp/bridge/mtl_sampler.m
++++ src/kosmickrisp/bridge/mtl_sampler.m
+@@ -98,6 +98,16 @@ mtl_sampler_descriptor_set_compare_function(mtl_sampler_descriptor *descriptor,
+    }
+ }
+ 
++void
++mtl_sampler_descriptor_set_lod_bias(mtl_sampler_descriptor *descriptor,
++                                    float lod_bias)
++{
++   @autoreleasepool {
++      MTLSamplerDescriptor *desc = (MTLSamplerDescriptor *)descriptor;
++      desc.lodBias = lod_bias;
++   }
++}
++
+ void
+ mtl_sampler_descriptor_set_reduction_mode(mtl_sampler_descriptor *descriptor,
+                                           enum mtl_sampler_reduction_mode mode)
+
+--- src/kosmickrisp/clc/kk_clc.c
++++ src/kosmickrisp/clc/kk_clc.c
+@@ -162,7 +162,10 @@ compile(void *memctx, const uint32_t *spirv, size_t spirv_size)
+    NIR_PASS(_, nir, nir_opt_if, 0);
+    NIR_PASS(_, nir, nir_opt_idiv_const, 16);
+ 
+-   msl_lower_textures(nir);
++   /* LOD bias is lowered unconditionally, we won't know until runtime if it
++    * is natively supported. This is safe as we can just pass in 0.0 for the
++    * bias lowering on natively supported hardware. */
++   msl_lower_textures(nir, true);
+ 
+    optimize(nir);
+ 
+
+--- src/kosmickrisp/compiler/msl_nir_lower_common.c
++++ src/kosmickrisp/compiler/msl_nir_lower_common.c
+@@ -220,12 +220,12 @@ msl_lower_robustness2_images(nir_shader *nir)
+ }
+ 
+ bool
+-msl_lower_textures(nir_shader *nir)
++msl_lower_textures(nir_shader *nir, bool lower_lod_bias)
+ {
+    bool progress = false;
+    nir_lower_tex_options lower_tex_options = {
+       .lower_txp = ~0u,
+-      .lower_sampler_lod_bias = true,
++      .lower_sampler_lod_bias = lower_lod_bias,
+ 
+       /* We don't use 1D textures because they are really limited in Metal */
+       .lower_1d = true,
+
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -1988,8 +1988,11 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
+       src_to_msl(ctx, sampler);
+       P(ctx, ", ");
+       src_to_msl(ctx, coord);
+-      P(ctx, ") + ");
+-      src_to_msl(ctx, bias);
++      P(ctx, ")");
++      if (bias) {
++         P(ctx, " + ");
++         src_to_msl(ctx, bias);
++      }
+       P(ctx, ", ");
+       src_to_msl(ctx, min);
+       P(ctx, ", ");
+
+--- src/kosmickrisp/compiler/nir_to_msl.h
++++ src/kosmickrisp/compiler/nir_to_msl.h
+@@ -75,7 +75,7 @@ bool msl_nir_fs_remove_depth_write(nir_shader *s);
+ void msl_nir_lower_input_attachments(
+    nir_shader *nir, const struct vk_input_attachment_location_state *ial,
+    const struct vk_color_attachment_location_state *cal);
+-bool msl_lower_textures(nir_shader *s);
++bool msl_lower_textures(nir_shader *s, bool lower_lod_bias);
+ 
+ bool msl_lower_robustness2_images(nir_shader *s);
+ 
+
+--- src/kosmickrisp/vulkan/kk_device.h
++++ src/kosmickrisp/vulkan/kk_device.h
+@@ -45,6 +45,7 @@ struct mtl_sampler_packed {
+    enum mtl_sampler_reduction_mode reduction_mode;
+ 
+    enum mtl_compare_function compare_func;
++   float lod_bias;
+    float min_lod;
+    float max_lod;
+    uint32_t max_anisotropy;
+
+--- src/kosmickrisp/vulkan/kk_sampler.c
++++ src/kosmickrisp/vulkan/kk_sampler.c
+@@ -40,7 +40,8 @@ is_border_color_custom(VkBorderColor color)
+ }
+ 
+ static struct mtl_sampler_packed
+-pack_sampler_info(const struct VkSamplerCreateInfo *sampler_info,
++pack_sampler_info(const struct kk_physical_device *pdev,
++                  const struct VkSamplerCreateInfo *sampler_info,
+                   bool custom_border)
+ {
+    /* Vulkan disallows unnormalized coordinates to sample 3D images in
+@@ -73,15 +74,20 @@ pack_sampler_info(const struct VkSamplerCreateInfo *sampler_info,
+       sampler_info->anisotropyEnable
+          ? util_next_power_of_two(MAX2(sampler_info->maxAnisotropy, 1))
+          : 1u;
++   float lod_bias =
++      pdev->info.gpu_apple_family >= 10 ? sampler_info->mipLodBias : 0.0f;
+ 
+    enum mtl_sampler_reduction_mode reduction_mode =
+       MTL_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
+-   const VkSamplerReductionModeCreateInfo *reduction_info =
+-      vk_find_struct_const(sampler_info->pNext,
+-                           SAMPLER_REDUCTION_MODE_CREATE_INFO);
+-   if (reduction_info)
+-      reduction_mode = vk_sampler_reduction_mode_to_mtl_sampler_reduction_mode(
+-         reduction_info->reductionMode);
++   if (pdev->vk.supported_extensions.EXT_sampler_filter_minmax) {
++      const VkSamplerReductionModeCreateInfo *reduction_info =
++         vk_find_struct_const(sampler_info->pNext,
++                              SAMPLER_REDUCTION_MODE_CREATE_INFO);
++      if (reduction_info)
++         reduction_mode =
++            vk_sampler_reduction_mode_to_mtl_sampler_reduction_mode(
++               reduction_info->reductionMode);
++   }
+ 
+    return (struct mtl_sampler_packed){
+       .mode_u = vk_sampler_address_mode_to_mtl_sampler_address_mode(
+@@ -98,6 +104,7 @@ pack_sampler_info(const struct VkSamplerCreateInfo *sampler_info,
+       .mip_filter = mip_filter,
+       .reduction_mode = reduction_mode,
+       .compare_func = compare,
++      .lod_bias = lod_bias,
+       .min_lod = sampler_info->minLod,
+       .max_lod = sampler_info->maxLod,
+       .max_anisotropy = max_anisotropy,
+@@ -126,6 +133,9 @@ create_sampler_descriptor(const struct kk_device *dev,
+    mtl_sampler_descriptor_set_compare_function(descriptor,
+                                                packed->compare_func);
+ 
++   if (pdev->info.gpu_apple_family >= 10)
++      mtl_sampler_descriptor_set_lod_bias(descriptor, packed->lod_bias);
++
+    if (pdev->vk.supported_extensions.EXT_sampler_filter_minmax)
+       mtl_sampler_descriptor_set_reduction_mode(descriptor,
+                                                 packed->reduction_mode);
+@@ -148,6 +158,7 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
+                  const VkAllocationCallbacks *pAllocator, VkSampler *pSampler)
+ {
+    VK_FROM_HANDLE(kk_device, dev, device);
++   struct kk_physical_device *pdev = kk_device_physical(dev);
+    VkResult result = VK_SUCCESS;
+    struct kk_sampler *sampler;
+ 
+@@ -161,7 +172,7 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
+                         is_border_color_custom(pCreateInfo->borderColor);
+ 
+    struct mtl_sampler_packed packed =
+-      pack_sampler_info(pCreateInfo, custom_border);
++      pack_sampler_info(pdev, pCreateInfo, custom_border);
+    result = kk_sampler_heap_add(dev, packed, &sampler->planes[0].hw);
+    if (result != VK_SUCCESS) {
+       kk_DestroySampler(device, kk_sampler_to_handle(sampler), pAllocator);
+@@ -233,10 +244,15 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
+    }
+ 
+    /* LOD data passed in the descriptor set */
+-   sampler->lod_bias_fp16 = _mesa_float_to_half(pCreateInfo->mipLodBias);
+    sampler->lod_min_fp16 = _mesa_float_to_half(pCreateInfo->minLod);
+    sampler->lod_max_fp16 = _mesa_float_to_half(pCreateInfo->maxLod);
+ 
++   /* When LOD bias is natively supported, pass 0 for any pre-compiled shaders
++    * that still lower it */
++   sampler->lod_bias_fp16 = pdev->info.gpu_apple_family < 10
++                               ? _mesa_float_to_half(pCreateInfo->mipLodBias)
++                               : 0;
++
+    *pSampler = kk_sampler_to_handle(sampler);
+ 
+    return VK_SUCCESS;
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -726,7 +726,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
+ 
+    /* Common msl texture lowering needs to happen after ycbcr lowering and
+     * before descriptor lowering. */
+-   NIR_PASS(_, nir, msl_lower_textures);
++   NIR_PASS(_, nir, msl_lower_textures, pdev->info.gpu_apple_family < 10);
+ 
+    /* Lower push constants before lower_descriptors */
+    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
+

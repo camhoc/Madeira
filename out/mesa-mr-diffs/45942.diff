@@ -1,0 +1,27 @@
+# CODEOWNERS: list Mary and Janne as Asahi owners
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45942 state=merged
+# ### Cc @marysaka @jannau 
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+CODEOWNERS: list Mary and Janne as Asahi owners
+
+they have been maintaining the drivers for a while now, report as much.
+
+Signed-off-by: Alyssa Rosenzweig <alyssa@rosenz.ca>
+```
+--- CODEOWNERS
++++ CODEOWNERS
+@@ -127,8 +127,8 @@ gitlab-ci*.yml @eric
+ /src/glx/applegl_glx.c @jeremyhu
+ 
+ # Asahi
+-/src/asahi/ @alyssa
+-/src/gallium/drivers/asahi/ @alyssa
++/src/asahi/ @alyssa @marysaka @jannau
++/src/gallium/drivers/asahi/ @alyssa @marysaka @jannau
+ 
+ # Broadcom
+ /src/broadcom/ @chema @jasuarez @itoral @apinheiro
+

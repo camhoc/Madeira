@@ -1,0 +1,2135 @@
+# pan/bi: SSA allocator
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/39804 state=closed
+# This is a port of the SSA allocator from agx plus some adaptations to make it work in pan. The biggest is the handling of constrained (fixed/tied registers) instructions for which I added another way of shuffling the register file.
+
+LCRA is still usable through a flag so we can switch back quickly if required minus the changes to spilling.
+
+There's two commits which will need to get squashed with the following one. I left them separate for now since it might help with reviewing.
+--- src/panfrost/compiler/bifrost/bifrost/bi_opt_message_preload.c
++++ src/panfrost/compiler/bifrost/bifrost/bi_opt_message_preload.c
+@@ -122,7 +122,7 @@ bi_opt_message_preload(bi_context *ctx)
+       bi_foreach_src(collect, i) {
+          unsigned reg = (nr_preload * 4) + i;
+ 
+-         collect->src[i] = bi_mov_i32(&b, bi_register(reg));
++         collect->src[i] = bi_preload(&b, reg);
+       }
+ 
+       bi_remove_instruction(I);
+
+--- src/panfrost/compiler/bifrost/test/meson.build
++++ src/panfrost/compiler/bifrost/test/meson.build
+@@ -14,6 +14,7 @@ test(
+       'test-pack-formats.cpp',
+       'test-packing.cpp',
+       'test-scheduler-predicates.cpp',
++      'test-ssa-ra.cpp',
+     ),
+     cpp_args : [cpp_msvc_compat_args],
+     gnu_symbol_visibility : 'hidden',
+
+--- src/panfrost/compiler/bifrost/test/test-ssa-ra.cpp
++++ src/panfrost/compiler/bifrost/test/test-ssa-ra.cpp
+@@ -0,0 +1,233 @@
++/*
++ * Copyright (C) 2021 Collabora, Ltd.
++ * Copyright (C) 2026 Arm Ltd.
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "bi_builder.h"
++#include "bi_debug.h"
++#include "bi_test.h"
++#include "compiler.h"
++
++#include <vector>
++#include <gtest/gtest.h>
++
++struct RaTestParams {
++   uint32_t arch;
++   uint32_t n_pressure_vals;
++   bool force_spill_debug = false;
++};
++
++class Ra : public testing::TestWithParam<RaTestParams> {
++ protected:
++   Ra()
++   {
++      if (GetParam().force_spill_debug)
++         bifrost_debug |= BIFROST_DBG_SPILL;
++      else
++         bifrost_debug &= ~BIFROST_DBG_SPILL;
++
++      mem_ctx = ralloc_context(NULL);
++      b = bit_builder(mem_ctx);
++      pressure_vals = {};
++   }
++
++   ~Ra()
++   {
++      ralloc_free(mem_ctx);
++   }
++
++   void SetUp() override
++   {
++      b->shader->arch = GetParam().arch;
++      load_pressure_vals(GetParam().n_pressure_vals);
++   }
++
++   bi_index TMP()
++   {
++      return bi_temp(b->shader);
++   }
++
++   bi_index IMMn(uint8_t n)
++   {
++      if (n == 1)
++         return bi_iadd_imm_i32(b, bi_zero(), 0);
++      else {
++         bi_index c = bi_temp(b->shader);
++         std::vector<bi_index> srcs;
++
++         for (uint8_t i = 0; i < n; ++i)
++            srcs.push_back(IMMn(1));
++
++         bi_instr *I = bi_collect_i32_to(b, c, n);
++
++         for (uint8_t i = 0; i < n; ++i)
++            I->src[i] = srcs[i];
++
++         return c;
++      }
++   }
++
++   void USE(const bi_index idx, uint8_t n)
++   {
++      bi_unused(b, idx, n);
++   }
++
++   std::vector<bi_index> SPLIT(const bi_index src, uint8_t n)
++   {
++      bi_instr *I = bi_split_i32_to(b, n, src);
++
++      std::vector<bi_index> dsts;
++      dsts.reserve(n);
++
++      for (uint8_t i = 0; i < n; ++i) {
++         dsts.push_back(TMP());
++         I->dest[i] = dsts[dsts.size() - 1];
++      }
++
++      return dsts;
++   }
++
++   void load_pressure_vals(uint32_t n)
++   {
++      /* Load a number of single register values to increase the base pressure
++       * before the actual tested instruction is encountered.
++       */
++      for (uint32_t i = 0; i < n; ++i)
++         pressure_vals.push_back(IMMn(1));
++   }
++
++   void use_pressure_vals()
++   {
++      for (const bi_index &val : pressure_vals)
++         USE(val, 1);
++   }
++
++   void exec()
++   {
++      /* Use pressure values at the very end so they are live until the end. */
++      use_pressure_vals();
++
++      /* Set correct liveness info. */
++      bi_compute_liveness_ssa(b->shader);
++
++      /* Calls bi_validate_ra internally. We don't check anything else extra. */
++      bi_register_allocate_ssa(b->shader);
++   }
++
++   void *mem_ctx;
++   bi_builder *b;
++   std::vector<bi_index> pressure_vals;
++};
++
++static const RaTestParams params[] = {
++   {7, 0},  {7, 16},  {7, BI_MAX_REGS},  {7, BI_MAX_REGS * 2},
++   {10, 0}, {10, 16}, {10, BI_MAX_REGS}, {10, BI_MAX_REGS * 2},
++   {10, BI_MAX_REGS, /* force spill */ true},
++};
++
++INSTANTIATE_TEST_SUITE_P(Ra, Ra, testing::ValuesIn(params));
++
++TEST_P(Ra, Basic)
++{
++   bi_index res = bi_fadd_f32(b, IMMn(1), IMMn(1));
++   USE(res, 1);
++   exec();
++}
++
++TEST_P(Ra, BLEND)
++{
++   bi_register_format regfmt = BI_REGISTER_FORMAT_AUTO;
++   bi_index res =
++      bi_blend(b, IMMn(4), IMMn(1), IMMn(1), IMMn(1), bi_null(), regfmt, 4, 0);
++   USE(res, 1);
++   exec();
++}
++
++TEST_P(Ra, BLEND_DUAL)
++{
++   bi_register_format regfmt = BI_REGISTER_FORMAT_AUTO;
++   bi_index res =
++      bi_blend(b, IMMn(4), IMMn(1), IMMn(1), IMMn(1), IMMn(4), regfmt, 4, 4);
++   USE(res, 1);
++   exec();
++}
++
++TEST_P(Ra, BLEND_DUAL_live_through)
++{
++   bi_register_format regfmt = BI_REGISTER_FORMAT_AUTO;
++   bi_index src1 = IMMn(1);
++   bi_index src2 = IMMn(4);
++   bi_index res =
++      bi_blend(b, src2, src1, IMMn(1), IMMn(1), IMMn(4), regfmt, 4, 4);
++   USE(res, 1);
++   res = bi_blend(b, IMMn(4), src1, IMMn(1), IMMn(1), src2, regfmt, 4, 4);
++   USE(res, 1);
++   exec();
++}
++
++TEST_P(Ra, ACMPXCHG_I32)
++{
++   /* Reads 2, writes 1. */
++   unsigned sr_count = 2;
++   bi_index res = TMP();
++   bi_instr *I =
++      bi_acmpxchg_i32_to(b, res, IMMn(sr_count), IMMn(1), IMMn(1), BI_SEG_NONE);
++   unsigned sr_write = bi_count_write_registers(I, 0);
++   GTEST_ASSERT_EQ(sr_write, 1);
++   USE(res, sr_write);
++
++   exec();
++}
++
++TEST_P(Ra, ATOM_RETURN_I32)
++{
++   /* Reads 1, writes 1 or 2. */
++   unsigned sr_count = b->shader->arch < 9 ? 2 : 1;
++   bi_index res = TMP();
++   bi_instr *I = bi_atom_return_i32_to(b, res, IMMn(1), IMMn(1), IMMn(1),
++                                       BI_ATOM_OPC_AADD, sr_count);
++   unsigned sr_write = bi_count_write_registers(I, 0);
++   GTEST_ASSERT_EQ(sr_write, sr_count);
++   USE(res, sr_write);
++
++   exec();
++}
++
++TEST_P(Ra, ACMPXCHG_I64)
++{
++   /* Reads 4, writes 2. */
++   unsigned sr_count = 4;
++   bi_index res = TMP();
++   bi_instr *I =
++      bi_acmpxchg_i64_to(b, res, IMMn(sr_count), IMMn(1), IMMn(1), BI_SEG_NONE);
++   unsigned sr_write = bi_count_write_registers(I, 0);
++   GTEST_ASSERT_EQ(sr_write, 2);
++   USE(res, sr_write);
++
++   exec();
++}
++
++TEST_P(Ra, ATOM_RETURN_I64)
++{
++   /* Reads 2, writes 2 or 4. */
++   unsigned sr_count = b->shader->arch < 9 ? 4 : 2;
++   bi_index res = TMP();
++   bi_instr *I = bi_atom_return_i64_to(b, res, IMMn(2), IMMn(1), IMMn(1),
++                                       BI_ATOM_OPC_AADD, sr_count);
++   unsigned sr_write = bi_count_write_registers(I, 0);
++   GTEST_ASSERT_EQ(sr_write, sr_count);
++   USE(res, sr_write);
++
++   exec();
++}
++
++TEST_P(Ra, ATEST)
++{
++   bi_index coverage = bi_preload(b, 60);
++   bi_index res = bi_atest(b, coverage, bi_fau(BIR_FAU_ZERO, false),
++                           bi_fau(BIR_FAU_ATEST_PARAM, false));
++   USE(res, 1);
++
++   exec();
++}
+
+--- src/panfrost/compiler/bifrost/valhall/va_lower_split_64bit.c
++++ src/panfrost/compiler/bifrost/valhall/va_lower_split_64bit.c
+@@ -15,7 +15,7 @@
+  * respected by RA. This could be optimized, but this is deferred for now.
+  */
+ static void
+-lower_split_src(bi_context *ctx, bi_instr *I, unsigned s, bi_instr** lut)
++lower_split_src(bi_context *ctx, bi_instr *I, unsigned s)
+ {
+    /* Skip sources that are already split properly */
+    bi_index offset_fau = I->src[s];
+@@ -26,49 +26,60 @@ lower_split_src(bi_context *ctx, bi_instr *I, unsigned s, bi_instr** lut)
+       return;
+    }
+ 
+-   /* Check if the source regs are already coming from a split. */
+-   bi_index* src_a = &I->src[s];
+-   bi_index* src_b = &I->src[s + 1];
+-   if (bi_is_ssa(*src_a) && bi_is_ssa(*src_b)) {
+-      bi_instr* src_ins_a = lut[src_a->value];
+-      bi_instr* src_ins_b = lut[src_b->value];
+-      if (src_ins_a->op == BI_OPCODE_SPLIT_I32 && src_ins_a == src_ins_b)
+-         return;
+-   }
+-
+    /* Allocate temporary before the instruction */
+    bi_builder b = bi_init_builder(ctx, bi_before_instr(I));
+    bi_index vec = bi_temp(ctx);
+    bi_instr *collect = bi_collect_i32_to(&b, vec, 2);
+-   bi_instr *split = bi_split_i32_to(&b, 2, vec);
+ 
+-   /* Emit collect */
+-   for (unsigned w = 0; w < 2; ++w) {
+-      collect->src[w] = I->src[s + w];
++   if (!ctx->ra_force_lcra) {
++      for (unsigned w = 0; w < 2; ++w) {
++         collect->src[w] = I->src[s + w];
++         I->src[s + w] = vec;
++      }
++   } else {
++      bi_instr *split = bi_split_i32_to(&b, 2, vec);
++      /* Emit collect */
++      for (unsigned w = 0; w < 2; ++w) {
++         collect->src[w] = I->src[s + w];
++
++         split->dest[w] = bi_temp(ctx);
++         I->src[s + w] = split->dest[w];
++      }
++   }
++}
++
++static void
++lower_split_src_postra(bi_context *ctx, bi_instr *I, unsigned s)
++{
++   if (ctx->ra_force_lcra)
++      return;
+ 
+-      split->dest[w] = bi_temp(ctx);
+-      I->src[s + w] = split->dest[w];
++   if (I->src[s].type == BI_INDEX_REGISTER) {
++      assert(I->src[s + 1].type == BI_INDEX_REGISTER);
++      assert(I->src[s + 1].value == I->src[s].value);
++      I->src[s + 1].value += 1;
+    }
+ }
+ 
+ void
+ va_lower_split_64bit(bi_context *ctx)
+ {
+-   unsigned count = ctx->ssa_alloc;
+-   bi_instr **lut = rzalloc_array(ctx, bi_instr *, count);
++   bi_foreach_instr_global(ctx, I) {
++      bi_foreach_src(I, s) {
++         if (bi_is_null(I->src[s]) || s >= 4)
++            continue;
+ 
+-   if (!lut)
+-      return;
++         struct va_src_info info = va_src_info(I->op, s);
+ 
+-   /* Record producers */
+-   bi_foreach_block(ctx, block) {
+-      bi_foreach_instr_in_block(block, I) {
+-         bi_foreach_dest(I, d) {
+-            lut[I->dest[d].value] = I;
+-         }
++         if (info.size == VA_SIZE_64)
++            lower_split_src(ctx, I, s);
+       }
+    }
++}
+ 
++void
++va_lower_split_64bit_postra(bi_context *ctx)
++{
+    bi_foreach_instr_global(ctx, I) {
+       bi_foreach_src(I, s) {
+          if (bi_is_null(I->src[s]) || s >= 4)
+@@ -77,9 +88,7 @@ va_lower_split_64bit(bi_context *ctx)
+          struct va_src_info info = va_src_info(I->op, s);
+ 
+          if (info.size == VA_SIZE_64)
+-            lower_split_src(ctx, I, s, lut);
++            lower_split_src_postra(ctx, I, s);
+       }
+    }
+-
+-   ralloc_free(lut);
+ }
+
+--- src/panfrost/compiler/bifrost/IR_pseudo.xml
++++ src/panfrost/compiler/bifrost/IR_pseudo.xml
+@@ -178,4 +178,16 @@
+     <src start="0"/>
+   </ins>
+ 
++  <!-- Used during parallel copy emission -->
++  <ins name="SWAP" pseudo="true" dests="0" unit="add">
++    <src start="0"/>
++    <src start="3"/>
++  </ins>
++
++  <!-- To represent unused results that DCE can't remove. -->
++  <ins name="UNUSED" pseudo="true" dests="0" unit="add">
++    <src start="0"/>
++    <immediate name="sr_count" size="4" pseudo="true"/>
++  </ins>
++
+ </bifrost>
+
+--- src/panfrost/compiler/bifrost/bi_debug.c
++++ src/panfrost/compiler/bifrost/bi_debug.c
+@@ -28,6 +28,7 @@ static const struct debug_named_value bifrost_debug_options[] = {
+    {"statsabs",   BIFROST_DBG_STATSABS,   "Don't normalize statistics"},
+    {"statsfull",  BIFROST_DBG_STATSFULL,  "Print verbose statistics"},
+    {"debuginfo",  BIFROST_DBG_DEBUGINFO,  "Print debug information"},
++   {"lcra",       BIFROST_DBG_LCRA,       "Force LCRA instead of SSA RA"},
+    DEBUG_NAMED_VALUE_END
+ };
+ /* clang-format on */
+
+--- src/panfrost/compiler/bifrost/bi_debug.h
++++ src/panfrost/compiler/bifrost/bi_debug.h
+@@ -32,6 +32,7 @@ extern "C" {
+ #define BIFROST_DBG_STATSABS   0x8000
+ #define BIFROST_DBG_STATSFULL 0x10000
+ #define BIFROST_DBG_DEBUGINFO 0x20000
++#define BIFROST_DBG_LCRA      0x40000
+ 
+ extern unsigned bifrost_debug;
+ 
+
+--- src/panfrost/compiler/bifrost/bi_lower_parallel_copy.c
++++ src/panfrost/compiler/bifrost/bi_lower_parallel_copy.c
+@@ -0,0 +1,296 @@
++/*
++ * Copyright 2025 Arm Ltd.
++ * Copyright 2022 Alyssa Rosenzweig
++ * Copyright 2021 Valve Corporation
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "bi_builder.h"
++#include "compiler.h"
++
++static void
++mov_lowered(bi_builder *b, bi_index dst, bi_index src)
++{
++   assert(dst.type == BI_INDEX_REGISTER);
++   assert(!dst.memory);
++
++   if (src.type == BI_INDEX_CONSTANT && b->shader->arch >= 9) {
++      bi_index zero = bi_fau(BIR_FAU_IMMEDIATE | 0, false);
++      bi_iadd_imm_i32_to(b, dst, zero, src.value);
++   } else {
++      bi_mov_i32_to(b, dst, src);
++   }
++}
++
++/*
++ * Emits code for
++ *
++ *    for (int i = 0; i < n; ++i)
++ *       registers[dests[i]] = registers[srcs[i]];
++ *
++ * ...with all copies happening in parallel.
++ *
++ * That is, emit machine instructions equivalent to a parallel copy. This is
++ * used to lower not only parallel copies but also collects and splits, which
++ * also have parallel copy semantics.
++ *
++ * We only handle register-register copies, not general bi_index sources. This
++ * suffices for its internal use for register allocation.
++ */
++
++static void
++do_copy(bi_builder *b, const struct bi_copy *copy)
++{
++   assert(copy->src.channels == 1);
++
++   bi_index dst =
++      copy->dest_mem ? bi_memory_register(copy->dest) : bi_register(copy->dest);
++   dst.channels = 1;
++
++   bi_index scratch_reg = bi_register(BI_RA_PCOPY_TMP_FIRST);
++   scratch_reg.channels = 1;
++
++   if (copy->dest_mem && copy->src.memory) {
++      /* Memory-memory copies need to be lowered to memory-register and
++       * register-memory, using a reserved scratch register.
++       */
++      bi_memmov_to(b, scratch_reg, copy->src);
++      bi_memmov_to(b, dst, scratch_reg);
++   } else if (copy->src.memory) {
++      bi_memmov_to(b, dst, copy->src);
++   } else if (copy->dest_mem) {
++      bi_index src = copy->src;
++
++      /* Source needs to be in a GPR */
++      if (src.type != BI_INDEX_REGISTER) {
++         mov_lowered(b, scratch_reg, src);
++         src = scratch_reg;
++      }
++
++      bi_memmov_to(b, dst, src);
++   } else {
++      mov_lowered(b, dst, copy->src);
++   }
++}
++
++static void
++do_swap(bi_builder *b, const struct bi_copy *copy)
++{
++   assert(copy->src.type == BI_INDEX_REGISTER && "only GPRs are swapped");
++   assert(copy->src.channels == 1);
++
++   if (copy->dest == copy->src.value)
++      return;
++
++   bi_index x =
++      copy->dest_mem ? bi_memory_register(copy->dest) : bi_register(copy->dest);
++   x.channels = 1;
++   bi_index y = copy->src;
++   assert(x.memory == y.memory);
++
++   /* Memory-memory swaps lowered here, GPR swaps lowered later */
++   if (x.memory) {
++      bi_index temp1 = bi_register(BI_RA_PCOPY_TMP_FIRST);
++      bi_index temp2 = bi_register(BI_RA_PCOPY_TMP_FIRST + 1);
++      temp1.channels = 1;
++      temp2.channels = 1;
++
++      bi_memmov_to(b, temp1, x);
++      bi_memmov_to(b, temp2, y);
++      bi_memmov_to(b, y, temp1);
++      bi_memmov_to(b, x, temp2);
++   } else {
++      bi_swap(b, x, y);
++   }
++}
++
++struct copy_ctx {
++   /* Number of copies being processed */
++   unsigned entry_count;
++
++   /* For each physreg, the number of pending copy entries that use it as a
++    * source. Once this drops to zero, then the physreg is unblocked and can
++    * be moved to.
++    */
++   unsigned physreg_use_count[BI_NUM_MODELED_REGS];
++
++   /* For each physreg, the pending copy_entry that uses it as a dest. */
++   struct bi_copy *physreg_dest[BI_NUM_MODELED_REGS];
++
++   struct bi_copy entries[BI_NUM_MODELED_REGS];
++};
++
++static bool
++entry_blocked(struct bi_copy *entry, struct copy_ctx *ctx)
++{
++   /* Copies are scalarized, so it's enough to look only at one register. */
++   return ctx->physreg_use_count[entry->dest] != 0;
++}
++
++static bool
++is_real(struct bi_copy *entry)
++{
++   return entry->src.type == BI_INDEX_REGISTER &&
++          entry->dest_mem == entry->src.memory;
++}
++
++static void
++bi_emit_parallel_copies_for_class(bi_builder *b, struct bi_copy *copies,
++                                  unsigned num_copies, bool cls)
++{
++   /* Filter for the copies of the correct class.
++    * Here we could also split large copies into smaller ones, should we need
++    * to in the future.
++    */
++   struct bi_copy *copies2 = calloc(sizeof(copies[0]), num_copies * 2);
++   unsigned num_copies2 = 0;
++
++   for (unsigned i = 0; i < num_copies; ++i) {
++      struct bi_copy copy = copies[i];
++
++      /* Filter by class */
++      if (copy.dest_mem != cls)
++         continue;
++
++      assert(copy.dest < BI_NUM_MODELED_REGS);
++
++      copies2[num_copies2++] = copy;
++   }
++
++   copies = copies2;
++   num_copies = num_copies2;
++
++   /* Set up the bookkeeping */
++   struct copy_ctx _ctx = {.entry_count = num_copies};
++   struct copy_ctx *ctx = &_ctx;
++
++   memset(ctx->physreg_dest, 0, sizeof(ctx->physreg_dest));
++   memset(ctx->physreg_use_count, 0, sizeof(ctx->physreg_use_count));
++
++   for (unsigned i = 0; i < ctx->entry_count; i++) {
++      struct bi_copy *entry = &copies[i];
++
++      ctx->entries[i] = *entry;
++
++      if (is_real(entry))
++         ctx->physreg_use_count[entry->src.value]++;
++
++      /* Copies should not have overlapping destinations. */
++      assert(!ctx->physreg_dest[entry->dest]);
++      ctx->physreg_dest[entry->dest] = &ctx->entries[i];
++   }
++
++   bool progress = true;
++   while (progress) {
++      progress = false;
++
++      /* Step 1: resolve paths in the transfer graph. This means finding
++       * copies whose destination aren't blocked by something else and then
++       * emitting them, continuing this process until every copy is blocked
++       * and there are only cycles left.
++       *
++       * TODO: We should note that src is also available in dest to unblock
++       * cycles that src is involved in.
++       */
++
++      for (unsigned i = 0; i < ctx->entry_count; i++) {
++         struct bi_copy *entry = &ctx->entries[i];
++         if (!entry->done && !entry_blocked(entry, ctx)) {
++            entry->done = true;
++            progress = true;
++            do_copy(b, entry);
++
++            if (is_real(entry))
++               ctx->physreg_use_count[entry->src.value]--;
++            ctx->physreg_dest[entry->dest] = NULL;
++         }
++      }
++
++      /* Step 2: Find and split partially blocked copies.
++       * All copies are 32bit -> not applicable atm. */
++   }
++
++   /* Step 3: resolve cycles through swapping.
++    *
++    * At this point, the transfer graph should consist of only cycles.
++    * The reason is that, given any physreg n_1 that's the source of a
++    * remaining entry, it has a destination n_2, which (because every
++    * copy is blocked) is the source of some other copy whose destination
++    * is n_3, and so we can follow the chain until we get a cycle. If we
++    * reached some other node than n_1:
++    *
++    *  n_1 -> n_2 -> ... -> n_i
++    *          ^             |
++    *          |-------------|
++    *
++    *  then n_2 would be the destination of 2 copies, which is illegal
++    *  (checked above in an assert). So n_1 must be part of a cycle:
++    *
++    *  n_1 -> n_2 -> ... -> n_i
++    *  ^                     |
++    *  |---------------------|
++    *
++    *  and this must be only cycle n_1 is involved in, because any other
++    *  path starting from n_1 would also have to end in n_1, resulting in
++    *  a node somewhere along the way being the destination of 2 copies
++    *  when the 2 paths merge.
++    *
++    *  The way we resolve the cycle is through picking a copy (n_1, n_2)
++    *  and swapping n_1 and n_2. This moves n_1 to n_2, so n_2 is taken
++    *  out of the cycle:
++    *
++    *  n_1 -> ... -> n_i
++    *  ^              |
++    *  |--------------|
++    *
++    *  and we can keep repeating this until the cycle is empty.
++    */
++
++   for (unsigned i = 0; i < ctx->entry_count; i++) {
++      struct bi_copy *entry = &ctx->entries[i];
++      if (entry->done)
++         continue;
++
++      assert(is_real(entry));
++
++      /* catch trivial copies */
++      if (entry->dest == entry->src.value) {
++         entry->done = true;
++         continue;
++      }
++
++      do_swap(b, entry);
++
++      /* Split any blocking copies whose sources are only partially
++       * contained within our destination.
++       * (Not applicable atm.)
++       */
++
++      /* Update sources of blocking copies.
++       *
++       * Note: at this point, every blocking copy's source should be
++       * contained within our destination.
++       */
++      for (unsigned j = 0; j < ctx->entry_count; j++) {
++         struct bi_copy *blocking = &ctx->entries[j];
++         if (blocking->src.value == entry->dest) {
++            blocking->src.value = entry->src.value;
++         }
++      }
++
++      entry->done = true;
++   }
++
++   free(copies2);
++}
++
++void
++bi_emit_parallel_copies(bi_builder *b, struct bi_copy *copies,
++                        unsigned num_copies)
++{
++   /* Emit copies fo reach register class separately because we don't have
++    * register class awareness in the parallel copy lowering data structure.
++    */
++   bi_emit_parallel_copies_for_class(b, copies, num_copies, false);
++   bi_emit_parallel_copies_for_class(b, copies, num_copies, true);
++}
+
+--- src/panfrost/compiler/bifrost/bi_lower_spill.c
++++ src/panfrost/compiler/bifrost/bi_lower_spill.c
+@@ -7,19 +7,36 @@
+ 
+ struct lower_spill_ctx {
+    bi_context *shader;
+-   uint32_t *sizes;
+    /* If bi_index::memory, tls_loc[idx.value] is valid. */
+    uint32_t *tls_loc;
+    /* Bytes of spill memory used so far. */
+    uint32_t spill_count;
+ };
+ 
++static unsigned
++get_tls_offset(struct lower_spill_ctx *ctx, bi_index idx)
++{
++   assert(idx.memory);
++
++   switch (idx.type) {
++   case BI_INDEX_NORMAL:
++      /* Used for LCRA. */
++      return ctx->tls_loc[idx.value];
++   case BI_INDEX_REGISTER:
++      /* Used for SSA. */
++      return idx.value * sizeof(uint32_t);
++   default:
++      UNREACHABLE("invalid index to get tls offset for");
++      return UINT32_MAX;
++   }
++}
++
+ static void
+ lower_memmov(struct lower_spill_ctx* ctx, bi_instr *I, uint32_t tls_base)
+ {
+    assert(I->op == BI_OPCODE_MEMMOV);
+    assert(I->nr_srcs == 1 && I->nr_dests == 1);
+-   assert(I->src[0].memory || I->dest[0].memory);
++   assert(I->src[0].memory != I->dest[0].memory);
+ 
+    bi_builder b = bi_init_builder(ctx->shader, bi_before_instr(I));
+ 
+@@ -27,13 +44,13 @@ lower_memmov(struct lower_spill_ctx* ctx, bi_instr *I, uint32_t tls_base)
+    bi_index dst = I->dest[0];
+ 
+    if (I->src[0].memory) {
+-      unsigned offset = ctx->tls_loc[src.value];
+-      unsigned bits = ctx->sizes[src.value] * 32;
++      unsigned offset = get_tls_offset(ctx, src);
++      unsigned bits = bi_channels(src) * 32;
+       assert(bits <= 128);
+       bi_load_tl(&b, bits, dst, tls_base + offset);
+    } else {
+-      unsigned offset = ctx->tls_loc[dst.value];
+-      unsigned bits = ctx->sizes[dst.value] * 32;
++      unsigned offset = get_tls_offset(ctx, dst);
++      unsigned bits = bi_channels(dst) * 32;
+       assert(bits <= 128);
+       bi_store_tl(&b, bits, src, tls_base + offset);
+    }
+@@ -57,8 +74,8 @@ lower_mem_phi(struct lower_spill_ctx* ctx, bi_instr *I, uint32_t tls_base)
+        * wider. But, those should all get eliminated as trivial because they
+        * are only defined once so they would all look like mX = PHI mX, mX.
+        */
+-      assert(ctx->sizes[dst.value] == 1);
+-      I->dest[0].value = tls_base + ctx->tls_loc[dst.value];
++      assert(bi_channels(dst) == 1);
++      I->dest[0].value = tls_base + get_tls_offset(ctx, dst);
+    }
+ 
+    bi_foreach_src(I, s) {
+@@ -67,41 +84,51 @@ lower_mem_phi(struct lower_spill_ctx* ctx, bi_instr *I, uint32_t tls_base)
+          continue;
+ 
+       assert(ctx->tls_loc[src.value] != UINT32_MAX && "Undefined source");
+-      assert(ctx->sizes[src.value] == 1);
+-      I->src[s].value = tls_base + ctx->tls_loc[src.value];
++      assert(bi_channels(src) == 1);
++      I->src[s].value = tls_base + get_tls_offset(ctx, src);
+    }
+ }
+ 
+ static void
+ assign_tls_locations(struct lower_spill_ctx *ctx) {
+    bi_foreach_instr_global(ctx->shader, I) {
+-      bi_foreach_ssa_dest(I, d) {
++      bi_foreach_dest(I, d) {
+          bi_index dst = I->dest[d];
+          if (!dst.memory)
+             continue;
+ 
+          assert(I->op == BI_OPCODE_MEMMOV || I->op == BI_OPCODE_PHI);
+-         assert(ctx->tls_loc[dst.value] == UINT32_MAX && "Broken SSA");
+ 
+-         ctx->tls_loc[dst.value] = ctx->spill_count;
+-         ctx->spill_count += 4 * ctx->sizes[dst.value];
++         if (dst.type == BI_INDEX_REGISTER) {
++            /* SSA RA only needs to track the highest memory register to
++             * allocate enough TLS memory. The actual assignment is already
++             * done.
++             */
++            uint32_t base = dst.value * sizeof(uint32_t);
++            uint32_t end = base + bi_channels(dst) * sizeof(uint32_t);
++            ctx->spill_count = MAX2(ctx->spill_count, end);
++         } else if (bi_is_ssa(dst)) {
++            assert((ctx->tls_loc[dst.value] == UINT32_MAX) && "Broken SSA");
++
++            if (ctx->tls_loc[dst.value] == UINT32_MAX) {
++               ctx->tls_loc[dst.value] = ctx->spill_count;
++               ctx->spill_count += 4 * bi_channels(dst);
++            }
++         }
+       }
+    }
+ }
+ 
+ unsigned
+-bi_lower_spill(bi_context* ctx, uint32_t tls_base) {
++bi_lower_spill(bi_context *ctx, uint32_t tls_base)
++{
+    void* memctx = ralloc_context(NULL);
+ 
+-   uint32_t *sizes = rzalloc_array(memctx, uint32_t, ctx->ssa_alloc);
+    uint32_t *tls_loc = ralloc_array(memctx, uint32_t, ctx->ssa_alloc);
+    memset(tls_loc, 0xff, sizeof(uint32_t) * ctx->ssa_alloc);
+ 
+-   bi_record_sizes(ctx, sizes);
+-
+    struct lower_spill_ctx lctx = {
+       .shader = ctx,
+-      .sizes = sizes,
+       .tls_loc = tls_loc,
+       .spill_count = 0,
+    };
+
+--- src/panfrost/compiler/bifrost/bi_opt_dce.c
++++ src/panfrost/compiler/bifrost/bi_opt_dce.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "util/u_memory.h"
++#include "bi_builder.h"
+ #include "compiler.h"
+ 
+ /**
+@@ -12,6 +13,19 @@
+  * This pass assumes that no loop header phis are dead.
+  */
+ 
++static void
++discard_unused_result(bi_context *ctx, bi_instr *I, uint32_t d)
++{
++   bi_builder b = bi_init_builder(ctx, bi_after_instr(I));
++
++   bi_index tmp = bi_temp(ctx);
++   I->dest[d] = tmp;
++
++   uint32_t n = bi_count_write_registers(I, d);
++
++   bi_unused(&b, tmp, n);
++}
++
+ void
+ bi_opt_dce(bi_context *ctx, bool partial)
+ {
+@@ -56,6 +70,16 @@ bi_opt_dce(bi_context *ctx, bool partial)
+       }
+    }
+ 
++   if (partial) {
++      bi_foreach_instr_global_safe(ctx, I) {
++         bi_foreach_dest(I, d) {
++            if (!bi_is_null(I->dest[d]))
++               continue;
++            discard_unused_result(ctx, I, d);
++         }
++      }
++   }
++
+    free(seen);
+ }
+ 
+
+--- src/panfrost/compiler/bifrost/bi_printer.c.py
++++ src/panfrost/compiler/bifrost/bi_printer.c.py
+@@ -72,8 +72,6 @@ bi_print_index(FILE *fp, bi_index index, unsigned nr_regs)
+         fprintf(fp, "_");
+     else if (index.type == BI_INDEX_CONSTANT)
+         fprintf(fp, "#0x%x", index.value);
+-    else if (index.type == BI_INDEX_FAU && index.memory)
+-        fprintf(fp, "m%u", index.value);
+     else if (index.type == BI_INDEX_FAU && index.value >= BIR_FAU_UNIFORM)
+         fprintf(fp, "u%u", index.value & ~BIR_FAU_UNIFORM);
+     else if (index.type == BI_INDEX_FAU)
+
+--- src/panfrost/compiler/bifrost/bi_ra.c
++++ src/panfrost/compiler/bifrost/bi_ra.c
+@@ -975,6 +975,11 @@ bi_out_of_ssa(bi_context *ctx)
+    unsigned first_reg = ctx->ssa_alloc;
+    bool allow_propagate;
+ 
++   bi_foreach_instr_global_safe(ctx, I) {
++      if (I->op == BI_OPCODE_UNUSED)
++         bi_remove_instruction(I);
++   }
++
+    /* Trivially lower phis */
+    bi_foreach_block(ctx, block) {
+       bi_foreach_instr_in_block_safe(block, I) {
+@@ -1142,7 +1147,7 @@ op_is_load_store(enum bi_opcode op)
+    }
+ }
+ 
+-static uint64_t
++uint64_t
+ compute_spill_cost(bi_context *ctx)
+ {
+    void *mctx = ralloc_context(NULL);
+@@ -1200,8 +1205,13 @@ bi_register_allocate(bi_context *ctx)
+     * so the closer we get to having enough registers free, the better
+     */
+    if (!(bifrost_debug & BIFROST_DBG_NOSSARA)) {
++      /* Spilling expects bi_index::channels to be set correctly. */
++      bi_record_sizes(ctx);
++
+       unsigned regs_to_use =
+-         ((bifrost_debug & BIFROST_DBG_SPILL) && !ctx->inputs->is_blend) ? 16 : BI_MAX_REGS;
++         ((bifrost_debug & BIFROST_DBG_SPILL) && !ctx->inputs->is_blend)
++            ? 16 + 1 + bi_ra_get_max_blend_pressure(ctx)
++            : BI_MAX_REGS;
+       bool verbose = bifrost_debug & BIFROST_DBG_VERBOSE;
+ 
+       bi_compute_liveness_ssa(ctx);
+
+--- src/panfrost/compiler/bifrost/bi_ra_ssa.c
++++ src/panfrost/compiler/bifrost/bi_ra_ssa.c
+
+--- src/panfrost/compiler/bifrost/bi_repair_ssa.c
++++ src/panfrost/compiler/bifrost/bi_repair_ssa.c
+@@ -129,6 +129,7 @@ seal_block(struct repair_ctx *ctx, bi_block *block)
+       if (phi->index) {
+          bi_index var = bi_get_index(phi->index - 1);
+          var.memory = phi->dest[0].memory;
++         var.channels = phi->dest[0].channels;
+          add_phi_operands(ctx, block, phi, var);
+          phi->index = 0;
+       }
+
+--- src/panfrost/compiler/bifrost/bi_spill_ssa.c
++++ src/panfrost/compiler/bifrost/bi_spill_ssa.c
+@@ -235,6 +235,12 @@ spill_block(struct spill_ctx *ctx, bi_block *block)
+  */
+ static inline unsigned
+ node_size(struct spill_ctx *ctx, unsigned node)
++{
++   return util_next_power_of_two(ctx->size[node]);
++}
++
++static inline unsigned
++node_size_unrounded(struct spill_ctx *ctx, unsigned node)
+ {
+    return ctx->size[node];
+ }
+@@ -302,6 +308,7 @@ static bi_index
+ reconstruct_index(struct spill_ctx *ctx, unsigned node)
+ {
+    bi_index r = bi_get_index(node);
++   r.channels = node_size_unrounded(ctx, node);
+    /* do we need to reconstruct the swizzle here? */
+    return r;
+ }
+@@ -549,8 +556,10 @@ insert_coupling_code(struct spill_ctx *ctx, bi_block *pred, bi_block *succ)
+ 
+          bi_index mem = bi_temp(ctx->shader);
+          mem.memory = true;
++         mem.channels = 1;
+ 
+          bi_index gpr = bi_temp(ctx->shader);
++         gpr.channels = 1;
+ 
+          assert(gpr.type == BI_INDEX_NORMAL);
+          if (ctx->arch >= 9 && I->src[s].type == BI_INDEX_CONSTANT) {
+@@ -584,7 +593,7 @@ insert_coupling_code(struct spill_ctx *ctx, bi_block *pred, bi_block *succ)
+       if (ctx->remat[I->src[s].value]) {
+          unsigned node = I->src[s].value;
+          bi_index idx = reconstruct_index(ctx, node);
+-         bi_index tmp = bi_temp(ctx->shader);
++         bi_index tmp = bi_temp_like(ctx->shader, idx);
+ 
+          remat_to(&b, tmp, ctx, node);
+          bi_memmov_to(&b, bi_index_as_mem(idx, ctx), tmp);
+@@ -719,18 +728,18 @@ calculate_local_next_use(struct spill_ctx *ctx, struct util_dynarray *out)
+       ip -= instr_cycles(I);
+ 
+       if (I->op != BI_OPCODE_PHI) {
+-         bi_foreach_ssa_dest_rev(I, d) {
+-            unsigned v = I->dest[d].value;
++         bi_foreach_ssa_src(I, s) {
++            unsigned v = I->src[s].value;
+             dist_t next_dist = search_next_uses(&nu, v);
+             util_dynarray_append(out, next_dist);
++            set_next_use(&nu, v, ip);
++            assert((next_dist == DIST_INFINITY) == I->src[s].kill_ssa);
+          }
+ 
+-         bi_foreach_ssa_src(I, s) {
+-            unsigned v = I->src[s].value;
++         bi_foreach_ssa_dest_rev(I, d) {
++            unsigned v = I->dest[d].value;
+             dist_t next_dist = search_next_uses(&nu, v);
+             util_dynarray_append(out, next_dist);
+-            assert((next_dist == DIST_INFINITY) == I->src[s].kill_ssa);
+-            set_next_use(&nu, v, ip);
+          }
+       }
+    }
+@@ -1231,16 +1240,16 @@ validate_next_ip(struct spill_ctx *ctx, struct util_dynarray *local_next_ip)
+    bi_foreach_instr_in_block(ctx->block, I) {
+       if (I->op == BI_OPCODE_PHI)
+          continue;
+-      bi_foreach_ssa_src_rev(I, s) {
++      bi_foreach_ssa_dest(I, d) {
+          assert(next_use_cursor >= 1);
+-
+          unsigned next_ip = next_ips[--next_use_cursor];
+-         assert((next_ip == DIST_INFINITY) == I->src[s].kill_ssa);
++         (void)next_ip;
+       }
+-      bi_foreach_ssa_dest(I, d) {
++      bi_foreach_ssa_src_rev(I, s) {
+          assert(next_use_cursor >= 1);
++
+          unsigned next_ip = next_ips[--next_use_cursor];
+-         (void)next_ip;
++         assert((next_ip == DIST_INFINITY) == I->src[s].kill_ssa);
+       }
+    }
+    assert(next_use_cursor == 0 && "exactly sized");
+@@ -1318,24 +1327,20 @@ min_algorithm(struct spill_ctx *ctx)
+          insert_W(ctx, node);
+       }
+ 
+-      /* Limit W to make space for the sources we just added */
+-      limit(ctx, I, ctx->k);
+-
+-      /* Update next-use distances for this instruction. Unlike the paper, we
+-       * prune dead values from W as we go. This doesn't affect correctness, but
+-       * it speeds up limit() on average.
++      /* Values that are live-through the BLEND can't be in the registers
++       * clobbered by the blend shader. Artificially reduce the available regs
++       * to ensure there is enough space outside the clobbered regs.
++       * Some sources can be in the clobbered regs, subtract those.
+        */
+-      bi_foreach_ssa_src_rev(I, s) {
+-         assert(next_use_cursor >= 1);
+-
+-         unsigned next_ip = next_ips[--next_use_cursor];
+-         assert((next_ip == DIST_INFINITY) == I->src[s].kill_ssa);
++      uint32_t blend_clobbers =
++         I->op == BI_OPCODE_BLEND
++            ? BI_BLEND_AVAILABLE_REGS -
++                 bi_ra_blend_clobberable_sources(ctx->shader, I)
++            : 0;
+ 
+-         if (next_ip == DIST_INFINITY)
+-            remove_W_if_present(ctx, I->src[s].value);
+-         else
+-            ctx->next_uses[I->src[s].value] = next_ip;
+-      }
++      /* Limit W to make space for the sources we just added */
++      assert(ctx->k > blend_clobbers);
++      limit(ctx, I, ctx->k - blend_clobbers);
+ 
+       bi_foreach_ssa_dest(I, d) {
+          assert(next_use_cursor >= 1);
+@@ -1356,13 +1361,30 @@ min_algorithm(struct spill_ctx *ctx)
+       }
+ 
+       /* Limit W to make space for the destinations. */
+-      limit(ctx, I, ctx->k - dest_size);
++      assert(ctx->k >= (dest_size + blend_clobbers));
++      limit(ctx, I, ctx->k - dest_size - blend_clobbers);
+ 
+       /* Destinations are now in the register file */
+       bi_foreach_ssa_dest(I, d) {
+          insert_W(ctx, I->dest[d].value);
+       }
+ 
++      /* Update next-use distances for this instruction. Unlike the paper, we
++       * prune dead values from W as we go. This doesn't affect correctness, but
++       * it speeds up limit() on average.
++       */
++      bi_foreach_ssa_src_rev(I, s) {
++         assert(next_use_cursor >= 1);
++
++         unsigned next_ip = next_ips[--next_use_cursor];
++         assert((next_ip == DIST_INFINITY) == I->src[s].kill_ssa);
++
++         if (next_ip == DIST_INFINITY)
++            remove_W_if_present(ctx, I->src[s].value);
++         else
++            ctx->next_uses[I->src[s].value] = next_ip;
++      }
++
+       /* Add reloads for the sources in front of the instruction. We need to be
+        * careful around exports, hoisting the reloads to before all exports.
+        *
+@@ -1395,59 +1417,76 @@ min_algorithm(struct spill_ctx *ctx)
+    util_dynarray_fini(&local_next_ip);
+ }
+ 
++static void
++set_index_channels(bi_index *idx, uint8_t *sizes, ASSERTED bi_instr *I)
++{
++   assert(idx->type != BI_INDEX_REGISTER ||
++          (I->op == BI_OPCODE_MOV_I32 || I->is_preload));
++
++   /* Only SSA values can be larger than 32bit. */
++   uint32_t s = idx->type == BI_INDEX_NORMAL ? sizes[idx->value] : 1;
++   assert(s > 0 && s < 8 && "invalid size");
++
++   idx->channels = s;
++}
++
+ void
+-bi_record_sizes(bi_context *ctx, uint32_t *sizes)
++bi_record_sizes(bi_context *ctx)
+ {
+-   bi_foreach_instr_global(ctx, I) {
+-      if (I->nr_dests == 0 || I->dest[0].type != BI_INDEX_NORMAL)
+-         continue;
+-      unsigned idx = I->dest[0].value;
+-      bi_foreach_ssa_dest(I, d) {
+-         idx = I->dest[d].value;
+-         assert(sizes[idx] == 0 && "SSA broken");
+-         switch (I->op) {
+-         case BI_OPCODE_PHI:
+-         case BI_OPCODE_MEMMOV:
+-            break;
+-         default:
+-            sizes[idx] = bi_count_write_registers(I, d);
+-            break;
+-         }
+-      }
+-   }
++   uint8_t *sizes = rzalloc_array(NULL, uint8_t, ctx->ssa_alloc);
+ 
+-   /* now that we know the rest of the sizes, find the sizes for PHI nodes */
+-   bi_foreach_block(ctx, block) {
+-      bi_foreach_phi_in_block(block, I) {
+-         if (I->dest[0].type != BI_INDEX_NORMAL)
+-            continue;
+-         unsigned idx = I->dest[0].value;
+-         sizes[idx] = 1;
+-         bi_foreach_ssa_src(I, s) {
+-            sizes[idx] = MAX2(sizes[idx], sizes[I->src[s].value]);
+-         }
+-      }
+-   }
++   bool progress = true;
+ 
+-   /* After we know PHI sizes, determine MEMMOV sizes. */
++   while (progress) {
++      progress = false;
+ 
+-   bi_foreach_instr_global(ctx, I) {
+-      if (I->op != BI_OPCODE_MEMMOV || I->dest[0].type != BI_INDEX_NORMAL)
+-         continue;
++      bi_foreach_instr_global(ctx, I) {
++         if (I->nr_dests == 0 || I->dest[0].type != BI_INDEX_NORMAL)
++            continue;
++
++         bi_foreach_ssa_dest(I, d) {
++            const uint8_t old_size = sizes[I->dest[d].value];
++            uint8_t new_size = old_size;
++
++            switch (I->op) {
++            case BI_OPCODE_PHI:
++            case BI_OPCODE_MEMMOV:
++               /* Output size determined by the inputs. */
++               bi_foreach_src(I, s) {
++                  switch (I->src[s].type) {
++                  case BI_INDEX_NORMAL:
++                     new_size = MAX2(new_size, sizes[I->src[s].value]);
++                     break;
++                  case BI_INDEX_CONSTANT:
++                  case BI_INDEX_FAU:
++                     new_size = 1;
++                     break;
++                  default:
++                     UNREACHABLE("invalid index type for size calculation\n");
++                  }
++               }
++               break;
++            default:
++               /* Output size independent of the inputs. */
++               new_size = bi_count_write_registers(I, d);
++               break;
++            }
+ 
+-      if (I->dest[0].memory) {
+-         assert(!I->src[0].memory);
+-         sizes[I->dest[0].value] = sizes[I->src[0].value];
++            /* Need to continue if there was a change or the dst is not yet
++             * defined. */
++            progress |= new_size == 0 || old_size != new_size;
++            sizes[I->dest[d].value] = new_size;
++         }
+       }
+    }
+ 
++   /* Store the sizes into all bi_index instances. */
+    bi_foreach_instr_global(ctx, I) {
+-      if (I->op != BI_OPCODE_MEMMOV || I->dest[0].type != BI_INDEX_NORMAL)
+-         continue;
+-
+-      if (!I->dest[0].memory) {
+-         assert(I->src[0].memory);
+-         sizes[I->dest[0].value] = sizes[I->src[0].value];
++      bi_foreach_src(I, s) {
++         set_index_channels(&I->src[s], sizes, I);
++      }
++      bi_foreach_dest(I, d) {
++         set_index_channels(&I->dest[d], sizes, I);
+       }
+    }
+ }
+@@ -1500,7 +1539,11 @@ bi_spill_ssa(bi_context *ctx, unsigned k)
+          remat[idx] = I;
+    }
+ 
+-   bi_record_sizes(ctx, sizes);
++   bi_foreach_instr_global(ctx, I) {
++      bi_foreach_ssa_dest(I, d) {
++         sizes[I->dest[d].value] = bi_channels(I->dest[d]);
++      }
++   }
+ 
+    struct spill_block *blocks =
+       rzalloc_array(memctx, struct spill_block, ctx->num_blocks);
+@@ -1598,4 +1641,9 @@ bi_spill_ssa(bi_context *ctx, unsigned k)
+    ralloc_free(memctx);
+ 
+    bi_repair_ssa(ctx);
++
++   /* Remat can introduce dead code */
++   bi_opt_dce(ctx, false);
++
++   bi_validate_channels(ctx);
+ }
+
+--- src/panfrost/compiler/bifrost/bi_test.h
++++ src/panfrost/compiler/bifrost/bi_test.h
+@@ -17,6 +17,7 @@ bit_block(bi_context *ctx)
+    bi_block *blk = rzalloc(ctx, bi_block);
+ 
+    util_dynarray_init(&blk->predecessors, blk);
++   _mesa_pointer_set_init(&blk->dom_frontier, ctx);
+    list_addtail(&blk->link, &ctx->blocks);
+    list_inithead(&blk->instructions);
+ 
+
+--- src/panfrost/compiler/bifrost/bi_validate.c
++++ src/panfrost/compiler/bifrost/bi_validate.c
+@@ -168,6 +168,38 @@ bi_validate_phi_ordering(bi_context *ctx)
+    return true;
+ }
+ 
++static bool
++bi_validate_block_order(bi_context *ctx, const char *after)
++{
++   bool fail = false;
++   int last_index = -1;
++
++   bi_foreach_block(ctx, block) {
++      if ((int)block->index <= last_index) {
++         fprintf(stderr, "Out-of-order block index %d vs %d after %s\n",
++                 block->index, last_index, after);
++         fail = true;
++      }
++
++      last_index = block->index;
++
++      int last_pred_index = -1;
++      bi_foreach_predecessor(block, pp) {
++         bi_block *p = *pp;
++         if ((int)p->index <= last_pred_index) {
++            fprintf(
++               stderr,
++               "Out-of-order predecessor index %d before %d in block %d after %s\n",
++               last_pred_index, p->index, block->index, after);
++            fail = true;
++         }
++         last_pred_index = p->index;
++      }
++   }
++
++   return !fail;
++}
++
+ void
+ bi_validate(bi_context *ctx, const char *after)
+ {
+@@ -201,6 +233,52 @@ bi_validate(bi_context *ctx, const char *after)
+       fail = true;
+    }
+ 
++   if (!bi_validate_block_order(ctx, after)) {
++      fprintf(stderr, "Unexpected block order %s\n", after);
++      fail = true;
++   }
++
++   if (fail) {
++      bi_print_shader(ctx, stderr);
++      exit(1);
++   }
++}
++
++void
++bi_validate_channels(bi_context *ctx)
++{
++   if (bifrost_debug & BIFROST_DBG_NOVALIDATE)
++      return;
++
++   /* First, remember the current channels values. */
++   uint8_t *channels = calloc(ctx->ssa_alloc, sizeof(uint8_t));
++   bi_foreach_instr_global(ctx, I) {
++      bi_foreach_ssa_dest(I, d) {
++         assert(channels[I->dest[d].value] == 0 && "SSA broken");
++         channels[I->dest[d].value] = bi_channels(I->dest[d]);
++      }
++   }
++
++   /* Then recalculate the channels. */
++   bi_record_sizes(ctx);
++
++   /* Finally, compare new numbers against the old ones. They should match. */
++   bool fail = false;
++   bi_foreach_instr_global(ctx, I) {
++      bi_foreach_ssa_dest(I, d) {
++         bi_index idx = I->dest[d];
++         if (bi_channels(idx) != channels[idx.value]) {
++            fprintf(stderr,
++                    "channel mismatch, old = %u != new = %u in dest %u at ",
++                    channels[idx.value], bi_channels(idx), d);
++            bi_print_instr(I, stderr);
++            fail = true;
++         }
++      }
++   }
++
++   free(channels);
++
+    if (fail) {
+       bi_print_shader(ctx, stderr);
+       exit(1);
+
+--- src/panfrost/compiler/bifrost/bi_validate_ra.c
++++ src/panfrost/compiler/bifrost/bi_validate_ra.c
+@@ -0,0 +1,353 @@
++/*
++ * Copyright 2026 Arm Ltd.
++ * Copyright 2024 Alyssa Rosenzweig
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "compiler.h"
++
++/* Validatation doesn't make sense in release builds */
++#ifndef NDEBUG
++
++static inline uint32_t
++bi_index_size_32(bi_index idx)
++{
++   return idx.channels;
++}
++
++/* Represents a single 16-bit slice of an SSA var */
++struct var_offset {
++   uint32_t var;
++   uint8_t offset;
++   uint8_t defined;
++   uint8_t pad[2];
++};
++static_assert(sizeof(struct var_offset) == 8);
++
++static struct var_offset
++var_index(bi_index idx, uint32_t offset)
++{
++   assert(idx.type == BI_INDEX_NORMAL);
++
++   return (struct var_offset){
++      .var = idx.value,
++      .offset = offset,
++      .defined = true,
++   };
++}
++
++static struct var_offset
++var_undef()
++{
++   return (struct var_offset){.defined = false};
++}
++
++static bool
++vars_equal(struct var_offset x, struct var_offset y)
++{
++   return x.defined && y.defined && x.var == y.var && x.offset == y.offset;
++}
++
++/* Represents the contents of a single register file */
++struct regfile {
++   struct var_offset r[RA_CLASSES][BI_NUM_MODELED_REGS];
++};
++
++static void
++print_regfile(struct regfile *file, FILE *fp)
++{
++   fprintf(fp, "regfile: \n");
++   for (enum ra_class cls = 0; cls < RA_CLASSES; ++cls) {
++      for (unsigned r = 0; r < BI_NUM_MODELED_REGS; ++r) {
++         struct var_offset v = file->r[cls][r];
++
++         if (v.defined) {
++            fprintf(fp, "   %c%u = %u[%u]\n", cls == RA_MEM ? 'm' : 'h', r,
++                    v.var, v.offset);
++         }
++      }
++   }
++   fprintf(fp, "\n");
++}
++
++#define bi_validate_assert_eq(file, I, s, offs, a, b)                          \
++   do {                                                                        \
++      __typeof(a) va = (a);                                                    \
++      __typeof(b) vb = (b);                                                    \
++      if (!(va == vb)) {                                                       \
++         fprintf(stderr,                                                       \
++                 "failed to validate RA source %u offs %u: " #a " == " #b      \
++                 " (%u != %u) \n",                                             \
++                 s, offs, va, vb);                                             \
++         bi_print_instr(I, stderr);                                            \
++         print_regfile(file, stderr);                                          \
++         return false;                                                         \
++      }                                                                        \
++   } while (false);
++
++#define bi_validate_assert(file, I, s, offs, stmt)                             \
++   if (!(stmt)) {                                                              \
++      fprintf(stderr, "failed to validate RA source %u offs %u: " #stmt "\n",  \
++              s, offs);                                                        \
++      bi_print_instr(I, stderr);                                               \
++      print_regfile(file, stderr);                                             \
++      return false;                                                            \
++   }
++
++static void
++copy_reg(struct regfile *file, bi_index dst, bi_index src)
++{
++   assert(dst.type == BI_INDEX_REGISTER);
++   assert(src.type == BI_INDEX_REGISTER);
++
++   enum ra_class dst_cls = ra_class_for_index(dst);
++   enum ra_class src_cls = ra_class_for_index(src);
++
++   /* MEMMOV could be larger but those don't come in here rn. */
++   const unsigned width = 1;
++   for (uint8_t offs = 0; offs < width; ++offs) {
++      assert(dst.value + offs < ARRAY_SIZE(file->r[dst_cls]));
++      file->r[dst_cls][dst.value + offs] = file->r[src_cls][src.value + offs];
++   }
++}
++
++static void
++swap_regs(struct regfile *file, bi_index a, bi_index b)
++{
++   assert(a.type == BI_INDEX_REGISTER);
++   assert(b.type == BI_INDEX_REGISTER);
++
++   enum ra_class a_cls = ra_class_for_index(a);
++   enum ra_class b_cls = ra_class_for_index(b);
++
++   unsigned size = bi_index_size_32(a);
++   assert(size == bi_index_size_32(b));
++
++   for (uint8_t offs = 0; offs < size; ++offs) {
++      assert(a.value + offs < ARRAY_SIZE(file->r[a_cls]));
++      assert(b.value + offs < ARRAY_SIZE(file->r[b_cls]));
++
++      struct var_offset tmp = file->r[a_cls][a.value + offs];
++      file->r[a_cls][a.value + offs] = file->r[b_cls][b.value + offs];
++      file->r[b_cls][b.value + offs] = tmp;
++   }
++}
++
++static void
++record_dest(struct regfile *file, bi_index idx)
++{
++   assert(idx.type == BI_INDEX_NORMAL && idx.has_reg);
++   enum ra_class cls = ra_class_for_index(idx);
++
++   for (uint8_t offs = 0; offs < bi_index_size_32(idx); ++offs) {
++      assert(idx.reg + offs < ARRAY_SIZE(file->r[cls]));
++      file->r[cls][idx.reg + offs] = var_index(idx, offs);
++   }
++}
++
++static bool
++validate_dest(bi_context *ctx, bi_instr *I, unsigned s, struct regfile *file,
++              bi_index idx)
++{
++   assert(idx.type == BI_INDEX_NORMAL && idx.has_reg);
++   unsigned fixed_reg = bi_get_fixed_reg(ctx, I, s, false);
++
++   if (fixed_reg != BI_MAX_REGS) {
++      bi_validate_assert(file, I, s, 0, idx.has_reg);
++      bi_validate_assert(file, I, s, 0, idx.reg == fixed_reg);
++   }
++
++   unsigned alignment = MIN2(2, bi_channels(idx));
++   bool align_ok = idx.reg % alignment == 0;
++   bi_validate_assert(file, I, s, 0, align_ok);
++
++   return true;
++}
++
++static bool
++validate_src(bi_context *ctx, bi_instr *I, unsigned s, struct regfile *file,
++             bi_index idx)
++{
++   assert(idx.type == BI_INDEX_NORMAL && idx.has_reg);
++   enum ra_class cls = ra_class_for_index(idx);
++   unsigned fixed_reg = bi_get_fixed_reg(ctx, I, s, true);
++
++   for (uint8_t offs = 0; offs < bi_index_size_32(idx); ++offs) {
++      assert(idx.reg + offs < ARRAY_SIZE(file->r[cls]));
++      struct var_offset actual = file->r[cls][idx.reg + offs];
++
++      bi_validate_assert(file, I, s, offs, actual.defined);
++      bi_validate_assert_eq(file, I, s, offs, actual.var, idx.value);
++      bi_validate_assert_eq(file, I, s, offs, actual.offset, offs);
++
++      if (fixed_reg != BI_MAX_REGS) {
++         bi_validate_assert(file, I, s, offs, idx.reg == fixed_reg);
++      }
++   }
++
++   return true;
++}
++
++static bool
++validate_block(bi_context *ctx, bi_block *block, struct regfile *blocks)
++{
++   struct regfile *file = &blocks[block->index];
++   bool success = true;
++
++   /* Pathological shaders can end up with loop headers that have only a single
++    * predecessor and act like normal blocks. Validate them as such, since RA
++    * treats them as such implicitly. Affects:
++    *
++    * dEQP-VK.graphicsfuzz.spv-stable-mergesort-dead-code
++    */
++   bool loop_header = block->loop_header && bi_num_predecessors(block) > 1;
++
++   /* Initialize the register file based on predecessors. This only works in
++    * non-loop headers, since loop headers have unprocessed predecessors.
++    * However, loop headers phi-declare everything instead of using implicit
++    * live-in sources, so that's ok.
++    */
++   if (!loop_header) {
++      bool first_pred = true;
++      bi_foreach_predecessor(block, pred) {
++         struct regfile *pred_file = &blocks[(*pred)->index];
++
++         for (enum ra_class cls = 0; cls < RA_CLASSES; ++cls) {
++            for (unsigned r = 0; r < BI_NUM_MODELED_REGS; ++r) {
++               if (first_pred)
++                  file->r[cls][r] = pred_file->r[cls][r];
++               else if (!vars_equal(file->r[cls][r], pred_file->r[cls][r]))
++                  file->r[cls][r] = var_undef();
++            }
++         }
++
++         first_pred = false;
++      }
++   }
++
++   bi_foreach_instr_in_block(block, I) {
++      /* Phis are special since they happen along the edge */
++      if (I->op != BI_OPCODE_PHI) {
++         bi_foreach_ssa_src(I, s) {
++            success &= validate_src(ctx, I, s, file, I->src[s]);
++         }
++      }
++
++      bi_foreach_ssa_dest(I, d) {
++         record_dest(file, I->dest[d]);
++         success &= validate_dest(ctx, I, d, file, I->dest[d]);
++      }
++
++      /* Lowered live range splits don't have SSA associated, handle
++       * directly at the register level.
++       */
++      if ((I->op == BI_OPCODE_MOV_I32 || I->op == BI_OPCODE_MEMMOV) &&
++          I->dest[0].type == BI_INDEX_REGISTER &&
++          I->src[0].type == BI_INDEX_REGISTER) {
++
++         copy_reg(file, I->dest[0], I->src[0]);
++      } else if (I->op == BI_OPCODE_SWAP) {
++         swap_regs(file, I->src[0], I->src[1]);
++      } else if (I->op == BI_OPCODE_PHI &&
++                 I->dest[0].type == BI_INDEX_REGISTER) {
++         /* Register-only phis which resolve to the same variable in all blocks.
++          * This is generated for edge case live range splits.
++          */
++         assert(!I->dest[0].memory);
++         assert(!loop_header);
++         for (uint8_t offs = 0; offs < bi_index_size_32(I->dest[0]); ++offs) {
++            bool all_same = true;
++            bool first = true;
++            struct var_offset same = var_undef();
++            bi_foreach_predecessor(block, pred) {
++               unsigned idx = bi_predecessor_index(block, *pred);
++               bi_index src = I->src[idx];
++
++               assert(!src.memory);
++               if (src.type != BI_INDEX_REGISTER) {
++                  all_same = false;
++                  first = false;
++                  continue;
++               }
++
++               struct regfile *pred_file = &blocks[(*pred)->index];
++               struct var_offset var = pred_file->r[RA_GPR][src.value + offs];
++               all_same &= first || vars_equal(var, same);
++               same = var;
++               first = false;
++            }
++
++            if (all_same) {
++               file->r[RA_GPR][I->dest[0].value + offs] = same;
++            }
++         }
++      } else if (I->op == BI_OPCODE_PHI && I->dest[0].has_reg && !loop_header) {
++         /* Phis which resolve to the same variable in all blocks.
++          * This is generated for live range splits.
++          */
++         enum ra_class cls = ra_class_for_index(I->dest[0]);
++         for (uint8_t offs = 0; offs < bi_index_size_32(I->dest[0]); ++offs) {
++            bool all_same = true;
++            bool first = true;
++            struct var_offset same = var_undef();
++            bi_foreach_predecessor(block, pred) {
++               unsigned idx = bi_predecessor_index(block, *pred);
++               bi_index src = I->src[idx];
++
++               assert(ra_class_for_index(src) == cls);
++               if (!src.has_reg) {
++                  all_same = false;
++                  first = false;
++                  continue;
++               }
++
++               struct regfile *pred_file = &blocks[(*pred)->index];
++               struct var_offset var = pred_file->r[cls][src.reg + offs];
++               all_same &= first || vars_equal(var, same);
++               same = var;
++               first = false;
++            }
++
++            if (all_same && I->dest[0].value == I->src[0].value) {
++               file->r[cls][I->dest[0].reg + offs] = same;
++            }
++         }
++      }
++   }
++
++   /* After processing a block, process the block's source in its successors'
++    * phis. These happen on the edge so we have all the information here, even
++    * with backedges.
++    */
++   bi_foreach_successor(block, succ) {
++      unsigned idx = bi_predecessor_index(succ, block);
++
++      bi_foreach_phi_in_block(succ, phi) {
++         if (phi->src[idx].type == BI_INDEX_NORMAL) {
++            success &= validate_src(ctx, phi, idx, file, phi->src[idx]);
++         }
++      }
++   }
++
++   return success;
++}
++
++void
++bi_validate_ra(bi_context *ctx)
++{
++   bool succ = true;
++   struct regfile *blocks = calloc(ctx->num_blocks, sizeof(*blocks));
++
++   bi_foreach_block(ctx, block) {
++      succ &= validate_block(ctx, block, blocks);
++   }
++
++   if (!succ) {
++      bi_print_shader(ctx, stderr);
++      UNREACHABLE("invalid RA");
++   }
++
++   free(blocks);
++}
++
++#endif /* NDEBUG */
+
+--- src/panfrost/compiler/bifrost/bifrost_compile.c
++++ src/panfrost/compiler/bifrost/bifrost_compile.c
+@@ -24,14 +24,13 @@ static void pan_stats_verbose(FILE *f, const char *prefix, bi_context *ctx,
+                               const struct pan_stats *stats,
+                               const struct pan_shader_info *info);
+ 
+-
+ /* How many bytes are prefetched by the Bifrost shader core. From the final
+  * clause of the shader, this range must be valid instructions or zero. */
+ #define BIFROST_SHADER_PREFETCH 128
+ 
+ static bi_block *emit_cf_list(bi_context *ctx, struct exec_list *list);
+ 
+-static bi_index
++bi_index
+ bi_preload(bi_builder *b, unsigned reg)
+ {
+    if (bi_is_null(b->shader->preloaded[reg])) {
+@@ -40,7 +39,10 @@ bi_preload(bi_builder *b, unsigned reg)
+       b_.cursor = bi_before_block(bi_start_block(&b->shader->blocks));
+ 
+       /* Cache the result */
+-      b->shader->preloaded[reg] = bi_mov_i32(&b_, bi_register(reg));
++      b->shader->preloaded[reg] = bi_temp(b->shader);
++      bi_instr *I =
++         bi_mov_i32_to(&b_, b->shader->preloaded[reg], bi_register(reg));
++      I->is_preload = true;
+    }
+ 
+    return b->shader->preloaded[reg];
+@@ -4688,9 +4690,6 @@ emit_loop(bi_context *ctx, nir_loop *nloop)
+ {
+    assert(!nir_loop_has_continue_construct(nloop));
+ 
+-   /* Remember where we are */
+-   bi_block *start_block = ctx->current_block;
+-
+    bi_block *saved_break = ctx->break_block;
+    bi_block *saved_continue = ctx->continue_block;
+ 
+@@ -4699,6 +4698,8 @@ emit_loop(bi_context *ctx, nir_loop *nloop)
+    ctx->after_block = ctx->continue_block;
+    ctx->after_block->loop_header = true;
+ 
++   bi_block_add_successor(ctx->current_block, ctx->continue_block);
++
+    /* Emit the body itself */
+    emit_cf_list(ctx, &nloop->body);
+ 
+@@ -4706,7 +4707,6 @@ emit_loop(bi_context *ctx, nir_loop *nloop)
+    bi_builder _b = bi_init_builder(ctx, bi_after_block(ctx->current_block));
+    bi_instr *I = bi_jump(&_b, bi_zero());
+    I->branch_target = ctx->continue_block;
+-   bi_block_add_successor(start_block, ctx->continue_block);
+    bi_block_add_successor(ctx->current_block, ctx->continue_block);
+ 
+    ctx->after_block = ctx->break_block;
+@@ -5202,6 +5202,8 @@ bi_compile_variant_nir(nir_shader *nir,
+    ctx->rtz_fp32 = nir_is_rounding_mode_rtz(execution_mode, 32);
+    ctx->ftz_fp32 = nir_is_denorm_flush_to_zero(execution_mode, 32);
+ 
++   ctx->ra_force_lcra = bifrost_debug & BIFROST_DBG_LCRA;
++
+    if (idvs == BI_IDVS_POSITION || idvs == BI_IDVS_VARYING) {
+       /* Specializing shaders for IDVS is destructive, so we need to
+        * clone. However, the last (second) IDVS shader does not need
+@@ -5407,7 +5409,13 @@ bi_compile_variant_nir(nir_shader *nir,
+       bi_validate(ctx, "Pre-RA scheduling");
+    }
+ 
+-   bi_register_allocate(ctx);
++   /* RA correctness depends on DCE. */
++   bi_opt_dce(ctx, true);
++
++   if (ctx->ra_force_lcra)
++      bi_register_allocate(ctx);
++   else
++      bi_register_allocate_ssa(ctx);
+ 
+    if (likely(optimize))
+       bi_opt_post_ra(ctx);
+
+--- src/panfrost/compiler/bifrost/bir.c
++++ src/panfrost/compiler/bifrost/bir.c
+@@ -77,6 +77,8 @@ bi_count_read_registers(const bi_instr *ins, unsigned s)
+       return ins->sr_count_2; /* Dual source blending */
+    else if (s == 0 && ins->op == BI_OPCODE_SPLIT_I32)
+       return ins->nr_dests;
++   else if (s == 0 && ins->op == BI_OPCODE_UNUSED)
++      return ins->sr_count;
+    else
+       return 1;
+ }
+@@ -185,6 +187,7 @@ bi_side_effects(const bi_instr *I)
+    switch (I->op) {
+    case BI_OPCODE_DISCARD_F32:
+    case BI_OPCODE_DISCARD_B32:
++   case BI_OPCODE_UNUSED:
+       return true;
+    default:
+       break;
+
+--- src/panfrost/compiler/bifrost/compiler.h
++++ src/panfrost/compiler/bifrost/compiler.h
+@@ -20,6 +20,10 @@
+ extern "C" {
+ #endif
+ 
++/* Semi-arbitrary limit for spill slot allocation */
++#define BI_NUM_MODELED_REGS_LOG2 (11)
++#define BI_NUM_MODELED_REGS      (1 << BI_NUM_MODELED_REGS_LOG2)
++
+ /* Swizzles across bytes in a 32-bit word. Expresses swz in the XML directly.
+  * To express widen, use the correpsonding replicated form, i.e. H01 = identity
+  * for widen = none, H00 for widen = h0, B1111 for widen = b1. For lane, also
+@@ -319,10 +323,33 @@ typedef struct {
+    /* Register class */
+    bool memory : 1;
+ 
++   /* Size in multiples of 32bit, used for RA. */
++   unsigned channels : 3;
++
++   /* If has_reg is set (during register allocation), the register assigned to
++    * this SSA value This is used with NORMAL. Contrast REGISTER which uses
++    * value instead.
++    *
++    * TODO: Unify.
++    */
++   unsigned reg : BI_NUM_MODELED_REGS_LOG2;
++   bool has_reg : 1;
++
+    /* Must be zeroed so we can hash the whole 64-bits at a time */
+-   unsigned padding : (32 - 16);
++   unsigned padding : (32 - 31);
+ } bi_index;
+ 
++static inline unsigned
++bi_channels(bi_index idx)
++{
++   if (idx.type == BI_INDEX_REGISTER || idx.type == BI_INDEX_NORMAL) {
++      assert(idx.channels > 0);
++      return idx.channels;
++   }
++   /* Constants and FAU values always have 1 channel implicitly. */
++   return 1;
++}
++
+ static inline bi_index
+ bi_get_index(unsigned value)
+ {
+@@ -362,6 +389,35 @@ bi_register(unsigned reg)
+    };
+ }
+ 
++static inline bi_index
++bi_memory_register(uint32_t imm)
++{
++   assert(imm < BI_NUM_MODELED_REGS);
++   return (bi_index){
++      .value = imm,
++      .type = BI_INDEX_REGISTER,
++      .memory = true,
++   };
++}
++
++static inline bi_index
++bi_register_like(uint32_t imm, bi_index like)
++{
++   return (bi_index){
++      .value = imm,
++      .type = BI_INDEX_REGISTER,
++      .memory = like.memory,
++      .channels = like.channels,
++   };
++}
++
++static inline bi_index
++bi_as_register(bi_index x)
++{
++   assert(x.has_reg);
++   return bi_register_like(x.reg, x);
++}
++
+ static inline bi_index
+ bi_imm_u32(uint32_t imm)
+ {
+@@ -686,6 +742,7 @@ typedef struct {
+       bool z_stencil;            /* LD_TILE */
+       bool scheduling_barrier;   /* NOP */
+       unsigned blend_target;     /* BLEND */
++      bool is_preload;           /* MOV.i32, treat mov as preload for RA. */
+ 
+       struct {
+          enum bi_special special;   /* FADD_RSCALE, FMA_RSCALE */
+@@ -1024,6 +1081,12 @@ typedef struct bi_block {
+     * a given block is dominated by another block an O(1) operation.
+     */
+    uint32_t dom_pre_index, dom_post_index;
++
++   /* For visited blocks during register assignment and live-out registers, the
++    * mapping of registers to SSA names at the end of the block. This is dense,
++    * unlike its inverse.
++    */
++   uint32_t *reg_to_ssa_out[2];
+ } bi_block;
+ 
+ static inline unsigned
+@@ -1115,6 +1178,17 @@ enum bi_idvs_mode {
+ };
+ 
+ #define BI_MAX_REGS 64
++/* How many registers a blend shader can use. */
++#define BI_BLEND_AVAILABLE_REGS 16
++
++/*
++ * SSA-RA treats the nesting counter, the divergent shuffle temporary, and the
++ * spiller temporaries as alive throughout if used anywhere. This could be
++ * optimized. Using a single power-of-two reserved region at the start ensures
++ * these registers are never shuffled.
++ */
++#define BI_RA_PCOPY_TMP_FIRST (8)
++#define BI_RA_PCOPY_TMP_COUNT (2)
+ 
+ typedef struct {
+    const struct pan_compile_inputs *inputs;
+@@ -1189,8 +1263,25 @@ typedef struct {
+ 
+    /* Computed after RA */
+    uint64_t spill_cost;
++
++   /* Use LCRA as a fallback. */
++   bool ra_force_lcra;
+ } bi_context;
+ 
++struct bi_copy {
++   /* Base register destination of the copy */
++   unsigned dest;
++
++   /* Destination is memory */
++   bool dest_mem;
++
++   /* Source of the copy */
++   bi_index src;
++
++   /* Whether the copy has been handled. Callers must leave to false. */
++   bool done;
++};
++
+ static inline enum bi_round
+ bi_round_mode(bi_context *ctx, unsigned bit_size)
+ {
+@@ -1519,8 +1610,20 @@ uint64_t bi_instr_read_mask(bi_instr *I, bool staging_only);
+ uint64_t bi_instr_write_mask(bi_instr *I);
+ void bi_assign_scoreboard(bi_context *ctx);
+ void bi_register_allocate(bi_context *ctx);
++void bi_register_allocate_ssa(bi_context *ctx);
++uint32_t bi_get_fixed_reg(bi_context *ctx, const bi_instr *ins, unsigned i,
++                          bool src);
++#ifndef NDEBUG
++void bi_validate_ra(bi_context *ctx);
++#else
++static inline void
++bi_validate_ra(UNUSED bi_context *ctx)
++{
++}
++#endif
+ void va_optimize(bi_context *ctx);
+ void va_lower_split_64bit(bi_context *ctx);
++void va_lower_split_64bit_postra(bi_context *ctx);
+ 
+ void bi_lower_opt_instructions(bi_context *ctx);
+ void bi_lower_mkvec_swz(bi_context *ctx);
+@@ -1538,6 +1641,7 @@ bool bi_reads_t(bi_instr *ins, unsigned src);
+ #ifndef NDEBUG
+ bool bi_validate_initialization(bi_context *ctx);
+ void bi_validate(bi_context *ctx, const char *after_str);
++void bi_validate_channels(bi_context *ctx);
+ #else
+ static inline bool
+ bi_validate_initialization(UNUSED bi_context *ctx)
+@@ -1564,19 +1668,21 @@ unsigned bi_calc_register_demand(bi_context *ctx);
+ void bi_postra_liveness(bi_context *ctx);
+ uint64_t MUST_CHECK bi_postra_liveness_ins(uint64_t live, bi_instr *ins);
+ 
+-/* Record sizes of SSA values into the provided array. */
+-void bi_record_sizes(bi_context *ctx, uint32_t *sizes);
++/* Record sizes of SSA values into bi_index::channels. */
++void bi_record_sizes(bi_context *ctx);
+ 
+ /* SSA spilling */
+ void bi_spill_ssa(bi_context *ctx, unsigned num_registers);
+ 
++uint64_t compute_spill_cost(bi_context *ctx);
++
+ void bi_repair_ssa(bi_context *ctx);
+ 
+ /* Reindex SSA to reduce memory usage */
+ void bi_reindex_ssa(bi_context *ctx);
+ 
+ /* Lower memory operands created during spilling. */
+-unsigned bi_lower_spill(bi_context* ctx, uint32_t tls_base);
++unsigned bi_lower_spill(bi_context *ctx, uint32_t tls_base);
+ 
+ /* Layout */
+ 
+@@ -1594,6 +1700,58 @@ bi_is_terminal_block(bi_block *block)
+                               bi_is_terminal_block(block->successors[1]));
+ }
+ 
++/* If the source is guaranteed to be in a clobbered register. */
++static inline bool
++bi_ra_blend_is_clobber_src(bi_context *ctx, bi_instr *I, uint32_t s)
++{
++   assert(I->op == BI_OPCODE_BLEND);
++   /* Only fixed inputs end up in the clobber range for sure. For others we
++    * can not guarantee it.
++    */
++   return bi_get_fixed_reg(ctx, I, s, true) != BI_MAX_REGS;
++}
++
++/* Sum of registers occupied by sources which are always in the clobbered
++ * registers.
++ * Requires bi_index::channels to be valid.
++ */
++static inline uint32_t
++bi_ra_blend_clobberable_sources(bi_context *ctx, bi_instr *I)
++{
++   assert(I->op == BI_OPCODE_BLEND);
++
++   uint32_t blend_clobbers = 0;
++   bi_foreach_ssa_src(I, s) {
++      if (bi_ra_blend_is_clobber_src(ctx, I, s)) {
++         /* RA allocates vectors in pow steps. */
++         blend_clobbers += util_next_power_of_two(bi_channels(I->src[s]));
++      }
++   }
++   return blend_clobbers;
++}
++
++/* Find the maximum pressure from sources not in fixed registers at BLENDs.
++ * Requires bi_index::channels to be valid.
++ */
++static inline uint32_t
++bi_ra_get_max_blend_pressure(bi_context *ctx)
++{
++   unsigned max_blend_pressure = 0;
++   bi_foreach_instr_global(ctx, blend) {
++      if (blend->op != BI_OPCODE_BLEND)
++         continue;
++
++      unsigned pressure = 0;
++      bi_foreach_ssa_src(blend, s) {
++         if (!bi_ra_blend_is_clobber_src(ctx, blend, s))
++            continue;
++         pressure += bi_channels(blend->src[s]);
++      }
++      max_blend_pressure = MAX2(max_blend_pressure, pressure);
++   }
++   return max_blend_pressure;
++}
++
+ /* Code emit */
+ 
+ /* Returns the size of the final clause */
+@@ -1828,6 +1986,9 @@ bi_builder_insert(bi_cursor *cursor, bi_instr *I)
+ 
+ bi_instr *bi_csel_from_mux(bi_builder *b, const bi_instr *I, bool must_sign);
+ 
++void bi_emit_parallel_copies(bi_builder *b, struct bi_copy *copies,
++                             unsigned num_copies);
++
+ /* Read back power-efficent garbage, TODO maybe merge with null? */
+ static inline bi_index
+ bi_dontcare(bi_builder *b)
+@@ -1841,6 +2002,8 @@ bi_dontcare(bi_builder *b)
+ bi_instr *bi_make_vec_to(bi_builder *b, bi_index dst, bi_index *src,
+                          unsigned *channel, unsigned count, unsigned bitsize);
+ 
++bi_index bi_preload(bi_builder *b, unsigned reg);
++
+ #define bi_worklist_init(ctx, w)        u_worklist_init(w, ctx->num_blocks, ctx)
+ #define bi_worklist_push_head(w, block) u_worklist_push_head(w, block, index)
+ #define bi_worklist_push_tail(w, block) u_worklist_push_tail(w, block, index)
+
+--- src/panfrost/compiler/bifrost/meson.build
++++ src/panfrost/compiler/bifrost/meson.build
+@@ -12,6 +12,7 @@ libpanfrost_bifrost_files = files(
+   'bi_liveness.c',
+   'bi_lower_divergent_indirects.c',
+   'bi_lower_mkvec_swz.c',
++  'bi_lower_parallel_copy.c',
+   'bi_lower_spill.c',
+   'bi_lower_swizzle.c',
+   'bi_print.c',
+@@ -31,6 +32,7 @@ libpanfrost_bifrost_files = files(
+   'bi_reindex_ssa.c',
+   'bi_repair_ssa.c',
+   'bi_validate.c',
++  'bi_validate_ra.c',
+   'bi_dominance.c',
+   'bi_debug.c',
+   'bir.c',
+

@@ -1,0 +1,237 @@
+# ntdll: Accept interface indices in multicast socket options
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12742 state=opened
+# Windows allows the interface of IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP and
+IP_MULTICAST_IF to be given as an interface index encoded as 0.0.0.<index>
+instead of an interface address. Linux interprets the value as an address and
+fails with ENODEV or EADDRNOTAVAIL. Such values are now translated to struct
+ip_mreqn / the ifindex form.
+
+The tests are being extended to actually send and receive multicast packets
+with both kinds of binding.
+
+Discussion: https://forum.winehq.org/viewtopic.php?t=34939
+--- dlls/ntdll/unix/socket.c
++++ dlls/ntdll/unix/socket.c
+@@ -1601,6 +1601,35 @@ static NTSTATUS do_setsockopt( HANDLE handle, IO_STATUS_BLOCK *io, int level,
+     return STATUS_SUCCESS;
+ }
+ 
++/* Windows accepts an interface index encoded as 0.0.0.<index> in place of an interface
++ * address for IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP and IP_MULTICAST_IF. */
++static int ws_ifindex_from_addr( const void *addr )
++{
++    const unsigned char *b = addr;
++    UINT32 val = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
++    return val > 0 && val < 0x10000 ? val : 0;
++}
++
++#ifdef __linux__
++static NTSTATUS do_ip_membership_setsockopt( HANDLE handle, IO_STATUS_BLOCK *io, int option,
++                                             const void *in_buffer, ULONG in_size )
++{
++    const struct ip_mreq *mreq = in_buffer;
++    struct ip_mreqn mreqn;
++    int ifindex;
++
++    if (in_size == sizeof(*mreq) && (ifindex = ws_ifindex_from_addr( &mreq->imr_interface )))
++    {
++        memset( &mreqn, 0, sizeof(mreqn) );
++        mreqn.imr_multiaddr = mreq->imr_multiaddr;
++        mreqn.imr_ifindex = ifindex;
++        return do_setsockopt( handle, io, IPPROTO_IP, option, &mreqn, sizeof(mreqn) );
++    }
++    return do_setsockopt( handle, io, IPPROTO_IP, option, in_buffer, in_size );
++}
++#endif
++
++
+ 
+ static int get_sock_type( HANDLE handle )
+ {
+@@ -2127,7 +2156,11 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+             return do_setsockopt( handle, io, SOL_SOCKET, SO_OOBINLINE, in_buffer, in_size );
+ 
+         case IOCTL_AFD_WINE_SET_IP_ADD_MEMBERSHIP:
++#ifdef __linux__
++            return do_ip_membership_setsockopt( handle, io, IP_ADD_MEMBERSHIP, in_buffer, in_size );
++#else
+             return do_setsockopt( handle, io, IPPROTO_IP, IP_ADD_MEMBERSHIP, in_buffer, in_size );
++#endif
+ 
+ #ifdef IP_ADD_SOURCE_MEMBERSHIP
+         case IOCTL_AFD_WINE_SET_IP_ADD_SOURCE_MEMBERSHIP:
+@@ -2199,7 +2232,11 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+ #endif
+ 
+         case IOCTL_AFD_WINE_SET_IP_DROP_MEMBERSHIP:
++#ifdef __linux__
++            return do_ip_membership_setsockopt( handle, io, IP_DROP_MEMBERSHIP, in_buffer, in_size );
++#else
+             return do_setsockopt( handle, io, IPPROTO_IP, IP_DROP_MEMBERSHIP, in_buffer, in_size );
++#endif
+ 
+ #ifdef IP_ADD_SOURCE_MEMBERSHIP
+         case IOCTL_AFD_WINE_SET_IP_DROP_SOURCE_MEMBERSHIP:
+@@ -2227,6 +2264,17 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+         {
+             int sock_type = get_sock_type( handle );
+             if (sock_type != SOCK_DGRAM && sock_type != SOCK_RAW) return STATUS_INVALID_PARAMETER;
++#ifdef __linux__
++            if (in_size == sizeof(struct in_addr))
++            {
++                int ifindex = ws_ifindex_from_addr( in_buffer );
++                if (ifindex)
++                {
++                    struct ip_mreqn mreqn = { .imr_ifindex = ifindex };
++                    return do_setsockopt( handle, io, IPPROTO_IP, IP_MULTICAST_IF, &mreqn, sizeof(mreqn) );
++                }
++            }
++#endif
+             return do_setsockopt( handle, io, IPPROTO_IP, IP_MULTICAST_IF, in_buffer, in_size );
+         }
+ 
+
+--- dlls/ws2_32/tests/sock.c
++++ dlls/ws2_32/tests/sock.c
+@@ -5896,6 +5896,132 @@ static void test_fionbio(void)
+     closesocket(s);
+ }
+ 
++/* Join the multicast group on the given interface, send a packet through the same interface and check that it
++ * is received. The interface may be given either as an address or as an index encoded as 0.0.0.<index>.
++ * If strict is FALSE, failures are not reported, they just make the function return FALSE. This allows to
++ * probe whether multicast works at all on a given machine and interface, which depends on the environment. */
++static BOOL multicast_roundtrip(struct in_addr interface, BOOL strict)
++{
++    static const char multicast_group[] = "239.255.250.250";
++    SOCKET receiver, sender = INVALID_SOCKET;
++    struct timeval timeout = {strict ? 2 : 1, 0};
++    struct sockaddr_in addr;
++    struct ip_mreq mreq;
++    BOOL success = FALSE;
++    char buffer[16];
++    fd_set readfds;
++    int ret, len;
++
++    receiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++    ok(receiver != INVALID_SOCKET, "got error %u\n", WSAGetLastError());
++    if (receiver == INVALID_SOCKET) return FALSE;
++
++    memset(&addr, 0, sizeof(addr));
++    addr.sin_family = AF_INET;
++    ret = bind(receiver, (struct sockaddr *)&addr, sizeof(addr));
++    ok(!ret, "got error %u\n", WSAGetLastError());
++    len = sizeof(addr);
++    ret = getsockname(receiver, (struct sockaddr *)&addr, &len);
++    ok(!ret, "got error %u\n", WSAGetLastError());
++
++    memset(&mreq, 0, sizeof(mreq));
++    mreq.imr_multiaddr.s_addr = inet_addr(multicast_group);
++    mreq.imr_interface = interface;
++    WSASetLastError(0xdeadbeef);
++    ret = setsockopt(receiver, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char *)&mreq, sizeof(mreq));
++    if (ret)
++    {
++        ok(!strict, "got %d, error %u\n", ret, WSAGetLastError());
++        goto done;
++    }
++
++    sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++    ok(sender != INVALID_SOCKET, "got error %u\n", WSAGetLastError());
++    WSASetLastError(0xdeadbeef);
++    ret = setsockopt(sender, IPPROTO_IP, IP_MULTICAST_IF, (const char *)&interface, sizeof(interface));
++    if (ret)
++    {
++        ok(!strict, "got %d, error %u\n", ret, WSAGetLastError());
++        goto done;
++    }
++
++    addr.sin_addr.s_addr = inet_addr(multicast_group);
++    ret = sendto(sender, "multicast", 10, 0, (struct sockaddr *)&addr, sizeof(addr));
++    if (ret != 10)
++    {
++        ok(!strict, "got %d, error %u\n", ret, WSAGetLastError());
++        goto done;
++    }
++
++    FD_ZERO(&readfds);
++    FD_SET(receiver, &readfds);
++    ret = select(0, &readfds, NULL, NULL, &timeout);
++    if (ret != 1)
++    {
++        ok(!strict, "got %d, error %u\n", ret, WSAGetLastError());
++        goto done;
++    }
++
++    memset(buffer, 0, sizeof(buffer));
++    ret = recv(receiver, buffer, sizeof(buffer), 0);
++    ok(ret == 10, "got %d, error %u\n", ret, WSAGetLastError());
++    ok(!strcmp(buffer, "multicast"), "got %s\n", debugstr_an(buffer, ret));
++    success = (ret == 10);
++
++    WSASetLastError(0xdeadbeef);
++    ret = setsockopt(receiver, IPPROTO_IP, IP_DROP_MEMBERSHIP, (const char *)&mreq, sizeof(mreq));
++    ok(!ret, "got %d, error %u\n", ret, WSAGetLastError());
++
++done:
++    if (sender != INVALID_SOCKET) closesocket(sender);
++    closesocket(receiver);
++    return success;
++}
++
++static void test_multicast_interface_index(void)
++{
++    IP_ADAPTER_ADDRESSES *adapters, *adapter;
++    struct in_addr if_addr, if_index;
++    BOOL found = FALSE;
++    ULONG size = 0;
++    int ret;
++
++    ret = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
++                               NULL, NULL, &size);
++    if (ret != ERROR_BUFFER_OVERFLOW)
++    {
++        skip("No network adapter found.\n");
++        return;
++    }
++    adapters = malloc(size);
++    ret = GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
++                               NULL, adapters, &size);
++    ok(!ret, "got error %d\n", ret);
++
++    /* Whether multicast packets are delivered depends on the environment (virtual machines, firewalls, routing),
++     * so first look for an adapter where it works when the interface is given as an address. The interface index
++     * is then expected to work as well. */
++    for (adapter = adapters; adapter && !ret && !found; adapter = adapter->Next)
++    {
++        if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK || adapter->OperStatus != IfOperStatusUp
++            || !adapter->IfIndex || !adapter->FirstUnicastAddress || (adapter->Flags & IP_ADAPTER_NO_MULTICAST))
++            continue;
++
++        if_addr = ((struct sockaddr_in *)adapter->FirstUnicastAddress->Address.lpSockaddr)->sin_addr;
++        if (!multicast_roundtrip(if_addr, FALSE)) continue;
++
++        /* The interface can be given as an index encoded as 0.0.0.<index> (in network byte order). */
++        if_index.s_addr = htonl(adapter->IfIndex);
++        winetest_push_context("interface index %lu", adapter->IfIndex);
++        multicast_roundtrip(if_index, TRUE);
++        winetest_pop_context();
++        found = TRUE;
++    }
++    if (!found) skip("No network adapter delivering multicast packets found.\n");
++
++    free(adapters);
++}
++
+ static void test_keepalive_vals(void)
+ {
+     OVERLAPPED overlapped = {0}, *overlapped_ptr;
+@@ -15111,6 +15237,7 @@ START_TEST( sock )
+     test_backlog_query();
+     test_get_interface_list();
+     test_keepalive_vals();
++    test_multicast_interface_index();
+     test_sioRoutingInterfaceQuery();
+     test_sioAddressListChange();
+     test_base_handle();
+

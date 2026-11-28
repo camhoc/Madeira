@@ -1,0 +1,313 @@
+# Draft: kosmickrisp: take flat varyings from the last vertex with a GS
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45938 state=closed
+# With `VK_EXT_provoking_vertex` set to last, a KosmicKrisp pipeline with a geometry shader shades flat varyings from the first vertex of each primitive, since Metal always provokes with the first vertex and only the no-GS path (which unrolls the draw) corrects the order.
+
+**Fix:** `poly_nir_lower_gs` gains an `emulate_flatshade_last` mode. In the GS rasterization shader, each vertex also selects the outputs of the last vertex of the line or triangle it starts in its strip, and forwards those for the flat slots (`poly_geometry_params::flat_outputs`, uploaded by kk from the fragment shader's non-interpolated inputs) when the draw's provoking vertex is last. Transform feedback keeps the vertex's own outputs. hk and agx pass `false`; the no-GS path is unchanged.
+
+**Testing** (M4 Pro, macOS 27, CTS 1.4.3.2, debugoptimized, Metal validation with the warning mode):
+
+- A standalone test drawing one triangle and a 6-vertex strip through a GS with flat colors, provoking first and last, with the Vulkan validation layer clean: main takes vertex 0 of each triangle in both modes; this branch takes vertex `i` in first mode and `i + 2` in last mode.
+- `dEQP-VK.geometry.*` and `dEQP-VK.rasterization.provoking_vertex.*` from the must-pass list (261 cases): 216 pass, 45 skip on main and on this branch, identical per case. The provoking_vertex cases use no GS, so CTS does not cover this.
+- 14,328 further must-pass cases mentioning geometry shaders (pipeline, glsl, draw, rasterization, clipping, spirv_assembly, tessellation): no per-case difference besides `spirv_assembly.*_geom` cases that hit `VK_ERROR_DEVICE_LOST` under 8 parallel jobs on main as well.
+--- src/asahi/vulkan/hk_shader.c
++++ src/asahi/vulkan/hk_shader.c
+@@ -1370,7 +1370,8 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
+ 
+       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
+ 
+-      poly_nir_lower_gs(nir, &count, &rast, &pre_gs, &count_variant->info.gs);
++      poly_nir_lower_gs(nir, &count, &rast, &pre_gs, &count_variant->info.gs,
++                        false);
+ 
+       agx_preprocess_nir(count);
+       agx_preprocess_nir(rast);
+
+--- src/gallium/drivers/asahi/agx_state.c
++++ src/gallium/drivers/asahi/agx_state.c
+@@ -1554,7 +1554,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
+    } else if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
+       NIR_PASS(_, nir, poly_nir_lower_tcs, true);
+    } else if (nir->info.stage == MESA_SHADER_GEOMETRY) {
+-      poly_nir_lower_gs(nir, &gs_count, &gs_copy, &pre_gs, &gs_info);
++      poly_nir_lower_gs(nir, &gs_count, &gs_copy, &pre_gs, &gs_info, false);
+ 
+       agx_preprocess_nir(gs_count);
+       agx_preprocess_nir(gs_copy);
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1298,6 +1298,11 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
+    struct poly_geometry_params params;
+    poly_geometry_params_init(&params, mode, wg_size);
+ 
++   /* With the provoking vertex last, the rasterization shader forwards these
++    * from the last vertex of each primitive */
++   struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
++   params.flat_outputs = fs ? fs->info.fs.flat_inputs : 0;
++
+    if (indirect) {
+       /* The indirect setup kernel writes the draw and allocates from the
+        * heap, including the index buffer */
+@@ -1953,7 +1958,7 @@ requires_unroll_flatshade(struct kk_cmd_buffer *cmd,
+ 
+    /* If the last vertex is provoking and the fragment shader uses flat inputs,
+     * we need to unroll to correct the vertex order */
+-   return !data->flatshade_first && fs && fs->info.fs.uses_flat_varyings;
++   return !data->flatshade_first && fs && fs->info.fs.flat_inputs;
+ }
+ 
+ static bool
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -884,20 +884,16 @@ gather_vs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+    return false;
+ }
+ 
++/* Flat inputs stay load_input after nir_lower_io_use_interpolated_input_intrinsics */
+ static bool
+-fs_uses_flat_varying(nir_shader *nir)
++gather_fs_flat_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+ {
+-   nir_foreach_function_impl(impl, nir) {
+-      nir_foreach_block_safe(block, impl) {
+-         nir_foreach_instr_safe(instr, block) {
+-            if (instr->type == nir_instr_type_intrinsic) {
+-               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+-               if (intr->intrinsic == nir_intrinsic_load_input)
+-                  return true;
+-            }
+-         }
+-      }
+-   }
++   if (intr->intrinsic != nir_intrinsic_load_input)
++      return false;
++
++   nir_io_semantics io = nir_intrinsic_io_semantics(intr);
++   uint64_t *flat_inputs = data;
++   *flat_inputs |= BITFIELD64_RANGE(io.location, io.num_slots);
+    return false;
+ }
+ 
+@@ -917,7 +913,8 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
+        * which is not a valid Metal layout */
+       if (nir->info.fs.depth_layout == FRAG_DEPTH_LAYOUT_NONE)
+          nir->info.fs.depth_layout = FRAG_DEPTH_LAYOUT_ANY;
+-      shader->info.fs.uses_flat_varyings = fs_uses_flat_varying(nir);
++      nir_shader_intrinsics_pass(nir, gather_fs_flat_inputs, nir_metadata_all,
++                                 &shader->info.fs.flat_inputs);
+    } else if (nir->info.stage == MESA_SHADER_COMPUTE) {
+       shader->info.cs.local_size.x = nir->info.workgroup_size[0];
+       shader->info.cs.local_size.y = nir->info.workgroup_size[1];
+@@ -1140,8 +1137,9 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
+       NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_in, NULL, NULL);
+ 
+       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
++      /* Metal takes the first vertex of a primitive as provoking */
+       NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
+-               &shader->info.gs);
++               &shader->info.gs, true);
+ 
+       /* Only transform feedback and pipeline statistics need these, and KK
+        * exposes neither */
+
+--- src/kosmickrisp/vulkan/kk_shader.h
++++ src/kosmickrisp/vulkan/kk_shader.h
+@@ -104,7 +104,8 @@ struct kk_shader_info {
+       struct poly_gs_info gs;
+ 
+       struct {
+-         bool uses_flat_varyings;
++         /* Varying slots read without interpolation */
++         uint64_t flat_inputs;
+       } fs;
+ 
+       struct {
+
+--- src/poly/nir/poly_nir.h
++++ src/poly/nir/poly_nir.h
+@@ -48,9 +48,14 @@ struct poly_gs_info {
+    uint8_t topology[64];
+ };
+ 
++/* emulate_flatshade_last: the hardware always takes the first vertex of a
++ * primitive as provoking, so the rasterization shader moves the flat outputs
++ * (poly_geometry_params::flat_outputs) of the last vertex there when
++ * load_provoking_last is set.
++ */
+ bool poly_nir_lower_gs(struct nir_shader *gs, struct nir_shader **gs_count,
+                        struct nir_shader **gs_copy, struct nir_shader **pre_gs,
+-                       struct poly_gs_info *info);
++                       struct poly_gs_info *info, bool emulate_flatshade_last);
+ 
+ bool poly_nir_lower_tcs(struct nir_shader *tcs,
+                         bool can_ignore_shader_out_barriers);
+
+--- src/poly/nir/poly_nir_lower_gs.c
++++ src/poly/nir/poly_nir_lower_gs.c
+@@ -160,6 +160,11 @@ lower_gs_intrinsics(nir_shader *shader)
+ }
+ 
+ struct lower_gs_state {
++   /* Whether the rasterization shader moves flat outputs to the first vertex
++    * of each primitive when the last vertex is provoking.
++    */
++   bool emulate_flatshade_last;
++
+    int static_count[POLY_MAX_VERTEX_STREAMS];
+ 
+    /* The index of each counter in the count buffer, or -1 if it's not in the
+@@ -210,6 +215,11 @@ load_geometry_param_offset(nir_builder *b, uint32_t offset, uint8_t bytes)
+ struct lower_output_to_var_slot {
+    nir_variable *output_var;
+    nir_variable *selected_var;
++
++   /* The output of the last vertex of the primitive this vertex starts, when
++    * emulating a provoking last vertex. NULL otherwise.
++    */
++   nir_variable *provoking_var;
+    nir_alu_type type;
+    unsigned nr_components;
+ };
+@@ -532,6 +542,11 @@ create_geometry_count_shader(nir_shader *gs, struct lower_gs_state *state)
+ struct lower_gs_rast_state {
+    nir_def *raw_instance_id;
+    nir_def *instance_id, *primitive_id, *output_id, *stream;
++
++   /* ID of the last vertex of the primitive that output_id starts, when
++    * emulating a provoking last vertex. NULL otherwise.
++    */
++   nir_def *provoking_id;
+    struct lower_output_to_var_slot outputs[NUM_TOTAL_VARYING_SLOTS];
+    bool points;
+ 
+@@ -543,9 +558,15 @@ select_rast_output(nir_builder *b, nir_intrinsic_instr *intr,
+                    struct lower_gs_rast_state *state)
+ {
+    b->cursor = nir_instr_remove(&intr->instr);
+-   nir_def *us = nir_ieq(b, intr->src[0].ssa, state->output_id);
+-   us = nir_iand(b, us,
+-                 nir_ieq_imm(b, state->stream, nir_intrinsic_stream_id(intr)));
++   nir_def *our_stream =
++      nir_ieq_imm(b, state->stream, nir_intrinsic_stream_id(intr));
++   nir_def *us =
++      nir_iand(b, nir_ieq(b, intr->src[0].ssa, state->output_id), our_stream);
++   nir_def *provoking = NULL;
++   if (state->provoking_id) {
++      provoking = nir_iand(
++         b, nir_ieq(b, intr->src[0].ssa, state->provoking_id), our_stream);
++   }
+ 
+    u_foreach_bit64(slot, b->shader->info.outputs_written) {
+       nir_def *orig = nir_load_var(b, state->outputs[slot].selected_var);
+@@ -555,6 +576,13 @@ select_rast_output(nir_builder *b, nir_intrinsic_instr *intr,
+ 
+       nir_store_var(b, state->outputs[slot].selected_var, value,
+                     nir_component_mask(value->num_components));
++
++      if (state->outputs[slot].provoking_var) {
++         orig = nir_load_var(b, state->outputs[slot].provoking_var);
++         value = nir_bcsel(b, provoking, data, orig);
++         nir_store_var(b, state->outputs[slot].provoking_var, value,
++                       nir_component_mask(value->num_components));
++      }
+    }
+ }
+ 
+@@ -760,6 +788,16 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
+       UNREACHABLE("invalid shape");
+    }
+ 
++   /* With the first vertex of each primitive provoking in hardware, a vertex
++    * of a line or triangle strip provokes the primitive it starts. Flat outputs
++    * of that primitive's last vertex are rasterized in its place when the last
++    * vertex is provoking.
++    */
++   if (state->emulate_flatshade_last && !rs.points) {
++      unsigned n = mesa_vertices_per_prim(gs->info.gs.output_primitive);
++      rs.provoking_id = nir_iadd_imm(b, rs.output_id, n - 1);
++   }
++
+    nir_shader_intrinsics_pass(shader, collect_output_types, nir_metadata_all,
+                               rs.outputs);
+ 
+@@ -778,6 +816,14 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
+       output->selected_var = nir_variable_create(
+          shader, nir_var_shader_temp, glsl_vector_type(type, output->nr_components),
+          ralloc_asprintf(shader, "%s-selected", slot_name));
++
++      /* Position is never flat, and the multistream kill below needs its own */
++      if (rs.provoking_id && slot != VARYING_SLOT_POS) {
++         output->provoking_var = nir_variable_create(
++            shader, nir_var_shader_temp,
++            glsl_vector_type(type, output->nr_components),
++            ralloc_asprintf(shader, "%s-provoking", slot_name));
++      }
+    }
+ 
+    NIR_PASS(_, shader, nir_shader_intrinsics_pass, lower_to_gs_rast,
+@@ -860,12 +906,27 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
+       }
+    }
+ 
++   nir_def *flat_outputs = NULL, *provoking_last = NULL;
++   if (rs.provoking_id) {
++      flat_outputs = load_geometry_param(b, flat_outputs);
++      provoking_last = nir_i2b(b, nir_load_provoking_last(b));
++   }
++
+    /* Forward each selected output to the rasterizer */
+    u_foreach_bit64(slot, shader->info.outputs_written) {
+       struct lower_output_to_var_slot *output = &rs.outputs[slot];
+       assert(output->selected_var != NULL);
+       nir_def *value = nir_load_var(b, output->selected_var);
+ 
++      /* Transform feedback above captured this vertex's own outputs; only the
++       * rasterized flat outputs come from the provoking vertex.
++       */
++      if (output->provoking_var) {
++         nir_def *flat = nir_test_mask(b, flat_outputs, BITFIELD64_BIT(slot));
++         value = nir_bcsel(b, nir_iand(b, flat, provoking_last),
++                           nir_load_var(b, output->provoking_var), value);
++      }
++
+       /* If at least one write occurred in the source shader, we should have a
+        * type. If no writes occurred, the output shouldn't be in outputs_written
+        */
+@@ -1242,7 +1303,8 @@ optimize_static_topology(struct poly_gs_info *info, nir_shader *gs)
+ 
+ bool
+ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
+-                  nir_shader **pre_gs, struct poly_gs_info *info)
++                  nir_shader **pre_gs, struct poly_gs_info *info,
++                  bool emulate_flatshade_last)
+ {
+    /* Lower I/O as assumed by the rest of GS lowering */
+    if (gs->xfb_info != NULL) {
+@@ -1312,7 +1374,10 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
+    /* If we know counts at compile-time we can simplify, so try to figure out
+     * the counts statically.
+     */
+-   struct lower_gs_state gs_state = {.info = info};
++   struct lower_gs_state gs_state = {
++      .emulate_flatshade_last = emulate_flatshade_last,
++      .info = info,
++   };
+ 
+    *info = (struct poly_gs_info){
+       .mode = gs->info.gs.output_primitive,
+
+--- src/poly/geometry.h
++++ src/poly/geometry.h
+@@ -276,7 +276,9 @@ struct poly_geometry_params {
+     */
+    DEVICE(uchar) xfb_base[POLY_MAX_SO_BUFFERS];
+ 
+-   /* Location-indexed mask of flat outputs, used for lowering GL edge flags. */
++   /* Location-indexed mask of flat outputs, used for lowering GL edge flags
++    * and for emulating a provoking last vertex in the rasterization shader.
++    */
+    uint64_t flat_outputs;
+ 
+    uint32_t xfb_size[POLY_MAX_SO_BUFFERS];
+

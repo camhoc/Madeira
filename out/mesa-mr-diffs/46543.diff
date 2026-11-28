@@ -1,0 +1,358 @@
+# asahi, hk: Add support for Apple Interchange
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46543 state=opened
+# ### What does this MR do and why?
+This MR adds support for Apple Interchange, a framebuffer format used for sharing between hardware blocks on Apple SoCs.
+
+It is very similar to the supported AGX tiled and compressed format, however the image tile size is a fixed 16x16 for RGB framebuffers regardless of bit depth. YCbCr formats are the exception, where the tile size is 32x32 for the luma channel and 16x16 for both chroma channels. In all cases, the compression subtiles are 16x16 with 8 bytes of metadata. This is currently unimportant as neither Asahi nor Honeykrisp currently support handling YUV images properly regardless of layout.
+
+AGX itself does not have "full" support for Apple Interchange; tt cannot be used for Z/S buffers or for array textures, for example. We therefore limit its use to single-layer scanout/shared buffers, and only allow it to be used if the corresponding DRM format modifier has been explicitly requested.
+
+No CTS regressions were found on an M2 MacBook Air or M2 Max Mac Studio.
+--- include/drm-uapi/drm_fourcc.h
++++ include/drm-uapi/drm_fourcc.h
+@@ -1616,6 +1616,30 @@ drm_fourcc_canonicalize_nvidia_format_mod(__u64 modifier)
+ #define DRM_FORMAT_MOD_APPLE_GPU_TILED fourcc_mod_code(APPLE, 1)
+ #define DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED fourcc_mod_code(APPLE, 2)
+ 
++/*
++ * Apple Interchange layout
++ *
++ * Apple Interchange is a compressed framebuffer format used exclusively for
++ * sharing buffers between hardware blocks (GPU, display controller, video
++ * codecs) on Apple platforms. It is similar to and uses the same compression
++ * scheme as GPU_TILED_COMPRESSED. There is no known uncompressed variant
++ * of Apple Interchange.
++ *
++ * Unlike the GPU layouts, tile size is not dependent on bit depth. RGB
++ * images and the chroma components of YUV images use 16x16 tiles. The
++ * luma component of YUV images uses 32x32 tiles. Compression tiles
++ * are once again 16x16 with 8 bytes of metadata per compression subtile.
++ *
++ * Following the example set by GPU_TILED_{,COMPRESSED}, Interchange images
++ * are treated as a single plane by software and do not have a meaningful
++ * stride.
++ *
++ * AGX has limited support for Apple Interchange. It cannot be used for Z/S
++ * buffers or array images, for example. It is intended for scanout buffer
++ * sharing only.
++ */
++#define DRM_FORMAT_MOD_APPLE_INTERCHANGE fourcc_mod_code(APPLE, 3)
++
+ /*
+  * AMD modifiers
+  *
+
+--- src/asahi/genxml/cmdbuf.xml
++++ src/asahi/genxml/cmdbuf.xml
+@@ -246,6 +246,7 @@
+     array texture (with a layered framebuffer) -->
+     <field name="Levels" size="4" start="104" type="uint" modifier="minus(1)"/>
+     <field name="Layers" size="14" start="108" type="uint" modifier="minus(1)"/>
++    <field name="Stride in tiles" size="14" start="108" type="uint" modifier="minus(1)"/>
+     <field name="Page-aligned layers" size="1" start="124" type="bool"/>
+ 
+     <!-- Should writes to this image convert to sRGB?
+@@ -309,6 +310,9 @@
+     <field name="Depth" size="14" start="110" type="uint" modifier="minus(1)"/>
+     <field name="Page-aligned layers" size="1" start="126" type="bool"/>
+ 
++    <!-- If layout is interchange -->
++    <field name="Stride in tiles" size="14" start="110" type="uint" modifier="minus(1)"/>
++
+     <!-- Read the next word (set for compression or linear 2D arrays) -->
+     <field name="Extended" size="1" start="127" type="bool"/>
+ 
+
+--- src/asahi/layout/layout.c
++++ src/asahi/layout/layout.c
+@@ -214,6 +214,43 @@ ail_initialize_gpu_tiled(struct ail_layout *layout)
+    layout->size_B = (uint64_t)layout->layer_stride_B * layout->depth_px;
+ }
+ 
++static void
++ail_initialize_interchange(struct ail_layout *layout)
++{
++   unsigned blocksize_B = ail_get_block_size_B(layout);
++   unsigned w_el = util_format_get_nblocksx(layout->format, layout->width_px);
++   unsigned h_el = util_format_get_nblocksy(layout->format, layout->height_px);
++   unsigned bw_px = util_format_get_blockwidth(layout->format);
++   unsigned bh_px = util_format_get_blockheight(layout->format);
++   bool compressed = util_format_is_compressed(layout->format);
++
++   /* Expect simple uncompressed formats  */
++   assert(bw_px == 1 && bh_px == 1);
++   assert(!compressed);
++
++   /* Do not allow for array textures */
++   assert(layout->depth_px == 1);
++
++   /* Interchange is only used with drm/gbm modifiers, assume scanout only,
++    * no mipmaps
++    */
++   assert(layout->levels == 1);
++
++   /* Assume fixed tilesize of 16x16 px for now. Wrong for luma channel of YUV. */
++   unsigned stx_tiles = DIV_ROUND_UP(w_el, 16);
++   unsigned sty_tiles = DIV_ROUND_UP(h_el, 16);
++   unsigned tile_size = 16 * 16 * blocksize_B;
++
++   layout->tilesize_el[0] = (struct ail_tile){.width_el = 16, .height_el = 16};
++   layout->stride_el[0] = util_format_get_nblocksx(layout->format, w_el);
++
++   /* Always align layers to cache line */
++   layout->layer_stride_B =
++      ALIGN_POT(stx_tiles * sty_tiles * tile_size, AIL_CACHELINE);
++
++   layout->size_B = layout->layer_stride_B;
++}
++
+ static void
+ ail_initialize_twiddled(struct ail_layout *layout)
+ {
+@@ -373,6 +410,9 @@ ail_make_miptree(struct ail_layout *layout)
+    case AIL_TILING_TWIDDLED:
+       ail_initialize_twiddled(layout);
+       break;
++   case AIL_TILING_INTERCHANGE:
++      ail_initialize_interchange(layout);
++      break;
+    default:
+       UNREACHABLE("Unsupported tiling");
+    }
+
+--- src/asahi/layout/layout.h
++++ src/asahi/layout/layout.h
+@@ -35,6 +35,12 @@ enum ail_tiling {
+     * Fully twiddled.
+     */
+    AIL_TILING_TWIDDLED,
++
++   /**
++    * Interchange. Used exclusively for sharing buffers between
++    * hardware blocks.
++    */
++   AIL_TILING_INTERCHANGE,
+ };
+ 
+ /*
+@@ -460,6 +466,15 @@ ail_can_compress(enum pipe_format format, unsigned w_px, unsigned h_px,
+           ail_effective_height_sa(h_px, sample_count_sa) >= 16;
+ }
+ 
++/* Interchange cannot be used for Z/S buffers or array textures */
++static inline bool
++ail_can_interchange(enum pipe_format format, bool is_array)
++{
++   return !util_format_is_depth_or_stencil(format) &&
++          !util_format_is_compressed(format) &&
++          !is_array;
++}
++
+ /* AGX compression mode for an uncompessed subtile. Frustratingly, this seems to
+  * depend on the format. It is possible that modes are actual 8-bit structures
+  * with multiple fields rather than plain enumerations.
+@@ -565,6 +580,8 @@ ail_drm_modifier_to_tiling(uint64_t modifier)
+    case DRM_FORMAT_MOD_APPLE_GPU_TILED:
+    case DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED:
+       return AIL_TILING_GPU;
++   case DRM_FORMAT_MOD_APPLE_INTERCHANGE:
++      return AIL_TILING_INTERCHANGE;
+    default:
+       UNREACHABLE("Unsupported modifier");
+    }
+@@ -578,6 +595,7 @@ ail_is_drm_modifier_compressed(uint64_t modifier)
+    case DRM_FORMAT_MOD_APPLE_GPU_TILED:
+       return false;
+    case DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED:
++   case DRM_FORMAT_MOD_APPLE_INTERCHANGE:
+       return true;
+    default:
+       UNREACHABLE("Unsupported modifier");
+
+--- src/asahi/lib/agx_helpers.h
++++ src/asahi/lib/agx_helpers.h
+@@ -88,6 +88,8 @@ agx_translate_layout(enum ail_tiling tiling)
+       return AGX_LAYOUT_TWIDDLED;
+    case AIL_TILING_LINEAR:
+       return AGX_LAYOUT_LINEAR;
++   case AIL_TILING_INTERCHANGE:
++      return AGX_LAYOUT_INTERCHANGE;
+    }
+ 
+    UNREACHABLE("Invalid tiling");
+
+--- src/asahi/vulkan/hk_format.c
++++ src/asahi/vulkan/hk_format.c
+@@ -20,6 +20,7 @@
+ 
+ uint64_t agx_best_modifiers[] = {
+    DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
++   DRM_FORMAT_MOD_APPLE_INTERCHANGE,
+    DRM_FORMAT_MOD_APPLE_GPU_TILED,
+    DRM_FORMAT_MOD_LINEAR,
+ };
+@@ -35,10 +36,14 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
+    }
+ 
+    /* Don't advertise compression for the uncompressable */
+-   if (mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
++   if (ail_is_drm_modifier_compressed(mod) &&
+        !hk_can_compress_format(dev, vk_format))
+       return 0;
+ 
++   if (mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE &&
++       !ail_can_interchange(vk_format_to_pipe_format(vk_format), false))
++      return 0;
++
+    if (mod == DRM_FORMAT_MOD_LINEAR)
+       return props->linearTilingFeatures;
+    else
+
+--- src/asahi/vulkan/hk_image.c
++++ src/asahi/vulkan/hk_image.c
+@@ -761,6 +761,9 @@ modifier_get_score(uint64_t mod)
+ {
+    switch (mod) {
+    case DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED:
++      return 15;
++
++   case DRM_FORMAT_MOD_APPLE_INTERCHANGE:
+       return 10;
+ 
+    case DRM_FORMAT_MOD_APPLE_GPU_TILED:
+@@ -782,6 +785,8 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
+    uint64_t best_mod = UINT64_MAX;
+    uint32_t best_score = 0;
+    bool can_compress = true;
++   bool can_interchange = ail_can_interchange(vk_format_to_pipe_format(info->format),
++                                              info->arrayLayers > 1);
+ 
+    for (uint8_t plane = 0; plane < plane_count; plane++) {
+       if (!hk_can_compress_create_info(dev, plane, info))
+@@ -789,8 +794,11 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
+    }
+ 
+    for (uint32_t i = 0; i < modifier_count; ++i) {
+-      if (!can_compress &&
+-          modifiers[i] == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED)
++      if (!can_compress && ail_is_drm_modifier_compressed(modifiers[i]))
++         continue;
++
++      if (modifiers[i] == DRM_FORMAT_MOD_APPLE_INTERCHANGE &&
++         !can_interchange)
+          continue;
+ 
+       uint32_t score = modifier_get_score(modifiers[i]);
+
+--- src/asahi/vulkan/hk_image_view.c
++++ src/asahi/vulkan/hk_image_view.c
+@@ -343,6 +343,9 @@ pack_texture(struct hk_image_view *view, unsigned view_plane,
+          cfg.depth_linear = layers;
+          cfg.layer_stride_linear = layout->layer_stride_B - 0x80;
+          cfg.extended = true;
++      } else if (layout->tiling == AIL_TILING_INTERCHANGE) {
++         assert(layers == 1);
++         cfg.depth = DIV_ROUND_UP(layout->width_px, 16);
+       } else {
+          assert((layout->tiling != AIL_TILING_LINEAR) || (layers == 1));
+          cfg.depth = layers;
+@@ -463,6 +466,9 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
+             cfg.depth_linear = layers;
+             cfg.layer_stride_linear = (layout->layer_stride_B - 0x80);
+             cfg.extended = true;
++         } else if (layout->tiling == AIL_TILING_INTERCHANGE) {
++            assert(layers == 1);
++            cfg.stride_in_tiles = DIV_ROUND_UP(layout->width_px, 16);
+          } else {
+             assert((layout->tiling != AIL_TILING_LINEAR) || (layers == 1));
+             cfg.layers = layers;
+
+--- src/gallium/drivers/asahi/agx_pipe.c
++++ src/gallium/drivers/asahi/agx_pipe.c
+@@ -57,6 +57,7 @@
+ 
+ uint64_t agx_best_modifiers[] = {
+    DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
++   DRM_FORMAT_MOD_APPLE_INTERCHANGE,
+    DRM_FORMAT_MOD_APPLE_GPU_TILED,
+    DRM_FORMAT_MOD_LINEAR,
+ };
+@@ -84,6 +85,7 @@ void agx_init_state_functions(struct pipe_context *ctx);
+ const static char *s_tiling[] = {
+    [AIL_TILING_LINEAR] = "LINR",
+    [AIL_TILING_GPU] = "GPU",
++   [AIL_TILING_INTERCHANGE] = "XCHG",
+ };
+ 
+ #define rsrc_debug(res, ...)                                                   \
+@@ -428,14 +430,31 @@ agx_compression_allowed(const struct agx_resource *pres)
+    return true;
+ }
+ 
++/* Limit Interchange to shared and scanout buffers only */
++static bool
++agx_interchange_allowed(const struct agx_resource *pres)
++{
++   return ail_can_interchange(pres->base.format, pres->layout.depth_px > 1) &&
++      (pres->base.bind & (PIPE_BIND_SCANOUT | PIPE_BIND_SHARED));
++}
++
+ static uint64_t
+ agx_select_modifier_from_list(const struct agx_resource *pres,
+                               const uint64_t *modifiers, int count)
+ {
+-   if (agx_twiddled_allowed(pres) && agx_compression_allowed(pres) &&
+-       drm_find_modifier(DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED, modifiers,
+-                         count))
+-      return DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED;
++   if (agx_twiddled_allowed(pres) && agx_compression_allowed(pres)) {
++      if (drm_find_modifier(DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
++                            modifiers, count)) {
++         return DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED;
++      }
++
++      if (agx_interchange_allowed(pres) &&
++          drm_find_modifier(DRM_FORMAT_MOD_APPLE_INTERCHANGE,
++                            modifiers, count)) {
++
++         return DRM_FORMAT_MOD_APPLE_INTERCHANGE;
++      }
++   }
+ 
+    if (agx_twiddled_allowed(pres) &&
+        drm_find_modifier(DRM_FORMAT_MOD_APPLE_GPU_TILED, modifiers, count))
+@@ -467,6 +486,10 @@ agx_select_best_modifier(const struct agx_resource *pres)
+       return DRM_FORMAT_MOD_LINEAR;
+    }
+ 
++   /* We only care about AGX tiling/compression here. We should only
++    * ever select Interchange when the client has explicitly asked
++    * for it.
++    */
+    if (agx_twiddled_allowed(pres)) {
+       if (agx_compression_allowed(pres))
+          return DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED;
+
+--- src/gallium/drivers/asahi/agx_state.c
++++ src/gallium/drivers/asahi/agx_state.c
+@@ -737,6 +737,9 @@ agx_pack_texture(void *out, struct agx_resource *rsrc,
+             cfg.depth_linear = layers;
+             cfg.layer_stride_linear = (rsrc->layout.layer_stride_B - 0x80);
+             cfg.extended = true;
++         } else if (rsrc->layout.tiling == AIL_TILING_INTERCHANGE) {
++            assert(layers == 1);
++            cfg.stride_in_tiles = DIV_ROUND_UP(rsrc->layout.width_px, 16);
+          } else {
+             assert((rsrc->layout.tiling != AIL_TILING_LINEAR) || (layers == 1));
+             cfg.depth = layers;
+@@ -1229,6 +1232,9 @@ agx_batch_upload_pbe(struct agx_batch *batch, struct agx_pbe_packed *out,
+             cfg.depth_linear = layers;
+             cfg.layer_stride_linear = (tex->layout.layer_stride_B - 0x80);
+             cfg.extended = true;
++         } else if (tex->layout.tiling == AIL_TILING_INTERCHANGE) {
++            assert(layers == 1);
++            cfg.stride_in_tiles = DIV_ROUND_UP(tex->layout.width_px, 16);
+          } else {
+             assert((tex->layout.tiling != AIL_TILING_LINEAR) || (layers == 1));
+             cfg.layers = layers;
+

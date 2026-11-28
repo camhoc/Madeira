@@ -1,0 +1,124 @@
+# winebus: Fix lost device removal and udev thread spin on unplug.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12543 state=opened
+# After unplugging a USB mouse that exposes several HID interfaces, the winebus `winedevice.exe` keeps one core at 100%, and never recovers. Its udev thread spins on a hidraw fd whose device is gone:
+
+```
+read(95, 0x10079c940, 1024)             = -1 EIO (Input/output error)
+poll([{fd=49, events=POLLIN}, {fd=41, events=POLLIN}, {fd=51, events=POLLIN}, {fd=52, events=POLLIN}, {fd=55, events=POLLIN}, {fd=56, events=POLLIN}, {fd=95, events=POLLIN}], 7, -1) = 1 ([{fd=95, revents=POLLERR|POLLHUP}])
+read(95, 0x10079c940, 1024)             = -1 EIO (Input/output error)
+```
+
+and the process still holds fds on the removed nodes:
+
+```
+87 -> /dev/hidraw12 (deleted)
+95 -> /dev/hidraw14 (deleted)
+```
+
+Plugging the device back in doesn't help: it gets new hidraw node numbers, and the old fd keeps spinning.
+
+### Root cause
+
+`bus_unlink_hid_device()` is called twice for every removed device: from `bus_main_thread()` on `BUS_EVENT_TYPE_DEVICE_REMOVED`, and again on `IRP_MN_REMOVE_DEVICE`. `list_remove()` leaves the entry's `prev` / `next` pointers stale, so the second call can link a neighbour that was removed in the meantime back into the list. With two adjacent devices A and B:
+
+1. `BUS_EVENT_TYPE_DEVICE_REMOVED` for A: A is unlinked, `A->next` still points to B.
+2. `BUS_EVENT_TYPE_DEVICE_REMOVED` for B: B is unlinked.
+3. `IRP_MN_REMOVE_DEVICE` for A: `list_remove(A)` sets `A->prev->next = B`, and B is back in the forward chain.
+
+The next `IRP_MN_QUERY_DEVICE_RELATIONS` still reports B, so PnP never removes it and its unix device is never stopped. With the udev backend, its hung-up fd stays in the poll set and `udev_bus_wait()` calls `read_report()` on it in a loop.
+
+Unplugging a multi-interface device is exactly when two adjacent devices get removed back to back. With only changes 2 and 3 applied, a `+hid` log of the unplug shows both hangups being handled, but only one winebus PDO receiving `IRP_MN_SURPRISE_REMOVAL` / `IRP_MN_REMOVE_DEVICE`, and no removal after the second `IRP_MN_
+--- dlls/winebus.sys/bus_udev.c
++++ dlls/winebus.sys/bus_udev.c
+@@ -103,6 +103,7 @@ struct base_device
+     struct unix_device unix_device;
+     void (*read_report)(struct unix_device *iface);
+     BOOL started;
++    BOOL removed;
+ 
+     struct udev_device *udev_device;
+     char devnode[MAX_PATH];
+@@ -229,7 +230,12 @@ static void stop_polling_device(struct unix_device *iface)
+     int i;
+ 
+     if (impl->device_fd == -1) return; /* already removed */
+-    if (!impl->started) return; /* not started */
++    if (!impl->started) /* not started, fd isn't being polled */
++    {
++        close(impl->device_fd);
++        impl->device_fd = -1;
++        return;
++    }
+     impl->started = FALSE;
+ 
+     for (i = 2; i < poll_count; ++i)
+@@ -286,6 +292,17 @@ static struct base_device *find_device_from_devnode(const char *path)
+     return NULL;
+ }
+ 
++static void queue_device_removed(struct base_device *impl)
++{
++    if (impl->removed) return; /* already queued */
++    impl->removed = TRUE;
++
++    /* unlink it so that its devnode can't match a new device anymore */
++    list_remove(&impl->unix_device.entry);
++    list_init(&impl->unix_device.entry);
++    bus_event_queue_device_removed(&event_queue, &impl->unix_device);
++}
++
+ static void hidraw_device_destroy(struct unix_device *iface)
+ {
+     struct hidraw_device *impl = hidraw_impl_from_unix_device(iface);
+@@ -1572,7 +1589,7 @@ static void maybe_remove_devnode(const char *base, const char *dir)
+ 
+     snprintf(devnode, sizeof(devnode), "%s/%s", dir, base);
+     impl = find_device_from_devnode(devnode);
+-    if (impl) bus_event_queue_device_removed(&event_queue, &impl->unix_device);
++    if (impl) queue_device_removed(impl);
+     else WARN("failed to find device for path %s\n", devnode);
+ }
+ 
+@@ -1769,7 +1786,7 @@ static void process_monitor_event(struct udev_monitor *monitor)
+     else
+     {
+         impl = find_device_from_devnode(devnode);
+-        if (impl) bus_event_queue_device_removed(&event_queue, &impl->unix_device);
++        if (impl) queue_device_removed(impl);
+         else WARN("failed to find device for udev device %p\n", dev);
+     }
+ 
+@@ -1874,8 +1891,16 @@ NTSTATUS udev_bus_wait(void *args)
+         for (i = 2; i < count; ++i)
+         {
+             if (!pfd[i].revents) continue;
+-            impl = find_device_from_fd(pfd[i].fd);
+-            if (impl) impl->read_report(&impl->unix_device);
++            if (!(impl = find_device_from_fd(pfd[i].fd))) continue;
++            if (!(pfd[i].revents & (POLLERR | POLLHUP | POLLNVAL))) impl->read_report(&impl->unix_device);
++            else
++            {
++                /* the device is gone and its fd will never be readable again, stop polling
++                 * it now instead of spinning until the removal has been fully processed */
++                TRACE("device %p fd %d hung up, removing it\n", impl, pfd[i].fd);
++                stop_polling_device(&impl->unix_device);
++                queue_device_removed(impl);
++            }
+         }
+         pthread_mutex_unlock(&udev_cs);
+     }
+
+--- dlls/winebus.sys/main.c
++++ dlls/winebus.sys/main.c
+@@ -439,7 +439,10 @@ static void bus_unlink_hid_device(DEVICE_OBJECT *device)
+     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
+ 
+     RtlEnterCriticalSection(&device_list_cs);
++    /* called again on IRP_MN_REMOVE_DEVICE after BUS_EVENT_TYPE_DEVICE_REMOVED, keep the
++     * entry self-linked so that the second unlink doesn't corrupt the list */
+     list_remove(&ext->entry);
++    list_init(&ext->entry);
+     RtlLeaveCriticalSection(&device_list_cs);
+ }
+ 
+

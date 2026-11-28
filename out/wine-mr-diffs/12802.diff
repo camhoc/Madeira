@@ -1,0 +1,427 @@
+# Draft: d2d1 Implement ID2D1SvgDocument and ID2D1SvgElement DOM methods
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12802 state=opened
+# As a draft, I'm mainly looking for direction on the questions below before going further, rather than full review.
+
+[Bug 57564](https://bugs.winehq.org/show_bug.cgi?id=57564) is caused by the stubbed CreateSvgDocument and DrawSvgDocument within d2d1.  This series represents the first part of implementing those.
+
+What the series contains:
+- `ID2D1SvgDocument` and `ID2D1SvgElement` IDL, creating document and root, creating/removing/inserting/replacing elements, text content, walking the element tree.
+- Reference counting matches Windows: holding a reference to an element keeps its ancestors and the document alive.
+- vtable order for `ID2D1SvgElement` was determined on Windows by calling each slot of a native SvgElement and identifying the method from its behavior (return values and effect on the tree).
+- Which elements may contain which is tested and matches Windows.
+
+Not in this series: attributes, XML loading, drawing.
+
+Open Questions/Confirmations:
+- `SetAttributeValue` and `GetAttributeValue` each have three distinct entries in the vtable.  To handle this overloading, I've used suffixes such as `_String`, `_Attribute`, `_POD`, and `_IID`. Is this acceptable, or is there a preferable way to handle this, or better naming? Note that mingw-w64's header orders slots 27–33 differently, but the order here was verified by probing on Windows.
+- For XML parsing, does xmllite's IXmlReader (which is already used in D2D) seem like the way to go?
+- Preliminary testing of attributes has shown that they are validated and parsed when set (setting `1in` and reading it back returns `96`), and enumerated in alphabetical order by attribute name.  I anticipate storing them in a sorted per-element array of {attribute id, value}, with attribute id coming from an enum, and value being a union of float/string/D2D types. Does that approach work for you?
+--- dlls/d2d1/tests/d2d1.c
++++ dlls/d2d1/tests/d2d1.c
+
+--- dlls/d2d1/Makefile.in
++++ dlls/d2d1/Makefile.in
+@@ -22,4 +22,5 @@ SOURCES = \
+ 	sprite_batch.c \
+ 	state_block.c \
+ 	stroke.c \
++	svg.c \
+ 	wic_render_target.c
+
+--- dlls/d2d1/d2d1_private.h
++++ dlls/d2d1/d2d1_private.h
+@@ -482,6 +482,59 @@ struct d2d_sprite_batch
+ HRESULT d2d_sprite_batch_create(ID2D1Factory *factory, struct d2d_sprite_batch **batch);
+ struct d2d_sprite_batch *unsafe_impl_from_ID2D1SpriteBatch(ID2D1SpriteBatch *iface);
+ 
++struct d2d_svg_elem;
++
++struct d2d_svg_doc
++{
++    ID2D1SvgDocument ID2D1SvgDocument_iface;
++    LONG refcount;
++
++    ID2D1Factory *factory;
++    D2D1_SIZE_F viewport_size;
++    struct d2d_svg_elem *root;
++};
++
++HRESULT d2d_svg_doc_create(struct d2d_device_context *context, IStream *input_xml_stream,
++        D2D1_SIZE_F viewport_size, struct d2d_svg_doc **svg);
++
++enum d2d_svg_tag
++{
++    D2D_SVG_TAG_NONE = -1,
++    D2D_SVG_TAG_CIRCLE = 0,
++    D2D_SVG_TAG_CLIP_PATH,
++    D2D_SVG_TAG_DEFS,
++    D2D_SVG_TAG_DESC,
++    D2D_SVG_TAG_ELLIPSE,
++    D2D_SVG_TAG_G,
++    D2D_SVG_TAG_IMAGE,
++    D2D_SVG_TAG_LINE,
++    D2D_SVG_TAG_LINEAR_GRADIENT,
++    D2D_SVG_TAG_PATH,
++    D2D_SVG_TAG_POLYGON,
++    D2D_SVG_TAG_POLYLINE,
++    D2D_SVG_TAG_RADIAL_GRADIENT,
++    D2D_SVG_TAG_RECT,
++    D2D_SVG_TAG_STOP,
++    D2D_SVG_TAG_SVG,
++    D2D_SVG_TAG_TITLE,
++    D2D_SVG_TAG_USE,
++    D2D_SVG_TAG_TEXT_CONTENT,
++};
++
++struct d2d_svg_elem
++{
++    ID2D1SvgElement ID2D1SvgElement_iface;
++    LONG refcount;
++
++    ID2D1Factory *factory;
++    struct d2d_svg_doc *document;
++    enum d2d_svg_tag tag;
++    struct d2d_svg_elem *parent;
++    struct list entry;
++    struct list children;
++    WCHAR *text;
++};
++
+ struct d2d_state_block
+ {
+     ID2D1DrawingStateBlock1 ID2D1DrawingStateBlock1_iface;
+
+--- dlls/d2d1/device.c
++++ dlls/d2d1/device.c
+@@ -3162,10 +3162,19 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_GetSvgGlyphImage(ID2D1Device
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateSvgDocument(ID2D1DeviceContext6 *iface,
+         IStream *input_xml_stream, D2D1_SIZE_F viewport_size, ID2D1SvgDocument **svg_document)
+ {
+-    FIXME("iface %p, input_xml_stream %p, svg_document %p stub!\n", iface, input_xml_stream,
+-            svg_document);
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    struct d2d_svg_doc *object;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("iface %p, input_xml_stream %p, viewport_size {%f, %f}, svg_document %p.\n",
++            iface, input_xml_stream, viewport_size.width, viewport_size.height, svg_document);
++
++    if (SUCCEEDED(hr = d2d_svg_doc_create(context, input_xml_stream, viewport_size, &object)))
++        *svg_document = &object->ID2D1SvgDocument_iface;
++    else
++        *svg_document = NULL;
++
++    return hr;
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_DrawSvgDocument(ID2D1DeviceContext6 *iface,
+
+--- dlls/d2d1/svg.c
++++ dlls/d2d1/svg.c
+
+--- include/Makefile.in
++++ include/Makefile.in
+@@ -123,6 +123,7 @@ SOURCES = \
+ 	d2d1effects.idl \
+ 	d2d1effects_1.idl \
+ 	d2d1effects_2.idl \
++	d2d1svg.idl \
+ 	d2dbasetypes.h \
+ 	d2derr.h \
+ 	d3d.h \
+
+--- include/d2d1_3.idl
++++ include/d2d1_3.idl
+@@ -18,6 +18,7 @@
+ 
+ import "d2d1_2.idl";
+ import "d2d1effects_2.idl";
++import "d2d1svg.idl";
+ 
+ interface IDWriteFontFace;
+ 
+@@ -530,8 +531,6 @@ interface ID2D1DeviceContext4 : ID2D1DeviceContext3
+     );
+ }
+ 
+-interface ID2D1SvgDocument;
+-
+ [
+     object,
+     uuid(1ab42875-c57f-4be9-bd85-9cd78d6f55ee),
+
+--- include/d2d1svg.idl
++++ include/d2d1svg.idl
+@@ -0,0 +1,270 @@
++/*
++ * Copyright 2025-2026 Jeff Smith
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++import "d2d1.idl";
++
++typedef enum D2D1_SVG_ATTRIBUTE_POD_TYPE {
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_FLOAT = 0,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_COLOR = 1,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_FILL_MODE = 2,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_DISPLAY = 3,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_OVERFLOW = 4,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_LINE_CAP = 5,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_LINE_JOIN = 6,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_VISIBILITY = 7,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_MATRIX = 8,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_UNIT_TYPE = 9,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_EXTEND_MODE = 10,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_PRESERVE_ASPECT_RATIO = 11,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_VIEWBOX = 12,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_LENGTH = 13,
++    D2D1_SVG_ATTRIBUTE_POD_TYPE_FORCE_DWORD = 0xffffffff
++} D2D1_SVG_ATTRIBUTE_POD_TYPE;
++
++typedef enum D2D1_SVG_ATTRIBUTE_STRING_TYPE {
++    D2D1_SVG_ATTRIBUTE_STRING_TYPE_SVG = 0,
++    D2D1_SVG_ATTRIBUTE_STRING_TYPE_ID = 1,
++    D2D1_SVG_ATTRIBUTE_STRING_TYPE_FORCE_DWORD = 0xffffffff
++} D2D1_SVG_ATTRIBUTE_STRING_TYPE;
++
++typedef enum D2D1_SVG_LENGTH_UNITS {
++    D2D1_SVG_LENGTH_UNITS_NUMBER = 0,
++    D2D1_SVG_LENGTH_UNITS_PERCENTAGE = 1,
++    D2D1_SVG_LENGTH_UNITS_FORCE_DWORD = 0xffffffff
++} D2D1_SVG_LENGTH_UNITS;
++
++typedef enum D2D1_SVG_PAINT_TYPE {
++    D2D1_SVG_PAINT_TYPE_NONE = 0,
++    D2D1_SVG_PAINT_TYPE_COLOR = 1,
++    D2D1_SVG_PAINT_TYPE_CURRENT_COLOR = 2,
++    D2D1_SVG_PAINT_TYPE_URI = 3,
++    D2D1_SVG_PAINT_TYPE_URI_NONE = 4,
++    D2D1_SVG_PAINT_TYPE_URI_COLOR = 5,
++    D2D1_SVG_PAINT_TYPE_URI_CURRENT_COLOR = 6,
++    D2D1_SVG_PAINT_TYPE_FORCE_DWORD = 0xffffffff
++} D2D1_SVG_PAINT_TYPE;
++
++typedef enum D2D1_SVG_PATH_COMMAND {
++    D2D1_SVG_PATH_COMMAND_CLOSE_PATH = 0,
++    D2D1_SVG_PATH_COMMAND_MOVE_ABSOLUTE = 1,
++    D2D1_SVG_PATH_COMMAND_MOVE_RELATIVE = 2,
++    D2D1_SVG_PATH_COMMAND_LINE_ABSOLUTE = 3,
++    D2D1_SVG_PATH_COMMAND_LINE_RELATIVE = 4,
++    D2D1_SVG_PATH_COMMAND_CUBIC_ABSOLUTE = 5,
++    D2D1_SVG_PATH_COMMAND_CUBIC_RELATIVE = 6,
++    D2D1_SVG_PATH_COMMAND_QUADRADIC_ABSOLUTE = 7,
++    D2D1_SVG_PATH_COMMAND_QUADRADIC_RELATIVE = 8,
++    D2D1_SVG_PATH_COMMAND_ARC_ABSOLUTE = 9,
++    D2D1_SVG_PATH_COMMAND_ARC_RELATIVE = 10,
++    D2D1_SVG_PATH_COMMAND_HORIZONTAL_ABSOLUTE = 11,
++    D2D1_SVG_PATH_COMMAND_HORIZONTAL_RELATIVE = 12,
++    D2D1_SVG_PATH_COMMAND_VERTICAL_ABSOLUTE = 13,
++    D2D1_SVG_PATH_COMMAND_VERTICAL_RELATIVE = 14,
++    D2D1_SVG_PATH_COMMAND_CUBIC_SMOOTH_ABSOLUTE = 15,
++    D2D1_SVG_PATH_COMMAND_CUBIC_SMOOTH_RELATIVE = 16,
++    D2D1_SVG_PATH_COMMAND_QUADRADIC_SMOOTH_ABSOLUTE = 17,
++    D2D1_SVG_PATH_COMMAND_QUADRADIC_SMOOTH_RELATIVE = 18,
++    D2D1_SVG_PATH_COMMAND_FORCE_DWORD = 0xffffffff
++} D2D1_SVG_PATH_COMMAND;
++
++typedef struct D2D1_SVG_LENGTH {
++    float value;
++    D2D1_SVG_LENGTH_UNITS units;
++} D2D1_SVG_LENGTH;
++
++interface ID2D1SvgDocument;
++interface ID2D1SvgAttribute;
++
++[
++    local,
++    object,
++    uuid(ac7b67a6-183e-49c1-a823-0ebe40b0db29)
++]
++interface ID2D1SvgElement : ID2D1Resource
++{
++    void GetDocument(
++        [out] ID2D1SvgDocument **document
++    );
++    HRESULT GetTagName(
++        [out] WCHAR *name,
++        [in] UINT32 name_count
++    );
++    UINT32 GetTagNameLength();
++    BOOL IsTextContent();
++    void GetParent(
++        [out] ID2D1SvgElement **parent
++    );
++    BOOL HasChildren();
++    void GetFirstChild(
++        [out] ID2D1SvgElement **child
++    );
++    void GetLastChild(
++        [out] ID2D1SvgElement **child
++    );
++    HRESULT GetPreviousChild(
++        [in] ID2D1SvgElement *ref_child,
++        [out] ID2D1SvgElement **prev_child
++    );
++    HRESULT GetNextChild(
++        [in] ID2D1SvgElement *ref_child,
++        [out] ID2D1SvgElement **next_child
++    );
++    HRESULT InsertChildBefore(
++        [in] ID2D1SvgElement *new_child,
++        [in, optional] ID2D1SvgElement *ref_child
++    );
++    HRESULT AppendChild(
++        [in] ID2D1SvgElement *new_child
++    );
++    HRESULT ReplaceChild(
++        [in] ID2D1SvgElement *new_child,
++        [in] ID2D1SvgElement *old_child
++    );
++    HRESULT RemoveChild(
++        [in] ID2D1SvgElement *old_child
++    );
++    HRESULT CreateChild(
++        [in] const WCHAR *tag_name,
++        [out] ID2D1SvgElement **new_child
++    );
++    BOOL IsAttributeSpecified(
++        [in] const WCHAR *name,
++        [out, optional] BOOL *inherited
++    );
++    UINT32 GetSpecifiedAttributeCount();
++    HRESULT GetSpecifiedAttributeName(
++        [in] UINT32 index,
++        [out] WCHAR *name,
++        [in] UINT32 name_count,
++        [out, optional] BOOL *inherited
++    );
++    HRESULT GetSpecifiedAttributeNameLength(
++        [in] UINT32 index,
++        [out] UINT32 *name_length,
++        [out, optional] BOOL *inherited
++    );
++    HRESULT RemoveAttribute(
++        [in] const WCHAR *name
++    );
++    HRESULT SetTextValue(
++        [in] const WCHAR *text,
++        [in] UINT32 text_count
++    );
++    HRESULT GetTextValue(
++        [out] WCHAR *text,
++        [in] UINT32 text_count
++    );
++    UINT32 GetTextValueLength();
++    HRESULT SetAttributeValue_Attribute(
++        [in] const WCHAR *name,
++        [in] ID2D1SvgAttribute *value
++    );
++    HRESULT SetAttributeValue_POD(
++        [in] const WCHAR *name,
++        [in] D2D1_SVG_ATTRIBUTE_POD_TYPE type,
++        [in] const void *value,
++        [in] UINT32 value_size
++    );
++    HRESULT SetAttributeValue_String(
++        [in] const WCHAR *name,
++        [in] D2D1_SVG_ATTRIBUTE_STRING_TYPE type,
++        [in] const WCHAR *value
++    );
++    HRESULT GetAttributeValue_IID(
++        [in] const WCHAR *name,
++        [in] REFIID riid,
++        [out] void **value
++    );
++    HRESULT GetAttributeValue_POD(
++        [in] const WCHAR *name,
++        [in] D2D1_SVG_ATTRIBUTE_POD_TYPE type,
++        [out] void *value,
++        [in] UINT32 value_size
++    );
++    HRESULT GetAttributeValue_String(
++        [in] const WCHAR *name,
++        [in] D2D1_SVG_ATTRIBUTE_STRING_TYPE type,
++        [out] WCHAR *value,
++        [in] UINT32 value_count
++    );
++    HRESULT GetAttributeValueLength(
++        [in] const WCHAR *name,
++        [in] D2D1_SVG_ATTRIBUTE_STRING_TYPE type,
++        [out] UINT32 *value_length
++    );
++}
++
++interface ID2D1SvgPaint;
++interface ID2D1SvgStrokeDashArray;
++interface ID2D1SvgPointCollection;
++interface ID2D1SvgPathData;
++
++[
++    local,
++    object,
++    uuid(86b88e4d-afa4-4d7b-88e4-68a51c4a0aec),
++]
++interface ID2D1SvgDocument : ID2D1Resource
++{
++    HRESULT SetViewportSize(
++        [in] D2D1_SIZE_F viewport_size
++    );
++    D2D1_SIZE_F GetViewportSize();
++    HRESULT SetRoot(
++        [in, optional] ID2D1SvgElement *root
++    );
++    void GetRoot(
++        [out] ID2D1SvgElement **root
++    );
++    HRESULT FindElementById(
++        [in] const WCHAR *id,
++        [out] ID2D1SvgElement **element
++    );
++    HRESULT Serialize(
++        [in] IStream *output_xml_stream,
++        [in, optional] ID2D1SvgElement *subtree
++    );
++    HRESULT Deserialize(
++        [in] IStream *input_xml_stream,
++        [out] ID2D1SvgElement **subtree
++    );
++    HRESULT CreatePaint(
++        [in] D2D1_SVG_PAINT_TYPE paint_type,
++        [in, optional] const D2D1_COLOR_F *color,
++        [in, optional] const WCHAR *id,
++        [out] ID2D1SvgPaint **paint
++    );
++    HRESULT CreateStrokeDashArray(
++        [in, optional] const D2D1_SVG_LENGTH *dashes,
++        [in] UINT32 dashes_count,
++        [out] ID2D1SvgStrokeDashArray **stroke_dash_array
++    );
++    HRESULT CreatePointCollection(
++        [in, optional] const D2D1_POINT_2F *points,
++        [in] UINT32 points_count,
++        [out] ID2D1SvgPointCollection **point_collection
++    );
++    HRESULT CreatePathData(
++        [in, optional] const float *segment_data,
++        [in] UINT32 segment_data_count,
++        [in, optional] const D2D1_SVG_PATH_COMMAND *commands,
++        [in] UINT32 commands_count,
++        [out] ID2D1SvgPathData **path_data
++    );
++}
++
+

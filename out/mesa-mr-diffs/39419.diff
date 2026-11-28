@@ -1,0 +1,84 @@
+# nir/lower_blend: Store according to present component offsets
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/39419 state=opened
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+```
+nir/lower_blend: Store according to present component offsets
+
+store_output intrinsics may contain a non-zero component. Without this
+change nir_lower_blend would always try to store the whole vector
+disregarding the component present in the intrinsic. Led to situations
+where the render target is RGBA, store_output contains component 1 with
+write_mask x (so a single channel G). After the blend pass, the
+store_output would be the same but the src being a vec4 which breaks
+nir validation because instr->num_components (4) + component > 4.
+
+Along with the mentioned issue, when loading the input for the previous
+case it would be loaded as R due to how the padding for the input is done.
+This change handles these cases too by applying the component to offset
+the values when loading the input.
+
+Signed-off-by: Aitor Camacho <aitor@lunarg.com>
+```
+
+KK recently started running debug builds in our internal CI and we are running into nir validation errors with `dEQP-VK.glsl.440.linkage.varying.component.frag_out.vec3.as_float_float_float`. This seems to only be a nir validation issue. Looking for feedback if this is a reasonable approach to fix the observed issues or if there is an already existing pass that handles this (or maybe we should not end up in a state that allows the mentioned behavior).
+
+Pre-blend pass:
+```
+shader: MESA_SHADER_FRAGMENT
+source_blake3: {0x500c0bbe, 0xf0c94243, 0xd45af341, 0x8b2e10a0, 0xe3010fb5, 0xb577fcb5, 0x7223b9af, 0xd77eddd2}
+inputs_read: 32
+outputs_written: 4
+api_subgroup_size: 32
+max_subgroup_size: 32
+min_subgroup_size: 32
+bit_sizes_float: 0x20
+bit_sizes_int: 0x20
+known_interpolation_qualifiers: true
+origin_upper_left: true
+decl_function main () (entrypoint)
+
+impl main {
+    block b0:   // preds:
+    32     %0 = load_const (0x00000000)
+    32x2   %1 = @load_barycentric_pixel (interp_mode=INTERP_MODE_SMOOTH)
+    32x3   %2 = @load_interpolated_
+--- src/compiler/nir/nir_lower_blend.c
++++ src/compiler/nir/nir_lower_blend.c
+@@ -507,7 +507,22 @@ nir_lower_blend_instr(nir_builder *b, nir_intrinsic_instr *store, void *data)
+    /* Grab the input color.  We always want 4 channels during blend.  Dead
+     * code will clean up any channels we don't need.
+     */
+-   nir_def *src = nir_pad_vector(b, store->src[0].ssa, 4);
++   uint32_t component = nir_intrinsic_component(store);
++   nir_def *src = store->src[0].ssa;
++   if (src->num_components != 4) {
++      nir_scalar components[4];
++      nir_scalar undef = nir_get_scalar(nir_undef(b, 1, src->bit_size), 0);
++      uint32_t i = 0;
++      assert(component + src->num_components <= 4 && "store_output has more than 4 components");
++      for (; i < component; i++)
++         components[i] = undef;
++      for (uint32_t j = 0u; j < src->num_components; j++, i++)
++         components[i] = nir_get_scalar(src, j);
++      for (; i < 4; i++)
++         components[i] = undef;
++
++      src = nir_vec_scalars(b, components, 4);
++   }
+ 
+    assert(nir_src_as_uint(store->src[1]) == 0 && "store_output invariant");
+ 
+@@ -558,8 +573,9 @@ nir_lower_blend_instr(nir_builder *b, nir_intrinsic_instr *store, void *data)
+ 
+    /* Grow or shrink the store destination as needed */
+    store->num_components = num_components;
+-   nir_intrinsic_set_write_mask(store, nir_intrinsic_write_mask(store) &
++   nir_intrinsic_set_write_mask(store, (nir_intrinsic_write_mask(store) << component) &
+                                           nir_component_mask(num_components));
++   nir_intrinsic_set_component(store, 0u);
+ 
+    /* Write out the final color instead of the input */
+    nir_src_rewrite(&store->src[0], blended);
+

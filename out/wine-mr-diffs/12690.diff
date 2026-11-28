@@ -1,0 +1,30 @@
+# winex11: Return zero when mapping virtual key zero to a scan code.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12690 state=opened
+# The dinput:device8 test fails on OpenBSD with the XFree86 keymap.
+
+test_sys_keyboard() expects the first five objects to be Esc, 1, 2, 3, 4. Instead, versions 0x500 and 0x700 enumerate an extra object first, causing 20 failures: five objects, two fields (dwOfs, dwType), two versions. Version 0x800 is unaffected.
+
+The XFree86 map used by OpenBSD defines the synthetic <MDSW> key at keycode 8, with the symbol Mode_switch. Wine maps keycode 8 to scan code zero. For scan zero, the DirectInput < 8 fallback therefore calls MapVirtualKeyW(0, MAPVK_VK_TO_VSC).
+
+The X11 reverse lookup searches keyc2vkey[] for the requested VK. Zero also denotes unassigned entries, so it selects the first such keycode, 92 in this run, and returns its scan code, 0x54. The synthetic object's name comes from keycode 8, but its identifier comes from keycode 92:
+
+```
+X11DRV_GetKeyNameText found scan=0000 keyc=8 keysym=ff7e vkey=00df string="Mode_switch"
+X11DRV_MapVirtualKeyEx wCode=0x0, wMapType=0, hkl 0x4090409
+X11DRV_MapVirtualKeyEx returning 0x54.
+device8.c:1010: Test failed: 0x500: obj[0]: got dwOfs 0x54
+device8.c:1012: Test failed: 0x500: obj[0]: got dwType 0x5404
+```
+
+The patch rejects VK zero before this search for both MAPVK_VK_TO_VSC and MAPVK_VK_TO_VSC_EX.
+--- dlls/winex11.drv/keyboard.c
++++ dlls/winex11.drv/keyboard.c
+@@ -2428,6 +2428,7 @@ UINT X11DRV_MapVirtualKeyEx( UINT wCode, UINT wMapType, HKL hkl )
+     {
+         case MAPVK_VK_TO_VSC: /* vkey-code to scan-code */
+         case MAPVK_VK_TO_VSC_EX:
++            if (!wCode) break;
+             switch (wCode)
+             {
+                 case VK_SHIFT: wCode = VK_LSHIFT; break;
+

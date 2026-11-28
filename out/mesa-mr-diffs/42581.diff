@@ -1,0 +1,158 @@
+# nir,spirv: add native inverse-trig opcodes and a keep option
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42581 state=opened
+# ### What does this MR do and why?
+<!-- Describe in detail what your merge request does and why. -->
+
+AI was used for the commit message and code comments.
+
+~This is required for KosmicKrisp in !42580. Translating to Metal's `acos` is needed to pass `dEQP-VK.spirv_assembly.instruction.graphics.float16.arithmetic_1.acos_*`. The lowered `acos` ends up with a big enough rounding error that makes the tests fail. This change exposes a way for shader to opt in if they can translate these directly.~
+
+!42653 fixes the real issue, this would help us reduce shader size and directly use Metal ones.
+
+```
+nir,spirv: add native inverse-trig opcodes and a keep option
+
+Add the ftan/fasin/facos/fatan unops and the fatan2 binop so a backend
+whose ISA exposes hardware transcendentals can keep them instead of the
+vtn polynomial lowering. spirv_to_nir_options gains a native_trig mask
+(enum nir_spirv_native_trig); for each set bit vtn_glsl450 emits the
+native opcode rather than expanding it to arithmetic. The arithmetic
+tangent builder is renamed nir_ftan_lowered so the new opcode can own
+the generated nir_ftan() builder; vtn_opencl's Native_tan keeps the
+lowered form.
+
+Signed-off-by: Aitor Camacho <aitor@lunarg.com>
+```
+--- src/compiler/nir/nir_builtin_builder.h
++++ src/compiler/nir/nir_builtin_builder.h
+@@ -248,7 +248,7 @@ nir_select(nir_builder *b, nir_def *x, nir_def *y, nir_def *s)
+ }
+ 
+ static inline nir_def *
+-nir_ftan(nir_builder *b, nir_def *x)
++nir_ftan_lowered(nir_builder *b, nir_def *x)
+ {
+    return nir_fdiv(b, nir_fsin(b, x), nir_fcos(b, x));
+ }
+
+--- src/compiler/nir/nir_opcodes.py
++++ src/compiler/nir/nir_opcodes.py
+@@ -442,6 +442,18 @@ unop("fquantize2f16", tfloat32, "(fabsf(src0) < ldexpf(1.0, -14)) ? copysignf(0.
+ unop("fsin", tfloat, "bit_size == 64 ? sin(src0) : sinf(src0)")
+ unop("fcos", tfloat, "bit_size == 64 ? cos(src0) : cosf(src0)")
+ 
++# Native inverse-trig / tangent opcodes.  These are normally lowered to
++# arithmetic by vtn (see the nir_acos()/nir_asin()/nir_atan()/
++# nir_ftan_lowered() builder helpers).  A backend whose target ISA exposes the corresponding
++# hardware transcendentals (e.g. Metal's <metal_math>) can ask the SPIR-V
++# front-end to keep them as opcodes via
++# spirv_to_nir_options::native_trig and map them directly, which avoids
++# the polynomial approximation and lets the result benefit from the native ones.
++unop("ftan", tfloat, "bit_size == 64 ? tan(src0) : tanf(src0)")
++unop("fasin", tfloat, "bit_size == 64 ? asin(src0) : asinf(src0)")
++unop("facos", tfloat, "bit_size == 64 ? acos(src0) : acosf(src0)")
++unop("fatan", tfloat, "bit_size == 64 ? atan(src0) : atanf(src0)")
++
+ # dfrexp
+ unop_convert("frexp_exp", tint32, tfloat, "frexp(src0, &dst);", valid_fp_math_ctrl = preserve_inf + preserve_nan + exact)
+ unop_convert("frexp_sig", tfloat, tfloat, "int n; dst = frexp(src0, &n);")
+@@ -1042,6 +1054,10 @@ binop("umax", tuint, _2src_commutative + associative, "MAX2(src0, src1)")
+ 
+ binop("fpow", tfloat, "", "bit_size == 64 ? pow(src0, src1) : powf(src0, src1)")
+ 
++# Native two-argument arctangent.  See the ftan/fasin/facos/fatan comment in
++# the unop section and spirv_to_nir_options::native_trig.
++binop("fatan2", tfloat, "", "bit_size == 64 ? atan2(src0, src1) : atan2f(src0, src1)")
++
+ binop_horiz("pack_half_2x16_split", 1, tuint32, 1, tfloat32, 1, tfloat32,
+             "pack_half_1x16(src0.x) | ((uint32_t)pack_half_1x16(src1.x) << 16)")
+ 
+
+--- src/compiler/spirv/nir_spirv.h
++++ src/compiler/spirv/nir_spirv.h
+@@ -41,6 +41,14 @@ enum nir_spirv_execution_environment {
+    NIR_SPIRV_OPENGL,
+ };
+ 
++enum nir_spirv_native_trig {
++   nir_spirv_native_trig_tan   = BITFIELD_BIT(0),
++   nir_spirv_native_trig_asin  = BITFIELD_BIT(1),
++   nir_spirv_native_trig_acos  = BITFIELD_BIT(2),
++   nir_spirv_native_trig_atan  = BITFIELD_BIT(3),
++   nir_spirv_native_trig_atan2 = BITFIELD_BIT(4),
++};
++
+ struct spirv_to_nir_options {
+    enum nir_spirv_execution_environment environment;
+ 
+@@ -71,6 +79,11 @@ struct spirv_to_nir_options {
+    /* Whether or not printf is supported */
+    bool printf;
+ 
++   /* Mask of enum nir_spirv_native_trig bits.  For each set bit, vtn keeps the
++    * corresponding GLSL.std.450 Tan/Asin/Acos/Atan/Atan2 as a native NIR ALU
++    * opcode instead of lowering it to a polynomial approximation. */
++   uint32_t native_trig;
++
+    /* Whether or not the driver wants consume debug information (Debugging purposes). */
+    bool debug_info;
+ 
+
+--- src/compiler/spirv/vtn_glsl450.c
++++ src/compiler/spirv/vtn_glsl450.c
+@@ -263,7 +263,9 @@ handle_glsl450_alu(struct vtn_builder *b, enum GLSLstd450 entrypoint,
+       dest->def = nir_degrees(nb, src[0]);
+       break;
+    case GLSLstd450Tan:
+-      dest->def = nir_ftan(nb, src[0]);
++      dest->def = (b->options->native_trig & nir_spirv_native_trig_tan)
++                     ? nir_ftan(nb, src[0])
++                     : nir_ftan_lowered(nb, src[0]);
+       break;
+ 
+    case GLSLstd450Modf: {
+@@ -518,19 +520,27 @@ handle_glsl450_alu(struct vtn_builder *b, enum GLSLstd450 entrypoint,
+    }
+ 
+    case GLSLstd450Asin:
+-      dest->def = nir_asin(nb, src[0]);
++      dest->def = (b->options->native_trig & nir_spirv_native_trig_asin)
++                     ? nir_fasin(nb, src[0])
++                     : nir_asin(nb, src[0]);
+       break;
+ 
+    case GLSLstd450Acos:
+-      dest->def = nir_acos(nb, src[0]);
++      dest->def = (b->options->native_trig & nir_spirv_native_trig_acos)
++                     ? nir_facos(nb, src[0])
++                     : nir_acos(nb, src[0]);
+       break;
+ 
+    case GLSLstd450Atan:
+-      dest->def = nir_atan(nb, src[0]);
++      dest->def = (b->options->native_trig & nir_spirv_native_trig_atan)
++                     ? nir_fatan(nb, src[0])
++                     : nir_atan(nb, src[0]);
+       break;
+ 
+    case GLSLstd450Atan2:
+-      dest->def = nir_atan2(nb, src[0], src[1]);
++      dest->def = (b->options->native_trig & nir_spirv_native_trig_atan2)
++                     ? nir_fatan2(nb, src[0], src[1])
++                     : nir_atan2(nb, src[0], src[1]);
+       break;
+ 
+    case GLSLstd450Ldexp: {
+
+--- src/compiler/spirv/vtn_opencl.c
++++ src/compiler/spirv/vtn_opencl.c
+@@ -678,7 +678,7 @@ handle_special(struct vtn_builder *b, uint32_t opcode,
+    case OpenCLstd_Native_log10:
+       return nir_fmul_imm(nb, nir_flog2(nb, srcs[0]), log(2) / log(10));
+    case OpenCLstd_Native_tan:
+-      return nir_ftan(nb, srcs[0]);
++      return nir_ftan_lowered(nb, srcs[0]);
+    case OpenCLstd_Ldexp:
+       if (!nb->shader->options->has_ldexp)
+          break;
+

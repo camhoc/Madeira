@@ -1,0 +1,145 @@
+# winex11, wineandroid: Use the default implementation for ShowWindow.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11626 state=opened
+# The wineandroid implementation already seem to match the default one, the winex11 implementation was checking current_event, which shouldn't be necessary anymore, as well as some extra heuristics introduced in 6f2c18609b27a4fe80f3e538e2454579d8d6b3aa which I don't fully understand. It seems to decide to keep minimized window at their current position in non-virtual desktop mode, or if system tray isn't visible. I don't understand why, or why it should be winex11 specific, and if we want to keep that we could probably move it to win32u.
+--- dlls/wineandroid.drv/android.h
++++ dlls/wineandroid.drv/android.h
+@@ -112,7 +112,6 @@ extern BOOL ANDROID_ProcessEvents( DWORD mask );
+ extern LRESULT ANDROID_DesktopWindowProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp );
+ extern void ANDROID_SetParent( HWND hwnd, HWND parent, HWND old_parent );
+ extern void ANDROID_SetCapture( HWND hwnd, UINT flags, HWND previous );
+-extern UINT ANDROID_ShowWindow( HWND hwnd, INT cmd, RECT *rect, UINT swp );
+ extern LRESULT ANDROID_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp );
+ extern BOOL ANDROID_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects );
+ extern struct client_surface *ANDROID_CreateClientSurface( HWND hwnd, int pixel_format );
+
+--- dlls/wineandroid.drv/init.c
++++ dlls/wineandroid.drv/init.c
+@@ -319,7 +319,6 @@ static const struct user_driver_funcs android_drv_funcs =
+     .pProcessEvents = ANDROID_ProcessEvents,
+     .pSetCapture = ANDROID_SetCapture,
+     .pSetParent = ANDROID_SetParent,
+-    .pShowWindow = ANDROID_ShowWindow,
+     .pWindowMessage = ANDROID_WindowMessage,
+     .pWindowPosChanging = ANDROID_WindowPosChanging,
+     .pCreateClientSurface = ANDROID_CreateClientSurface,
+
+--- dlls/wineandroid.drv/window.c
++++ dlls/wineandroid.drv/window.c
+@@ -1058,22 +1058,6 @@ void ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UI
+ }
+ 
+ 
+-/***********************************************************************
+- *           ANDROID_ShowWindow
+- */
+-UINT ANDROID_ShowWindow( HWND hwnd, INT cmd, RECT *rect, UINT swp )
+-{
+-    if (!(NtUserGetWindowLongW( hwnd, GWL_STYLE ) & WS_MINIMIZE)) return swp;
+-    /* always hide icons off-screen */
+-    if (rect->left != -32000 || rect->top != -32000)
+-    {
+-        OffsetRect( rect, -32000 - rect->left, -32000 - rect->top );
+-        swp &= ~(SWP_NOMOVE | SWP_NOCLIENTMOVE);
+-    }
+-    return swp;
+-}
+-
+-
+ /*****************************************************************
+  *	     ANDROID_SetParent
+  */
+
+--- dlls/winex11.drv/init.c
++++ dlls/winex11.drv/init.c
+@@ -653,7 +653,6 @@ static const struct user_driver_funcs x11drv_funcs =
+     .pSetWindowRgn = X11DRV_SetWindowRgn,
+     .pSetWindowStyle = X11DRV_SetWindowStyle,
+     .pSetWindowText = X11DRV_SetWindowText,
+-    .pShowWindow = X11DRV_ShowWindow,
+     .pSysCommand = X11DRV_SysCommand,
+     .pClipboardWindowProc = X11DRV_ClipboardWindowProc,
+     .pUpdateClipboard = X11DRV_UpdateClipboard,
+
+--- dlls/winex11.drv/window.c
++++ dlls/winex11.drv/window.c
+@@ -3350,68 +3350,6 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     if (was_fullscreen) NtUserClipCursor( NULL );
+ }
+ 
+-/* check if the window icon should be hidden (i.e. moved off-screen) */
+-static BOOL hide_icon( struct x11drv_win_data *data )
+-{
+-    static const WCHAR trayW[] = {'S','h','e','l','l','_','T','r','a','y','W','n','d',0};
+-    UNICODE_STRING str = RTL_CONSTANT_STRING( trayW );
+-
+-    if (data->managed) return TRUE;
+-    /* hide icons in desktop mode when the taskbar is active */
+-    if (!is_virtual_desktop()) return FALSE;
+-    return NtUserIsWindowVisible( NtUserFindWindowEx( 0, 0, &str, NULL, 0 ));
+-}
+-
+-/***********************************************************************
+- *           ShowWindow   (X11DRV.@)
+- */
+-UINT X11DRV_ShowWindow( HWND hwnd, INT cmd, RECT *rect, UINT swp )
+-{
+-    int x, y;
+-    unsigned int width, height, border, depth;
+-    Window root, top;
+-    POINT pos;
+-    DWORD style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+-    struct x11drv_thread_data *thread_data = x11drv_thread_data();
+-    struct x11drv_win_data *data = get_win_data( hwnd );
+-
+-    if (!data || !data->whole_window) goto done;
+-    if (style & WS_MINIMIZE)
+-    {
+-        if (((rect->left != -32000 || rect->top != -32000)) && hide_icon( data ))
+-        {
+-            OffsetRect( rect, -32000 - rect->left, -32000 - rect->top );
+-            swp &= ~(SWP_NOMOVE | SWP_NOCLIENTMOVE);
+-        }
+-        goto done;
+-    }
+-    if (!data->managed || data->desired_state.wm_state != NormalState) goto done;
+-
+-    /* only fetch the new rectangle if the ShowWindow was a result of a window manager event */
+-
+-    if (!thread_data->current_event || thread_data->current_event->xany.window != data->whole_window)
+-        goto done;
+-
+-    if (thread_data->current_event->type != ConfigureNotify &&
+-        thread_data->current_event->type != PropertyNotify)
+-        goto done;
+-
+-    TRACE( "win %p/%lx cmd %d at %s flags %08x\n",
+-           hwnd, data->whole_window, cmd, wine_dbgstr_rect(rect), swp );
+-
+-    XGetGeometry( thread_data->display, data->whole_window,
+-                  &root, &x, &y, &width, &height, &border, &depth );
+-    XTranslateCoordinates( thread_data->display, data->whole_window, root, 0, 0, &x, &y, &top );
+-    pos = root_to_virtual_screen( x, y );
+-    SetRect( rect, pos.x, pos.y, pos.x + width, pos.y + height );
+-    *rect = window_rect_from_visible( &data->rects, *rect );
+-    swp &= ~(SWP_NOMOVE | SWP_NOCLIENTMOVE | SWP_NOSIZE | SWP_NOCLIENTSIZE);
+-
+-done:
+-    release_win_data( data );
+-    return swp;
+-}
+-
+ 
+ /**********************************************************************
+  *		SetWindowIcons (X11DRV.@)
+
+--- dlls/winex11.drv/x11drv.h
++++ dlls/winex11.drv/x11drv.h
+@@ -242,7 +242,6 @@ extern void X11DRV_SetWindowIcons( HWND hwnd, HICON icon, const ICONINFO *ii, HI
+ extern void X11DRV_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw );
+ extern void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style );
+ extern void X11DRV_SetWindowText( HWND hwnd, LPCWSTR text );
+-extern UINT X11DRV_ShowWindow( HWND hwnd, INT cmd, RECT *rect, UINT swp );
+ extern LRESULT X11DRV_SysCommand( HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT *pos );
+ extern LRESULT X11DRV_ClipboardWindowProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp );
+ extern void X11DRV_UpdateClipboard(void);
+

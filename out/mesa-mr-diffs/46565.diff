@@ -1,0 +1,810 @@
+# kk: Work around zero-extended 32-bit shift miscompile (Apple FB25499479)
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46565 state=opened
+# ### What does this MR do and why?
+
+On Enshrouded this was creating fully black shadows which ideally would be lightened by global illumination. It took two days to find out the exact reason, and here we are. It can be removed if apple fixes it however I doubt on timing. I keep it on my local as it is a big artifact on visuals.
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+kk: Work around zero-extended 32-bit shift miscompile
+
+Works around a Metal compiler bug that makes some shaders read and write
+the wrong memory. Reported to Apple as FB25499479 on 2026-11-09, no
+feedback so far.
+
+## The bug
+
+Metal miscompiles `zext(shl i32 x, c)` used as a 64-bit address offset
+when the top bits of `x` are set: the shifted-out bits are kept, as if
+the shift was done in 64 bits. The access lands outside the buffer, loads
+return 0 and stores are dropped without a fault. Masking the value in
+the shader does not help, the front end folds it back. Seen on M5 Pro,
+in Enshrouded (black global illumination and shadows). Not caught by
+the CTS. A standalone repro is available if Apple or reviewers want it.
+
+## The workaround
+
+Xor the shared 32-bit base of each affected address with an opaque zero
+loaded from the root descriptor table (`dynamic_buffers[0].zero`), so the
+backend no longer sees the shift and keeps the math in 32 bits. Internal
+shaders (`kk_clc`, `kosmicomp`) rebuild the tree in 64 bits and mask it
+instead. `MESA_KK_WA21_FORM=widen` selects that form for the driver.
+It is workaround 21 because 20 is already the OOM guard in `kk_bo.c`.
+Disable with `MESA_KK_DISABLE_WORKAROUNDS=21`. It is documented in
+`workarounds.rst` and can be dropped once Apple fixes the bug.
+
+## Testing
+
+- `msl_compiler_tests`: 15/15 pass (new `test_widen_u2u64_shifts`).
+- CTS r1c: 0 new failures against plain upstream.
+- All 2,754 compute modules of a shader corpus compile.
+- Cost on Enshrouded, plain upstream, 3 rounds: -0.52% mean FPS, -0.67%
+  1% low. That is the price of the cor
+--- docs/drivers/kosmickrisp/workarounds.rst
++++ docs/drivers/kosmickrisp/workarounds.rst
+@@ -49,6 +49,38 @@ info on what was updated.
+ Workarounds
+ ===========
+ 
++KK_WORKAROUND_21
++----------------
++| macOS version: 27.2
++| Metal ticket: FB25499479
++| Metal ticket status: Waiting resolution
++| CTS test failure: None known. Found in Enshrouded (black global illumination)
++| Comments:
++
++The Metal compiler backend miscompiles a 64-bit address whose offset is the
++zero-extension of a 32-bit left shift (LLVM ``zext(shl i32 x, c)``, also
++``mul`` by a power of two and ``add``/``or`` on top of it) when the top ``c``
++bits of ``x`` are set: the shifted-out bits are kept, as if the shift was done
++in 64 bits. The access lands outside the buffer, loads return 0 and stores are
++dropped without a fault. Masking the 32-bit value or ``ulong(off) & 0xFFFFFFFF``
++does not help, the front end folds it back. Seen on M5 Pro.
++
++Worked around by xoring the shared 32-bit base of such an address with a zero
++the compiler cannot see: ``dynamic_buffers[0].zero`` of the root descriptor
++table, loaded once per shader. The xor does not change the value and hides that
++the low 32 bits come from a shift, so the backend keeps the address math in 32
++bits and compiles it correctly. Draws and dispatches that bind no descriptors
++also bind a root table, since the shader reads buffer 0 unconditionally.
++Internal shaders, whose buffer 0 is not the root table, instead rebuild the
++32-bit ``ishl``/``iadd``/``ior``/``imul`` tree under the ``u2u64`` in 64 bits
++and mask the result with ``0xFFFFFFFF``, which is also bit-exact;
++``MESA_KK_WA21_FORM=widen`` selects that form for the driver too. The
++workaround is applied on every macOS version and GPU family.
++
++| Log:
++| 2026-11-08: Workaround implemented.
++| 2026-11-09: Reported to Apple.
++
+ KK_WORKAROUND_20
+ ----------------
+ | macOS version: 26
+
+--- src/kosmickrisp/clc/kk_clc.c
++++ src/kosmickrisp/clc/kk_clc.c
+@@ -290,7 +290,7 @@ main(int argc, char **argv)
+ 
+          msl_preprocess_nir(s);
+          msl_preprocess_nir_workarounds(nir, 0);
+-         msl_optimize_nir(nir);
++         msl_optimize_nir(nir, 0, -1);
+ 
+          NIR_PASS(_, s, nir_opt_deref);
+          NIR_PASS(_, s, nir_lower_vars_to_ssa);
+
+--- src/kosmickrisp/compiler/tests/test_widen_u2u64_shifts.cpp
++++ src/kosmickrisp/compiler/tests/test_widen_u2u64_shifts.cpp
+@@ -0,0 +1,315 @@
++/*
++ * Copyright 2026 Sercan Firat, Nivogli
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "tests/nir_test.h"
++
++extern "C" {
++#include "msl_private.h"
++}
++
++#include <functional>
++#include <vector>
++
++typedef std::function<nir_def *(nir_builder *, nir_def *)> build_fn;
++typedef std::function<uint32_t(uint32_t)> eval_fn;
++
++/* Byte offset of the opaque zero in buffer 0 for the opaque-zero form. */
++#define ZERO_OFFSET 52
++#define WIDEN_FORM -1
++
++class msl_widen_u2u64_shifts_test : public nir_test {
++protected:
++   msl_widen_u2u64_shifts_test() : nir_test("msl_widen_u2u64_shifts_test")
++   {
++   }
++
++   unsigned count_alu(nir_op op)
++   {
++      unsigned n = 0;
++      nir_foreach_function_impl(impl, b->shader)
++         nir_foreach_block(block, impl)
++            nir_foreach_instr(instr, block)
++               n += instr->type == nir_instr_type_alu &&
++                    nir_instr_as_alu(instr)->op == op;
++      return n;
++   }
++
++   /* The opaque zero the pass loaded, or NULL. */
++   nir_intrinsic_instr *find_zero()
++   {
++      nir_intrinsic_instr *zero = NULL;
++      nir_foreach_function_impl(impl, b->shader)
++         nir_foreach_block(block, impl)
++            nir_foreach_instr(instr, block) {
++               if (instr->type != nir_instr_type_intrinsic ||
++                   nir_instr_as_intrinsic(instr)->intrinsic !=
++                      nir_intrinsic_load_global_constant)
++                  continue;
++               EXPECT_EQ(zero, nullptr) << "more than one opaque zero";
++               zero = nir_instr_as_intrinsic(instr);
++            }
++      return zero;
++   }
++
++   nir_intrinsic_instr *store(nir_def *value)
++   {
++      return nir_store_global(b, value, nir_imm_int64(b, 0));
++   }
++
++   /* Builds u2u64(build(x)) for every x, runs the pass and constant folding,
++    * and checks the result against the 32-bit result computed on the CPU.
++    */
++   void check_values(build_fn build, eval_fn eval, int32_t form)
++   {
++      static const uint32_t inputs[] = {
++         0x00000000, 0x00000001, 0x0000ffff, 0x10000001,
++         0x20000003, 0x7fffffff, 0x80000000, 0xe0000005,
++         0xf0000fff, 0xffffffff, 0x12345678, 0xdeadbeef,
++      };
++
++      std::vector<nir_intrinsic_instr *> stores;
++      for (uint32_t x : inputs)
++         stores.push_back(store(nir_u2u64(b, build(b, nir_imm_int(b, x)))));
++
++      ASSERT_TRUE(msl_nir_widen_u2u64_shifts(b->shader, form));
++      nir_validate_shader(b->shader, "after msl_nir_widen_u2u64_shifts");
++      if (form >= 0) {
++         /* The zero is opaque by design; fold it here to check the values. */
++         nir_intrinsic_instr *zero = find_zero();
++         ASSERT_NE(zero, nullptr);
++         EXPECT_EQ(nir_intrinsic_access(zero) & ACCESS_CAN_SPECULATE,
++                   ACCESS_CAN_SPECULATE);
++         b->cursor = nir_after_instr(&zero->instr);
++         nir_def_replace(&zero->def, nir_imm_int(b, 0));
++      }
++      nir_opt_constant_folding(b->shader);
++
++      for (unsigned i = 0; i < ARRAY_SIZE(inputs); i++) {
++         nir_src *value = &stores[i]->src[0];
++         ASSERT_TRUE(nir_src_is_const(*value));
++         EXPECT_EQ(nir_src_as_uint(*value), (uint64_t)eval(inputs[i]))
++            << "input 0x" << std::hex << inputs[i];
++      }
++   }
++
++   void check_values(build_fn build, eval_fn eval)
++   {
++      check_values(build, eval, WIDEN_FORM);
++      if (HasFatalFailure())
++         return;
++      /* Fresh shader for the opaque-zero form. */
++      ralloc_free(b->shader);
++      *b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &options,
++                                          "opaque_zero");
++      check_values(build, eval, ZERO_OFFSET);
++   }
++
++   /* Checks that the pass rewrites u2u64(build(x)) for a non-constant x into
++    * a 64-bit iand with 0xffffffff.
++    */
++   void check_rewritten(build_fn build)
++   {
++      nir_def *x = nir_load_local_invocation_index(b);
++      nir_intrinsic_instr *st = store(nir_u2u64(b, build(b, x)));
++
++      ASSERT_TRUE(msl_nir_widen_u2u64_shifts(b->shader, WIDEN_FORM));
++      nir_validate_shader(b->shader, "after msl_nir_widen_u2u64_shifts");
++
++      nir_scalar res = nir_get_scalar(st->src[0].ssa, 0);
++      ASSERT_TRUE(nir_scalar_is_alu(res));
++      EXPECT_EQ(nir_scalar_alu_op(res), nir_op_iand);
++      EXPECT_EQ(res.def->bit_size, 64);
++      nir_scalar mask = nir_scalar_chase_alu_src(res, 1);
++      ASSERT_TRUE(nir_scalar_is_const(mask));
++      EXPECT_EQ(nir_scalar_as_uint(mask), 0xffffffffull);
++   }
++};
++
++TEST_F(msl_widen_u2u64_shifts_test, ishl)
++{
++   check_values([](nir_builder *b, nir_def *x) { return nir_ishl_imm(b, x, 4); },
++                [](uint32_t x) { return x << 4; });
++}
++
++TEST_F(msl_widen_u2u64_shifts_test, ishl_count_wraps)
++{
++   /* A 32-bit shift only uses the low 5 bits of the count. */
++   check_values([](nir_builder *b, nir_def *x) { return nir_ishl(b, x, nir_imm_int(b, 36)); },
++                [](uint32_t x) { return x << 4; });
++}
++
++TEST_F(msl_widen_u2u64_shifts_test, imul_pow2)
++{
++   check_values([](nir_builder *b, nir_def *x) { return nir_imul(b, x, nir_imm_int(b, 16)); },
++                [](uint32_t x) { return x * 16u; });
++}
++
++TEST_F(msl_widen_u2u64_shifts_test, imul_non_pow2)
++{
++   check_values([](nir_builder *b, nir_def *x) { return nir_imul(b, x, nir_imm_int(b, 48)); },
++                [](uint32_t x) { return x * 48u; });
++}
++
++TEST_F(msl_widen_u2u64_shifts_test, iadd_of_ishl)
++{
++   check_values(
++      [](nir_builder *b, nir_def *x) { return nir_iadd_imm(b, nir_ishl_imm(b, x, 6), 0xfffffff0); },
++      [](uint32_t x) { return (x << 6) + 0xfffffff0u; });
++}
++
++TEST_F(msl_widen_u2u64_shifts_test, ior_of_ishl)
++{
++   check_values(
++      [](nir_builder *b, nir_def *x) { return nir_ior(b, nir_ishl_imm(b, x, 28), x); },
++      [](uint32_t x) { return (x << 28) | x; });
++}
++
++TEST_F(msl_widen_u2u64_shifts_test, deeper_than_limit)
++{
++   /* Six levels: the levels below the limit stay in 32 bits. */
++   check_values(
++      [](nir_builder *b, nir_def *x) {
++         nir_def *v = x;
++         for (unsigned i = 0; i < 6; i++)
++            v = nir_iadd_imm(b, nir_ishl_imm(b, v, 3), i + 1);
++         return v;
++      },
++      [](uint32_t x) {
++         for (unsigned i = 0; i < 6; i++)
++            x = (x << 3) + (i + 1);
++         return x;
++      });
++}
++
++TEST_F(msl_widen_u2u64_shifts_test, rewrites_ishl)
++{
++   check_rewritten([](nir_builder *b, nir_def *x) { return nir_ishl_imm(b, x, 4); });
++}
++
++TEST_F(msl_widen_u2u64_shifts_test, rewrites_iadd_of_ishl)
++{
++   check_rewritten(
++      [](nir_builder *b, nir_def *x) { return nir_iadd(b, nir_ishl_imm(b, x, 2), x); });
++}
++
++TEST_F(msl_widen_u2u64_shifts_test, no_shift)
++{
++   nir_def *x = nir_load_local_invocation_index(b);
++   store(nir_u2u64(b, nir_iadd(b, x, x)));
++   store(nir_u2u64(b, nir_imul(b, x, x)));
++   store(nir_u2u64(b, x));
++
++   EXPECT_FALSE(msl_nir_widen_u2u64_shifts(b->shader, WIDEN_FORM));
++   EXPECT_FALSE(msl_nir_widen_u2u64_shifts(b->shader, ZERO_OFFSET));
++   EXPECT_EQ(find_zero(), nullptr);
++}
++
++TEST_F(msl_widen_u2u64_shifts_test, vector_not_handled)
++{
++   nir_def *x = nir_load_local_invocation_index(b);
++   nir_def *v = nir_ishl_imm(b, nir_vec2(b, x, x), 4);
++   nir_store_global(b, nir_u2u64(b, v), nir_imm_int64(b, 0));
++   /* A scalar u2u64 of one channel of a vector shift. */
++   store(nir_u2u64(b, nir_channel(b, v, 1)));
++   nir_opt_copy_prop(b->shader);
++
++   EXPECT_FALSE(msl_nir_widen_u2u64_shifts(b->shader, WIDEN_FORM));
++   EXPECT_FALSE(msl_nir_widen_u2u64_shifts(b->shader, ZERO_OFFSET));
++}
++
++/* Struct fields x + 4, x + 12 and a bounds check x + 7 share one base x:
++ * one opaque zero, one ixor on x, and every user of x reads the ixor.
++ */
++TEST_F(msl_widen_u2u64_shifts_test, opaque_zero_shared_base)
++{
++   nir_def *i = nir_load_local_invocation_index(b);
++   nir_def *x = nir_imul_imm(b, i, 68);
++   nir_def *f0 = nir_iadd_imm(b, x, 4);
++   nir_def *f1 = nir_iadd_imm(b, nir_iadd_imm(b, x, 8), 4);
++   nir_def *chk = nir_ult(b, nir_iadd_imm(b, x, 7), i);
++   store(nir_u2u64(b, f0));
++   store(nir_u2u64(b, f1));
++   store(nir_u2u64(b, x));
++   store(nir_b2i64(b, chk));
++
++   ASSERT_TRUE(msl_nir_widen_u2u64_shifts(b->shader, ZERO_OFFSET));
++   nir_validate_shader(b->shader, "after msl_nir_widen_u2u64_shifts");
++
++   nir_intrinsic_instr *zero = find_zero();
++   ASSERT_NE(zero, nullptr);
++   EXPECT_EQ(zero->def.bit_size, 32);
++   nir_scalar addr = nir_scalar_chase_alu_src(
++      nir_get_scalar(zero->src[0].ssa, 0), 1);
++   ASSERT_TRUE(nir_scalar_is_const(addr));
++   EXPECT_EQ(nir_scalar_as_uint(addr), ZERO_OFFSET);
++
++   EXPECT_EQ(count_alu(nir_op_ixor), 1);
++   EXPECT_EQ(count_alu(nir_op_iand), 0);
++   /* x's only remaining user is the ixor. */
++   EXPECT_TRUE(list_is_singular(&x->uses));
++   nir_foreach_use(use, x) {
++      nir_instr *u = nir_src_use_instr(use);
++      ASSERT_EQ(u->type, nir_instr_type_alu);
++      EXPECT_EQ(nir_instr_as_alu(u)->op, nir_op_ixor);
++   }
++   /* The constant offsets stay outside the ixor. */
++   EXPECT_EQ(nir_scalar_alu_op(nir_scalar_chase_alu_src(
++                nir_get_scalar(f0, 0), 0)),
++             nir_op_ixor);
++}
++
++/* y = x + v (runtime v) is a base of its own: x ^ z feeds y, and y ^ z feeds
++ * the address. Collecting first gives the same result for either site order.
++ */
++TEST_F(msl_widen_u2u64_shifts_test, opaque_zero_nested_bases)
++{
++   nir_def *i = nir_load_local_invocation_index(b);
++   nir_def *v = nir_load_subgroup_invocation(b);
++   nir_def *x = nir_ishl_imm(b, i, 4);
++   nir_def *y = nir_iadd(b, x, v);
++   store(nir_u2u64(b, nir_iadd_imm(b, y, 8)));
++   store(nir_u2u64(b, nir_iadd_imm(b, x, 4)));
++
++   ASSERT_TRUE(msl_nir_widen_u2u64_shifts(b->shader, ZERO_OFFSET));
++   nir_validate_shader(b->shader, "after msl_nir_widen_u2u64_shifts");
++
++   EXPECT_EQ(count_alu(nir_op_ixor), 2);
++   nir_scalar y0 = nir_scalar_chase_alu_src(nir_get_scalar(y, 0), 0);
++   ASSERT_TRUE(nir_scalar_is_alu(y0));
++   EXPECT_EQ(nir_scalar_alu_op(y0), nir_op_ixor);
++   EXPECT_TRUE(list_is_singular(&y->uses));
++}
++
++/* ior is not peeled: (x ^ z) | c would lose x's known-zero low bits. */
++TEST_F(msl_widen_u2u64_shifts_test, opaque_zero_ior_not_peeled)
++{
++   nir_def *i = nir_load_local_invocation_index(b);
++   nir_def *o = nir_ior_imm(b, nir_ishl_imm(b, i, 4), 8);
++   nir_intrinsic_instr *st = store(nir_u2u64(b, o));
++
++   ASSERT_TRUE(msl_nir_widen_u2u64_shifts(b->shader, ZERO_OFFSET));
++   nir_validate_shader(b->shader, "after msl_nir_widen_u2u64_shifts");
++
++   EXPECT_EQ(count_alu(nir_op_ixor), 1);
++   nir_scalar u = nir_get_scalar(st->src[0].ssa, 0);
++   ASSERT_EQ(nir_scalar_alu_op(u), nir_op_u2u64);
++   EXPECT_EQ(nir_scalar_alu_op(nir_scalar_chase_alu_src(u, 0)), nir_op_ixor);
++}
++
++/* A base used in two blocks: the ixor dominates both. */
++TEST_F(msl_widen_u2u64_shifts_test, opaque_zero_across_blocks)
++{
++   nir_def *i = nir_load_local_invocation_index(b);
++   nir_def *x = nir_ishl_imm(b, i, 4);
++   nir_push_if(b, nir_ieq_imm(b, i, 3));
++   store(nir_u2u64(b, nir_iadd_imm(b, x, 4)));
++   nir_push_else(b, NULL);
++   store(nir_u2u64(b, nir_iadd_imm(b, x, 12)));
++   nir_pop_if(b, NULL);
++
++   ASSERT_TRUE(msl_nir_widen_u2u64_shifts(b->shader, ZERO_OFFSET));
++   nir_validate_shader(b->shader, "after msl_nir_widen_u2u64_shifts");
++   EXPECT_EQ(count_alu(nir_op_ixor), 1);
++}
+
+--- src/kosmickrisp/compiler/meson.build
++++ src/kosmickrisp/compiler/meson.build
+@@ -35,3 +35,20 @@ idep_msl_to_nir = declare_dependency(
+   link_with : libmsl_compiler,
+ )
+ 
++
++if with_tests
++  test(
++    'msl_compiler_tests',
++    executable(
++      'msl_compiler_tests',
++      files('tests/test_widen_u2u64_shifts.cpp'),
++      cpp_args : [cpp_msvc_compat_args],
++      gnu_symbol_visibility : 'hidden',
++      include_directories : [inc_include, inc_src],
++      dependencies : [idep_gtest, idep_nir, idep_mesautil],
++      link_with : [libmsl_compiler],
++    ),
++    suite : ['kosmickrisp'],
++    protocol : 'gtest',
++  )
++endif
+
+--- src/kosmickrisp/compiler/msl_nir_lower_common.c
++++ src/kosmickrisp/compiler/msl_nir_lower_common.c
+@@ -11,6 +11,7 @@
+ #include "nir_builtin_builder.h"
+ 
+ #include "util/format/u_format.h"
++#include "util/u_dynarray.h"
+ 
+ bool
+ msl_nir_vs_remove_point_size_write(nir_builder *b, nir_intrinsic_instr *intrin,
+@@ -992,3 +993,201 @@ msl_nir_lower_multisample_alpha(nir_shader *s, bool alpha_to_coverage,
+ 
+    return progress;
+ }
++
++/* KK_WORKAROUND_21
++ *
++ * Rewrites u2u64(x), where the 32-bit x is computed by a tree of ishl, iadd,
++ * ior and imul that contains a shift (or a multiplication by a constant), as
++ * iand(x', 0xffffffff), where x' is the same tree computed in 64 bits. The
++ * low 32 bits of these operations only depend on the low 32 bits of their
++ * operands, so the result is identical for every input.
++ *
++ * Limits: only scalar u2u64 is handled, other ways to zero-extend (such as
++ * pack_64_2x32_split(x, 0)) are not, and only the top WIDEN_MAX_DEPTH levels
++ * of the tree are rebuilt; anything below them stays in 32 bits.
++ *
++ * WIDEN_MAX_DEPTH bounds the rebuilt tree to 15 instructions per u2u64. The
++ * known failing pattern, a shifted index, needs one level.
++ *
++ * Opaque-zero form (opaque_zero_root_offset >= 0): instead of rebuilding the
++ * tree in 64 bits, xor its base with a 32-bit zero loaded from buffer 0 at
++ * that byte offset. The back end only miscompiles when it can see that the
++ * low 32 bits come straight from a shift or multiply; a value loaded from
++ * memory hides that, and everything stays in 32 bits. The base is the u2u64
++ * source with constant iadds peeled off, so struct fields (x + 4, x + 12...)
++ * and bounds checks built from the same x share one ixor. Bases are
++ * collected first and rewritten afterwards: an ixor already in the tree would
++ * hide its shift from widen_has_shift.
++ */
++#define WIDEN_MAX_DEPTH 4
++
++static bool
++widen_is_op(nir_scalar s)
++{
++   if (nir_def_instr_type(s.def) != nir_instr_type_alu || s.def->bit_size != 32 ||
++       s.def->num_components != 1)
++      return false;
++   switch (nir_scalar_alu_op(s)) {
++   case nir_op_ishl:
++   case nir_op_iadd:
++   case nir_op_ior:
++   case nir_op_imul:
++      return true;
++   default:
++      return false;
++   }
++}
++
++static bool
++widen_has_shift(nir_scalar s, unsigned depth)
++{
++   if (depth == 0 || !widen_is_op(s))
++      return false;
++   nir_op op = nir_scalar_alu_op(s);
++   if (op == nir_op_ishl)
++      return true;
++   if (op == nir_op_imul && (nir_scalar_is_const(nir_scalar_chase_alu_src(s, 0)) ||
++                             nir_scalar_is_const(nir_scalar_chase_alu_src(s, 1))))
++      return true;
++   return widen_has_shift(nir_scalar_chase_alu_src(s, 0), depth - 1) ||
++          widen_has_shift(nir_scalar_chase_alu_src(s, 1), depth - 1);
++}
++
++static nir_def *
++widen_build(nir_builder *b, nir_scalar s, unsigned depth)
++{
++   if (depth == 0 || !widen_is_op(s))
++      return nir_u2u64(b, nir_mov_scalar(b, s));
++
++   nir_scalar s0 = nir_scalar_chase_alu_src(s, 0);
++   nir_scalar s1 = nir_scalar_chase_alu_src(s, 1);
++   nir_def *a = widen_build(b, s0, depth - 1);
++   switch (nir_scalar_alu_op(s)) {
++   case nir_op_ishl:
++      /* 32-bit ishl uses the shift count mod 32 */
++      return nir_ishl(b, a, nir_iand_imm(b, nir_mov_scalar(b, s1), 31));
++   case nir_op_iadd:
++      return nir_iadd(b, a, widen_build(b, s1, depth - 1));
++   case nir_op_ior:
++      return nir_ior(b, a, widen_build(b, s1, depth - 1));
++   case nir_op_imul:
++      return nir_imul(b, a, widen_build(b, s1, depth - 1));
++   default:
++      UNREACHABLE("widen_is_op");
++   }
++}
++
++/* Returns the scalar u2u64 if it needs the workaround (with its 32-bit source
++ * in *src), or NULL.
++ */
++static nir_alu_instr *
++widen_site(nir_instr *instr, nir_scalar *src)
++{
++   if (instr->type != nir_instr_type_alu)
++      return NULL;
++   nir_alu_instr *alu = nir_instr_as_alu(instr);
++   if (alu->op != nir_op_u2u64 || alu->def.num_components != 1 ||
++       nir_src_bit_size(alu->src[0].src) != 32)
++      return NULL;
++
++   *src = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), 0);
++   return widen_has_shift(*src, WIDEN_MAX_DEPTH) ? alu : NULL;
++}
++
++static bool
++widen_u2u64_shift(nir_builder *b, nir_instr *instr, void *data)
++{
++   nir_scalar src;
++   nir_alu_instr *alu = widen_site(instr, &src);
++   if (!alu)
++      return false;
++
++   b->cursor = nir_before_instr(instr);
++   nir_def *wide = widen_build(b, src, WIDEN_MAX_DEPTH);
++   nir_def *res = nir_iand_imm(b, wide, 0xffffffffull);
++   nir_def_replace(&alu->def, res);
++   return true;
++}
++
++/* Peels iadd(x, const) down to x. Only iadd: (x ^ z) | c would lose the
++ * known-zero low bits of x that let the back end fold c into the address.
++ */
++static nir_scalar
++widen_base(nir_scalar s)
++{
++   while (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iadd) {
++      nir_scalar s0 = nir_scalar_chase_alu_src(s, 0);
++      nir_scalar s1 = nir_scalar_chase_alu_src(s, 1);
++      if (nir_scalar_is_const(s1))
++         s = s0;
++      else if (nir_scalar_is_const(s0))
++         s = s1;
++      else
++         break;
++   }
++   return s;
++}
++
++static bool
++widen_opaque_zero_impl(nir_function_impl *impl, int32_t root_offset)
++{
++   /* Phase 1: collect the bases, read-only, in program order (the set only
++    * removes duplicates) so the output does not depend on pointer values.
++    */
++   struct set *seen = _mesa_pointer_set_create(NULL);
++   struct util_dynarray bases;
++   util_dynarray_init(&bases, NULL);
++   nir_foreach_block(block, impl) {
++      nir_foreach_instr(instr, block) {
++         nir_scalar src;
++         if (!widen_site(instr, &src))
++            continue;
++         /* widen_has_shift held, and peeling only drops constants, so the
++          * base is a scalar 32-bit ALU op (widen_is_op).
++          */
++         nir_scalar base = widen_base(src);
++         assert(widen_is_op(base) && base.comp == 0);
++         bool found;
++         _mesa_set_search_or_add(seen, base.def, &found);
++         if (!found)
++            util_dynarray_append(&bases, base.def);
++      }
++   }
++   _mesa_set_destroy(seen, NULL);
++
++   if (!util_dynarray_num_elements(&bases, nir_def *)) {
++      util_dynarray_fini(&bases);
++      return nir_no_progress(impl);
++   }
++
++   /* Phase 2: one opaque zero per impl, one ixor per base. */
++   nir_builder b = nir_builder_at(nir_before_impl(impl));
++   nir_def *root = nir_load_buffer_ptr_kk(&b, 1, 64, .binding = 0);
++   nir_def *zero = nir_build_load_global_constant(
++      &b, 1, 32, nir_iadd_imm(&b, root, root_offset), .align_mul = 4,
++      .access = ACCESS_CAN_SPECULATE);
++
++   util_dynarray_foreach(&bases, nir_def *, xp) {
++      nir_def *x = *xp;
++      /* Bases are ALU ops (asserted above), so never phis. */
++      b.cursor = nir_after_instr(nir_def_instr(x));
++      nir_def *x_xor = nir_ixor(&b, x, zero);
++      nir_def_rewrite_uses_after(x, x_xor);
++   }
++
++   util_dynarray_fini(&bases);
++   return nir_progress(true, impl, nir_metadata_control_flow);
++}
++
++bool
++msl_nir_widen_u2u64_shifts(nir_shader *nir, int32_t opaque_zero_root_offset)
++{
++   if (opaque_zero_root_offset < 0)
++      return nir_shader_instructions_pass(nir, widen_u2u64_shift,
++                                          nir_metadata_control_flow, NULL);
++
++   bool progress = false;
++   nir_foreach_function_impl(impl, nir)
++      progress |= widen_opaque_zero_impl(impl, opaque_zero_root_offset);
++   return progress;
++}
+
+--- src/kosmickrisp/compiler/msl_private.h
++++ src/kosmickrisp/compiler/msl_private.h
+@@ -87,3 +87,7 @@ bool msl_def_is_texture(struct nir_to_msl_ctx *ctx, nir_def *def);
+ void msl_nir_lower_subgroups(nir_shader *nir);
+ 
+ bool msl_nir_lower_algebraic_late(nir_shader *shader);
++
++/* KK_WORKAROUND_21 */
++bool msl_nir_widen_u2u64_shifts(nir_shader *nir,
++                                int32_t opaque_zero_root_offset);
+
+--- src/kosmickrisp/compiler/nir_to_msl.c
++++ src/kosmickrisp/compiler/nir_to_msl.c
+@@ -2296,7 +2296,8 @@ msl_preprocess_nir(struct nir_shader *nir)
+ }
+ 
+ bool
+-msl_optimize_nir(struct nir_shader *nir)
++msl_optimize_nir(struct nir_shader *nir, uint64_t disabled_workarounds,
++                 int32_t opaque_zero_root_offset)
+ {
+    bool progress;
+    NIR_PASS(_, nir, nir_lower_int64);
+@@ -2336,6 +2337,19 @@ msl_optimize_nir(struct nir_shader *nir)
+     * the store. */
+    NIR_PASS(_, nir, nir_opt_shrink_stores, false);
+    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
++   /* KK_WORKAROUND_21: after the loop so nir_opt_algebraic cannot fold the
++    * mask (or the opaque-zero ixor) back. CSE merges subtrees widened for several users and DCE drops
++    * the 32-bit instructions that are no longer used.
++    */
++   if (!(disabled_workarounds & BITFIELD64_BIT(21))) {
++      bool widened = false;
++      NIR_PASS(widened, nir, msl_nir_widen_u2u64_shifts,
++               opaque_zero_root_offset);
++      if (widened) {
++         NIR_PASS(_, nir, nir_opt_cse);
++         NIR_PASS(_, nir, nir_opt_dce);
++      }
++   }
+    NIR_PASS(_, nir, msl_nir_lower_algebraic_late);
+    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
+    NIR_PASS(_, nir, nir_trivialize_registers);
+
+--- src/kosmickrisp/compiler/nir_to_msl.h
++++ src/kosmickrisp/compiler/nir_to_msl.h
+@@ -30,7 +30,12 @@ char *nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options);
+ 
+ /* Call this after all API-specific lowerings. It will bring the NIR out of SSA
+  * at the end */
+-bool msl_optimize_nir(struct nir_shader *nir);
++/* opaque_zero_root_offset: byte offset of a 32-bit word in buffer 0 that is
++ * always zero, used by KK_WORKAROUND_21's opaque-zero form; -1 selects the
++ * 64-bit widening form (shaders whose buffer 0 has no such word).
++ */
++bool msl_optimize_nir(struct nir_shader *nir, uint64_t disabled_workarounds,
++                      int32_t opaque_zero_root_offset);
+ 
+ /* Call this before all API-speicific lowerings, it will */
+ void msl_preprocess_nir(struct nir_shader *nir);
+
+--- src/kosmickrisp/vulkan/kk_cmd_dispatch.c
++++ src/kosmickrisp/vulkan/kk_cmd_dispatch.c
+@@ -27,7 +27,10 @@ kk_flush_compute_state(struct kk_cmd_buffer *cmd)
+ 
+    if (desc->push_dirty)
+       kk_cmd_buffer_flush_push_descriptors(cmd, desc);
+-   if (desc->root_dirty)
++   /* Shaders may read buffer 0 even with nothing bound (KK_WORKAROUND_21's
++    * opaque zero), so always bind a root table.
++    */
++   if (desc->root_dirty || !desc->root.addr)
+       kk_upload_descriptor_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+ 
+    if (desc->root.addr)
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1505,7 +1505,10 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+       desc->root_dirty = true;
+    }
+ 
+-   if (desc->root_dirty)
++   /* Shaders may read buffer 0 even with nothing bound (KK_WORKAROUND_21's
++    * opaque zero), so always bind a root table.
++    */
++   if (desc->root_dirty || !desc->root.addr)
+       kk_upload_descriptor_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+ 
+    if (desc->root.addr) {
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -976,6 +976,11 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
+ 
+    _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
+                        sizeof(instance->driver_build_sha));
++   /* Workarounds change the generated shaders */
++   _mesa_blake3_update(&blake3_ctx, &pdev->settings.disabled_workarounds,
++                       sizeof(pdev->settings.disabled_workarounds));
++   _mesa_blake3_update(&blake3_ctx, &pdev->settings.wa21_widen_form,
++                       sizeof(pdev->settings.wa21_widen_form));
+ 
+    unsigned char blake3[BLAKE3_KEY_LEN];
+    _mesa_blake3_final(&blake3_ctx, blake3);
+@@ -1105,6 +1110,9 @@ kk_parse_environment_options(struct kk_physical_device *pdev)
+          debug_get_bool_option("MESA_KK_GPU_CAPTURE_IMMEDIATELY", false);
+    }
+ 
++   settings->wa21_widen_form =
++      !strcmp(debug_get_option("MESA_KK_WA21_FORM", ""), "widen");
++
+    const char *list = debug_get_option("MESA_KK_DISABLE_WORKAROUNDS", "");
+    const char *all_workarounds = "all";
+    const size_t all_len = strlen(all_workarounds);
+
+--- src/kosmickrisp/vulkan/kk_physical_device.h
++++ src/kosmickrisp/vulkan/kk_physical_device.h
+@@ -56,6 +56,8 @@ struct kk_env_settings {
+    bool gpu_capture_immediately;
+    const char *gpu_capture_dir;
+    uint64_t disabled_workarounds;
++   /* MESA_KK_WA21_FORM=widen: KK_WORKAROUND_21 keeps the 64-bit widening form */
++   bool wa21_widen_form;
+ };
+ 
+ struct kk_physical_device {
+
+--- src/kosmickrisp/vulkan/kk_shader.c
++++ src/kosmickrisp/vulkan/kk_shader.c
+@@ -999,7 +999,12 @@ kk_compile_msl(struct kk_physical_device *pdev, nir_shader *nir,
+ {
+    NIR_PASS(_, nir, kk_nir_lower_poly);
+ 
+-   msl_optimize_nir(nir);
++   /* KK_WORKAROUND_21 opaque zero: buffer 0 is the root descriptor table. */
++   msl_optimize_nir(nir, pdev->settings.disabled_workarounds,
++                    pdev->settings.wa21_widen_form
++                       ? -1
++                       : (int32_t)offsetof(struct kk_root_descriptor_table,
++                                           dynamic_buffers[0].zero));
+    modify_nir_info(nir);
+ 
+    struct nir_to_msl_options translate_options = {
+
+--- src/kosmickrisp/kosmicomp.c
++++ src/kosmickrisp/kosmicomp.c
+@@ -112,7 +112,7 @@ optimize(nir_shader *nir)
+    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
+ 
+-   msl_optimize_nir(nir);
++   msl_optimize_nir(nir, 0, -1);
+ }
+ 
+ static mesa_shader_stage
+

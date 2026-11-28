@@ -1,0 +1,252 @@
+# kk: Add barrier variants that take visibility options
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/46468 state=closed
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+```
+kk: Use device visibility at the end of render encoders
+
+end_encoder ends every encoder with an ALL to ALL barrier with resource alias visibility. Render encoders that never enabled visibility results now use device visibility for that barrier. Render encoders that did, and compute encoders, keep resource alias visibility, because occlusion results are read back through another address of the same memory.
+
+The ALL to ALL wait is unchanged on every encoder: pipeline barriers recorded outside an encoder and vkCmdWaitEvents2 emit nothing and rely on it.
+
+Open question for review: KosmicKrisp places images in a heap that a buffer also maps. A test that renders into one placed texture and reads an aliased texture and the heap buffer in the next encoder showed no stale data with device visibility, but it also showed none with no visibility option at all, so it does not settle whether device visibility is enough for aliased memory.
+
+The first commit adds barrier wrappers that take the visibility options (also part of !).
+
+Testing (Apple M5 Pro, macOS 27.2): no dEQP-VK regressions against main on a 107,052 case list (synchronization, synchronization2, query pools, memory mapping, binding and barriers) or on a 79,312 case list; occlusion queries 441 cases × 80 with no failures.
+
+Assisted-by: LLM
+```
+--- src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -18,12 +18,26 @@ mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+ {
+ }
+ 
++void
++mtl_barrier_after_stages_options(void *encoder, enum mtl_stages after_stages,
++                                 enum mtl_stages before_queue_stages,
++                                 enum mtl_visibility_options visibility)
++{
++}
++
+ void
+ mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
+                                  enum mtl_stages before_queue_stages)
+ {
+ }
+ 
++void
++mtl_barrier_after_encoder_stages_options(void *encoder, enum mtl_stages after_stages,
++                                         enum mtl_stages before_queue_stages,
++                                         enum mtl_visibility_options visibility)
++{
++}
++
+ void
+ mtl_barrier_after_queue_stages(void *encoder,
+                                enum mtl_stages after_queue_stages,
+@@ -31,6 +45,14 @@ mtl_barrier_after_queue_stages(void *encoder,
+ {
+ }
+ 
++void
++mtl_barrier_after_queue_stages_options(void *encoder,
++                                       enum mtl_stages after_queue_stages,
++                                       enum mtl_stages before_stages,
++                                       enum mtl_visibility_options visibility)
++{
++}
++
+ void
+ mtl_update_fence(void *encoder, mtl_fence *fence, enum mtl_stages after_stages)
+ {
+
+--- src/kosmickrisp/bridge/mtl_encoder.h
++++ src/kosmickrisp/bridge/mtl_encoder.h
+@@ -15,13 +15,25 @@
+ void mtl_end_encoding(void *encoder);
+ void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+                               enum mtl_stages before_queue_stages);
++void mtl_barrier_after_stages_options(void *encoder,
++                                      enum mtl_stages after_stages,
++                                      enum mtl_stages before_queue_stages,
++                                      enum mtl_visibility_options visibility);
+ void mtl_barrier_after_encoder_stages(void *encoder,
+                                       enum mtl_stages after_stages,
+                                       enum mtl_stages before_queue_stages);
++void mtl_barrier_after_encoder_stages_options(void *encoder,
++                                              enum mtl_stages after_stages,
++                                              enum mtl_stages before_queue_stages,
++                                              enum mtl_visibility_options visibility);
+ 
+ void mtl_barrier_after_queue_stages(void *encoder,
+                                     enum mtl_stages after_queue_stages,
+                                     enum mtl_stages before_stages);
++void mtl_barrier_after_queue_stages_options(void *encoder,
++                                            enum mtl_stages after_queue_stages,
++                                            enum mtl_stages before_stages,
++                                            enum mtl_visibility_options visibility);
+ 
+ void mtl_update_fence(void *encoder, mtl_fence *fence,
+                       enum mtl_stages after_stages);
+
+--- src/kosmickrisp/bridge/mtl_encoder.m
++++ src/kosmickrisp/bridge/mtl_encoder.m
+@@ -23,42 +23,68 @@ mtl_end_encoding(void *encoder)
+ }
+ 
+ void
+-mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+-                         enum mtl_stages before_queue_stages)
++mtl_barrier_after_stages_options(void *encoder, enum mtl_stages after_stages,
++                                 enum mtl_stages before_queue_stages,
++                                 enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+-      /* TODO_KOSMICKRISP Expose visibility option since resource alias should only be required
+-       * if occlusion queries are used */
+       [enc barrierAfterStages:(MTLStages)after_stages beforeQueueStages:(MTLStages)before_queue_stages
+-           visibilityOptions:MTL4VisibilityOptionResourceAlias];
++           visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
+ void
+-mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
+-                                 enum mtl_stages before_queue_stages)
++mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
++                         enum mtl_stages before_queue_stages)
++{
++   mtl_barrier_after_stages_options(encoder, after_stages, before_queue_stages,
++                                    MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++}
++
++void
++mtl_barrier_after_encoder_stages_options(void *encoder, enum mtl_stages after_stages,
++                                         enum mtl_stages before_queue_stages,
++                                         enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+       [enc barrierAfterEncoderStages:(MTLStages)after_stages beforeEncoderStages:(MTLStages)before_queue_stages
+-           visibilityOptions:MTL4VisibilityOptionResourceAlias];
++           visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
+ void
+-mtl_barrier_after_queue_stages(void *encoder,
+-                               enum mtl_stages after_queue_stages,
+-                               enum mtl_stages before_stages)
++mtl_barrier_after_encoder_stages(void *encoder, enum mtl_stages after_stages,
++                                 enum mtl_stages before_queue_stages)
++{
++   mtl_barrier_after_encoder_stages_options(encoder, after_stages, before_queue_stages,
++                                           MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++}
++
++void
++mtl_barrier_after_queue_stages_options(void *encoder,
++                                       enum mtl_stages after_queue_stages,
++                                       enum mtl_stages before_stages,
++                                       enum mtl_visibility_options visibility)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+       [enc barrierAfterQueueStages:(MTLStages)after_queue_stages
+                       beforeStages:(MTLStages)before_stages
+-                 visibilityOptions:MTL4VisibilityOptionResourceAlias];
++                 visibilityOptions:(MTL4VisibilityOptions)visibility];
+    }
+ }
+ 
++void
++mtl_barrier_after_queue_stages(void *encoder,
++                               enum mtl_stages after_queue_stages,
++                               enum mtl_stages before_stages)
++{
++   mtl_barrier_after_queue_stages_options(encoder, after_queue_stages, before_stages,
++                                         MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
++}
++
+ void
+ mtl_update_fence(void *encoder, mtl_fence *fence, enum mtl_stages after_stages)
+ {
+
+--- src/kosmickrisp/bridge/mtl_types.h
++++ src/kosmickrisp/bridge/mtl_types.h
+@@ -252,6 +252,12 @@ enum mtl_barrier_scope {
+    MTL_BARRIER_SCOPE_RENDER_TARGETS = 1 << 2,
+ };
+ 
++enum mtl_visibility_options {
++   MTL_VISIBILITY_OPTION_NONE = 0,
++   MTL_VISIBILITY_OPTION_DEVICE = 1 << 0,
++   MTL_VISIBILITY_OPTION_RESOURCE_ALIAS = 1 << 1,
++};
++
+ enum mtl_stages {
+    MTL_STAGE_VERTEX = 1 << 0,
+    MTL_STAGE_FRAGMENT = 1 << 1,
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -335,8 +335,24 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+ static void
+ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
+ {
+-   /* TODO_KOSMICKRISP This is probably overkill */
+-   mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++   /* Every encoder ends with a full ALL -> ALL barrier. Pipeline barriers
++    * recorded while no encoder is open and vkCmdWaitEvents2 emit nothing, so
++    * they rely on this one.
++    *
++    * Occlusion query results are written to the visibility buffer and read
++    * back through another address of the same memory, so a render encoder
++    * that had visibility results enabled flushes with ResourceAlias. Other
++    * render encoders only make their writes visible to the device. Compute
++    * encoders keep ResourceAlias.
++    */
++   const bool device_only = encoder == cmd->metal.render &&
++                            !cmd->state.gfx.occlusion.vis_enabled;
++   if (encoder == cmd->metal.render)
++      cmd->state.gfx.occlusion.vis_enabled = false;
++   mtl_barrier_after_stages_options(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL,
++                                    device_only
++                                       ? MTL_VISIBILITY_OPTION_DEVICE
++                                       : MTL_VISIBILITY_OPTION_RESOURCE_ALIAS);
+    mtl_end_encoding(encoder);
+    mtl_release(encoder);
+ 
+
+--- src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -164,6 +164,11 @@ struct kk_graphics_state {
+        * There can only be one active at a time (hardware constraint).
+        */
+       uint16_t index;
++
++      /* Visibility results were enabled at some point in the open render
++       * encoder, so it may have written them.
++       */
++      bool vis_enabled;
+    } occlusion;
+ 
+    /* Index buffer */
+
+--- src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1513,6 +1513,8 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
+    }
+ 
+    if (gfx->dirty & KK_DIRTY_OCCLUSION) {
++      gfx->occlusion.vis_enabled |=
++         gfx->occlusion.mode != MTL_VISIBILITY_RESULT_MODE_DISABLED;
+       mtl_set_visibility_result_mode(enc, gfx->occlusion.mode,
+                                      gfx->occlusion.index * sizeof(uint64_t));
+    }
+

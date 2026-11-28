@@ -1,0 +1,1195 @@
+# Draft: ntdll: Spawn main thread as a separate thread.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/10058 state=closed
+# This makes sure macOS main thread is a Wine thread as in https://gitlab.winehq.org/wine/wine/-/merge_requests/9579, while keeping its event loop usable for GUI, and makes every other platform work the same. Their main thread is parked for now, but the idea is to use the poll loop for various unix side internal purposes, such as winewayland pipe polling, compositing, etc. On macOS the main loop would be used similarly.
+--- dlls/ntdll/unix/env.c
++++ dlls/ntdll/unix/env.c
+@@ -67,8 +67,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(environ);
+ PEB *peb = NULL;
+ WOW_PEB *wow_peb = NULL;
+ USHORT *uctable = NULL, *lctable = NULL;
+-SIZE_T startup_info_size = 0;
+ BOOL is_prefix_bootstrap = FALSE;
++LONG init_redirect = FALSE;
+ 
+ static const WCHAR bootstrapW[] = {'W','I','N','E','B','O','O','T','S','T','R','A','P','M','O','D','E'};
+ 
+@@ -1991,6 +1991,7 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
+ 
+     get_initial_console( params );
+ 
++    init_redirect = NtCurrentTeb64() && NtCurrentTeb64()->TlsSlots[WOW64_TLS_FILESYSREDIR];
+     return params;
+ }
+ 
+@@ -1998,29 +1999,26 @@ static RTL_USER_PROCESS_PARAMETERS *build_initial_params( void **module )
+ /*************************************************************************
+  *		init_startup_info
+  */
+-void init_startup_info(void)
++void init_startup_info( SIZE_T info_size )
+ {
+     WCHAR *src, *dst, *env;
+     void *module = NULL;
+     unsigned int status;
+-    SIZE_T size, info_size, env_size, env_pos;
++    SIZE_T size, env_size, env_pos;
+     RTL_USER_PROCESS_PARAMETERS *params = NULL;
++    const TEB64 *teb64 = NtCurrentTeb64();
+     struct startup_info_data *info;
+     UNICODE_STRING nt_name;
+     USHORT machine;
+ 
+-    if (!startup_info_size)
+-    {
+-        params = build_initial_params( &module );
+-        init_peb( params, module );
+-        return;
+-    }
+-
+-    info = malloc( startup_info_size );
++    info = info_size ? malloc( info_size ) : NULL;
+ 
+     SERVER_START_REQ( get_startup_info )
+     {
+-        wine_server_set_reply( req, info, startup_info_size );
++        /* always send the native PEB / TEB */
++        req->peb = teb64 ? teb64->Peb : wine_server_client_ptr( peb );
++        req->teb = wine_server_client_ptr( teb64 ? (void *)teb64 : NtCurrentTeb() );
++        if (info) wine_server_set_reply( req, info, info_size );
+         status = wine_server_call( req );
+         machine = reply->machine;
+         info_size = reply->info_size;
+@@ -2029,6 +2027,13 @@ void init_startup_info(void)
+     SERVER_END_REQ;
+     assert( !status );
+ 
++    if (!info)
++    {
++        params = build_initial_params( &module );
++        init_peb( params, module );
++        return;
++    }
++
+     env = malloc( env_size * sizeof(WCHAR) );
+     memcpy( env, (char *)info + info_size, env_size * sizeof(WCHAR) );
+     env_pos = env_size - 1;
+
+--- dlls/ntdll/unix/loader.c
++++ dlls/ntdll/unix/loader.c
+@@ -1857,22 +1857,23 @@ static ULONG_PTR get_image_address(void)
+ static void start_main_thread(void)
+ {
+     TEB *teb = virtual_alloc_first_teb();
++    SIZE_T info_size;
+ 
+     signal_init_threading();
+     dbg_init();
+-    startup_info_size = server_init_process();
++    info_size = server_init_process();
+     virtual_map_user_shared_data();
+     init_cpu_info();
+     init_files();
+-    init_startup_info();
++    init_startup_info( info_size );
+     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
+     set_load_order_app_name( main_wargv[0] );
+-    init_thread_stack( teb, 0, 0, 0 );
++    init_thread_stack( teb, 0, 0, 0, TRUE );
+     NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
+     load_ntdll();
+     load_wow64_ntdll( main_image_info.Machine );
+     load_apiset_dll();
+-    server_init_process_done();
++    server_start_main_thread();
+ }
+ 
+ #ifdef __ANDROID__
+@@ -1998,45 +1999,8 @@ jint JNI_OnLoad( JavaVM *vm, void *reserved )
+ #endif  /* __ANDROID__ */
+ 
+ #ifdef __APPLE__
+-static void *apple_wine_thread( void *arg )
+-{
+-    start_main_thread();
+-    return NULL;
+-}
+-
+-/***********************************************************************
+- *           apple_create_wine_thread
+- *
+- * Spin off a secondary thread to complete Wine initialization, leaving
+- * the original thread for the Mac frameworks.
+- *
+- * Invoked as a CFRunLoopSource perform callback.
+- */
+-static void apple_create_wine_thread( void *arg )
+-{
+-    pthread_t thread;
+-    pthread_attr_t attr;
+-
+-    pthread_attr_init( &attr );
+-    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_JOINABLE );
+-    if (pthread_create( &thread, &attr, apple_wine_thread, NULL )) exit(1);
+-    pthread_attr_destroy( &attr );
+-}
+-
+-
+-/***********************************************************************
+- *           apple_main_thread
+- *
+- * Park the process's original thread in a Core Foundation run loop for
+- * use by the Mac frameworks, especially receiving and handling
+- * distributed notifications.  Spin off a new thread for the rest of the
+- * Wine initialization.
+- */
+ static void apple_main_thread(void)
+ {
+-    CFRunLoopSourceContext source_context = { 0 };
+-    CFRunLoopSourceRef source;
+-
+     if (!pthread_main_np()) return;
+ 
+ #pragma clang diagnostic push
+@@ -2051,19 +2015,6 @@ static void apple_main_thread(void)
+      * center scheduled on this thread's run loop.  In theory, it's scheduled
+      * in the first thread to ask for it. */
+     CFNotificationCenterGetDistributedCenter();
+-
+-    /* We use this run loop source for two purposes.  First, a run loop exits
+-     * if it has no more sources scheduled.  So, we need at least one source
+-     * to keep the run loop running.  Second, although it's not critical, it's
+-     * preferable for the Wine initialization to not proceed until we know
+-     * the run loop is running.  So, we signal our source immediately after
+-     * adding it and have its callback spin off the Wine thread. */
+-    source_context.perform = apple_create_wine_thread;
+-    source = CFRunLoopSourceCreate( NULL, 0, &source_context );
+-    CFRunLoopAddSource( CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes );
+-    CFRunLoopSourceSignal( source );
+-    CFRelease( source );
+-    CFRunLoopRun(); /* Should never return, except on error. */
+ }
+ #endif  /* __APPLE__ */
+ 
+
+--- dlls/ntdll/unix/process.c
++++ dlls/ntdll/unix/process.c
+@@ -690,8 +690,8 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
+     unsigned int status;
+     BOOL success = FALSE;
+     HANDLE file_handle, process_info = 0, process_handle = 0, thread_handle = 0;
+-    struct object_attributes *objattr;
+-    data_size_t attr_len;
++    struct object_attributes *objattr, *thread_objattr;
++    data_size_t attr_len, thread_attr_len;
+     char *winedebug = NULL;
+     char *unix_name = NULL;
+     struct startup_info_data *startup_info = NULL;
+@@ -782,6 +782,11 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
+     env_size = get_env_size( params, &winedebug );
+ 
+     if ((status = alloc_object_attributes( process_attr, &objattr, &attr_len ))) goto done;
++    if ((status = alloc_object_attributes( thread_attr, &thread_objattr, &thread_attr_len )))
++    {
++        free( thread_objattr );
++        goto done;
++    }
+ 
+     if ((status = alloc_handle_list( handles_attr, &handles, &handles_size )))
+     {
+@@ -823,16 +828,19 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
+         req->token          = wine_server_obj_handle( token );
+         req->debug          = wine_server_obj_handle( debug );
+         req->parent_process = wine_server_obj_handle( parent );
+-        req->flags          = process_flags;
++        req->process_flags  = process_flags;
++        req->thread_flags   = thread_flags;
+         req->socket_fd      = socketfd[1];
+         req->access         = process_access;
+         req->machine        = machine;
+         req->info_size      = startup_info_size;
+         req->handles_size   = handles_size;
+         req->jobs_size      = jobs_size;
++        req->sd_len         = thread_objattr ? thread_objattr->sd_len : 0;
+         wine_server_add_data( req, objattr, attr_len );
+         wine_server_add_data( req, handles, handles_size );
+         wine_server_add_data( req, jobs, jobs_size );
++        wine_server_add_data( req, thread_objattr + 1, req->sd_len );
+         wine_server_add_data( req, startup_info, startup_info_size );
+         wine_server_add_data( req, params->Environment, env_size );
+         if (!(status = wine_server_call( req )))
+@@ -844,6 +852,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
+     }
+     SERVER_END_REQ;
+     close( socketfd[1] );
++    free( thread_objattr );
+     free( objattr );
+     free( handles );
+     free( jobs );
+@@ -863,25 +872,6 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
+         goto done;
+     }
+ 
+-    if ((status = alloc_object_attributes( thread_attr, &objattr, &attr_len ))) goto done;
+-
+-    SERVER_START_REQ( new_thread )
+-    {
+-        req->process    = wine_server_obj_handle( process_handle );
+-        req->access     = thread_access;
+-        req->flags      = thread_flags;
+-        req->request_fd = -1;
+-        wine_server_add_data( req, objattr, attr_len );
+-        if (!(status = wine_server_call( req )))
+-        {
+-            thread_handle = wine_server_ptr_handle( reply->handle );
+-            id.UniqueThread = ULongToHandle( reply->tid );
+-        }
+-    }
+-    SERVER_END_REQ;
+-    free( objattr );
+-    if (status) goto done;
+-
+     /* create the child process */
+ 
+     if ((status = spawn_process( params, socketfd[0], unixdir, winedebug, &pe_info ))) goto done;
+@@ -894,10 +884,14 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
+     NtWaitForSingleObject( process_info, FALSE, NULL );
+     SERVER_START_REQ( get_new_process_info )
+     {
+-        req->info = wine_server_obj_handle( process_info );
++        req->info       = wine_server_obj_handle( process_info );
++        req->access     = thread_access;
++        req->attributes = thread_attr ? thread_attr->Attributes : 0;
+         wine_server_call( req );
+         success = reply->success;
+         status = reply->exit_code;
++        thread_handle = wine_server_ptr_handle( reply->handle );
++        id.UniqueThread = ULongToHandle( reply->tid );
+     }
+     SERVER_END_REQ;
+ 
+
+--- dlls/ntdll/unix/sched.c
++++ dlls/ntdll/unix/sched.c
+@@ -0,0 +1,55 @@
++/*
++ * Copyright 2026 Rémi Bernon for CodeWeavers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <stddef.h>
++#include <stdarg.h>
++
++#include <poll.h>
++
++#include "unix_private.h"
++
++#ifdef __APPLE__
++
++#include <CoreFoundation/CoreFoundation.h>
++
++void sched_run(void)
++{
++/*
++    CFRunLoopSourceRef source = CFRunLoopSourceCreate( NULL, 0, NULL );
++    CFRunLoopAddSource( CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes );
++    CFRelease( source );
++*/
++
++    CFRunLoopRun(); /* Should never return, except on error. */
++    assert( 0 );
++}
++
++#else
++
++void sched_run(void)
++{
++    for (;;) poll( NULL, 0, -1 );
++}
++
++#endif
+
+--- dlls/ntdll/unix/server.c
++++ dlls/ntdll/unix/server.c
+@@ -1656,6 +1656,9 @@ size_t server_init_process(void)
+     /* work around Ubuntu's ptrace breakage */
+     if (server_pid != -1) prctl( 0x59616d61 /* PR_SET_PTRACER */, server_pid );
+ #endif
++#ifdef __APPLE__
++    send_server_task_port();
++#endif
+ 
+     /* ignore SIGPIPE so that we get an EPIPE error instead  */
+     sig_act.sa_handler = SIG_IGN;
+@@ -1665,7 +1668,7 @@ size_t server_init_process(void)
+ 
+     reply_pipe = init_thread_pipe();
+ 
+-    SERVER_START_REQ( init_first_thread )
++    SERVER_START_REQ( init_process )
+     {
+         req->unix_pid    = getpid();
+         req->unix_tid    = get_unix_tid();
+@@ -1692,7 +1695,7 @@ size_t server_init_process(void)
+     SERVER_END_REQ;
+     close( reply_pipe );
+ 
+-    if (ret) server_protocol_error( "init_first_thread failed with status %x\n", ret );
++    if (ret) server_protocol_error( "init_process failed with status %x\n", ret );
+ 
+     if (!supported_machines_count)
+         fatal_error( "'%s' is a 64-bit installation, it cannot be used with a 32-bit wineserver.\n",
+@@ -1727,24 +1730,19 @@ size_t server_init_process(void)
+ 
+ 
+ /***********************************************************************
+- *           server_init_process_done
++ *           server_start_main_thread
+  */
+-void server_init_process_done(void)
++void server_start_main_thread(void)
+ {
+-    void *teb;
+     unsigned int status;
+-    int suspend;
+     FILE_FS_DEVICE_INFORMATION info;
+     struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
++    HANDLE handle;
+ 
+     if (!get_device_info( initial_cwd, &info ) && (info.Characteristics & FILE_REMOVABLE_MEDIA))
+         chdir( "/" );
+     close( initial_cwd );
+ 
+-#ifdef __APPLE__
+-    send_server_task_port();
+-#endif
+-
+     /* Install signal handlers; this cannot be done earlier, since we cannot
+      * send exceptions to the debugger before the create process event that
+      * is sent by init_process_done */
+@@ -1752,21 +1750,12 @@ void server_init_process_done(void)
+     thread_data->syscall_table = KeServiceDescriptorTable;
+     thread_data->syscall_trace = TRACE_ON(syscall);
+ 
+-    /* always send the native TEB */
+-    if (!(teb = NtCurrentTeb64())) teb = NtCurrentTeb();
+-
+-    /* Signal the parent process to continue */
+-    SERVER_START_REQ( init_process_done )
+-    {
+-        req->teb = wine_server_client_ptr( teb );
+-        req->peb = NtCurrentTeb64() ? NtCurrentTeb64()->Peb : wine_server_client_ptr( peb );
+-        status = wine_server_call( req );
+-        suspend = reply->suspend;
+-    }
+-    SERVER_END_REQ;
+-
++    status = NtCreateThreadEx( &handle, THREAD_ALL_ACCESS, NULL, NtCurrentProcess(),
++                               main_image_info.TransferAddress, peb, 0, 0, 0, 0, NULL );
+     assert( !status );
+-    signal_start_thread( main_image_info.TransferAddress, peb, suspend, NtCurrentTeb() );
++    NtClose( handle );
++
++    sched_run();
+ }
+ 
+ 
+
+--- dlls/ntdll/unix/signal_x86_64.c
++++ dlls/ntdll/unix/signal_x86_64.c
+@@ -2825,13 +2825,42 @@ static void *mac_thread_gsbase(void)
+ #endif
+ 
+ 
++static void init_wow_sel(void)
++{
++    INITIAL_TEB stack;
++    WOW_TEB *wow_teb;
++    NTSTATUS status;
++    SIZE_T size = 0;
++
++    if (!(wow_teb = get_wow_teb( NtCurrentTeb() ))) return;
++
++    /* main thread doesn't have a user stack, create a temporary one to please alloc_fs_sel */
++
++    if ((status = virtual_alloc_thread_stack( &stack, 0, 0, 0x1000, 0x1000, TRUE ))) return;
++    wow_teb->Tib.StackBase = PtrToUlong( stack.StackBase );
++    wow_teb->Tib.StackLimit = PtrToUlong( stack.StackLimit );
++    wow_teb->DeallocationStack = PtrToUlong( stack.DeallocationStack );
++
++#ifdef __linux__
++    cs32_sel = 0x23;
++    fs32_sel = alloc_fs_sel( -1, wow_teb );
++#elif defined(__APPLE__)
++    cs32_sel = ldt_alloc_entry( ldt_make_cs32_entry() );
++#endif
++
++    NtFreeVirtualMemory( GetCurrentProcess(), &stack.DeallocationStack, &size, MEM_RELEASE );
++    wow_teb->Tib.StackBase = 0;
++    wow_teb->Tib.StackLimit = 0;
++    wow_teb->DeallocationStack = 0;
++}
++
++
+ /**********************************************************************
+  *		signal_init_process
+  */
+ void signal_init_process(void)
+ {
+     struct sigaction sig_act;
+-    WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
+     struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
+     void *ptr, *kernel_stack = (char *)thread_data->kernel_stack + kernel_stack_size;
+ 
+@@ -2847,16 +2876,7 @@ void signal_init_process(void)
+ 
+     xstate_extended_features = user_shared_data->XState.EnabledFeatures & ~(UINT64)3;
+ 
+-    if (wow_teb)
+-    {
+-#ifdef __linux__
+-        cs32_sel = 0x23;
+-        fs32_sel = alloc_fs_sel( -1, wow_teb );
+-#elif defined(__APPLE__)
+-        cs32_sel = ldt_alloc_entry( ldt_make_cs32_entry() );
+-#endif
+-    }
+-
++    init_wow_sel();
+     signal_alloc_thread( NtCurrentTeb() );
+ 
+     sig_act.sa_mask = server_block_set;
+
+--- dlls/ntdll/unix/thread.c
++++ dlls/ntdll/unix/thread.c
+@@ -84,7 +84,7 @@ WINE_DECLARE_DEBUG_CHANNEL(threadname);
+ 
+ pthread_key_t teb_key = 0;
+ 
+-static LONG nb_threads = 1;
++static LONG nb_threads = 0;
+ 
+ static inline int get_unix_exit_code( NTSTATUS status )
+ {
+@@ -1199,7 +1199,7 @@ void set_thread_id( TEB *teb, DWORD pid, DWORD tid )
+ /***********************************************************************
+  *           init_thread_stack
+  */
+-NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size )
++NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size, BOOL only_kernel )
+ {
+     struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
+     WOW_TEB *wow_teb = get_wow_teb( teb );
+@@ -1211,6 +1211,8 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
+         return status;
+     thread_data->kernel_stack = stack.DeallocationStack;
+ 
++    if (only_kernel) return STATUS_SUCCESS;
++
+     if (wow_teb)
+     {
+         WOW64_CPURESERVED *cpu;
+@@ -1420,7 +1422,7 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
+ 
+     if ((status = virtual_alloc_teb( &teb ))) goto done;
+ 
+-    if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit )))
++    if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit, FALSE )))
+     {
+         virtual_free_teb( teb );
+         goto done;
+@@ -1436,6 +1438,10 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
+         wow_teb->SkipThreadAttach = teb->SkipThreadAttach;
+         wow_teb->SkipLoaderInit = teb->SkipLoaderInit;
+     }
++#ifndef _WIN64
++    if (InterlockedExchange( &init_redirect, FALSE ) && teb->GdiBatchCount)
++        ((TEB64 *)teb->GdiBatchCount)->TlsSlots[WOW64_TLS_FILESYSREDIR] = TRUE;
++#endif
+ 
+     thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
+     thread_data->request_fd  = request_pipe[1];
+
+--- dlls/ntdll/unix/unix_private.h
++++ dlls/ntdll/unix/unix_private.h
+@@ -188,8 +188,8 @@ extern pthread_key_t teb_key;
+ extern PEB *peb;
+ extern USHORT *uctable;
+ extern USHORT *lctable;
+-extern SIZE_T startup_info_size;
+ extern BOOL is_prefix_bootstrap;
++extern LONG init_redirect;
+ extern int main_argc;
+ extern char **main_argv;
+ extern WCHAR **main_wargv;
+@@ -206,7 +206,7 @@ extern struct _KUSER_SHARED_DATA *user_shared_data;
+ extern ULONG process_cookie;
+ 
+ extern void init_environment(void);
+-extern void init_startup_info(void);
++extern void init_startup_info( SIZE_T info_size );
+ extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_flags,
+                                   const RTL_USER_PROCESS_PARAMETERS *params,
+                                   const struct pe_image_info *pe_info, DWORD *info_size );
+@@ -237,7 +237,7 @@ extern int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *u
+ extern int wine_server_receive_fd( obj_handle_t *handle );
+ extern void process_exit_wrapper( int status ) DECLSPEC_NORETURN;
+ extern size_t server_init_process(void);
+-extern void server_init_process_done(void);
++extern void server_start_main_thread(void);
+ extern void server_init_thread( void *entry_point, BOOL *suspend );
+ extern int server_pipe( int fd[2] );
+ 
+@@ -262,7 +262,7 @@ extern void set_process_instrumentation_callback( void *callback );
+ 
+ extern void *get_cpu_area( USHORT machine );
+ extern void set_thread_id( TEB *teb, DWORD pid, DWORD tid );
+-extern NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size );
++extern NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size, BOOL only_kernel );
+ extern void DECLSPEC_NORETURN abort_thread( int status );
+ extern void DECLSPEC_NORETURN abort_process( int status );
+ extern void DECLSPEC_NORETURN exit_process( int status );
+@@ -388,6 +388,8 @@ extern NTSTATUS wow64_wine_server_handle_to_fd( void *args );
+ extern NTSTATUS wow64_wine_spawnvp( void *args );
+ #endif
+ 
++extern void sched_run(void);
++
+ extern void dbg_init(void);
+ 
+ extern void close_inproc_sync( HANDLE handle );
+
+--- dlls/ntdll/Makefile.in
++++ dlls/ntdll/Makefile.in
+@@ -56,6 +56,7 @@ SOURCES = \
+ 	unix/loadorder.c \
+ 	unix/process.c \
+ 	unix/registry.c \
++	unix/sched.c \
+ 	unix/security.c \
+ 	unix/serial.c \
+ 	unix/server.c \
+
+--- server/process.c
++++ server/process.c
+@@ -665,6 +665,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+     }
+     process->sync            = NULL;
+     process->parent_id       = 0;
++    process->sched_thread    = NULL;
+     process->debug_obj       = NULL;
+     process->debug_event     = NULL;
+     process->handles         = NULL;
+@@ -675,6 +676,8 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+     process->unix_pid        = -1;
+     process->exit_code       = STILL_ACTIVE;
+     process->running_threads = 0;
++    process->thread_flags    = 0;
++    process->thread_sd       = NULL;
+     process->priority        = PROCESS_PRIOCLASS_NORMAL;
+     process->base_priority   = 8;
+     process->disable_boost   = 0;
+@@ -771,6 +774,15 @@ data_size_t get_process_startup_info_size( struct process *process )
+     return info->data_size;
+ }
+ 
++struct security_descriptor *get_first_thread_info( struct process *process, unsigned int *flags )
++{
++    struct startup_info *info = process->startup_info;
++
++    if (!info) return NULL;
++    *flags = process->thread_flags;
++    return process->thread_sd;
++}
++
+ /* destroy a process when its refcount is 0 */
+ static void process_destroy( struct object *obj )
+ {
+@@ -778,6 +790,7 @@ static void process_destroy( struct object *obj )
+     assert( obj->ops == &process_ops );
+ 
+     /* we can't have a thread remaining */
++    assert( !process->sched_thread );
+     assert( list_empty( &process->thread_list ));
+     assert( list_empty( &process->asyncs ));
+ 
+@@ -801,6 +814,7 @@ static void process_destroy( struct object *obj )
+     free( process->rawinput_devices );
+     free( process->dir_cache );
+     free( process->image );
++    free( process->thread_sd );
+ }
+ 
+ /* dump a process on stdout for debugging purposes */
+@@ -981,6 +995,11 @@ void kill_console_processes( struct thread *renderer, int exit_code )
+ /* a process has been killed (i.e. its last thread died) */
+ static void process_killed( struct process *process )
+ {
++    assert( process->sched_thread );
++    kill_thread( process->sched_thread, 0 );
++    release_object( process->sched_thread );
++    process->sched_thread = NULL;
++
+     assert( list_empty( &process->thread_list ));
+     process->end_time = current_time;
+     close_process_desktop( process );
+@@ -1006,6 +1025,8 @@ static void process_killed( struct process *process )
+ /* add a thread to a process running threads list */
+ void add_process_thread( struct process *process, struct thread *thread )
+ {
++    assert( process->sched_thread );
++
+     list_add_tail( &process->thread_list, &thread->proc_entry );
+     if (!process->running_threads++)
+     {
+@@ -1028,6 +1049,7 @@ void remove_process_thread( struct process *process, struct thread *thread )
+ {
+     assert( process->running_threads > 0 );
+     assert( !list_empty( &process->thread_list ));
++    assert( process->sched_thread );
+ 
+     list_remove( &thread->proc_entry );
+ 
+@@ -1152,13 +1174,13 @@ DECL_HANDLER(new_process)
+     struct startup_info *info;
+     const void *info_ptr;
+     struct unicode_str name, desktop_path = {0};
+-    const struct security_descriptor *sd;
++    const struct security_descriptor *sd, *thread_sd = NULL;
+     const struct object_attributes *objattr = get_req_object_attributes( &sd, &name, NULL );
+     struct process *process = NULL;
+     struct token *token = NULL;
+     struct debug_obj *debug_obj = NULL;
+     struct process *parent;
+-    struct thread *parent_thread = current;
++    struct thread *thread, *parent_thread = current;
+     int socket_fd = thread_get_inflight_fd( current, req->socket_fd );
+     const obj_handle_t *handles = NULL;
+     const obj_handle_t *job_handles = NULL;
+@@ -1202,7 +1224,7 @@ DECL_HANDLER(new_process)
+ 
+     /* If a job further in the job chain does not permit breakaway process creation
+      * succeeds and the process which is trying to breakaway is assigned to that job. */
+-    if (parent->job && (req->flags & PROCESS_CREATE_FLAGS_BREAKAWAY) &&
++    if (parent->job && (req->process_flags & PROCESS_CREATE_FLAGS_BREAKAWAY) &&
+         !(parent->job->limit_flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)))
+     {
+         set_error( STATUS_ACCESS_DENIED );
+@@ -1255,6 +1277,24 @@ DECL_HANDLER(new_process)
+         info_ptr = (const char *)info_ptr + req->jobs_size;
+         info->data_size -= req->jobs_size;
+     }
++    if (req->sd_len > info->data_size)
++    {
++        set_error( STATUS_INVALID_PARAMETER );
++        close( socket_fd );
++        goto done;
++    }
++    if (req->sd_len)
++    {
++        thread_sd = info_ptr;
++        info_ptr = (const char *)thread_sd + req->sd_len;
++        info->data_size -= req->sd_len;
++    }
++    if (thread_sd && !sd_is_valid( thread_sd, req->sd_len ))
++    {
++        set_error( STATUS_INVALID_PARAMETER );
++        close( socket_fd );
++        goto done;
++    }
+ 
+     job_handle_count = req->jobs_size / sizeof(*handles);
+     for (i = 0; i < job_handle_count; ++i)
+@@ -1320,18 +1360,20 @@ DECL_HANDLER(new_process)
+         goto done;
+     }
+ 
+-    if (!(process = create_process( socket_fd, parent, req->flags, info->data, sd,
++    if (!(process = create_process( socket_fd, parent, req->process_flags, info->data, sd,
+                                     handles, req->handles_size / sizeof(*handles), token )))
+         goto done;
+ 
+     process->machine = req->machine;
+     process->startup_info = (struct startup_info *)grab_object( info );
++    process->thread_flags = req->thread_flags;
++    if (thread_sd && !(process->thread_sd = memdup( thread_sd, req->sd_len ))) goto done;
+ 
+     job = parent->job;
+     while (job)
+     {
+         if (!(job->limit_flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
+-                && !(req->flags & PROCESS_CREATE_FLAGS_BREAKAWAY
++                && !(req->process_flags & PROCESS_CREATE_FLAGS_BREAKAWAY
+                 && job->limit_flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK))
+         {
+             add_job_process( job, process );
+@@ -1361,7 +1403,7 @@ DECL_HANDLER(new_process)
+         info->data->console = duplicate_handle( parent, info->data->console, process,
+                                                 0, 0, DUPLICATE_SAME_ACCESS );
+ 
+-    if (!(req->flags & PROCESS_CREATE_FLAGS_INHERIT_HANDLES) && info->data->console != 1)
++    if (!(req->process_flags & PROCESS_CREATE_FLAGS_INHERIT_HANDLES) && info->data->console != 1)
+     {
+         info->data->hstdin  = duplicate_handle( parent, info->data->hstdin, process,
+                                                 0, 0, DUPLICATE_SAME_ACCESS | DUPLICATE_SAME_ATTRIBUTES );
+@@ -1378,7 +1420,7 @@ DECL_HANDLER(new_process)
+     if (debug_obj)
+     {
+         process->debug_obj = debug_obj;
+-        process->debug_children = !(req->flags & PROCESS_CREATE_FLAGS_NO_DEBUG_INHERIT);
++        process->debug_children = !(req->process_flags & PROCESS_CREATE_FLAGS_NO_DEBUG_INHERIT);
+     }
+     else if (parent->debug_children)
+     {
+@@ -1392,6 +1434,10 @@ DECL_HANDLER(new_process)
+         info->data->process_group_id = process->group_id;
+ 
+     info->process = (struct process *)grab_object( process );
++
++    if (!(thread = create_thread( -1, process, 0, NULL ))) goto done;
++    thread->system_regs = current->system_regs;
++
+     reply->info = alloc_handle( current->process, info, SYNCHRONIZE, 0 );
+     reply->pid = get_process_id( process );
+     reply->handle = alloc_handle_no_access_check( current->process, process, req->access, objattr->attributes );
+@@ -1408,14 +1454,22 @@ DECL_HANDLER(new_process)
+ DECL_HANDLER(get_new_process_info)
+ {
+     struct startup_info *info;
++    struct thread *thread;
+ 
+-    if ((info = (struct startup_info *)get_handle_obj( current->process, req->info,
+-                                                       0, &startup_info_ops )))
++    if (!(info = (struct startup_info *)get_handle_obj( current->process, req->info, 0, &startup_info_ops ))) return;
++    if (!(thread = get_process_first_thread( info->process )))
+     {
+-        reply->success = is_process_init_done( info->process );
+-        reply->exit_code = info->process->exit_code;
+-        release_object( info );
++        set_error( STATUS_INVALID_PARAMETER );
++        goto done;
+     }
++
++    reply->tid = get_thread_id( thread );
++    reply->handle = alloc_handle_no_access_check( current->process, thread, req->access, req->attributes );
++    reply->success = is_process_init_done( info->process );
++    reply->exit_code = info->process->exit_code;
++
++done:
++    release_object( info );
+ }
+ 
+ /* Itererate processes using global process list */
+@@ -1459,6 +1513,10 @@ DECL_HANDLER(get_startup_info)
+     struct startup_info *info = process->startup_info;
+     data_size_t size;
+ 
++    current->teb = req->teb;
++    process->peb = req->peb;
++    init_process_tracing( process );
++
+     if (!info) return;
+ 
+     /* we return the data directly without making a copy so this can only be called once */
+@@ -1472,29 +1530,19 @@ DECL_HANDLER(get_startup_info)
+ }
+ 
+ /* signal the end of the process initialization */
+-DECL_HANDLER(init_process_done)
++void init_process_done( struct process *process )
+ {
+-    struct process *process = current->process;
+-
+     if (is_process_init_done(process))
+     {
+         set_error( STATUS_INVALID_PARAMETER );
+         return;
+     }
+ 
+-    current->teb = req->teb;
+-    process->peb = req->peb;
+-
+-    process->start_time = current_time;
+-
+-    init_process_tracing( process );
+-    generate_startup_debug_events( process );
+     set_process_startup_state( process, STARTUP_DONE );
+ 
+     if (process->image_info.subsystem != IMAGE_SUBSYSTEM_WINDOWS_CUI)
+         process->idle_event = create_event( NULL, NULL, 0, 1, 0, NULL );
+     if (process->debug_obj) set_process_debug_flag( process, 1 );
+-    reply->suspend = (current->suspend || process->suspend);
+ }
+ 
+ /* open a handle to a process */
+@@ -1672,6 +1720,7 @@ void set_process_base_priority( struct process *process, int base_priority )
+ 
+     process->base_priority = base_priority;
+ 
++    if ((thread = process->sched_thread)) set_thread_base_priority( thread, thread->base_priority );
+     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
+     {
+         set_thread_base_priority( thread, thread->base_priority );
+@@ -1717,6 +1766,7 @@ static void set_process_disable_boost( struct process *process, int disable_boos
+ 
+     process->disable_boost = disable_boost;
+ 
++    if ((thread = process->sched_thread)) set_thread_disable_boost( thread, disable_boost );
+     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
+     {
+         set_thread_disable_boost( thread, disable_boost );
+@@ -1735,6 +1785,7 @@ static void set_process_affinity( struct process *process, affinity_t affinity )
+ 
+     process->affinity = affinity;
+ 
++    if ((thread = process->sched_thread)) set_thread_affinity( thread, affinity );
+     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
+     {
+         set_thread_affinity( thread, affinity );
+
+--- server/process.h
++++ server/process.h
+@@ -39,6 +39,7 @@ struct process
+     struct object       *sync;            /* sync object for wait/signal */
+     struct list          entry;           /* entry in system-wide process list */
+     process_id_t         parent_id;       /* parent process id (at the time of creation) */
++    struct thread       *sched_thread;    /* sched / unix main thread */
+     struct list          thread_list;     /* thread list */
+     struct debug_obj    *debug_obj;       /* debug object debugging this process */
+     struct debug_event  *debug_event;     /* debug event being sent to debugger */
+@@ -53,6 +54,8 @@ struct process
+     int                  unix_pid;        /* Unix pid for final SIGKILL */
+     int                  exit_code;       /* process exit code */
+     int                  running_threads; /* number of threads running in this process */
++    unsigned int         thread_flags;    /* first thread flags */
++    struct security_descriptor *thread_sd; /* first thread security descriptor */
+     timeout_t            start_time;      /* absolute time at process start */
+     timeout_t            end_time;        /* absolute time at process end */
+     affinity_t           affinity;        /* process affinity mask */
+@@ -99,7 +102,9 @@ extern struct process *create_process( int fd, struct process *parent, unsigned
+                                        const struct startup_info_data *info,
+                                        const struct security_descriptor *sd, const obj_handle_t *handles,
+                                        unsigned int handle_count, struct token *token );
++extern void init_process_done( struct process *process );
+ extern data_size_t get_process_startup_info_size( struct process *process );
++extern struct security_descriptor *get_first_thread_info( struct process *process, unsigned int *flags );
+ extern struct thread *get_process_first_thread( struct process *process );
+ extern struct process *get_process_from_id( process_id_t id );
+ extern struct process *get_process_from_handle( obj_handle_t handle, unsigned int access );
+
+--- server/protocol.def
++++ server/protocol.def
+@@ -1087,16 +1087,19 @@ typedef volatile struct
+     obj_handle_t token;          /* process token */
+     obj_handle_t debug;          /* process debug object */
+     obj_handle_t parent_process; /* parent process */
+-    unsigned int flags;          /* process creation flags */
++    unsigned int process_flags;  /* process creation flags */
++    unsigned int thread_flags;   /* process creation flags */
+     int          socket_fd;      /* file descriptor for process socket */
+     unsigned int access;         /* access rights for process object */
+     unsigned short machine;      /* architecture that the new process will use */
+     data_size_t  info_size;      /* size of startup info */
+     data_size_t  handles_size;   /* length of explicit handles list */
+     data_size_t  jobs_size;      /* length of jobs list */
++    data_size_t  sd_len;         /* size of security descriptor */
+     VARARG(objattr,object_attributes);   /* object attributes */
+     VARARG(handles,uints,handles_size);  /* handles list */
+     VARARG(jobs,uints,jobs_size);        /* jobs list */
++    VARARG(sd,security_descriptor,sd_len); /* thread security descriptor */
+     VARARG(info,startup_info,info_size); /* startup information */
+     VARARG(env,unicode_str);     /* environment for new process */
+ @REPLY
+@@ -1109,7 +1112,11 @@ typedef volatile struct
+ /* Retrieve information about a newly started process */
+ @REQ(get_new_process_info)
+     obj_handle_t info;           /* info handle returned from new_process_request */
++    unsigned int access;         /* wanted handle access rights */
++    unsigned int attributes;     /* handle object attributes */
+ @REPLY
++    thread_id_t  tid;          /* main thread id */
++    obj_handle_t handle;       /* main thread handle (in the current process) */
+     int          success;      /* did the process start successfully? */
+     int          exit_code;    /* process exit code if failed */
+ @END
+@@ -1130,6 +1137,8 @@ typedef volatile struct
+ 
+ /* Retrieve the new process startup info */
+ @REQ(get_startup_info)
++    client_ptr_t teb;          /* TEB of new thread (in process address space) */
++    client_ptr_t peb;          /* PEB of new process (in process address space) */
+ @REPLY
+     data_size_t  info_size;    /* size of startup info */
+     unsigned short machine;    /* architecture for the new process */
+@@ -1138,17 +1147,8 @@ typedef volatile struct
+ @END
+ 
+ 
+-/* Signal the end of the process initialization */
+-@REQ(init_process_done)
+-    client_ptr_t teb;          /* TEB of new thread (in process address space) */
+-    client_ptr_t peb;          /* PEB of new process (in process address space) */
+-@REPLY
+-    int          suspend;      /* is process suspended? */
+-@END
+-
+-
+-/* Initialize the first thread of a new process */
+-@REQ(init_first_thread)
++/* Initialize a new process */
++@REQ(init_process)
+     int          unix_pid;     /* Unix pid of new process */
+     int          unix_tid;     /* Unix tid of new thread */
+     int          debug_level;  /* new debug level */
+
+--- server/request.c
++++ server/request.c
+@@ -409,8 +409,10 @@ int receive_fd( struct process *process )
+     {
+         struct thread *thread;
+ 
++        if (data.tid == get_thread_id( process->sched_thread )) data.tid = 0;
++
+         if (data.tid) thread = get_thread_from_id( data.tid );
+-        else thread = (struct thread *)grab_object( get_process_first_thread( process ));
++        else thread = (struct thread *)grab_object( process->sched_thread );
+ 
+         if (!thread || thread->process != process || thread->state == TERMINATED)
+         {
+@@ -563,7 +565,7 @@ static void master_socket_poll_event( struct fd *fd, int event )
+         fcntl( client, F_SETFL, O_NONBLOCK );
+         if ((process = create_process( client, NULL, 0, NULL, NULL, NULL, 0, NULL )))
+         {
+-            create_thread( -1, process, NULL );
++            create_thread( -1, process, 0, NULL );
+             release_object( process );
+         }
+     }
+
+--- server/thread.c
++++ server/thread.c
+@@ -501,13 +501,14 @@ static struct context *create_thread_context( struct thread *thread )
+ 
+ 
+ /* create a new thread */
+-struct thread *create_thread( int fd, struct process *process, const struct security_descriptor *sd )
++struct thread *create_thread( int fd, struct process *process, unsigned int flags,
++                              const struct security_descriptor *sd )
+ {
+     struct desktop *desktop;
+     struct thread *thread;
+-    int request_pipe[2];
++    int is_sched, request_pipe[2];
+ 
+-    if (fd == -1)
++    if ((is_sched = (fd == -1)))
+     {
+         if (pipe( request_pipe ) == -1)
+         {
+@@ -539,13 +540,16 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
+ 
+     init_thread_structure( thread );
+ 
++    thread->is_sched = is_sched;
+     thread->process = (struct process *)grab_object( process );
+     thread->desktop = 0;
+     thread->affinity = process->affinity;
+     thread->disable_boost = process->disable_boost;
+     if (!current) current = thread;
+ 
+-    list_add_tail( &thread_list, &thread->entry );
++    /* avoid adding kernel threads to the global thread list */
++    if (thread->is_sched) list_init( &thread->entry );
++    else list_add_tail( &thread_list, &thread->entry );
+ 
+     if (sd && !set_sd_defaults_from_token( &thread->obj, sd,
+                                            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+@@ -566,7 +570,7 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
+     if (!(thread->sync = create_internal_sync( 1, 0 ))) goto error;
+     if (get_inproc_device_fd() >= 0 && !(thread->alert_sync = create_inproc_internal_sync( 1, 0 ))) goto error;
+ 
+-    if (process->desktop)
++    if (!thread->is_sched && process->desktop)
+     {
+         if (!(desktop = get_desktop_obj( process, process->desktop, 0 ))) clear_error();  /* ignore errors */
+         else
+@@ -577,7 +581,12 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
+     }
+ 
+     set_fd_events( thread->request_fd, POLLIN );  /* start listening to events */
+-    add_process_thread( thread->process, thread );
++    if (is_sched) process->sched_thread = (struct thread *)grab_object( thread );
++    else add_process_thread( process, thread );
++
++    if (flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) thread->suspend++;
++    thread->dbg_hidden = !!(flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
++    thread->bypass_proc_suspend = !!(flags & THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE);
+     return thread;
+ 
+ error:
+@@ -751,7 +760,11 @@ struct thread *get_thread_from_id( thread_id_t id )
+ {
+     struct object *obj = get_ptid_entry( id );
+ 
+-    if (obj && obj->ops == &thread_ops) return (struct thread *)grab_object( obj );
++    if (obj && obj->ops == &thread_ops)
++    {
++        struct thread *thread = (struct thread *)obj;
++        if (!thread->is_sched) return (struct thread *)grab_object( thread );
++    }
+     set_error( STATUS_INVALID_CID );
+     return NULL;
+ }
+@@ -1607,6 +1620,7 @@ int thread_get_inflight_fd( struct thread *thread, int client )
+ /* kill a thread on the spot */
+ void kill_thread( struct thread *thread, int violent_death )
+ {
++    struct process *process = thread->process;
+     if (thread->state == TERMINATED) return;  /* already killed */
+     thread->state = TERMINATED;
+     thread->exit_time = current_time;
+@@ -1626,7 +1640,8 @@ void kill_thread( struct thread *thread, int violent_death )
+     signal_sync( thread->sync );
+     if (violent_death) send_thread_signal( thread, SIGQUIT );
+     cleanup_thread( thread );
+-    remove_process_thread( thread->process, thread );
++    if (thread->is_sched) kill_process( process, violent_death );
++    else remove_process_thread( process, thread );
+     release_object( thread );
+ }
+ 
+@@ -1659,9 +1674,10 @@ DECL_HANDLER(new_thread)
+     struct thread *thread;
+     struct process *process;
+     struct unicode_str name;
+-    const struct security_descriptor *sd;
++    const struct security_descriptor *sd, *first_sd;
+     const struct object_attributes *objattr = get_req_object_attributes( &sd, &name, NULL );
+     int request_fd = thread_get_inflight_fd( current, req->request_fd );
++    unsigned int flags = req->flags;
+ 
+     if (!(process = get_process_from_handle( req->process, 0 )))
+     {
+@@ -1671,17 +1687,9 @@ DECL_HANDLER(new_thread)
+ 
+     if (process != current->process)
+     {
+-        if (request_fd != -1)  /* can't create a request fd in a different process */
+-        {
+-            close( request_fd );
+-            set_error( STATUS_INVALID_PARAMETER );
+-            goto done;
+-        }
+-        if (process->running_threads)  /* only the initial thread can be created in another process */
+-        {
+-            set_error( STATUS_ACCESS_DENIED );
+-            goto done;
+-        }
++        if (request_fd != -1) close( request_fd );
++        set_error( STATUS_ACCESS_DENIED );
++        goto done;
+     }
+     else if (request_fd == -1 || fcntl( request_fd, F_SETFL, O_NONBLOCK ) == -1)
+     {
+@@ -1696,12 +1704,12 @@ DECL_HANDLER(new_thread)
+         goto done;
+     }
+ 
+-    if ((thread = create_thread( request_fd, process, sd )))
++    /* if first thread, use security descriptor from startup info */
++    if ((first_sd = get_first_thread_info( process, &flags ))) sd = first_sd;
++
++    if ((thread = create_thread( request_fd, process, flags, sd )))
+     {
+         thread->system_regs = current->system_regs;
+-        if (req->flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) thread->suspend++;
+-        thread->dbg_hidden = !!(req->flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
+-        thread->bypass_proc_suspend = !!(req->flags & THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE);
+         reply->tid = get_thread_id( thread );
+         if ((reply->handle = alloc_handle_no_access_check( current->process, thread,
+                                                            req->access, objattr->attributes )))
+@@ -1746,8 +1754,8 @@ static int init_thread( struct thread *thread, int reply_fd, int wait_fd )
+     return 0;
+ }
+ 
+-/* initialize the first thread of a new process */
+-DECL_HANDLER(init_first_thread)
++/* initialize a new process */
++DECL_HANDLER(init_process)
+ {
+     struct process *process = current->process;
+     int fd;
+@@ -1756,6 +1764,7 @@ DECL_HANDLER(init_first_thread)
+ 
+     current->unix_pid = process->unix_pid = req->unix_pid;
+     current->unix_tid = req->unix_tid;
++    process->start_time = current_time;
+ 
+     if (!process->parent_id)
+         process->affinity = current->affinity = get_thread_affinity( current );
+@@ -1784,6 +1793,7 @@ DECL_HANDLER(init_first_thread)
+ /* initialize a new thread */
+ DECL_HANDLER(init_thread)
+ {
++    struct thread *first_thread = get_process_first_thread( current->process );
+     if (!init_thread( current, req->reply_fd, req->wait_fd )) return;
+ 
+     if (!is_valid_address(req->teb))
+@@ -1798,11 +1808,13 @@ DECL_HANDLER(init_thread)
+     current->entry_point = req->entry;
+ 
+     init_thread_context( current );
+-    generate_debug_event( current, DbgCreateThreadStateChange, &req->entry );
++    if (current == first_thread) generate_startup_debug_events( current->process );
++    else generate_debug_event( current, DbgCreateThreadStateChange, &req->entry );
+     set_thread_base_priority( current, current->base_priority );
+     set_thread_affinity( current, current->affinity );
+ 
+     reply->suspend = (is_thread_suspended( current ) || current->context != NULL);
++    if (current == first_thread) init_process_done( current->process );
+ }
+ 
+ /* terminate a thread */
+
+--- server/thread.h
++++ server/thread.h
+@@ -88,8 +88,9 @@ struct thread
+     int                    base_priority; /* base priority level (relative to process base priority class) */
+     int                    disable_boost; /* disable thread priority boost */
+     int                    suspend;       /* suspend count */
+-    int                    dbg_hidden;    /* hidden from debugger */
+-    int                    bypass_proc_suspend; /* will still run if the process is suspended */
++    unsigned int           is_sched:1;    /* sched / unix main thread */
++    unsigned int           dbg_hidden:1;  /* hidden from debugger */
++    unsigned int           bypass_proc_suspend:1; /* will still run if the process is suspended */
+     obj_handle_t           desktop;       /* desktop handle */
+     int                    desktop_users; /* number of objects using the thread desktop */
+     timeout_t              creation_time; /* Thread creation time */
+@@ -105,7 +106,7 @@ extern struct thread *current;
+ 
+ /* thread functions */
+ 
+-extern struct thread *create_thread( int fd, struct process *process,
++extern struct thread *create_thread( int fd, struct process *process, unsigned int flags,
+                                      const struct security_descriptor *sd );
+ extern struct thread *get_thread_from_id( thread_id_t id );
+ extern struct thread *get_thread_from_handle( obj_handle_t handle, unsigned int access );
+

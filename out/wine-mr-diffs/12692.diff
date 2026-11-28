@@ -1,0 +1,49 @@
+# ntdll: Use the actual image mapping base for transfer addresses.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12692 state=closed
+# Since https://gitlab.winehq.org/wine/wine/-/commit/8eb8dd9977fe164de76754d2ab4400160a78e47c `virtual_fill_image_information()` uses `pe_info->map_addr` to calculate `info->TransferAddress`.
+
+On OpenBSD `map_image_view()` fails because the random address is above user space limits.
+
+It falls back to `map_image_into_view()` but does not reflect the new base in map_addr.
+
+[wine-test-debug.log](/uploads/41a18dd403d78e0015b0f21163993374/wine-test-debug.log)
+
+> trace:virtual:virtual_init host addr space limit: 0x7f7fffff0000
+>
+> trace:virtual:map_view got mem in reserved area 0x10000-0x83000
+>
+> trace:module:map_image_into_view relocating L"\\??\\C:\\windows\\system32\\wineboot.exe" dynamic base 140000000 -\> 7ff6ef620000 mapped at 0x10000
+>
+> trace:module:perform_relocations relocating from 00007FF6EF620000-00007FF6EF693000 to 0000000000010000-0000000000083000
+
+Consequently, it crashes using the wrong address.
+
+> wine: Unhandled page fault on execute access to 00007FF6EF628220 at address 00007FF6EF628220 (thread 002c), starting debugger...
+
+As I'm confused by all these mappings/views, server/client, base/map_addr ... I doubt the two changes I made are the correct fix.
+
+Hopefully this is at least a good hint. With those two changes, tests run.
+
+Next, I'm going to adjust the random range on OpenBSD and see how it works (any advice?).
+--- dlls/ntdll/unix/virtual.c
++++ dlls/ntdll/unix/virtual.c
+@@ -3202,6 +3202,7 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
+     }
+     if (NT_SUCCESS(status))
+     {
++        pe_mapping->image.map_addr = pe_mapping->image.base - offset;
+         if (is_builtin && !offset) add_builtin_module( view->base, NULL );
+         *addr_ptr = view->base;
+         *size_ptr = size;
+
+--- server/mapping.c
++++ server/mapping.c
+@@ -1734,6 +1734,7 @@ DECL_HANDLER(map_image_view)
+         view->committed = NULL;
+         view->shared    = mapping->shared ? (struct shared_map *)grab_object( mapping->shared ) : NULL;
+         view->image     = mapping->image;
++        view->image.map_addr = req->base - req->offset;
+         if (add_process_view( current, view ))
+         {
+             current->entry_point = view->base + req->entry;
+

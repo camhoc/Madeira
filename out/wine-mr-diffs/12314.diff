@@ -1,0 +1,296 @@
+# Handle dead keys correctly in shared VkKeyScanEx and MapVirtualKeyEx implementations.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/12314 state=opened
+# 
+--- dlls/user32/tests/input.c
++++ dlls/user32/tests/input.c
+@@ -3292,6 +3292,7 @@ static void test_key_map(void)
+         UINT map_type;
+         UINT expected;
+         BOOL todo;
++        WORD lang;
+     } tests[] =
+     {
+         {0x136, MAPVK_VSC_TO_VK_EX, 0, TRUE},
+@@ -3324,6 +3325,15 @@ static void test_key_map(void)
+         {VK_SCROLL, MAPVK_VK_TO_VSC_EX, 0x46},
+         {VK_CANCEL, MAPVK_VK_TO_VSC_EX, 0xe046, TRUE},
+         {VK_SNAPSHOT, MAPVK_VK_TO_VSC_EX, 0x54},
++
++        {VK_SPACE, MAPVK_VK_TO_CHAR, ' '},
++        {VK_SHIFT, MAPVK_VK_TO_CHAR, 0},
++        {VK_RIGHT, MAPVK_VK_TO_CHAR, 0},
++        {'Q', MAPVK_VK_TO_CHAR, 'Q', TRUE, 0x0419},
++        {VK_OEM_PERIOD, MAPVK_VK_TO_CHAR, 0x044e, TRUE, 0x0419},
++        {'A', MAPVK_VK_TO_CHAR, 'A', FALSE, 0x040c},
++        {'2', MAPVK_VK_TO_CHAR, 0x00e9, TRUE, 0x040c},
++        {VK_OEM_6, MAPVK_VK_TO_CHAR, 0x8000005e, TRUE, 0x040c},
+     };
+     HKL kl = GetKeyboardLayout(0);
+     UINT kL, kR, s, sL, r;
+@@ -3340,34 +3350,34 @@ static void test_key_map(void)
+         { VK_NUMPAD9, VK_PRIOR },
+     };
+ 
+-    s  = MapVirtualKeyExA(VK_SHIFT,  MAPVK_VK_TO_VSC, kl);
++    s  = MapVirtualKeyExW(VK_SHIFT,  MAPVK_VK_TO_VSC, kl);
+     ok(s != 0, "MapVirtualKeyEx(VK_SHIFT) should return non-zero\n");
+-    sL = MapVirtualKeyExA(VK_LSHIFT, MAPVK_VK_TO_VSC, kl);
++    sL = MapVirtualKeyExW(VK_LSHIFT, MAPVK_VK_TO_VSC, kl);
+     ok(s == sL || broken(sL == 0), /* win9x */
+        "%x != %x\n", s, sL);
+ 
+-    kL = MapVirtualKeyExA(0x2a, MAPVK_VSC_TO_VK, kl);
++    kL = MapVirtualKeyExW(0x2a, MAPVK_VSC_TO_VK, kl);
+     ok(kL == VK_SHIFT, "Scan code -> vKey = %x (not VK_SHIFT)\n", kL);
+-    kR = MapVirtualKeyExA(0x36, MAPVK_VSC_TO_VK, kl);
++    kR = MapVirtualKeyExW(0x36, MAPVK_VSC_TO_VK, kl);
+     ok(kR == VK_SHIFT, "Scan code -> vKey = %x (not VK_SHIFT)\n", kR);
+ 
+-    kL = MapVirtualKeyExA(0x2a, MAPVK_VSC_TO_VK_EX, kl);
++    kL = MapVirtualKeyExW(0x2a, MAPVK_VSC_TO_VK_EX, kl);
+     ok(kL == VK_LSHIFT || broken(kL == 0), /* win9x */
+        "Scan code -> vKey = %x (not VK_LSHIFT)\n", kL);
+-    kR = MapVirtualKeyExA(0x36, MAPVK_VSC_TO_VK_EX, kl);
++    kR = MapVirtualKeyExW(0x36, MAPVK_VSC_TO_VK_EX, kl);
+     ok(kR == VK_RSHIFT || broken(kR == 0), /* win9x */
+        "Scan code -> vKey = %x (not VK_RSHIFT)\n", kR);
+ 
+     /* test that MAPVK_VSC_TO_VK prefers the non-numpad vkey if there's ambiguity */
+     for (i = 0; i < ARRAY_SIZE(numpad_collisions); i++)
+     {
+-        UINT numpad_scan = MapVirtualKeyExA(numpad_collisions[i][0],  MAPVK_VK_TO_VSC, kl);
+-        UINT other_scan  = MapVirtualKeyExA(numpad_collisions[i][1],  MAPVK_VK_TO_VSC, kl);
++        UINT numpad_scan = MapVirtualKeyExW(numpad_collisions[i][0],  MAPVK_VK_TO_VSC, kl);
++        UINT other_scan  = MapVirtualKeyExW(numpad_collisions[i][1],  MAPVK_VK_TO_VSC, kl);
+ 
+         /* do they really collide for this layout? */
+         if (numpad_scan && other_scan == numpad_scan)
+         {
+-            UINT vkey = MapVirtualKeyExA(numpad_scan, MAPVK_VSC_TO_VK, kl);
++            UINT vkey = MapVirtualKeyExW(numpad_scan, MAPVK_VSC_TO_VK, kl);
+             ok(vkey != numpad_collisions[i][0],
+                "Got numpad vKey %x for scan code %x when there was another choice\n",
+                vkey, numpad_scan);
+@@ -3375,20 +3385,59 @@ static void test_key_map(void)
+     }
+ 
+     /* test the scan code prefixes of the right variant of a keys */
+-    s = MapVirtualKeyExA(VK_RCONTROL, MAPVK_VK_TO_VSC, kl);
++    s = MapVirtualKeyExW(VK_RCONTROL, MAPVK_VK_TO_VSC, kl);
+     ok(s >> 8 == 0x00, "Scan code prefixes should not be returned when not using MAPVK_VK_TO_VSC_EX %#1x\n", s >> 8);
+-    s = MapVirtualKeyExA(VK_RCONTROL, MAPVK_VK_TO_VSC_EX, kl);
++    s = MapVirtualKeyExW(VK_RCONTROL, MAPVK_VK_TO_VSC_EX, kl);
+     ok(s >> 8 == 0xE0 || broken(s == 0), "Scan code prefix for VK_RCONTROL should be 0xE0 when MAPVK_VK_TO_VSC_EX is set, was %#1x\n", s >> 8);
+-    s = MapVirtualKeyExA(VK_RMENU, MAPVK_VK_TO_VSC_EX, kl);
++    s = MapVirtualKeyExW(VK_RMENU, MAPVK_VK_TO_VSC_EX, kl);
+     ok(s >> 8 == 0xE0 || broken(s == 0), "Scan code prefix for VK_RMENU should be 0xE0 when MAPVK_VK_TO_VSC_EX is set, was %#1x\n", s >> 8);
+-    s = MapVirtualKeyExA(VK_RSHIFT, MAPVK_VK_TO_VSC_EX, kl);
++    s = MapVirtualKeyExW(VK_RSHIFT, MAPVK_VK_TO_VSC_EX, kl);
+     ok(s >> 8 == 0x00 || broken(s == 0), "The scan code shouldn't have a prefix, got %#1x\n", s >> 8);
+ 
+     for (i = 0; i < ARRAY_SIZE(tests); i++)
+     {
+-        r = MapVirtualKeyExA(tests[i].input, tests[i].map_type, kl);
+-        todo_wine_if(tests[i].todo) ok(r == tests[i].expected, "Unexpected %s %x -> %x\n",
+-                                       debug_map_type(tests[i].map_type), tests[i].input, r);
++        if (tests[i].lang && tests[i].lang != HIWORD(kl)) continue;
++        r = MapVirtualKeyExW(tests[i].input, tests[i].map_type, kl);
++        todo_wine_if(tests[i].todo) ok(r == tests[i].expected, "Layout %p: unexpected %s %x -> %x, expected %x\n",
++                                       kl, debug_map_type(tests[i].map_type), tests[i].input, r, tests[i].expected);
++    }
++}
++
++static void test_VkKeyScanEx(void)
++{
++    static const struct
++    {
++        WORD lang;
++        WCHAR character;
++        SHORT expected;
++        BOOL todo;
++    } tests[] =
++    {
++        {0x0409, 'a', 'A'},
++        {0x0409, 'A', 0x0141},
++        {0x0409, '1', '1'},
++        {0x0409, '+', 0x01bb},
++        {0x0409, '*', 0x0138},
++        {0x0409, 0, 0x0332, TRUE},
++        {0x0409, 0x00e9, -1},
++        {0x0409, 0x0800, -1},
++        {0x040c, 0x00e9, '2'},
++        {0x040c, '^', VK_OEM_6, TRUE},
++        {0x040c, 0x00a8, 0x0100 | VK_OEM_6, TRUE},
++        {0x040c, '`', 0x0637, TRUE},
++        {0x040c, 0x0800, -1},
++    };
++    HKL layout = GetKeyboardLayout(0);
++    SHORT ret;
++    UINT i;
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        if (tests[i].lang != HIWORD(layout)) continue;
++        ret = VkKeyScanExW(tests[i].character, layout);
++        todo_wine_if(tests[i].todo)
++        ok(ret == tests[i].expected, "Layout %p, character %#x: got %#x, expected %#x\n",
++           layout, tests[i].character, (WORD)ret, (WORD)tests[i].expected);
+     }
+ }
+ 
+@@ -6920,6 +6969,7 @@ START_TEST(input)
+     run_in_desktop( argv, "test_input_desktop", 1 );
+     test_keynames();
+     test_key_map();
++    test_VkKeyScanEx();
+     test_ToUnicode();
+     test_ToAscii();
+     test_get_async_key_state();
+
+--- dlls/win32u/input.c
++++ dlls/win32u/input.c
+@@ -448,19 +448,31 @@ static void kbd_tables_init_vsc2vk( const KBDTABLES *tables, USHORT vsc2vk[0x300
+ 
+ #define NEXT_ENTRY(t, e) ((void *)&(e)->wch[(t)->nModifications])
+ 
+-static void kbd_tables_init_vk2char( const KBDTABLES *tables, BYTE vk2char[0x100] )
++static void kbd_tables_init_vk2char( const KBDTABLES *tables, UINT vk2char[0x100] )
+ {
+     const VK_TO_WCHAR_TABLE *table;
+-    const VK_TO_WCHARS1 *entry;
++    const VK_TO_WCHARS1 *entry, *dead;
++    WCHAR wch;
++    UINT flags;
+ 
+-    memset( vk2char, 0, 0x100 );
++    memset( vk2char, 0, 0x100 * sizeof(*vk2char) );
+ 
+     for (table = tables->pVkToWcharTable; table->pVkToWchars; table++)
+     {
+         for (entry = table->pVkToWchars; entry->VirtualKey; entry = NEXT_ENTRY(table, entry))
+         {
+-            if (entry->VirtualKey & ~0xff) continue;
+-            vk2char[entry->VirtualKey] = entry->wch[0];
++            if (entry->VirtualKey == 0xff) continue;
++            wch = entry->wch[0];
++            flags = 0;
++            if (wch == WCH_DEAD)
++            {
++                dead = NEXT_ENTRY(table, entry);
++                if (dead->VirtualKey != 0xff) continue;
++                wch = dead->wch[0];
++                flags = 0x80000000;
++            }
++            if (wch == WCH_NONE || wch == WCH_DEAD) continue;
++            vk2char[entry->VirtualKey] = flags | wch;
+         }
+     }
+ }
+@@ -493,8 +505,9 @@ static UINT kbd_tables_get_mod_num( const KBDTABLES *tables, const BYTE *state,
+ static WORD kbd_tables_wchar_to_vkey( const KBDTABLES *tables, WCHAR wch )
+ {
+     const VK_TO_WCHAR_TABLE *table;
+-    const VK_TO_WCHARS1 *entry;
++    const VK_TO_WCHARS1 *entry, *dead;
+     WORD bits;
++    WCHAR value;
+     BYTE mod;
+ 
+     if (wch == '\x001b') return VK_ESCAPE;
+@@ -503,9 +516,17 @@ static WORD kbd_tables_wchar_to_vkey( const KBDTABLES *tables, WCHAR wch )
+     {
+         for (entry = table->pVkToWchars; entry->VirtualKey; entry = NEXT_ENTRY(table, entry))
+         {
++            if (entry->VirtualKey == 0xff) continue;
+             for (mod = 0; mod < table->nModifications; ++mod)
+             {
+-                if (entry->wch[mod] == WCH_NONE || entry->wch[mod] != wch) continue;
++                value = entry->wch[mod];
++                if (value == WCH_DEAD)
++                {
++                    dead = NEXT_ENTRY(table, entry);
++                    if (dead->VirtualKey != 0xff) continue;
++                    value = dead->wch[mod];
++                }
++                if (value == WCH_NONE || value != wch) continue;
+                 bits = kbd_tables_get_mod_bits( tables, mod );
+                 return (bits << 8) | entry->VirtualKey;
+             }
+@@ -1231,13 +1252,38 @@ WORD WINAPI NtUserVkKeyScanEx( WCHAR chr, HKL layout )
+ }
+ 
+ 
++static UINT map_virtual_key_scan( const KBDTABLES *tables, UINT code, BOOL vsc_to_vk )
++{
++    USHORT vsc2vk[0x300];
++    UINT ret;
++
++    kbd_tables_init_vsc2vk( tables, vsc2vk );
++    if (vsc_to_vk)
++    {
++        if (code >= ARRAY_SIZE(vsc2vk)) return 0;
++        return vsc2vk[code] & 0xff;
++    }
++
++    for (ret = 0; ret < ARRAY_SIZE(vsc2vk); ++ret) if ((vsc2vk[ret] & 0xff) == code) break;
++    if (ret >= ARRAY_SIZE(vsc2vk)) return 0;
++    return ret;
++}
++
++static UINT map_virtual_key_char( const KBDTABLES *tables, UINT code )
++{
++    UINT vk2char[0x100];
++
++    kbd_tables_init_vk2char( tables, vk2char );
++    if (code >= ARRAY_SIZE(vk2char)) return 0;
++    if (code >= 'A' && code <= 'Z') return code;
++    return vk2char[code];
++}
++
+ /******************************************************************************
+  *	     NtUserMapVirtualKeyEx    (win32u.@)
+  */
+ UINT WINAPI NtUserMapVirtualKeyEx( UINT code, UINT type, HKL layout )
+ {
+-    USHORT vsc2vk[0x300];
+-    BYTE vk2char[0x100];
+     const KBDTABLES *kbd_tables;
+     UINT ret = 0;
+ 
+@@ -1269,9 +1315,7 @@ UINT WINAPI NtUserMapVirtualKeyEx( UINT code, UINT type, HKL layout )
+         case VK_DECIMAL: code = VK_DELETE; break;
+         }
+ 
+-        kbd_tables_init_vsc2vk( kbd_tables, vsc2vk );
+-        for (ret = 0; ret < ARRAY_SIZE(vsc2vk); ++ret) if ((vsc2vk[ret] & 0xff) == code) break;
+-        if (ret >= ARRAY_SIZE(vsc2vk)) ret = 0;
++        ret = map_virtual_key_scan( kbd_tables, code, FALSE );
+ 
+         if (type == MAPVK_VK_TO_VSC)
+         {
+@@ -1282,11 +1326,8 @@ UINT WINAPI NtUserMapVirtualKeyEx( UINT code, UINT type, HKL layout )
+         break;
+     case MAPVK_VSC_TO_VK:
+     case MAPVK_VSC_TO_VK_EX:
+-        kbd_tables_init_vsc2vk( kbd_tables, vsc2vk );
+-
+         if (code & 0xe000) code -= 0xdf00;
+-        if (code >= ARRAY_SIZE(vsc2vk)) ret = 0;
+-        else ret = vsc2vk[code] & 0xff;
++        ret = map_virtual_key_scan( kbd_tables, code, TRUE );
+ 
+         if (type == MAPVK_VSC_TO_VK)
+         {
+@@ -1299,10 +1340,7 @@ UINT WINAPI NtUserMapVirtualKeyEx( UINT code, UINT type, HKL layout )
+         }
+         break;
+     case MAPVK_VK_TO_CHAR:
+-        kbd_tables_init_vk2char( kbd_tables, vk2char );
+-        if (code >= ARRAY_SIZE(vk2char)) ret = 0;
+-        else if (code >= 'A' && code <= 'Z') ret = code;
+-        else ret = vk2char[code];
++        ret = map_virtual_key_char( kbd_tables, code );
+         break;
+     default:
+         FIXME_(keyboard)( "unknown type %d\n", type );
+

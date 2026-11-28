@@ -1,0 +1,51 @@
+# winemac: Make macdrv_client_surface_detach() thread-safe.
+# https://gitlab.winehq.org/wine/wine/-/merge_requests/11917 state=closed
+# The issue this fixes is a bit tricky to reproduce, but does happen fairly reliably with the FFXIV benchmark, and shows up in logs like so :
+
+```
+27095.417:0020:0024:trace:macdrv:macdrv_client_surface_detach 0x100d6/0x600002c30a80
+27095.417:0020:0024:trace:win:client_surface_release_locked 0x100d6/0x600002c1c0e0 decreasing refcount to 1
+27095.417:0020:0024:trace:wgl:opengl_drawable_release 0x0/0x600002c30a80/0x6000030846e0 (format 13) decreasing refcount to 1
+27095.417:0020:0024:trace:wgl:opengl_drawable_release 0x0/0x600002c30a80/0x6000030846e0 (format 13) decreasing refcount to 0
+27095.417:0020:0024:trace:wgl:framebuffer_surface_destroy 0x0/0x600002c30a80/0x6000030846e0 (format 13)
+27095.417:0020:0024:trace:wgl:macdrv_make_current draw 0x0/0x600002c30a80/0x600003084dc0 (format 13), read 0x0/0x600002c30a80/0x600003084dc0 (format 13), context 0x60000230fa80
+27095.417:0020:0024:trace:wgl:macdrv_make_current making context current with draw_view 0x7f7f0e64e200 draw_pbuffer 0x0 read_view 0x0 read_pbuffer 0x0 format 1
+27095.417:0020:00f0:trace:seh:handle_syscall_fault code=c0000005 flags=0 addr=0x7ff805715f1d ip=7ff805715f1d
+27095.417:0020:00f0:trace:seh:handle_syscall_fault info[0]=0000000000000000
+27095.417:0020:00f0:trace:seh:handle_syscall_fault info[1]=0000000000000018
+27095.417:0020:00f0:trace:seh:handle_syscall_fault rax=00007f7f0e64e200 rbx=0000600001d2ed40 rcx=ff80008800000001 rdx=000060000084d650
+27095.417:0020:00f0:trace:seh:handle_syscall_fault rsi=000000020f8be425 rdi=00007f7f0e64e200 rbp=00007ff20650ca00 rsp=00007ff20650c9e8
+27095.417:0020:00f0:trace:seh:handle_syscall_fault r8=0000003000000000 r9=0000000000000000 r10=0000000000000000 r11=000000020f8be425
+27095.417:0020:00f0:trace:seh:handle_syscall_fault r12=000000020f8c65a8 r13=00007ff20650ca50 r14=00007f7f0e705140 r15=00007f7f0e80b070
+27095.417:0020:00f0:err:seh:send_debug_event Exception c0000005 in system thread at 0x7ff805715f1d
+00f0: terminate_process( handle=ffffffff, exit_code=-1073741819 )
+0024: k
+--- dlls/winemac.drv/window.c
++++ dlls/winemac.drv/window.c
+@@ -1082,21 +1082,22 @@ static void macdrv_client_surface_destroy(struct client_surface *client)
+ static void macdrv_client_surface_detach(struct client_surface *client)
+ {
+     struct macdrv_client_surface *surface = impl_from_client_surface(client);
++    macdrv_view cocoa_view;
+ 
+     TRACE("%s\n", debugstr_client_surface(client));
+ 
+-    if (surface->cocoa_view)
++    if ((cocoa_view = InterlockedExchangePointer((void **)&surface->cocoa_view, NULL)))
+     {
+         struct macdrv_win_data *data;
+ 
+         if ((data = get_win_data(client->hwnd)))
+         {
+-            if (data->client_view == surface->cocoa_view)
++            if (data->client_view == cocoa_view)
+                 data->client_view = NULL;
+             release_win_data(data);
+         }
+ 
+-        macdrv_dispose_view(surface->cocoa_view);
++        macdrv_dispose_view(cocoa_view);
+     }
+ }
+ 
+

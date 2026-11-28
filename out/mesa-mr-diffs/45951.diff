@@ -1,0 +1,41 @@
+# kk: Disable KK_WORKAROUND_10 on M3+
+# https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/45951 state=merged
+# ### What does this MR do and why?
+
+<!--Describe in detail what your merge request does and why.-->
+
+In bcsel, the extra true is no longer needed to avoid the compiler error. The error happened on M1 and M2. On M3+ it no longer happens.
+
+Changed one line in kk_physical_device.c, inside the M3+ workarounds block. Added new condition for M3+ (`gpu_apple_family >= 9`). Added a new line in the Log section of the KK_WORKAROUND_10 entry in workarounds.rst.
+
+* CTS: 56,319 subgroups, glsl, spirv and draw tests. Results were exactly the same with the workaround enabled and disabled: 9,402 Pass, 6 Fail and 6 DeviceLost that already existed before, and the rest NotSupported. This includes the subgroupinclusive\*\_vec4 tests, which were the ones originally failing, and they pass.
+* Hardware: M5 Pro, macOS 27.2.
+* Improvement: in a heavy game in a PS5 emulator, with the workaround, compiling large compute shaders took about 3 times longer, and the game froze while compiling.
+
+Assisted-by: LLM 
+
+Original Language: ESP
+--- docs/drivers/kosmickrisp/workarounds.rst
++++ docs/drivers/kosmickrisp/workarounds.rst
+@@ -197,6 +197,7 @@ of the ``bcsel``.
+ 
+ | Log:
+ | 2026-05-14: Workaround implemented
++| 2026-11-05: Workaround disabled on M3+
+ 
+ KK_WORKAROUND_9
+ ---------------
+
+--- src/kosmickrisp/vulkan/kk_physical_device.c
++++ src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -1139,6 +1139,9 @@ kk_parse_environment_options(struct kk_physical_device *pdev)
+    if (pdev->info.gpu_apple_family < 9) {
+       settings->disabled_workarounds |= BITFIELD64_BIT(18);
+    }
++   if (pdev->info.gpu_apple_family >= 9) {
++      settings->disabled_workarounds |= BITFIELD64_BIT(10);
++   }
+ }
+ 
+ VkResult
+

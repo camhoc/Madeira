@@ -17,3 +17,9 @@ Off switch: `env.MADEIRA_METAL_GATE_SKIP_SYSTEM = 0` restores 0.2.180 behaviour 
 - 041e4539 (iPad, process-exit): main in SwiftUI layout, 5 DepotDownloader.write threads running. Not explained.
 - 204bb8b1 (iPad13,18, scene-update "stuck", foreground): main idle, thread 5 `cap_main` (BackgroundCPUCap). Not explained.
 - BO3 black window after the game kills itself: no link found in these stacks (none involve the gate or app inactivity). Unproven either way.
+
+## Revision 2 (Nov 28, after laptop review FAIL)
+1. Test: check-background-run.py updated (new commit-line check, RenderBox-only check, MadeiraConfig.flag and madeira_metal_gate_skip_system stubs). Not run here (no Swift on this box); laptop must run it.
+2. dladdr now runs only while inactive (mbg_inactive_now() first), never on the active render path.
+3. Wrong-skip risk: match narrowed from all /System/ + /usr/lib/ images to `/RenderBox.framework/` only, so a tail-called commit with libdispatch as caller still waits. MoltenVK/Mesa call sites not audited: unproven; narrow match is the guard.
+4. ConfigCatalog entry for env.MADEIRA_METAL_GATE_SKIP_SYSTEM still needed (generated; build thread adds).

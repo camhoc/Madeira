@@ -1,0 +1,2 @@
+# CHECK: oversize-reserve-min-mb
+Port of arabdogwater commits 37361885c + 5c4fdc449 (GPL-3.0; credit in README). Native: virtual_ios.c + signal_arm64_ios.c + catalog keys; all off by default. Independent second review plus compile check. It touches signal_arm64_ios.c, which fix/bo3-stp-sd-emul also edits: check the hunks do not collide. Check the items README says were not checked (jumbo-fit interaction is moot, jumbo-fit-pow2 was dropped; signal hunks). RESULT.md "Compile:" and "Review:" PASS or FAIL.

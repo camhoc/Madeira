@@ -1,0 +1,195 @@
+diff --git a/app/Madeira/ConfigCatalog.generated.swift b/app/Madeira/ConfigCatalog.generated.swift
+index fd7481d..052a46c 100644
+--- a/app/Madeira/ConfigCatalog.generated.swift
++++ b/app/Madeira/ConfigCatalog.generated.swift
+@@ -746,6 +746,9 @@ extension ConfigCatalog {
+         ConfigOption(key: "oversize-reserve", title: "", kind: .bool, defaultValue: "0", category: "Memory & JIT pool", note: "ml1298: serve a reserve too big for the map in part (Game details > Large memory reservations)", choices: [], sources: ["build/ntdll-unix/virtual_ios.c"]),
+         ConfigOption(key: "oversize-reserve-mb", title: "", kind: .int, defaultValue: "16384", category: "Memory & JIT pool", note: "ml1298: its real part (MB)", choices: [], sources: ["build/ntdll-unix/virtual_ios.c"]),
+         ConfigOption(key: "oversize-reserve-min-gb", title: "", kind: .int, defaultValue: "64", category: "Memory & JIT pool", note: "ml1300: the size from which a reserve counts as oversize. Default 64 GB. A game's own config can lower it with oversize-reserve-min-gb (never below 33, so Chromium's 16 and 32 GB pools stay on their own paths). Subliminal (UE5) asks for ...", choices: [], sources: ["build/ntdll-unix/virtual_ios.c"]),
++        ConfigOption(key: "oversize-reserve-top", title: "", kind: .bool, defaultValue: "0", category: "Memory & JIT pool", note: "ml1298b: put the real part against the top of the address space, so the unmapped rest lies past the task ceiling", choices: [], sources: ["build/ntdll-unix/virtual_ios.c"]),
++        ConfigOption(key: "oversize-pool-real-mb", title: "", kind: .int, defaultValue: "1024", category: "Memory & JIT pool", note: "ml1298c: real part of a reserve under 64 GB served in part (MB)", choices: [], sources: ["build/ntdll-unix/virtual_ios.c"]),
++        ConfigOption(key: "oversize-reserve-min-mb", title: "", kind: .int, defaultValue: "0", category: "Memory & JIT pool", note: "ml1298c: smallest failed unhinted reserve served in part (MB, 1024 to 65536); 0 = use oversize-reserve-min-gb. Below 65536 this also serves pools", choices: [], sources: ["build/ntdll-unix/virtual_ios.c"]),
+         ConfigOption(key: "pool", title: "JIT pool size (MB)", kind: .text, defaultValue: "", category: "Memory & JIT pool", note: "madeira.cfg pool: the JIT pool size in MB (256 to 1152); wins over the size above. The game's own file wins over madeira.cfg, so a game can size the pool to fit a free run above its executable window and pair it with pool-low.", choices: [], sources: ["app/Madeira/ContentView.swift"]),
+         ConfigOption(key: "pool-low", title: "JIT code buffers below the executable window", kind: .bool, defaultValue: "0", category: "Memory & JIT pool", note: "1: a free run below the 0x140000000 executable window (less pool-low-margin) becomes a third debugger region for the emulator's code buffers, so the whole JIT pool is left to DLL copies (GTA V: about 300 MB more). Needs the pool above the window; costs the region's size in memory. Off by default; read at launch, the game's own file wins.", choices: [], sources: ["app/Madeira/StikJITHelper.swift"]),
+         ConfigOption(key: "pool-low-margin", title: "Code-buffer region: MB left free below the window", kind: .int, defaultValue: "128", category: "Memory & JIT pool", note: "With pool-low on: how much of the free run below the executable window stays free for programs that load there (child processes' main executables). A run with a free run at least this large below it keeps none. 128 by default.", choices: [], sources: ["app/Madeira/StikJITHelper.swift"]),
+diff --git a/build/ntdll-unix/signal_arm64_ios.c b/build/ntdll-unix/signal_arm64_ios.c
+index c475956..9dbc541 100644
+--- a/build/ntdll-unix/signal_arm64_ios.c
++++ b/build/ntdll-unix/signal_arm64_ios.c
+@@ -2182,6 +2182,20 @@ void ios_reclaim_note_page( unsigned long long pg )
+     ios_rr_pages[slot % IOS_RRPAGE_MAX] = pg;
+ }
+ 
++/* ml1298b: the emulator's host arena as ios_reserve_fex_arena published it
++ * (virtual_ios.c), else the hardware band it takes by default. The recovery
++ * paths below repair EMULATOR pages in it (restore R|X, or a fresh zero page for
++ * a reclaimed code-cache page); with arena-mb moving the arena, the hardware
++ * band holds guest memory instead, where the same repair would hide a real
++ * access violation or zero live data. */
++extern ULONG_PTR ios_fex_arena_base_unix, ios_fex_arena_end_unix;
++static inline int ios_in_fex_arena( unsigned long long a )
++{
++    if (ios_fex_arena_end_unix > ios_fex_arena_base_unix)
++        return a >= ios_fex_arena_base_unix && a < ios_fex_arena_end_unix;
++    return a >= 0x7C00000000ULL && a < 0x8000000000ULL;
++}
++
+ void ios_reclaim_pages_report( const char *when, unsigned long long fault_addr );
+ void ios_reclaim_pages_report( const char *when, unsigned long long fault_addr )
+ {
+@@ -6855,7 +6869,7 @@ wx_done: ;
+                     uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
+                     int in_pool_rx = (rx && fa >= rx && fa < rx + ios_jit_pool_size_global) ||
+                                      ios_jit_low_contains( (uintptr_t)fa );   /* madeira-bcd pool-low */
+-                    int in_band    = (fa >= 0x7C00000000ULL && fa < 0x8000000000ULL);
++                    int in_band    = ios_in_fex_arena( fa );   /* ml1298b */
+ 
+                     if (in_pool_rx || in_band)
+                     {
+@@ -6969,8 +6983,7 @@ wx_done: ;
+                          ios_jit_low_rw_contains( (uintptr_t)fa )))   /* madeira-bcd pool-low */
+                         goto skip_reclaim_band;
+                 }
+-                if (!handled && fa != (uint64_t)fault_pc &&
+-                    fa >= 0x7C00000000ULL && fa < 0x8000000000ULL)
++                if (!handled && fa != (uint64_t)fault_pc && ios_in_fex_arena( fa ))   /* ml1298b */
+                 {
+                     static volatile uint64_t rr_pg[16] = {0};
+                     static volatile uint32_t rr_n[16]  = {0};
+diff --git a/build/ntdll-unix/virtual_ios.c b/build/ntdll-unix/virtual_ios.c
+index bdeff36..7ccfd8e 100644
+--- a/build/ntdll-unix/virtual_ios.c
++++ b/build/ntdll-unix/virtual_ios.c
+@@ -27968,10 +27968,28 @@ static SIZE_T ios_oversize_min( void )
+         long long gb = madeira_cfg_int( "oversize-reserve-min-gb", 64 );
+         if (gb < 33 || gb > 64) gb = 64;
+         min = (SIZE_T)gb << 30;
++        /* ml1298c (arabdogwater/Madeira 5c4fdc449, GPL-3.0, ported with credit): oversize-reserve-min-mb lowers it
++         * below 33 GB, down to 1024 MB, so a game's 4 GB pools that fail to reserve are served in part too. The
++         * pools take the oversize-pool-real-mb path in ios_oversize_reserve. 0 (default) keeps min-gb alone. */
++        long long mb = madeira_cfg_int( "oversize-reserve-min-mb", 0 );
++        if (mb > 0)
++        {
++            if (mb < 1024) mb = 1024;
++            if (mb > 65536) mb = 65536;
++            min = (SIZE_T)mb << 20;
++        }
+     }
+     return min;
+ }
+ 
++/* ml1298c: the real part of a reserve under 64 GB served in part (MB). Default 1024. */
++static long long ios_oversize_pool_real_mb( void )
++{
++    static long long mb = -1;
++    if (mb < 0) mb = madeira_cfg_int( "oversize-pool-real-mb", 1024 );
++    return mb;
++}
++
+ static long long ios_oversize_real_mb( void )
+ {
+     static long long mb = -1;
+@@ -35036,6 +35054,51 @@ static struct { uintptr_t base; SIZE_T real, size; } ios_oversize[IOS_OVERSIZE_S
+ static unsigned ios_oversize_n;
+ static pthread_mutex_t ios_oversize_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
++/* ml1298b: where the real part goes. By default it takes the lowest hole that
++ * fits, and the unmapped rest of the reserve then covers whatever else the map
++ * holds above it -- Wine's DLLs, thread stacks, the emulator's arena, other
++ * pools. A program that commits deep into its reserve (Cyberpunk 2077 2.5 asked
++ * for 64 GB and committed past a 2 GB and a 6 GB real part, 2026-11-05) then
++ * either fails on a foreign image or, where the address is free inside
++ * someone else's reservation, commits into it. Against the top of the map the
++ * rest of the reserve lies past the task ceiling, where nothing can be mapped:
++ * every commit past the real part fails, and only the owner's commits are
++ * logged by ios_oversize_commit_failed. */
++static int ios_oversize_top( void )
++{
++    static int top = -1;
++    if (top < 0)
++        top = madeira_cfg_bool( "oversize-reserve-top", 0 );   /* ml1298b: put the real part against the top of the address space, so the unmapped rest lies past the task ceiling */
++    return top;
++}
++
++/* ml1298b: the real part as high as it fits, in 16 MB steps down from the map's
++ * end. The map ends at 0x8000000000 here (ml990); the last few MB below it are
++ * usually taken, so the first candidates fail and cost one view lookup each. */
++static NTSTATUS ios_oversize_place_top( void **base, SIZE_T *sz, ULONG type, ULONG protect )
++{
++    const ULONG_PTR ceiling = 0x8000000000ULL, step = 0x1000000;
++    ULONG_PTR cand;
++    unsigned tries;
++
++    if (*sz >= ceiling - 0x7000000000ULL) return STATUS_NO_MEMORY;
++    for (cand = (ceiling - *sz) & ~(ULONG_PTR)0xffff, tries = 0;
++         cand >= 0x7000000000ULL && tries < 2048; cand -= step, tries++)
++    {
++        void *b = (void *)cand;
++        SIZE_T s = *sz;
++        if (!allocate_virtual_memory( &b, &s, type & ~MEM_TOP_DOWN, protect, 0, 0, 0, 0 ))
++        {
++            dprintf( 2, "[oversize] ml1298b real part at the top: %p+%llu MB, %llu MB below the map's end "
++                     "(%u candidate(s))\n", b, (unsigned long long)(s >> 20),
++                     (unsigned long long)((ceiling - ((ULONG_PTR)b + s)) >> 20), tries + 1 );
++            *base = b; *sz = s;
++            return STATUS_SUCCESS;
++        }
++    }
++    return STATUS_NO_MEMORY;
++}
++
+ static NTSTATUS ios_oversize_reserve( void **ret, SIZE_T *size_ptr, ULONG type, ULONG protect )
+ {
+     long long cap_mb = ios_oversize_real_mb();
+@@ -35053,6 +35116,15 @@ static NTSTATUS ios_oversize_reserve( void **ret, SIZE_T *size_ptr, ULONG type,
+     }
+     real = (SIZE_T)cap_mb << 20;
+     floor = min( real, (SIZE_T)1 << 30 );
++    if (want < IOS_OVERSIZE_MIN)   /* ml1298c: a pool (oversize-reserve-min-mb below 64 GB) */
++    {
++        long long pm = ios_oversize_pool_real_mb();
++        if (pm <= 0) return STATUS_NO_MEMORY;
++        real = min( real, (SIZE_T)pm << 20 );
++        if (real > want / 2) real = (want / 2) & ~(SIZE_T)(IOS_OVERSIZE_ALIGN - 1);
++        floor = min( real, (SIZE_T)256 << 20 );
++        if (!real) return STATUS_NO_MEMORY;
++    }
+     if (ios_fft_arena_size > floor) floor = ios_fft_arena_size;   /* ml1299: the patched arena must be real */
+     for (; real >= floor; real >>= 1)
+     {
+@@ -35060,7 +35132,11 @@ static NTSTATUS ios_oversize_reserve( void **ret, SIZE_T *size_ptr, ULONG type,
+         SIZE_T sz = real, full = ROUND_SIZE( 0, want, page_mask );
+         unsigned slot;
+ 
+-        if (allocate_virtual_memory( &base, &sz, type, protect, 0, 0, IOS_OVERSIZE_ALIGN, 0 )) continue;
++        if (ios_oversize_top() && !ios_fft_arena_size && want >= IOS_OVERSIZE_MIN)   /* ml1298c: pools take a normal hole */
++        {
++            if (ios_oversize_place_top( &base, &sz, type, protect )) continue;
++        }
++        else if (allocate_virtual_memory( &base, &sz, type, protect, 0, 0, IOS_OVERSIZE_ALIGN, 0 )) continue;
+         pthread_mutex_lock( &ios_oversize_lock );
+         slot = ios_oversize_n++ % IOS_OVERSIZE_SLOTS;
+         ios_oversize[slot].base = (uintptr_t)base;
+@@ -35083,15 +35159,21 @@ static NTSTATUS ios_oversize_reserve( void **ret, SIZE_T *size_ptr, ULONG type,
+ /* ml1298: a failed commit past the real part of an oversized reserve. */
+ static void ios_oversize_commit_failed( const void *addr, SIZE_T size, NTSTATUS status )
+ {
++    /* ml1298b: the first 8, then each new depth at least 64 MB past the deepest so
++     * far (up to 64 lines): with the real part at the top these are only the
++     * owner's commits, and the deepest one is the real part it needs. */
+     static unsigned logged;
++    static uintptr_t deepest;
+     uintptr_t a = (uintptr_t)addr;
+     unsigned i;
+ 
+-    if (!ios_oversize_n || logged >= 16) return;
++    if (!ios_oversize_n || logged >= 64) return;
+     for (i = 0; i < IOS_OVERSIZE_SLOTS; i++)
+     {
+         uintptr_t b = ios_oversize[i].base;
+         if (!b || a < b + ios_oversize[i].real || a >= b + ios_oversize[i].size) continue;
++        if (logged >= 8 && a - b < deepest + (64u << 20)) return;
++        if (a - b > deepest) deepest = a - b;
+         logged++;
+         dprintf( 2, "[oversize] ml1298 commit %p+0x%llx failed (0x%x): %llu MB into the reserve at 0x%llx, "
+                  "past its real %llu MB\n", addr, (unsigned long long)size, (unsigned)status,

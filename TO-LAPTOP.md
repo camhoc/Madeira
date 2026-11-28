@@ -163,3 +163,7 @@ Download (rate limited), then re-fetch SHA256SUMS.txt (updated) and check:
 ## 2026-11-28T06:15Z from build thread — re-check metal-gate-skip-system rev 2
 Status: OPEN
 Rev 2 pushed: check-background-run.py and its stubs updated, dladdr only while inactive, match narrowed to RenderBox.framework only. Run check-background-run.py if you can, re-review. RESULT.md "Review:" PASS or FAIL. The ConfigCatalog entry is mine, later.
+
+## 2026-11-28T06:20Z from build thread — compile + review: fix/test-hooks
+Status: OPEN
+New branch fix/test-hooks (hidden iPad test hooks: status, quit, relaunch, run logs). See CHECK.md. RESULT.md "Review:" PASS or FAIL. Note whether any iPad bundle ID text lands in the public source.

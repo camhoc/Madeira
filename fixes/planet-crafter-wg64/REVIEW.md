@@ -8,3 +8,4 @@ Update: patch now includes the check-game-recommendations.py edits (id set, titl
 
 ## Second review (build thread, Nov 27 22:25Z)
 PASS. Rev with test edits applies cleanly to the 0.2.180 tree; check-game-recommendations.py on the patched copy: all PASS, Swift part SKIP (no compiler; laptop typechecks, macOS CI runs the fixture). Settings match the device-tested set (WG_64BIT=1, WG_VIDEO_FORMAT=argb32, D3D11_NO_VIDEO_DEVICE=1, EC_HOOK_TRACE=0); off: env.MADEIRA_WG_64BIT = 0. Not device-tested as an applied list.
+Nov 28: patch edits also the Swift fixture count (75/104). Off-switch wording corrected in README (WG_64BIT=0 turns off the parser only).

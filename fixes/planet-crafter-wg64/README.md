@@ -53,3 +53,8 @@ Off switch: `env.MADEIRA_WG_64BIT = 0` in the game's config (parser refused agai
 
 ## Update Nov 27 ~22:30Z: host test updated
 Laptop check (fix/planet-crafter-wg64 RESULT.md): patch applied and typechecked, but tests/host/check-game-recommendations.py failed (preset id set, title count). planet-crafter-wg64.patch now also edits that test (paths relative to the Madeira root): add 'planet-crafter' to the expected id set, to the "recognised once" loop, to the "tested without madeira-bcd defaults" tuple, and SteamTitle count len(MERGED)+4 -> +5. Not run here (no swiftc in this session); needs a laptop re-run.
+
+## Update Nov 28 ~05:00Z (laptop rev 2 FAIL, fixed)
+Laptop: check-game-recommendations.py exit 1 at the Swift fixture "74 titles in the Steam table, 103 lists". Patch now also edits that line (line ~957 of the test): 75 titles, 104 lists, message names The Planet Crafter. Not re-run here (no swiftc); laptop must re-run.
+Off switch, corrected wording: `env.MADEIRA_WG_64BIT = 0` in the game's config only turns the 64-bit parser back off (as before this patch); with the parser refused, WG_VIDEO_FORMAT and D3D11_NO_VIDEO_DEVICE are not used for video, but that is unproven. Full revert = delete the four lines from the game's config or drop the patch.
+"Fixes the Loading hang" is proven on the iPad only (retest 2, Nov 27: world open in 24 s, Player.log no WindowsVideoMedia error), not by the laptop; the laptop only checks the code compiles and the list test passes.

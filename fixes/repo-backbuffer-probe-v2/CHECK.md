@@ -1,0 +1,2 @@
+# CHECK: repo-backbuffer-probe-v2
+DXMT present probe: staging readback texture should use CreateStagingTexture2D (same signature, d3d11_resource.hpp:512) instead of CreateDeviceTexture2D. Diagnostic only, off unless env.MADEIRA_PRESENT_PROBE = 1. Apply on the 0.2.180 DXMT tree, compile if possible (clang syntax check with the DXMT headers), verify the signature and that the staging texture is mappable for CPU read. Overlaps dxmt-d3d11-tex-trace? (check same files). RESULT.md "Compile:" and "Review:" PASS or FAIL.

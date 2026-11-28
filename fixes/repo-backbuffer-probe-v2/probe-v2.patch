@@ -1,0 +1,15 @@
+--- a/dxmt/src/d3d11/d3d11_swapchain.cpp	2026-11-28 06:19:18.151505927 +0000
++++ b/dxmt/src/d3d11/d3d11_swapchain.cpp	2026-11-28 06:19:18.202809861 +0000
+@@ -918,7 +918,11 @@
+     d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+     d.MiscFlags = 0;
+     ID3D11Texture2D1 *stage = nullptr;
+-    if (FAILED(dxmt::CreateDeviceTexture2D(device_, &d, nullptr, &stage)) || !stage) {
++    /* v2 (Nov 28): a STAGING desc must go through CreateStagingTexture2D, as
++     * MTLD3D11Device::CreateTexture2D1 does for D3D11_USAGE_STAGING. v1 used
++     * CreateDeviceTexture2D, so Map found no staging resource and the R.E.P.O.
++     * run logged "[present-probe] Map failed". */
++    if (FAILED(dxmt::CreateStagingTexture2D(device_, &d, nullptr, &stage)) || !stage) {
+       Logger::warn("[present-probe] staging texture create failed");
+       return;
+     }

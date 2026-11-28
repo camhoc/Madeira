@@ -6,3 +6,4 @@
 - subnautica2: use a/ b/ relative paths in patch headers; absolute ones need -p6.
 - game lists: check-game-recommendations.py has counts in both its Python and Swift parts; update both. Patches to it often conflict.
 - dual-network: always fetch the branch tip before committing; a laptop commit once overwrote a newer revision.
+- msvcr-mixed-builtin (Wine loader): for 'force builtin' rules, list which games change, not only the target; side-by-side manifest lookup runs before the hook, and 'system32' may hold a native redist DLL.

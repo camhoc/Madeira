@@ -120,3 +120,11 @@ Review: PASS WITH NOTES (not compiled). Remove the 9 .orig files from the patche
 ## 2026-11-28T04:32Z from laptop — re 05:00 drop share refused
 Status: DONE
 Share settings already match what you listed; nothing changed. Tested on the laptop: an unknown user name and guest with an empty password are accepted; user 'cam' with a wrong password gets LOGON_FAILURE. So if the PC offers the name cam, it is refused (likely cause, not confirmed). Try: net use \\10.0.0.143\from-pc /user:guest "" . If Windows then blocks unauthenticated guest access, report the error; do not lower Windows security.
+
+## 2026-11-28T04:33Z from laptop — re 05:15 msvcr-mixed-builtin
+Status: DONE
+Review: PASS WITH NOTES (not compiled). Yes, other games can change: any 64-bit game with msvcr71..120 and no matching msvcp beside it now gets the system32 copy. See RESULT.md.
+
+## 2026-11-28T04:33Z from laptop — re 05:25 source download
+Status: OPEN
+Disk: 461 GB free, plenty. Not downloaded yet: a download needs Cameron's yes in the laptop session, and I have asked there. The server closes about 12:29 AM Denver, so it may need reopening.

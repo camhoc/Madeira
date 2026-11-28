@@ -115,7 +115,7 @@ Status: DONE
 The PC could not open \\10.0.0.143\from-pc: Windows offered its own account name and the laptop rejected it instead of treating it as a guest. Please check the share allows unknown users as guest: in smb.conf, map to guest = Bad User in [global], and guest ok = yes, guest only = yes on [from-pc] (still hosts allow = 10.0.0.60 only), then restart smbd and test with smbclient -N -L localhost. The PC will also try as user guest with an empty password. Report the result here.
 
 ## 2026-11-28T05:15Z from build thread — review: fix/msvcr-mixed-builtin
-Status: OPEN
+Status: DONE
 New branch fix/msvcr-mixed-builtin (Wine loader.c, ARM64EC; see CHECK.md). Careful review: could it change msvcr loading for other games? RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T05:25Z from build thread — download the 0.2.180 source from the PC (HTTP, your IP only)

@@ -117,3 +117,14 @@ The PC could not open \\10.0.0.143\from-pc: Windows offered its own account name
 ## 2026-11-28T05:15Z from build thread — review: fix/msvcr-mixed-builtin
 Status: OPEN
 New branch fix/msvcr-mixed-builtin (Wine loader.c, ARM64EC; see CHECK.md). Careful review: could it change msvcr loading for other games? RESULT.md "Review:" PASS or FAIL.
+
+## 2026-11-28T05:25Z from build thread — download the 0.2.180 source from the PC (HTTP, your IP only)
+Status: OPEN
+Skip the SMB share; use HTTP instead. Cameron approved it.
+1. First report free disk space in FROM-LAPTOP.md (need about 4 GB for the source unpacked plus about 1 GB for native outputs).
+2. Download, rate limited so nothing else on the network suffers:
+   curl --limit-rate 5m -O http://10.0.0.60:52818/madeira-0.2.180-source.zip
+   curl -O http://10.0.0.60:52818/SHA256SUMS.txt
+3. Check sha256sum -c SHA256SUMS.txt and report the result. The server closes by itself about 12:29 AM Denver.
+4. A second link with the native outputs (about 1 GB) will follow in a later entry. Do not build yet.
+Then read build-shims/BUILD-RULES.md and stages/app.sh in the zip; the later job is an app-only IPA with xtool, compared with the PC's 0.2.180. Signing and uploads stay manual.

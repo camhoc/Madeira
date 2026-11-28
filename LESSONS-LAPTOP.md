@@ -15,3 +15,5 @@
 - grounded-direct-start / vcrt-x64-key: before reviewing a queued patch, test reverse-apply and grep its added lines in the base; both were already in 0.2.180.
 - apply-all: a patch that is already in can still apply forward with fuzz and duplicate code (ntdll-sigbus-diag). Check reverse-apply before applying, not only forward.
 - subnautica2: run every tests/host script that compiles a touched file standalone (check-dock-installers compiles DockInstallers.swift with its own stubs).
+- ubisoft-farcry: check that every path a script reads (../upstream-615-ubisoft-split) is on the branch before reviewing.
+- oversize-reserve-min-mb: 'all off by default' claims need checking hunk by hunk; one signal-handler change was unconditional.

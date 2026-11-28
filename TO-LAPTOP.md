@@ -185,43 +185,43 @@ Status: DONE
 Cameron: nothing may clash or overlap. In a clean copy of ~/src/pc-0.2.180, apply every patch of the reviewed fix/* branches (all except kk-playport-pack and fex-playport-split-mono, which are Mesa/FEX packs: do those separately) in this order: bo3-stp-sd-emul, l1-null-guard, halo-mcc-exit-ring, sigbus-diag, outputdebugstring-wide-order, msvcr-mixed-builtin, metal-gate-skip-system, d3d12-residency-noop, cyberpunk-newbuffer-probe, dxmt-d3d11-tex-trace, dock-eac-entry, dock-install-dir-wait, remote-run-status, wcp-import, steam-layout-import, steam-big-picture, library-scroll-shadow, storage-files-link, editor-plain-labels, cyberpunk-direct-start, grounded-direct-start, planet-crafter-wg64, subnautica2-engine-ini, dual-network-download, jumbo-fit-pow2, vcrt-x64-key, pool-reserve, test-hooks, gmod-sandbox-reparse, fo4-alias-table-1024, bg3-cxx-unlink-guard. Report in FROM-LAPTOP.md: every reject or fuzz, every overlapping hunk, every env.MADEIRA_* key or per-game config line set twice, then whether Swift still typechecks and tests/host passes. Do not fix anything; just report.
 
 ## 2026-11-28T06:45Z from build thread — compile + review: fix/kk-archive-cap
-Status: OPEN
+Status: DONE
 New branch (see CHECK.md). Mesa KK patch. Also check it does not collide with kk-playport-pack rev 2. RESULT.md "Review:" PASS or FAIL. Add it at the end of the apply-all test (Mesa side, with kk-playport-pack).
 
 ## 2026-11-28T06:50Z from build thread — note on test-hooks
-Status: OPEN
+Status: DONE
 fix/test-hooks is a delta on top of the ipad-test-hooks already in 0.2.180 (edits only enum IPadTestHooks in SavesAndShortcuts.swift). Apply it to the plain 0.2.180 source; never apply the old ipad-test-hooks.patch with it. Add fix/kk-archive-cap and the Mesa-side to the apply-all test.
 
 ## 2026-11-28T06:55Z from build thread — review: fix/steam-sdl3-x64
-Status: OPEN
+Status: DONE
 New branch (see CHECK.md): build script for the 64-bit SDL3.dll (Steam Input fix). Careful review of build.sh and the notices row; try a Linux build if possible. RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T07:00Z from build thread — quick check: does 0.2.180 ship a 64-bit msiexec.exe?
-Status: OPEN
+Status: DONE
 In ~/src/pc-0.2.180 (source plus native outputs), find every msiexec.exe (find . -iname 'msiexec*') and, for each, report path, size and PE machine type (file or objdump -f: x86-64 / ARM64EC / i386). Say which would be inside the IPA's Wine prefix files (system32 vs syswow64 equivalent). Also check whether the IPA's file list (stages/ or fix-markers lists) names it. Short answer first: "64-bit msiexec.exe: yes/no, path".
 
 ## 2026-11-28T07:05Z from build thread — jumbo-fit-pow2 DROPPED
-Status: OPEN
+Status: DONE
 Do not review or apply fix/jumbo-fit-pow2 (dropped in favour of oversize-reserve-min-mb, which a Cyberpunk-thread port will bring later). Remove it from the apply-all list. pool-reserve stays (opt-in).
 
 ## 2026-11-28T07:10Z from build thread — compile + second review: fix/oversize-reserve-min-mb
-Status: OPEN
+Status: DONE
 New branch (CHECK.md). Native, off by default. Edits signal_arm64_ios.c like fix/bo3-stp-sd-emul: check no collision (put it after bo3-stp-sd-emul in the apply-all test). RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T07:15Z from build thread — compile + review: fix/fh6-smc-block
-Status: OPEN
+Status: DONE
 New branch (CHECK.md). FEX + ARM64EC, off by default. Module.cpp collision check with halo-mcc-exit-ring / l1-null-guard / sigbus-diag. Add to the apply-all test after those. RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T07:20Z from build thread — compile + review: fix/fh6-keep-jit-regs
-Status: OPEN
+Status: DONE
 New branch (CHECK.md). signal_arm64_ios.c, off by default. Collision check with bo3-stp-sd-emul and oversize-reserve-min-mb (all three edit that file); add to the apply-all test after them. RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T07:25Z from build thread — compile + review: fix/ubisoft-farcry
-Status: OPEN
+Status: DONE
 New branch (CHECK.md): Far Cry 3/4 + Ubisoft Connect port. Read apply.sh and hand-merge.py first, run only on a scratch copy, nothing that uses the network. Add to the apply-all test last (after the game-recommendation patches). RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T07:30Z from build thread — ubisoft-farcry updated
-Status: OPEN
+Status: DONE
 fix/ubisoft-farcry changed: apply.sh now applies the pool patches (0002, 0004, 0012; order 0002, 0004, 0012) and pad 0005 by default (POOL=0 / PAD=0 skip). Review also: CARVE_MERGE vs pool-low / POOL_CODE_KEEP_BIG, and 0004 must stay off in the Cyberpunk list. Check the latest head.
 
 ## 2026-11-28T07:35Z from build thread — check ten written fixes against 0.2.180: fix/dropped-work-check

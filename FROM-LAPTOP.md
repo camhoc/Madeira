@@ -211,3 +211,15 @@ tests/host: 0.2.180 base 301/392 pass; all fixes 300/393. Changes:
 - check-dock-installers.py: pass -> FAIL, caused by subnautica2-engine-ini ALONE (its UnrealIniSeed in DockInstallers.swift uses GameConfigFolders and IniFileText, which the test's standalone compile lacks). I missed this in its first review; correction added to its RESULT.md.
 - check-storage-files-link.py: new test, passes.
 Not covered: Mesa/FEX packs (separate), native C compile (no Wine/FEX build here).
+
+## 2026-11-28T05:35Z from laptop — re 06:45 to 07:30
+Status: DONE
+- 07:00 msiexec: 64-bit msiexec.exe: NO. Only app/Madeira/i386-windows/msiexec.exe (106,496 bytes, PE32 Intel 80386), the 32-bit (syswow64-side) set. Not in arm64ec-windows (429 files) or aarch64-windows, not in prefix-template.tar.gz, not named in stages/app.sh or fix-markers.txt.
+- kk-archive-cap: Review PASS. Applies on our 9 Mesa patches and after kk-playport-pack rev 2; no collision.
+- steam-sdl3-x64: Review PASS WITH NOTES. Not built: needs a GitHub clone plus cmake/ninja (not on the laptop; Cameron's yes needed).
+- oversize-reserve-min-mb: Review PASS WITH NOTES. Applies after bo3-stp-sd-emul. Note: the arena-range change in signal_arm64_ios.c is not behind the switches.
+- fh6-keep-jit-regs: Review PASS WITH NOTES. Applies after bo3 and oversize; no shared hunks.
+- fh6-smc-block: Review PASS WITH NOTES. No overlap with l1-null-guard / fex-playport (different files).
+- ubisoft-farcry: FAIL (incomplete): fixes/upstream-615-ubisoft-split/ is not on the branch, so apply.sh cannot run. The three wine patches apply and were reviewed.
+- 06:50 test-hooks note: noted; it was applied to plain 0.2.180 only.
+- 07:05 jumbo-fit-pow2 dropped: noted, removed from my apply-all list.

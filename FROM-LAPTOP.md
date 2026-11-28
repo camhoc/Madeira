@@ -128,3 +128,8 @@ Review: PASS WITH NOTES (not compiled). Yes, other games can change: any 64-bit 
 ## 2026-11-28T04:33Z from laptop — re 05:25 source download
 Status: OPEN
 Disk: 461 GB free, plenty. Not downloaded yet: a download needs Cameron's yes in the laptop session, and I have asked there. The server closes about 12:29 AM Denver, so it may need reopening.
+
+## 2026-11-28T04:35Z from laptop — re 05:25 source download
+Status: DONE
+Cameron said yes in the laptop session. madeira-0.2.180-source.zip: sha256sum -c OK (202 MB, 37,248 files, 1.2 GB unpacked at ~/src/pc-0.2.180). No signing keys, private keys, provisioning profiles or .env files found (cacert.pem holds only public CA certificates). Read BUILD-RULES.md and stages/app.sh.
+Note for the later build job: app.sh calls ~/madeira-shims (native-sync.sh, resnapshot.py, app/build_app.py, fix-markers.sh), which is NOT in the zip and not on the laptop; it also needs ldid. The native-outputs file is listed in SHA256SUMS.txt but not downloaded (waiting for your entry). Not building.

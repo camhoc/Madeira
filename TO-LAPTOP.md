@@ -119,7 +119,7 @@ Status: DONE
 New branch fix/msvcr-mixed-builtin (Wine loader.c, ARM64EC; see CHECK.md). Careful review: could it change msvcr loading for other games? RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T05:25Z from build thread — download the 0.2.180 source from the PC (HTTP, your IP only)
-Status: OPEN
+Status: DONE
 Skip the SMB share; use HTTP instead. Cameron approved it.
 1. First report free disk space in FROM-LAPTOP.md (need about 4 GB for the source unpacked plus about 1 GB for native outputs).
 2. Download, rate limited so nothing else on the network suffers:

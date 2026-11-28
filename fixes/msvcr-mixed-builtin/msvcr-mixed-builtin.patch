@@ -1,0 +1,102 @@
+--- a/wine/dlls/ntdll/loader.c
++++ b/wine/dlls/ntdll/loader.c
+@@ -4213,6 +4213,86 @@
+ }
+ 
+ #ifdef __arm64ec__
++/***********************************************************************
++ *	madeira_msvcr_mixed_builtin
++ *
++ * Madeira [msvcr-builtin] (default on; env MADEIRA_NATIVE_MSVCR = 1 turns it off).
++ *
++ * A 64-bit game that ships Microsoft's x64 msvcr100.dll but NOT msvcp100.dll gets
++ * Wine's builtin ARM64EC msvcp100.dll (from sysx64) bound to the game's x64 msvcr100.
++ * The ARM64EC msvcp100 reaches memcpy/memmove/memset through linker thunks that carry
++ * NO exit thunk (x10 = image base, "adrp x10,<base>; add x10,x10,#0"), because the
++ * ARM64EC ABI expects those imports to be ARM64EC code. With an x64 target,
++ * arm64x_check_call answers "not EC code" and the thunk calls x10, which is the first
++ * byte of msvcp100.dll (its MZ header): c000001d at msvcp100.dll+0x0, "loader_init
++ * MSVCP100.dll failed to initialize" (Outlast, Binaries/Win64, 0.2.180 logs).
++ *
++ * So when the app directory has an msvcr<NN>.dll but no msvcp<NN>.dll beside it, serve
++ * msvcr<NN> from system32 too (the builtin ARM64EC copy), exactly as ucrtbase is
++ * served in madeira_force_builtin_dll. When the game ships BOTH natively nothing
++ * changes. Only msvcr100 is proven by a log; the other versions share the
++ * thunk pattern (msvcp71..120) and are listed so the same mixed layout cannot hit them.
++ */
++static BOOL madeira_msvcr_mixed_builtin( const WCHAR *load_path, const WCHAR *name )
++{
++    static const WCHAR * const names[] =
++    {
++        L"msvcr71.dll", L"msvcr80.dll", L"msvcr90.dll", L"msvcr100.dll", L"msvcr110.dll", L"msvcr120.dll",
++    };
++    static int native = -1;
++    static LONG logged;
++    WCHAR companion[16], path[MAX_PATH];
++    const WCHAR *paths = load_path ? load_path : default_load_path;
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(names); i++)
++        if (!wcsicmp( name, names[i] )) break;
++    if (i == ARRAY_SIZE(names)) return FALSE;
++
++    if (native < 0)
++    {
++        UNICODE_STRING nm, val;
++        WCHAR buf[8];
++        RtlInitUnicodeString( &nm, L"MADEIRA_NATIVE_MSVCR" );
++        val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
++        native = (!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) && val.Length && buf[0] == '1');
++    }
++    if (native || !paths) return FALSE;
++
++    /* msvcr<NN>.dll -> msvcp<NN>.dll */
++    wcscpy( companion, names[i] );
++    companion[4] = 'p';
++
++    while (*paths)
++    {
++        const WCHAR *end = paths;
++        SIZE_T len;
++
++        while (*end && *end != ';') end++;
++        len = end - paths;
++        if (len && len + wcslen( companion ) + 2 < ARRAY_SIZE(path))
++        {
++            memcpy( path, paths, len * sizeof(WCHAR) );
++            if (path[len - 1] != '\\') path[len++] = '\\';
++            path[len] = 0;
++            /* the search order reaches system32 after the app directory; a native copy
++             * beyond it is not "shipped with the game" */
++            if (!wcsicmp( path, system_dir )) break;
++            wcscpy( path + len, companion );
++            if (RtlDoesFileExists_U( path )) return FALSE;   /* game ships its own msvcp<NN>: leave as is */
++        }
++        paths = *end ? end + 1 : end;
++    }
++
++    if (InterlockedIncrement( &logged ) <= 8)
++        ERR( "[msvcr-builtin] %s: no %s beside it, so the game's x64 copy would feed the builtin ARM64EC %s "
++             "(null exit thunk); using the builtin %s (MADEIRA_NATIVE_MSVCR=1 turns this off)\n",
++             debugstr_w(name), debugstr_w(companion), debugstr_w(companion), debugstr_w(name) );
++    return TRUE;
++}
++#endif
++
++#ifdef __arm64ec__
+ /* iOS-Madeira: the mixed-arch fallback below loads sysx64\<basename> when a
+  * load fails. When the file is simply not there (STATUS_DLL_NOT_FOUND) and the
+  * name is relative with a folder in it, such as the
+@@ -4296,7 +4376,11 @@
+ 
+     if (RtlDetermineDosPathNameType_U( libname ) == RtlPathTypeRelative)
+     {
+-        if (madeira_force_builtin_dll( libname ))
++        BOOL force_builtin = madeira_force_builtin_dll( libname );
++#ifdef __arm64ec__
++        if (!force_builtin) force_builtin = madeira_msvcr_mixed_builtin( load_path, libname );
++#endif
++        if (force_builtin)
+         {
+             TRACE( "%s: searching system32 only, for the builtin\n", debugstr_w(libname) );
+             load_path = system_dir;

@@ -1,6 +1,6 @@
 diff -ruN orig/app/Madeira/SavesAndShortcuts.swift mod/app/Madeira/SavesAndShortcuts.swift
 --- orig/app/Madeira/SavesAndShortcuts.swift	2026-11-28 05:00:47.921223428 +0000
-+++ mod/app/Madeira/SavesAndShortcuts.swift	2026-11-28 05:16:33.685034456 +0000
++++ mod/app/Madeira/SavesAndShortcuts.swift	2026-11-28 05:35:32.449926804 +0000
 @@ -53,6 +53,9 @@
  /// restamps one binary for iPhone, iPad and public, so everyone ships this code but it returns at once
  /// unless the bundle id is the iPad test id AND env.MADEIRA_IPAD_TEST_HOOKS = 1 in madeira.cfg (off by default).
@@ -37,7 +37,7 @@ diff -ruN orig/app/Madeira/SavesAndShortcuts.swift mod/app/Madeira/SavesAndShort
          if host == "launch" {
              guard let app, app > 0, app <= Int(UInt32.max) else {
                  LogStore.shared.log("[ipad-hooks] launch needs steam=<appid>", level: .error); return true
-@@ -91,7 +105,173 @@
+@@ -91,7 +105,254 @@
      /// At app start: the last game's logs, after the external drives mounted.
      static func exportAtStart() {
          guard enabled else { return }
@@ -147,6 +147,7 @@ diff -ruN orig/app/Madeira/SavesAndShortcuts.swift mod/app/Madeira/SavesAndShort
 +    /// The PC cannot always open madeira:// links on the iPad, so the same hooks run from a file: it writes
 +    /// Documents/test-hooks/command.txt over AFC (house_arrest), one command on the first line:
 +    ///   launch <appid> | quit | quit force | relaunch <appid> | status | export-logs [appid]
++    ///   | key <name>[+<name>] | tap <x>,<y> | config <appid> <key> = <value> | config <appid> unset <key>   (see runExtra)
 +    /// Polled every 2 s on a background timer (so it works while a game runs); the file is deleted when read and the
 +    /// outcome is written to Documents/test-hooks/command-result.txt ("<time> <command>: done" or an error).
 +    /// A file older than 120 s is deleted unread. launch while a game is running is a relaunch (one game per app run).
@@ -170,6 +171,13 @@ diff -ruN orig/app/Madeira/SavesAndShortcuts.swift mod/app/Madeira/SavesAndShort
 +                try? "\(ISO8601DateFormatter().string(from: Date())) \(line): \(m)\n".write(to: result, atomically: true, encoding: .utf8)
 +            }
 +            if age < -120 { report("ignored, file older than 120 s"); return }
++            switch words.first?.lowercased() {
++            case "key", "tap", "config":
++                // Input to the running game and per-game config edits (test-hooks); each returns what happened.
++                DispatchQueue.main.async { report(runExtra(words, line: line)) }
++                return
++            default: break
++            }
 +            var link: String?
 +            switch (words.first?.lowercased(), words.count) {
 +            case ("launch", 2), ("relaunch", 2): if let a = Int(words[1]), a > 0 { link = "relaunch?steam=\(a)" }
@@ -191,6 +199,79 @@ diff -ruN orig/app/Madeira/SavesAndShortcuts.swift mod/app/Madeira/SavesAndShort
 +        t.resume()
 +        commandTimer = t
 +        LogStore.shared.log("[ipad-hooks] command file armed: Documents/test-hooks/command.txt")
++    }
++
++    private static let keyCodes: [String: Int32] = [
++        "enter": 0x0D, "return": 0x0D, "esc": 0x1B, "escape": 0x1B, "space": 0x20, "tab": 0x09, "backspace": 0x08,
++        "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27, "ctrl": 0x11, "alt": 0x12, "shift": 0x10,
++    ]
++    private static func vk(_ name: String) -> Int32? {
++        let n = name.lowercased()
++        if let v = keyCodes[n] { return v }
++        if n.count >= 2, n.hasPrefix("f"), let k = Int(n.dropFirst()), (1...12).contains(k) { return Int32(0x6F + k) }
++        if n.count == 1, let c = n.uppercased().unicodeScalars.first, c.isASCII,
++           ("A"..."Z").contains(Character(c)) || ("0"..."9").contains(Character(c)) { return Int32(c.value) }
++        return nil
++    }
++
++    /// key <name>[+<name>...]  (e.g. key enter, key esc, key alt+f4)   tap <x>,<y>   (game coordinates, as winios_post_touch_*)
++    /// config <appid> <key> = <value>   config <appid> unset <key>   (the game's own config, GameProfiles.swift; applies at its next start).
++    /// Main thread. key and tap need a running game; the config file is copied to
++    /// Documents/test-hooks/config-backups/<appid>-<time>.cfg first, and the change is logged.
++    private static func runExtra(_ w: [String], line: String) -> String {
++        let model = LibraryModel.shared
++        switch w[0].lowercased() {
++        case "key":
++            guard w.count == 2, model.current != nil else { return "needs a running game: key <name>" }
++            let codes = w[1].split(separator: "+").map { vk(String($0)) }
++            guard !codes.isEmpty, !codes.contains(where: { $0 == nil }) else { return "unknown key" }
++            let keys = codes.compactMap { $0 }
++            for k in keys { winios_post_key(k, 1) }
++            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { for k in keys.reversed() { winios_post_key(k, 0) } }
++            return "done"
++        case "tap":
++            let xy = (w.count == 2 ? w[1] : "").split(separator: ",").compactMap { Int32($0) }
++            guard xy.count == 2, model.current != nil else { return "needs a running game: tap <x>,<y>" }
++            winios_post_touch_down(xy[0], xy[1])
++            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { winios_post_touch_up(xy[0], xy[1]) }
++            return "done"
++        default:
++            return editConfig(line)
++        }
++    }
++
++    private static func editConfig(_ line: String) -> String {
++        // "config <appid> <key> = <value>" or "config <appid> unset <key>"; the value may contain spaces.
++        let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true).map(String.init)
++        guard parts.count == 3, let app = Int(parts[1]), app > 0 else { return "not understood: config <appid> <key> = <value>" }
++        guard let entry = LibraryModel.shared.entries.first(where: { $0.steamAppID == app }) else { return "Steam app \(app) is not in the library" }
++        var key: String, value: String?
++        if parts[2].lowercased().hasPrefix("unset ") {
++            key = String(parts[2].dropFirst(6)).trimmingCharacters(in: .whitespaces); value = nil
++        } else if let eq = parts[2].firstIndex(of: "=") {
++            key = parts[2][..<eq].trimmingCharacters(in: .whitespaces)
++            value = parts[2][parts[2].index(after: eq)...].trimmingCharacters(in: .whitespaces)
++        } else { return "not understood: config <appid> <key> = <value>" }
++        guard !key.isEmpty, !key.contains(where: { $0.isWhitespace || $0 == "#" || $0 == "=" }),
++              !(value ?? "").contains(where: { $0.isNewline }) else { return "bad key or value" }
++        let file = GameProfile(windowsPath: entry.windowsPath)
++        let old = file.text
++        if let dir = testDir?.appendingPathComponent("config-backups", isDirectory: true) {
++            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
++            let stamp = DateFormatter(); stamp.dateFormat = "yyyyMMdd-HHmmss"
++            try? old.write(to: dir.appendingPathComponent("\(app)-\(stamp.string(from: Date())).cfg"), atomically: true, encoding: .utf8)
++        }
++        // Drop every line that sets this key (the native reader lets the last one win), then add the new one.
++        var lines = old.components(separatedBy: "\n").filter { l in
++            let t = l.trimmingCharacters(in: .whitespaces)
++            guard !t.hasPrefix("#"), let eq = t.firstIndex(of: "=") else { return true }
++            return t[..<eq].trimmingCharacters(in: .whitespaces) != key
++        }
++        while lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { lines.removeLast() }
++        if let value { lines.append("\(key) = \(value)") }
++        file.text = lines.joined(separator: "\n")
++        LogStore.shared.log("[ipad-hooks] config \(entry.title) (\(app)): \(value.map { "\(key) = \($0)" } ?? "unset \(key)"); backup in test-hooks/config-backups")
++        return "done"
 +    }
 +
 +    /// Per-run logs: Documents/logs/ already keeps the newest 40 session logs (LogStore.startSessionLog). At every app start

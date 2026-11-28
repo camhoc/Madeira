@@ -1,4 +1,4 @@
-From 211a93442155715401629d8670727b1ff061e9f7 Mon Sep 17 00:00:00 2001
+From 2cd01fcc2ff95c620afaebaa0bbe13ae8d0de90a Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Sat, 28 Nov 2026 04:10:56 +0000
 Subject: [PATCH] kk: drop storage image access to an undefined image before

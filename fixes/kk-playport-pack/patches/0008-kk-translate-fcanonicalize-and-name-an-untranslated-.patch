@@ -1,4 +1,4 @@
-From 91318765de130274898aa555c73d65d13a3e8bcd Mon Sep 17 00:00:00 2001
+From 484d5620ffc9f67a9e76d7833f598af24e0db322 Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Sat, 28 Nov 2026 04:10:56 +0000
 Subject: [PATCH] kk: translate fcanonicalize, and name an untranslated ALU op

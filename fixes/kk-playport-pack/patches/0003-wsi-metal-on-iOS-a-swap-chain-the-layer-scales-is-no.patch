@@ -1,4 +1,4 @@
-From 887ebc2dd9c6880d90058d11dbf7a8523c5815ab Mon Sep 17 00:00:00 2001
+From 9cbb110749f019eaca5bfc26731cce1f0f6ea6a1 Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Sat, 28 Nov 2026 04:10:55 +0000
 Subject: [PATCH] wsi/metal: on iOS a swap chain the layer scales is not

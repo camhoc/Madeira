@@ -1,4 +1,4 @@
-From 7b237c77558df740d33cb56ba36d31bde22fdc16 Mon Sep 17 00:00:00 2001
+From 8d4014c809345e0dbfde1132ad424c03f5eaf1a5 Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Sat, 28 Nov 2026 04:10:56 +0000
 Subject: [PATCH] kk: build a pipeline with too many samples at the highest
@@ -33,13 +33,13 @@ Ported from Playport patches/mesa/0039-kk-build-a-pipeline-with-too-many-samples
  1 file changed, 20 insertions(+), 4 deletions(-)
 
 diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
-index 26e7558..2fa5694 100644
+index 26e7558..56980e1 100644
 --- a/src/kosmickrisp/vulkan/kk_shader.c
 +++ b/src/kosmickrisp/vulkan/kk_shader.c
-@@ -1482,10 +1482,25 @@ kk_compile_depth_stencil_state(struct kk_device *device,
+@@ -1480,12 +1480,27 @@ kk_compile_depth_stencil_state(struct kk_device *device,
+    return kk_compile_ds_state(device, &info);
+ }
  
- /* Copies all msl shader data to the vertex and gathers information for pipeline
-  * compilation. */
 +/* The highest sample count the device supports, up to samples. An
 + * application may build a pipeline with a rasterizationSamples it cannot
 + * render with (Red Dead Redemption 2 builds 8-sample pipelines when the
@@ -55,6 +55,8 @@ index 26e7558..2fa5694 100644
 +   return samples;
 +}
 +
+ /* Copies all msl shader data to the vertex and gathers information for pipeline
+  * compilation. */
  static void
  gather_graphics_pipeline_create_info(
 -   const struct vk_graphics_pipeline_state *state, struct kk_shader **shaders,

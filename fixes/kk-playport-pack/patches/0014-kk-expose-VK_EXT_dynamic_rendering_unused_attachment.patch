@@ -1,4 +1,4 @@
-From 14f6d8f3b78173ad466467935bd88768f6fd03fd Mon Sep 17 00:00:00 2001
+From b096cc3515ccb82099d885b03738b5584dde319b Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Sat, 28 Nov 2026 04:10:57 +0000
 Subject: [PATCH] kk: expose VK_EXT_dynamic_rendering_unused_attachments

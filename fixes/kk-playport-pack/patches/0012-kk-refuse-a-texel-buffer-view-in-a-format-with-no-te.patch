@@ -1,4 +1,4 @@
-From acc5064c1629e0f48a79456333b28511474e8ef8 Mon Sep 17 00:00:00 2001
+From 1cedef2f954e38809534d15ec7028adca737be04 Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Sat, 28 Nov 2026 04:10:57 +0000
 Subject: [PATCH] kk: refuse a texel buffer view in a format with no texel

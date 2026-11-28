@@ -1,4 +1,4 @@
-From 14601e9027132f327ab2c54c4fcf00dbd8fc8a98 Mon Sep 17 00:00:00 2001
+From 51a94dc2153a5267a1098861137491e1cc58c6ad Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Sat, 28 Nov 2026 04:10:56 +0000
 Subject: [PATCH] wsi/metal: an opaque swap chain's layer is opaque on iOS

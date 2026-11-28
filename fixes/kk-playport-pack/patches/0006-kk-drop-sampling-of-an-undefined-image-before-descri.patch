@@ -1,4 +1,4 @@
-From beed96bb41ba088c2134dd433419bbb03aff132d Mon Sep 17 00:00:00 2001
+From b509c9f3ac7e95f1d8acb1d7db59af9a1ad9d3c6 Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Sat, 28 Nov 2026 04:10:56 +0000
 Subject: [PATCH] kk: drop sampling of an undefined image before descriptor

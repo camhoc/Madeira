@@ -5,10 +5,14 @@
 - Base: Mesa 26.3.1 + our 9 build/mesa-ios/patches/kosmickrisp-ios-*.patch (all 9 apply to 26.3.1).
   Playport's series is on Mesa main b39d173, so 8 of 18 needed fuzz (list below). Patches here are
   re-generated against OUR base and apply with `git apply` in order 0001-0018.
-- Original number -> our number (fuzz): 0004->0001 (exact), 0010->0002 (f2), 0011->0003, 0012->0004,
-  0045->0005, 0037->0006, 0040->0007, 0041->0008 (f1,f2), 0042->0009, 0038->0010 (f3), 0039->0011 (f1,f3),
-  0060->0012 (f2,f3), 0090->0013 (f3), 0093->0014 (f1), 0126->0015 (f3), 0127->0016, 0152->0017,
-  0155->0018 (f1,f2). Fuzz 3 = context lines ignored; hunk placement must be eyeballed on the laptop.
+- REVISION 2 (Nov 28, after the laptop review FAILED rev 1): 14 patches, 0001-0014. Dropped from rev 1 because their fuzz-3 hunks
+  landed in wrong places or needed symbols we lack: pipeline-statistics pool, 'four small correctness fixes' (needs KK_DEBUG_GPU,
+  zero_page_addr from other Playport patches), linear-image texture (large, fuzz), geometry-heap overflow. Unroll-hint patch
+  (now 0010) was re-done by hand: enum bit KK_DEBUG_UNROLL_HINTS = 1<<3, debug table, hash key, and the pass before nir_opt_loop_unroll.
+  Too-many-samples patch (0009) had its comment moved back above the right function. All 14 apply with `git apply` in order, exactly.
+  Order now: 0001 memory budget, 0002 present wait, 0003/0004/0005 WSI, 0006/0007 undefined image, 0008 fcanonicalize, 0009 samples,
+  0010 unroll hints, 0011 timestamp fence, 0012 texel-buffer NULL, 0013 heap message, 0014 dynamic_rendering_unused_attachments.
+  Patches 0002, 0011, 0012 still applied with fuzz 1-2 (eyeballed, hunks sit in the right functions; not compiled).
 - What each one is for (all from Playport's commit messages, run on their games, not ours):
   0001 iOS memory budget = process limit (os_proc_available_memory), so Vulkan doesn't promise memory iOS kills us for.
   0002 present wait gives up after 100 ms (DXVK hang after first frame). 0003/0004 no suboptimal-loop for scaled layer,

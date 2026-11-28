@@ -1,4 +1,4 @@
-From b0fdff32649c7673947b00295c679798a7a50cfd Mon Sep 17 00:00:00 2001
+From 7f7f050ca983f1c7c5f8a617aa18ddec1665ad64 Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Sat, 28 Nov 2026 04:10:57 +0000
 Subject: [PATCH] kk: a timestamp resolve updates a fence the next compute

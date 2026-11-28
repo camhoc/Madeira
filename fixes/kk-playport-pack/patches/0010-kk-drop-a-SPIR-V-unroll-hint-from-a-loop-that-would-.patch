@@ -1,79 +1,66 @@
-From a9768c0b25cb2830bf2f99b657a8f0f7f475c005 Mon Sep 17 00:00:00 2001
+From 6dfac91c22b2ce3774abc34efa6baecea0dc056f Mon Sep 17 00:00:00 2001
 From: x <a@b>
-Date: Sat, 28 Nov 2026 04:10:56 +0000
+Date: Sat, 28 Nov 2026 04:51:22 +0000
 Subject: [PATCH] kk: drop a SPIR-V unroll hint from a loop that would unroll
  too large
 
-A SPIR-V unroll hint (LoopControl Unroll, HLSL's [unroll]) makes
-nir_opt_loop_unroll unroll a loop whatever its size. A loop whose trip
-count has a bound but which may break earlier unrolls into one if nested
-in the last for each iteration. Red Dead Redemption 2 has nine fragment
-shaders with such a loop: up to 64 iterations, NIR instruction cost 692.
-Unrolled, each became 5.3 to 6.7 MB of MSL nested 64 levels deep, which
-MTLCompilerService on iOS failed to compile in 34 to 40 s per attempt, ended
-by jetsam at its 150 MB memory limit (MTLLibraryErrorDomain:3, interrupted).
+A SPIR-V unroll hint makes nir_opt_loop_unroll unroll a loop whatever its
+size. Above KK_UNROLL_HINT_COST_LIMIT (NIR cost times trip count) the hint is
+dropped and Metal's compiler gets a loop, so MTLCompilerService on iOS is not
+killed at its memory limit. MESA_KK_DEBUG=unroll_hints keeps every hint and
+keys the compiled shaders apart.
 
-Before each nir_opt_loop_unroll, a loop whose cost times trip count is
-over 4096 loses the hint and is left to Metal's compiler as a loop, as one
-without a hint is (KosmicKrisp sets no max_unroll_iterations). The largest
-hinted loop below the limit in that game's pipelines costs 1,460, and their
-MSL is unchanged byte for byte; the nine become 67 to 308 KB. Geometry
-shaders keep their hints: poly counts their vertices from unrolled loops.
-Compute pipelines never run this loop pass.
-
-MESA_KK_DEBUG=unroll_hints keeps every hint, as upstream does, and keys
-the compiled shaders apart.
-
-Class: ios-port
-Evidence: docs/evidence/2026-10-20-kk-msl-size.md
-Offered-upstream: no
-
-Ported from Playport patches/mesa/0060-kk-drop-a-SPIR-V-unroll-hint-from-a-loop-that-would-.patch (GPL-3.0-or-later, Mesa is MIT) onto Mesa 26.3.1 + Madeira KK patches; fuzz fuzz 2,fuzz 3,.
+Ported by hand from Playport patches/mesa/0060 (the original applied with
+fuzz 3 and put its hunks in the wrong places). Playport's evidence is RDR2.
 ---
  src/kosmickrisp/vulkan/kk_debug.c  |  1 +
  src/kosmickrisp/vulkan/kk_debug.h  |  3 ++
- src/kosmickrisp/vulkan/kk_shader.c | 66 ++++++++++++++++++++++++++++++
- 3 files changed, 70 insertions(+)
+ src/kosmickrisp/vulkan/kk_shader.c | 67 ++++++++++++++++++++++++++++++
+ 3 files changed, 71 insertions(+)
 
 diff --git a/src/kosmickrisp/vulkan/kk_debug.c b/src/kosmickrisp/vulkan/kk_debug.c
-index 1805d66..a4dbe3c 100644
+index 1805d66..e5094b7 100644
 --- a/src/kosmickrisp/vulkan/kk_debug.c
 +++ b/src/kosmickrisp/vulkan/kk_debug.c
-@@ -18,6 +18,7 @@ DEBUG_GET_ONCE_FLAGS_OPTION(mesa_kk_debug, "MESA_KK_DEBUG", debug_flags, 0);
- 
- enum kk_experimental kk_mesa_experimental_flags = 0;
- 
+@@ -11,6 +11,7 @@ const struct debug_named_value debug_flags[] = {
+    {"nir", KK_DEBUG_NIR},
+    {"msl", KK_DEBUG_MSL},
+    {"force_robustness", KK_DEBUG_FORCE_ROBUSTNESS},
 +   {"unroll_hints", KK_DEBUG_UNROLL_HINTS},
- const struct debug_named_value experimental_flags[] = {
-    {"all", UINT64_MAX},
-    {"custom_border", KK_EXPERIMENTAL_CUSTOM_BORDER},
+    {NULL, 0},
+ };
+ 
 diff --git a/src/kosmickrisp/vulkan/kk_debug.h b/src/kosmickrisp/vulkan/kk_debug.h
-index f454804..d15f1bf 100644
+index f454804..06b730b 100644
 --- a/src/kosmickrisp/vulkan/kk_debug.h
 +++ b/src/kosmickrisp/vulkan/kk_debug.h
-@@ -36,3 +36,6 @@ extern enum kk_experimental kk_mesa_experimental_flags;
- extern void kk_process_debug_variable(void);
- 
- #endif /* KK_DEBUG_H */
+@@ -12,6 +12,9 @@ enum kk_debug {
+    KK_DEBUG_MSL = 1ull << 1,
+    /* Forces robustness for all shaders */
+    KK_DEBUG_FORCE_ROBUSTNESS = 1ull << 2,
 +   /* Unroll every loop with a SPIR-V unroll hint, as upstream does, however
 +    * large it grows (kk_drop_costly_unroll_hints) */
-+   KK_DEBUG_UNROLL_HINTS = 1ull << 10,
++   KK_DEBUG_UNROLL_HINTS = 1ull << 3,
+ };
+ 
+ extern enum kk_debug kk_mesa_debug_flags;
 diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
-index 2fa5694..40dbcce 100644
+index 56980e1..4abb20f 100644
 --- a/src/kosmickrisp/vulkan/kk_shader.c
 +++ b/src/kosmickrisp/vulkan/kk_shader.c
-@@ -287,6 +287,10 @@ kk_populate_fs_key(struct kk_fs_key *key,
-       key->static_sample_mask = state->ms->sample_mask;
-       key->sample_shading_enable = state->ms->sample_shading_enable;
-    }
+@@ -348,6 +348,11 @@ kk_hash_graphics_state(struct vk_physical_device *device,
+    enum kk_feature_key feature_key = kk_make_feature_key(enabled_features);
+    _mesa_blake3_update(&blake3_ctx, &feature_key, sizeof(feature_key));
+ 
 +   if (KK_DEBUG(UNROLL_HINTS)) {
 +      const char unroll_hints[] = "kk-debug-unroll-hints";
 +      _mesa_blake3_update(&blake3_ctx, unroll_hints, sizeof(unroll_hints));
 +   }
++
+    _mesa_blake3_final(&blake3_ctx, blake3_out);
+ }
  
-    /* Depth writes are removed unless there's an actual attachment */
-    key->has_depth = state->rp->depth_attachment_format != VK_FORMAT_UNDEFINED;
-@@ -1279,6 +1283,67 @@ kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
+@@ -1279,6 +1284,67 @@ kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
     return VK_SUCCESS;
  }
  
@@ -141,7 +128,7 @@ index 2fa5694..40dbcce 100644
  static void
  nir_opts(nir_shader *nir, void *data)
  {
-@@ -1309,6 +1374,7 @@ nir_opts(nir_shader *nir, void *data)
+@@ -1309,6 +1375,7 @@ nir_opts(nir_shader *nir, void *data)
        NIR_PASS(progress, nir, nir_opt_constant_folding);
  
        NIR_PASS(progress, nir, nir_opt_undef);

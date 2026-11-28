@@ -1,4 +1,4 @@
-From 6a351e9aa8fdc233cb8594b0aed3a79c5de511a5 Mon Sep 17 00:00:00 2001
+From 1fd1825d72da627ae318a4cec5e3ba9c6b0bd492 Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Sat, 28 Nov 2026 04:10:57 +0000
 Subject: [PATCH] kk: say what ran out when Metal gives no heap

@@ -1,4 +1,4 @@
-From 18daeb50b607cfccec0fed707b6be8a887711c2d Mon Sep 17 00:00:00 2001
+From f951f5e2d12c86db34ab9bfd489f34db03f486be Mon Sep 17 00:00:00 2001
 From: x <a@b>
 Date: Sat, 28 Nov 2026 04:10:56 +0000
 Subject: [PATCH] wsi/metal: a swap chain configures the layer again when

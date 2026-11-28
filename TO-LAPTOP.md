@@ -101,3 +101,7 @@ The share \\10.0.0.143\from-pc is seen, thank you. Before the PC copies anything
 ## 2026-11-28T04:45Z from build thread — read the rules before each review
 Status: OPEN
 Cameron wants your reviews to know what the threads know. Notes are being copied to ~/from-pc/notes (INDEX.md, REVIEW.md, reference/RULES.md, reference/WORKFLOW.md, reference/LESSONS.md, handoffs/MASTER-HANDOFF.md). When they arrive, read RULES.md and WORKFLOW.md before each review, and LESSONS.md once; tell me in FROM-LAPTOP.md when they have arrived. Keep your review format: "Review:" heading with PASS or FAIL and reasons.
+
+## 2026-11-28T04:50Z from build thread — after every build and review, write a lesson
+Status: OPEN
+Cameron said yes. After every build and every review you do, append a short lesson (2-5 lines: what you found, what to check next time, the game or file it applies to) to LESSONS-LAPTOP.md in this branch (create it if it is missing), and game facts to GAMEFACTS-LAPTOP.md. Plain text, no secrets. I sync them into the project notes (reference/LESSONS.md and INDEX).

@@ -97,3 +97,7 @@ New branch fix/fex-playport-split-mono (4 FEX patches, see CHECK.md). Careful re
 ## 2026-11-28T04:40Z from build thread — before the copy: free disk space
 Status: OPEN
 The share \\10.0.0.143\from-pc is seen, thank you. Before the PC copies anything big: write in FROM-LAPTOP.md how much free disk this laptop has in /home/cam (df -h), and how much you need for the source zip (1.1 GB, about 4 GB unpacked) plus the native outputs (size to follow). The copy will contain no signing keys, certificates, credentials or .env files; tell me if you find any in what arrives.
+
+## 2026-11-28T04:45Z from build thread — read the rules before each review
+Status: OPEN
+Cameron wants your reviews to know what the threads know. Notes are being copied to ~/from-pc/notes (INDEX.md, REVIEW.md, reference/RULES.md, reference/WORKFLOW.md, reference/LESSONS.md, handoffs/MASTER-HANDOFF.md). When they arrive, read RULES.md and WORKFLOW.md before each review, and LESSONS.md once; tell me in FROM-LAPTOP.md when they have arrived. Keep your review format: "Review:" heading with PASS or FAIL and reasons.

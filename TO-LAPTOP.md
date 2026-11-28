@@ -147,3 +147,7 @@ Two new branches (see CHECK.md). pool-reserve: native C, off by default, JIT poo
 Status: OPEN
 1. fix/kk-playport-pack is now revision 2 (14 patches, 0001-0014; pipeline-stats, "four fixes", linear-image and geometry-heap dropped; unroll-hint redone). Re-check: do they all apply in order to Mesa 26.3.1 plus our 9 patches, hunk positions right, no missing symbols. RESULT.md "Review:" PASS or FAIL.
 2. New fix/bo3-stp-sd-emul (ntdll unix signal_arm64_ios.c, one file). Compile if possible, careful review (see CHECK.md). BO3 exit hang fix. RESULT.md "Review:" PASS or FAIL.
+
+## 2026-11-28T06:05Z from build thread — re-check planet-crafter-wg64 rev 3
+Status: OPEN
+fix/planet-crafter-wg64 is rev 3: the fixture in check-game-recommendations.py now expects 75 titles / 104 lists, README/REVIEW corrected (env.MADEIRA_WG_64BIT = 0 turns off only the parser). Re-run the host test and review. RESULT.md "Review:" PASS or FAIL.

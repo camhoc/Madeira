@@ -1,0 +1,136 @@
+diff --git a/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index ca5240f..6a61cea 100644
+--- a/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -20,6 +20,7 @@
+ #endif
+ 
+ #include <array>
++#include <cstdlib>
+ #include <tuple>
+ #include <utility>
+ 
+@@ -39,6 +40,17 @@ extern "C" uint32_t IosCallRetStackElided = 0;
+ #endif
+ 
+ namespace FEXCore::CPU {
++// MADEIRA [l1-null-guard]: see Arm64Emitter.h.
++bool IosL1NullGuardEnabled() {
++  static const bool Enabled = [] {
++    const char* Env = getenv("MADEIRA_FEX_L1_NULL_GUARD");
++    const bool On = !(Env && Env[0] == '0' && Env[1] == '\0');
++    LogMan::Msg::EFmt("[l1-null-guard] rev=l1-null-guard-3 {}", On ? "on" : "off (MADEIRA_FEX_L1_NULL_GUARD=0)");
++    return On;
++  }();
++  return Enabled;
++}
++
+ 
+ // LLVM's preserve_all doc, this is used throughout this file and reproduced
+ // here for reference:
+diff --git a/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h b/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+index dbe9603..1f87626 100644
+--- a/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
++++ b/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+@@ -32,6 +32,13 @@ namespace FEXCore::CPU {
+ // Contains the address to the currently available CPU state
+ constexpr auto STATE = ARMEmitter::XReg::x28;
+ 
++// MADEIRA [l1-null-guard] rev=l1-null-guard-3. Ported from MetalSharp-Wine FEX patch 0050 (Avery Felts,
++// https://github.com/aaf2tbz, MIT, MetalSharp-Wine PR #147). An empty L1 entry is {host 0, guest 0} and matches a
++// guest RIP of 0, so a guest call through a null pointer branched natively to host address 0 and the guest's handler
++// got FEX's registers. With this on (default), a match whose host code is 0 goes to the dispatcher, which compiles
++// RIP 0 and raises the fault with the guest's own state. Read once, at emit time. Off: MADEIRA_FEX_L1_NULL_GUARD=0.
++bool IosL1NullGuardEnabled();
++
+ #ifndef ARCHITECTURE_arm64ec
+ // GPR temporaries. Only x3 can be used across spill boundaries
+ // so if these ever need to change, be very careful about that.
+diff --git a/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 2daad2e..d96c0b2 100644
+--- a/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -874,8 +874,11 @@ void Dispatcher::EmitDispatcher() {
+         sub(TMP1, TMP1, TMP3);
+         if (LastWay) {
+           (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &LoopTop);
++          // MADEIRA [l1-null-guard]: an empty entry ({0, 0}) matches RIP 0; never branch to host 0.
++          if (IosL1NullGuardEnabled()) (void)cbz(ARMEmitter::Size::i64Bit, TMP2, &LoopTop);
+         } else {
+           (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &NextWay);
++          if (IosL1NullGuardEnabled()) (void)cbz(ARMEmitter::Size::i64Bit, TMP2, &NextWay);
+         }
+         br(TMP2);
+         if (!LastWay) {
+diff --git a/FEX/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEX/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+index da5669c..633668a 100644
+--- a/FEX/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEX/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -377,7 +377,15 @@ DEF_OP(ExitFunction) {
+ 
+       // Note: sub+cbnz used over cmp+br to preserve flags.
+       sub(TMP1, TMP1, RipReg.X());
+-      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
++      if (IosL1NullGuardEnabled()) {
++        // MADEIRA [l1-null-guard]: an entry whose host code is 0 is empty and must not be taken (RIP 0).
++        ARMEmitter::ForwardLabel L1NullMiss;
++        (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &L1NullMiss);
++        (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &SkipFullLookup);
++        (void)Bind(&L1NullMiss);
++      } else {
++        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
++      }
+     } else {
+       /* MADEIRA (125hz, ml920): set-associative probe (LookupCache::L1_WAYS). The set pointer is kept
+        * in TMP3, which is emitter scratch and dead at a block exit. A way-0 hit costs the same as the
+@@ -390,7 +398,16 @@ DEF_OP(ExitFunction) {
+       for (size_t Way = 0; Way < LookupCache::L1_WAYS; ++Way) {
+         ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP3, Way * sizeof(LookupCache::LookupCacheEntry));
+         sub(TMP1, TMP1, RipReg.X());
+-        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
++        if (IosL1NullGuardEnabled()) {
++          // MADEIRA [l1-null-guard]: an entry whose host code is 0 is empty and must not be taken (RIP 0).
++          // TMP2 is only read again on a hit (SkipFullLookup) or overwritten below, so a miss here is harmless.
++          ARMEmitter::ForwardLabel L1NullMiss;
++          (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &L1NullMiss);
++          (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &SkipFullLookup);
++          (void)Bind(&L1NullMiss);
++        } else {
++          (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
++        }
+       }
+     }
+     ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+diff --git a/FEX/FEXCore/Source/Interface/Core/LookupCache.h b/FEX/FEXCore/Source/Interface/Core/LookupCache.h
+index 13ea604..baccb61 100644
+--- a/FEX/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEX/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -20,6 +20,11 @@
+ #include <utility>
+ #include <mutex>
+ 
++namespace FEXCore::CPU {
++// MADEIRA [l1-null-guard]: defined in ArchHelpers/Arm64Emitter.cpp.
++bool IosL1NullGuardEnabled();
++} // namespace FEXCore::CPU
++
+ namespace FEXCore {
+ struct LookupCacheBaseLockToken {
+ protected:
+@@ -406,6 +411,16 @@ public:
+ #endif
+       for (size_t Way = 0; Way < L1_WAYS; ++Way) {
+         if (L1Set[Way].GuestCode == Address) {
++          // MADEIRA [l1-null-guard] (second review SHOULD 1): a cleared entry kept its old HostCode with
++          // GuestCode 0, so a jump to RIP 0 matched it (here in FindBlock and in the emitted probes) and ran
++          // the stale code of another address. Clear to a RIP no guest can reach instead. Off: as before.
++          // Re-review SHOULD: also drop HostCode, so even a jump to RIP ~0 can't reach the old code. Every L1
++          // reader rejects host 0 with the guard on, so the "concurrent lookups" note below no longer applies.
++          if (CPU::IosL1NullGuardEnabled()) {
++            L1Set[Way].GuestCode = ~uintptr_t {0};
++            L1Set[Way].HostCode = 0;
++            continue;
++          }
+           L1Set[Way].GuestCode = 0;
+           // Leave HostCode as is, so that concurrent lookups won't read a null pointer
+           // This is a soft guarantee for cross thread invalidation, as atomics are not used

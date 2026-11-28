@@ -1,0 +1,75 @@
+--- ContentView.pre-direct-rel.swift	2026-11-24 23:48:59.290458814 +0000
++++ "src98/Madeira Nightly 0.2.98 source/Madeira/app/Madeira/ContentView.swift"	2026-11-24 23:50:47.826559643 +0000
+@@ -713,6 +713,39 @@
+         winios_pointer(event.x, event.y, event.flags, event.data)
+     }
+ 
++    /// direct-relative-touch: a direct (non-Dock) session with "Relative" pointer mode on
++    /// sends finger motion as scaled deltas (sensRel * speed), like the Dock path, instead of
++    /// absolute positions. Absolute positions against a game that locks the cursor become huge,
++    /// position-dependent deltas that ignore sensRel (player report: finger camera far too
++    /// sensitive, sensRel 0.01 no effect). Off: env.MADEIRA_DIRECT_RELATIVE_TOUCH = 0.
++    private func directRelativeTouch() -> Bool {
++        guard InputSettings.shared.relative else { return false }
++        return MadeiraConfig.gameValue("env.MADEIRA_DIRECT_RELATIVE_TOUCH").map { $0 != "0" }
++            ?? MadeiraConfig.flag("MADEIRA_DIRECT_RELATIVE_TOUCH")
++    }
++    private var directRelLast: CGPoint = .zero
++    /// The one finger driving a relative camera; decided at touch-down so a mode change mid-touch cannot strand a button.
++    private weak var directRelTouch: UITouch?
++    private var directRelLogged = false
++    private func directRelativeMove(_ t: UITouch) {
++        let p = t.location(in: self)
++        let dx = p.x - directRelLast.x, dy = p.y - directRelLast.y
++        directRelLast = p
++        let tuning = MouseTuning.current
++        let sens = CGFloat(InputSettings.shared.sensRel * tuning.speed)
++        relCarryX += dx * sens
++        relCarryY += dy * sens * CGFloat(tuning.yFactor)
++        let ix = Int32(max(-30000, min(30000, relCarryX)))
++        let iy = Int32(max(-30000, min(30000, relCarryY)))
++        relCarryX -= CGFloat(ix)
++        relCarryY -= CGFloat(iy)
++        if !directRelLogged {
++            directRelLogged = true
++            fputs("[direct-relative-touch] deltas scaled by sensRel \(InputSettings.shared.sensRel)\n", stderr)
++        }
++        if ix != 0 || iy != 0 { postSurfacePointer(ix, iy, F_MOVE) }
++    }
++
+     private func postSurfaceTouchDown(_ x: Int32, _ y: Int32) {
+         if HardwareInput.shared.hardwareOwnsRelativeMotion {
+             postSurfacePointer(x, y, F_MOVE | F_LDOWN | F_ABS)
+@@ -777,6 +810,8 @@
+         if touchPointerMode { touchModeBegan(touches); return }
+         guard desktopMode else {
+             guard let t = touches.first else { return }
++            if directRelTouch != nil { return }   // a second finger never steals the camera
++            if directRelativeTouch() { directRelTouch = t; directRelLast = t.location(in: self); relCarryX = 0; relCarryY = 0; return }
+             let (x, y) = mapTouch(t)
+             postSurfaceTouchDown(x, y)
+             return
+@@ -824,6 +859,7 @@
+         guard let touches = tmgFilter(touches, .moved) else { return }
+         if touchPointerMode { touchModeMoved(touches, event); return }
+         guard desktopMode else {
++            if let d = directRelTouch { if touches.contains(d) { directRelativeMove(d) }; return }
+             guard let t = touches.first else { return }
+             let (x, y) = mapTouch(t)
+             postSurfaceTouchMove(x, y)
+@@ -908,6 +944,7 @@
+         if touchPointerMode { touchModeEnded(touches, event); return }
+         guard desktopMode else {
+             guard let t = touches.first else { return }
++            if let d = directRelTouch { if touches.contains(d) { directRelTouch = nil; relCarryX = 0; relCarryY = 0 }; return }
+             let (x, y) = mapTouch(t)
+             postSurfaceTouchUp(x, y)
+             return
+@@ -950,6 +987,7 @@
+         if touchPointerMode { touchModeCancelled(touches); return }
+         guard desktopMode else {
+             guard let t = touches.first else { return }
++            if let d = directRelTouch { if touches.contains(d) { directRelTouch = nil; relCarryX = 0; relCarryY = 0 }; return }
+             let (x, y) = mapTouch(t)
+             postSurfaceTouchUp(x, y)
+             return

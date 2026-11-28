@@ -1,0 +1,114 @@
+diff --git a/app/Madeira/WineProcessBridge.m b/app/Madeira/WineProcessBridge.m
+index dc2eb2a..2c814f2 100644
+--- a/app/Madeira/WineProcessBridge.m
++++ b/app/Madeira/WineProcessBridge.m
+@@ -1556,6 +1556,53 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
+             dxvk_linked ? "DXVK" : "DXMT", dxvk_linked);
+ }
+ 
++/* d3d12 = mullion (experimental; Mullion, github.com/dttdrv/mullion, LGPL-2.1+):
++ * this session's d3d12.dll, d3d12core.dll, dxgi.dll, d3d11.dll and d3d10core.dll
++ * are Mullion's (vulkan/mullion in the bundle, build/mullion-ios/build-pe.sh),
++ * Direct3D 12 straight on Metal with mesh shaders. They import mlnmetal.dll (Mullion's
++ * winemetal under another name), whose unix side is bound only in a build made with
++ * MADEIRA_MULLION=1 (build/ntdll-unix/virtual_ios.c). Mullion's D3D11 comes too, because
++ * its dxgi is not DXMT's. Unset or anything else changes nothing: every session relinks
++ * the farms first, so the next session gets madeira-d3d12 and DXMT again. Refused with
++ * d3d11 = dxvk (both would own dxgi.dll). x64 programs only. */
++static void madeira_setup_mullion(NSFileManager *fm, NSString *prefix, NSString *bundle, BOOL use_arm64ec)
++{
++    char v[32] = "";
++    NSString *win = [prefix stringByAppendingPathComponent:@"drive_c/windows"];
++    NSString *stack = [bundle stringByAppendingPathComponent:@"vulkan/mullion"];
++    NSArray<NSString *> *dlls = @[@"d3d12.dll", @"d3d12core.dll", @"dxgi.dll", @"d3d11.dll", @"d3d10core.dll",
++                                  @"mlnmetal.dll"];
++    NSArray<NSString *> *dirs = use_arm64ec ? @[@"system32", @"sysx64"] : @[@"sysx64"];
++    int linked = 0;
++
++    /* a previous session's Mullion links: mlnmetal.dll is in no farm, and a !use_arm64ec session's relink keeps a
++     * system32 link that still resolves, so remove every link into the bundle's Mullion folder */
++    for (NSString *dir in @[@"system32", @"sysx64"])
++        for (NSString *dll in dlls) {
++            NSString *path = [[win stringByAppendingPathComponent:dir] stringByAppendingPathComponent:dll];
++            NSString *dest = [fm destinationOfSymbolicLinkAtPath:path error:nil];
++            if (dest && [dest rangeOfString:@"/vulkan/mullion/"].location != NSNotFound)
++                [fm removeItemAtPath:path error:nil];
++        }
++    if (!madeira_cfg_get("d3d12", v, sizeof v) || strcasecmp(v, "mullion")) return;
++    if (madeira_d3d11_dxvk_wanted()) {
++        dprintf(STDERR_FILENO, "[mullion] d3d12 = mullion ignored with d3d11 = dxvk (both need their own dxgi.dll)\n");
++        return;
++    }
++    for (NSString *dll in dlls)
++        if (access([stack stringByAppendingPathComponent:dll].fileSystemRepresentation, R_OK) != 0) {
++            dprintf(STDERR_FILENO, "[mullion] d3d12 = mullion, but the bundle has no vulkan/mullion/%s "
++                    "(build/mullion-ios/build-pe.sh): madeira-d3d12 stays\n", dll.UTF8String);
++            return;
++        }
++    for (NSString *dir in dirs)
++        for (NSString *dll in dlls)
++            linked += madeira_link_vulkan_file(fm, [win stringByAppendingPathComponent:dir], dll,
++                                               [stack stringByAppendingPathComponent:dll]);
++    dprintf(STDERR_FILENO, "[mullion] on: D3D12, D3D10/11 and DXGI = Mullion (%d links in %s)\n", linked,
++            use_arm64ec ? "system32 + sysx64" : "sysx64");
++}
++
+ /* ml1275: C:\windows\mono\mono-2.0 -> the bundle's Wine Mono, when the build
+  * carries one (the "Bundle Wine Mono" build phase); otherwise the copy Madeira
+  * downloaded from WineHQ (WineMono.swift, Library/Application Support/WineMono/
+@@ -2817,6 +2864,7 @@ static void *wine_process_thread(void *arg) {
+             if (madeira_d3d9_wined3d_wanted())
+                 madeira_link_d3d9_wined3d(fm, prefix, bundlePath, has_i386_set);
+             madeira_setup_vulkan(fm, prefix, bundlePath, use_arm64ec);
++            madeira_setup_mullion(fm, prefix, bundlePath, use_arm64ec);   /* d3d12 = mullion */
+             if (use_arm64ec) madeira_overlay_xaudio2(fm, prefix, NO);
+ 
+             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
+diff --git a/build/ntdll-unix/build.sh b/build/ntdll-unix/build.sh
+index ef1399f..7aa40e1 100644
+--- a/build/ntdll-unix/build.sh
++++ b/build/ntdll-unix/build.sh
+@@ -16,6 +16,10 @@ VULKAN_FLAGS=()
+ if [ "${MADEIRA_MOLTENVK:-0}" = 1 ]; then
+     VULKAN_FLAGS=(-DMADEIRA_MOLTENVK=1)
+ fi
++# Optional Mullion D3D12 lane (build/mullion-ios): bind its tables only when its object is built.
++if [ "${MADEIRA_MULLION:-0}" = 1 ]; then
++    VULKAN_FLAGS+=(-DMADEIRA_MULLION=1)
++fi
+ 
+ # Detect optional diagnostic fields in the SDK used for this target build.
+ # Keep SDK versions without this member buildable; it is not a runtime requirement.
+diff --git a/build/ntdll-unix/virtual_ios.c b/build/ntdll-unix/virtual_ios.c
+index 536db87..5eeb707 100644
+--- a/build/ntdll-unix/virtual_ios.c
++++ b/build/ntdll-unix/virtual_ios.c
+@@ -13269,6 +13269,13 @@ extern NTSTATUS win32u_unix_lib_init(void);
+  * dxmt_winemetal_unix_call_wow64_funcs.  A library without one is refused for
+  * a 32-bit caller. */
+ extern const void *dxmt_winemetal_unix_call_wow64_funcs[];
++#ifdef MADEIRA_MULLION
++/* Mullion (github.com/dttdrv/mullion, LGPL-2.1+): the d3d12 = mullion lane.
++ * Its PE winemetal is built as mlnmetal.dll (build/mullion-ios/build-pe.sh) and
++ * its unix side is one prelinked object in libdxmt_combined.a
++ * (build/mullion-ios/build.sh) whose only globals are these two tables. */
++extern const void *mullion_winemetal_unix_call_funcs[];
++#endif
+ extern const void *ws2_32_unix_call_wow64_funcs[];
+ extern const void *secur32_unix_call_wow64_funcs[];
+ extern const void *crypt32_unix_call_wow64_funcs[];
+@@ -13499,6 +13506,14 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
+          * so they have no layout to get wrong. */
+         const char *libname = NULL;
+         const void *funcs64 = NULL, *funcs_wow64 = NULL;
++#ifdef MADEIRA_MULLION
++        if (match && strstr(match, "mlnmetal")) {
++            libname = "mlnmetal";
++            funcs64 = (const void *)mullion_winemetal_unix_call_funcs;
++            /* Mullion's wow64 table is upstream WoW64 (no ios_wow_base): refuse 32-bit callers */
++            funcs_wow64 = NULL;
++        } else
++#endif
+         if (match && strstr(match, "winemetal")) {
+             libname = "winemetal";
+             funcs64 = (const void *)dxmt_winemetal_unix_call_funcs;

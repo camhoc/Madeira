@@ -1,0 +1,1063 @@
+From 556e68c59441610bc2825c4c6437c35a984e94fc Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 18:26:24 +0000
+Subject: [PATCH 1/2] winemetal unix: build for iOS (Madeira)
+
+---
+ src/winemetal/unix/cache.c          |   1 +
+ src/winemetal/unix/mullion_ios.h    |  29 +++
+ src/winemetal/unix/winemetal_unix.c | 275 +++++++++++++++++++---------
+ 3 files changed, 220 insertions(+), 85 deletions(-)
+ create mode 100644 src/winemetal/unix/mullion_ios.h
+
+diff --git a/src/winemetal/unix/cache.c b/src/winemetal/unix/cache.c
+index c231a34..e0db04f 100644
+--- a/src/winemetal/unix/cache.c
++++ b/src/winemetal/unix/cache.c
+@@ -1,3 +1,4 @@
++#include "mullion_ios.h"
+ #import <Foundation/Foundation.h>
+ #include <os/lock.h>
+ #include <sys/file.h>
+diff --git a/src/winemetal/unix/mullion_ios.h b/src/winemetal/unix/mullion_ios.h
+new file mode 100644
+index 0000000..327784c
+--- /dev/null
++++ b/src/winemetal/unix/mullion_ios.h
+@@ -0,0 +1,29 @@
++/* Madeira: iOS build of Mullion's winemetal unix side (LGPL-2.1+, like Mullion).
++ * Included first by winemetal_unix.c and cache.c. On macOS it only defines
++ * MLN_SDK_AT_LEAST, so the Mac build is unchanged.
++ *
++ * On iOS this file sits in the SAME app image as DXMT's winemetal, so:
++ * - ObjC classes are renamed (class names are process-global at runtime),
++ * - the call tables are renamed (build/mullion-ios/build.sh then hides every
++ *   other symbol with ld -r -exported_symbols_list),
++ * - the Mac-only headers are swapped for UIKit + small stubs. */
++#ifndef MULLION_IOS_H
++#define MULLION_IOS_H
++#include <TargetConditionals.h>
++
++#if TARGET_OS_IOS
++#include <Availability.h>
++/* the Mac SDK numbers Mullion tests map to the iOS SDK of the same year */
++#define MLN_SDK_AT_LEAST(mac) (__IPHONE_OS_VERSION_MAX_ALLOWED >= ((mac) == 150000 ? 180000 : (mac) == 160000 ? 260000 : (mac)))
++
++#define CacheReader MullionCacheReader
++#define CacheWriter MullionCacheWriter
++#define WMTListenerHold MullionListenerHold
++#define WMTSharedNameKeeper MullionSharedNameKeeper
++#define __wine_unix_call_funcs mullion_winemetal_unix_call_funcs
++#define __wine_unix_call_wow64_funcs mullion_winemetal_unix_call_wow64_funcs
++#else
++#define MLN_SDK_AT_LEAST(mac) (__MAC_OS_X_VERSION_MAX_ALLOWED >= (mac))
++#endif
++
++#endif
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 8b3ca0e..ef0539f 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -4,15 +4,29 @@
+ #include <pthread.h>
+ #include <unistd.h>
+ #include <os/lock.h>
++#include "mullion_ios.h"
++#if TARGET_OS_IOS
++#import <UIKit/UIKit.h>
++#include <objc/message.h>
++#include <objc/runtime.h>
++/* iOS has no CGDirectDisplay: one display, id 1 (as in Madeira's DXMT) */
++typedef uint32_t CGDirectDisplayID;
++#define kCGNullDirectDisplay ((CGDirectDisplayID)0)
++static inline CGDirectDisplayID CGMainDisplayID(void) { return 1; }
++/* the iOS SDK omits bootstrap.h; the functions are in libSystem */
++typedef char name_t[128];
++extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
++#else
+ #import <Cocoa/Cocoa.h>
+ #import <IOKit/IOKitLib.h>
+ #import <ColorSync/ColorSync.h>
++#include "objc/objc-runtime.h"
++#include <bootstrap.h>
++#endif
+ #import <CoreFoundation/CFRunLoop.h>
+ #import <Metal/Metal.h>
+ #import <MetalFX/MetalFX.h>
+ #import <QuartzCore/QuartzCore.h>
+-#include "objc/objc-runtime.h"
+-#include <bootstrap.h>
+ #include <mach/mach_port.h>
+ #include <mach/mach.h>
+ #include <mach/mach_time.h>
+@@ -146,7 +160,7 @@ _NSString_getCString(void *obj) {
+ // state per device, of 1 MB, which Metal fills between command buffers. Metal 4's queues take it per command buffer,
+ // so their command buffers have none
+ static id<MTLLogState>
+-queue_log_state(id<MTLDevice> device) API_AVAILABLE(macos(15.0)) {
++queue_log_state(id<MTLDevice> device) API_AVAILABLE(macos(15.0), ios(18.0)) {
+   static bool asked, on;
+   static id<MTLLogState> state;
+   static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+@@ -179,7 +193,7 @@ static NTSTATUS
+ CREATES(_MTLDevice_newCommandQueue)(void *obj) {
+   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
+   id<MTLDevice> device = (id<MTLDevice>)params->handle;
+-  if (@available(macOS 15.0, *)) {
++  if (@available(macOS 15.0, iOS 18.0, *)) {
+     id<MTLLogState> log = queue_log_state(device);
+     if (log) {
+       MTLCommandQueueDescriptor *desc = [[MTLCommandQueueDescriptor alloc] init];
+@@ -338,7 +352,7 @@ CREATES(_MTLDevice_newSamplerState)(void *obj) {
+   sampler_desc.supportArgumentBuffers = info->support_argument_buffers;
+   if (info->reduction_mode != WMTSamplerReductionModeWeightedAverage) {
+     family_needs(10, "sampler minimum and maximum reduction");
+-    if (@available(macOS 26.0, *))
++    if (@available(macOS 26.0, iOS 26.0, *))
+       sampler_desc.reductionMode = (MTLSamplerReductionMode)info->reduction_mode;
+   }
+ 
+@@ -402,7 +416,7 @@ fill_texture_descriptor(MTLTextureDescriptor *desc, struct WMTTextureInfo *info)
+   if (info->usage & WMTTextureUsageLossyCompression)
+     desc.compressionType = MTLTextureCompressionTypeLossy;
+   desc.resourceOptions = (MTLResourceOptions)info->options;
+-  if (@available(macOS 26.0, *))
++  if (@available(macOS 26.0, iOS 26.0, *))
+     desc.placementSparsePageSize = (MTLSparsePageSize)info->placement_sparse_page_size;
+ };
+ 
+@@ -718,7 +732,7 @@ MTLMeshRenderPipelineDescriptor ()
+ // leaves every target's format, write mask and blending to a specialization (_MTLDevice_newSpecializedRenderPipeline)
+ static void
+ unspecialize(MTLRenderPipelineColorAttachmentDescriptorArray *colors) {
+-  if (@available(macOS 26.0, *))
++  if (@available(macOS 26.0, iOS 26.0, *))
+     for (unsigned i = 0; i < 8; i++) {
+       colors[i].pixelFormat = MTLPixelFormatUnspecialized;
+       colors[i].writeMask = MTLColorWriteMaskUnspecialized;
+@@ -796,7 +810,7 @@ CREATES(_MTLDevice_newRenderPipelineState)(void *obj) {
+ 
+ // the device's compiler of Metal 4 pipelines, made once; `error` says why there is none
+ static id<MTL4Compiler>
+-API_AVAILABLE(macos(26.0)) device_compiler(id<MTLDevice> device, NSError **error) {
++API_AVAILABLE(macos(26.0), ios(26.0)) device_compiler(id<MTLDevice> device, NSError **error) {
+   static char key;
+   @synchronized(device) {
+     id<MTL4Compiler> compiler = objc_getAssociatedObject(device, &key);
+@@ -817,7 +831,7 @@ CREATES(_MTLDevice_newSpecializedRenderPipeline)(void *obj) {
+   const struct WMTColorAttachmentBlendInfo *colors = params->colors.ptr;
+   params->ret_pso = 0;
+   params->ret_error = 0;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MTL4RenderPipelineDescriptor *descriptor = [[MTL4RenderPipelineDescriptor alloc] init];
+     for (unsigned i = 0; i < 8; i++) {
+       MTL4RenderPipelineColorAttachmentDescriptor *color = descriptor.colorAttachments[i];
+@@ -926,8 +940,8 @@ CREATES(_MTLDevice_newMeshRenderPipelineState)(void *obj) {
+   descriptor.supportIndirectCommandBuffers = info->support_indirect_command_buffers;
+ 
+   MTLPipelineOption options = MTLPipelineOptionNone;
+-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+-  if (@available(macOS 15, *)) {
++#if MLN_SDK_AT_LEAST(150000)
++  if (@available(macOS 15, iOS 18.0, *)) {
+     if (info->num_binary_archives_for_lookup && info->binary_archives_for_lookup.ptr)
+       descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
+                                                       count:info->num_binary_archives_for_lookup];
+@@ -940,8 +954,8 @@ CREATES(_MTLDevice_newMeshRenderPipelineState)(void *obj) {
+                                                                                                reflection:nil
+                                                                                                     error:&err];
+   params->ret_error = (obj_handle_t)[err retain];
+-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+-  if (@available(macOS 15, *)) {
++#if MLN_SDK_AT_LEAST(150000)
++  if (@available(macOS 15, iOS 18.0, *)) {
+     if (params->ret_pso && info->keep_for_binary_archive)
+       objc_setAssociatedObject((id)params->ret_pso, &archive_descriptor, descriptor, OBJC_ASSOCIATION_RETAIN);
+   }
+@@ -1400,7 +1414,7 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
+     case WMTRenderCommandSetDepthTestBounds: {
+       struct wmtcmd_render_setdepthtestbounds *body = (struct wmtcmd_render_setdepthtestbounds *)next;
+       family_needs(10, "depth bounds testing");
+-      if (@available(macOS 26.0, *))
++      if (@available(macOS 26.0, iOS 26.0, *))
+         [encoder setDepthTestMinBound:body->min maxBound:body->max];
+       break;
+     }
+@@ -1718,7 +1732,11 @@ _MTLTexture_replaceRegion(void *obj) {
+ static NTSTATUS
+ _MTLBuffer_didModifyRange(void *obj) {
+   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
++#if !TARGET_OS_IOS
+   [(id<MTLBuffer>)params->handle didModifyRange:NSMakeRange(params->arg, params->ret)];
++#else
++  (void)params; /* iOS: no managed storage, nothing to flush */
++#endif
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -1806,7 +1824,7 @@ _MTLDevice_supports32BitMSAA(void *obj) {
+ static bool
+ vertex_values_work(id<MTLDevice> device) {
+   bool works = false;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     @autoreleasepool {
+       NSString *source = @"#include <metal_stdlib>\n"
+                           "using namespace metal;\n"
+@@ -1884,7 +1902,7 @@ _MTLDevice_supportsShaderBarycentricCoordinates(void *obj) {
+ static bool
+ probe_sampler_reduction(id<MTLDevice> device) {
+   bool honoured = false;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     @autoreleasepool {
+       NSString *source = @"#include <metal_stdlib>\n"
+                           "using namespace metal;\n"
+@@ -2086,8 +2104,8 @@ static const int SIGNALS[] = {
+ // whether the descriptor takes what the info asks of the motion vectors
+ static bool
+ temporal_scaler_motion(MTLFXTemporalScalerDescriptor *desc, const struct WMTFXTemporalScalerInfo *info) {
+-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+-  if (@available(macOS 27.0, *)) {
++#if MLN_SDK_AT_LEAST(270000)
++  if (@available(macOS 27.0, iOS 27.0, *)) {
+     desc.jitteredMotionVectorsEnabled = info->jittered_motion_vectors;
+     return true;
+   }
+@@ -2116,15 +2134,15 @@ CREATES(_MTLDevice_newTemporalScaler)(void *obj) {
+   desc.inputContentMaxScale = info->input_content_max_scale;
+   desc.inputContentMinScale = info->input_content_min_scale;
+   desc.inputContentPropertiesEnabled = info->input_content_properties_enabled;
+-  #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+-  if (@available(macOS 15, *)) {
++  #if MLN_SDK_AT_LEAST(150000)
++  if (@available(macOS 15, iOS 18.0, *)) {
+     desc.requiresSynchronousInitialization = info->requires_synchronous_initialization;
+   }
+   #endif
+   desc.autoExposureEnabled = info->auto_exposure;
+ 
+   struct sigaction old_action[sizeof(SIGNALS) / sizeof(int)], new_action;
+-  if (@available(macOS 16, *)) {} else {
++  if (@available(macOS 16, iOS 26.0, *)) {} else {
+     new_action.sa_handler = temp_handler;
+     sigemptyset(&new_action.sa_mask);
+     new_action.sa_flags = 0;
+@@ -2134,7 +2152,7 @@ CREATES(_MTLDevice_newTemporalScaler)(void *obj) {
+ 
+   params->ret = (obj_handle_t)[desc newTemporalScalerWithDevice:(id<MTLDevice>)params->device];
+ 
+-  if (@available(macOS 16, *)) {} else {
++  if (@available(macOS 16, iOS 26.0, *)) {} else {
+     for (unsigned int i = 0; i < sizeof(SIGNALS) / sizeof(int); i++)
+       sigaction(SIGNALS[i], &old_action[i], NULL);
+   }
+@@ -2200,7 +2218,7 @@ static NTSTATUS
+ CREATES(_MTLDevice_newSpatialScaler4)(void *obj) {
+   struct unixcall_mtldevice_newfxspatialscaler *params = obj;
+   params->ret = NULL_OBJECT_HANDLE;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     id<MTLDevice> device = (id<MTLDevice>)params->device;
+     const struct WMTFXSpatialScalerInfo *info = params->info.ptr;
+     MTL4CompilerDescriptor *compiler_desc;
+@@ -2233,7 +2251,7 @@ static NTSTATUS _MTL4CommandBuffer_encodeTemporalScale(void *obj);
+ static NTSTATUS _MTLCommandBuffer_encodeDenoisedScale(void *obj);
+ 
+ static id<MTL4Compiler>
+-API_AVAILABLE(macos(26.0)) metalfx_compiler(id<MTLDevice> device) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metalfx_compiler(id<MTLDevice> device) {
+   MTL4CompilerDescriptor *desc = [[MTL4CompilerDescriptor alloc] init];
+   id<MTL4Compiler> compiler = [device newCompilerWithDescriptor:desc error:nil];
+   [desc release];
+@@ -2244,7 +2262,7 @@ static NTSTATUS
+ CREATES(_MTLDevice_newTemporalScaler4)(void *obj) {
+   struct unixcall_mtldevice_newfxtemporalscaler *params = obj;
+   params->ret = NULL_OBJECT_HANDLE;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     id<MTLDevice> device = (id<MTLDevice>)params->device;
+     const struct WMTFXTemporalScalerInfo *info = params->info.ptr;
+     MTLFXTemporalScalerDescriptor *desc;
+@@ -2278,7 +2296,7 @@ static NTSTATUS
+ CREATES(_MTLDevice_newDenoisedScaler)(void *obj) {
+   struct unixcall_mtldevice_newfxdenoisedscaler *params = obj;
+   params->ret = NULL_OBJECT_HANDLE;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     id<MTLDevice> device = (id<MTLDevice>)params->device;
+     const struct WMTFXDenoisedScalerInfo *info = params->info.ptr;
+     MTLFXTemporalDenoisedScalerDescriptor *desc;
+@@ -2429,7 +2447,7 @@ _MTLDevice_supportsFXDenoisedScaler(void *obj) {
+   id<MTLDevice> device = (id<MTLDevice>)params->handle;
+   params->ret = 0;
+   // "MetalFX denoised upscaling", Apple9
+-  if (@available(macOS 26.0, *))
++  if (@available(macOS 26.0, iOS 26.0, *))
+     params->ret = family_has(9) && (params->arg ? [MTLFXTemporalDenoisedScalerDescriptor supportsMetal4FX:device]
+                                                 : [MTLFXTemporalDenoisedScalerDescriptor supportsDevice:device]);
+   return STATUS_SUCCESS;
+@@ -2443,7 +2461,9 @@ _MetalLayer_setProps(void *obj) {
+   // a present sets them all each frame, and each setting waits for the main thread: only a change is set
+   if (layer.device == (id<MTLDevice>)props->device && layer.opaque == props->opaque &&
+       layer.framebufferOnly == props->framebuffer_only && layer.contentsScale == props->contents_scale &&
++#if !TARGET_OS_IOS
+       layer.displaySyncEnabled == props->display_sync_enabled &&
++#endif
+       CGSizeEqualToSize(layer.drawableSize, CGSizeMake(props->drawable_width, props->drawable_height)) &&
+       layer.pixelFormat == to_metal_pixel_format(props->pixel_format))
+     return STATUS_SUCCESS;
+@@ -2452,7 +2472,9 @@ _MetalLayer_setProps(void *obj) {
+     layer.opaque = props->opaque;
+     layer.framebufferOnly = props->framebuffer_only;
+     layer.contentsScale = props->contents_scale;
++#if !TARGET_OS_IOS
+     layer.displaySyncEnabled = props->display_sync_enabled;
++#endif
+     layer.drawableSize = CGSizeMake(props->drawable_width, props->drawable_height);
+     layer.pixelFormat = to_metal_pixel_format(props->pixel_format);
+   });
+@@ -2468,7 +2490,11 @@ _MetalLayer_getProps(void *obj) {
+   props->opaque = layer.opaque;
+   props->framebuffer_only = layer.framebufferOnly;
+   props->contents_scale = layer.contentsScale;
++#if TARGET_OS_IOS
++  props->display_sync_enabled = 1; /* iOS layers always sync to the display */
++#else
+   props->display_sync_enabled = layer.displaySyncEnabled;
++#endif
+   props->drawable_height = layer.drawableSize.height;
+   props->drawable_width = layer.drawableSize.width;
+   props->pixel_format = layer.pixelFormat;
+@@ -2505,6 +2531,7 @@ struct macdrv_functions_t {
+   void (*on_main_thread)(dispatch_block_t b);
+ };
+ 
++#if !TARGET_OS_IOS
+ // a Metal layer over a window's client area, and the view that shows it once the main thread has made it. mouse
+ // events go to Wine's views under it
+ @interface MullionMetalView : NSView
+@@ -2558,6 +2585,8 @@ MullionPlace(MullionMetalHost *host, struct WMTWindowPlacement placement) {
+   }
+   NSLog(@"winemetal: no window to present %#llx in", placement.top_level);
+ }
++#endif /* !TARGET_OS_IOS: on iOS the window driver (wineios.drv) exports macdrv_functions, so the
++        * host-view fallback for a winemac.drv that exports nothing is never needed */
+ 
+ static NTSTATUS
+ _CreateMetalViewFromHWND(void *obj) {
+@@ -2591,7 +2620,9 @@ _CreateMetalViewFromHWND(void *obj) {
+       params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
+     }
+     pfn_release_win_data(win_data);
+-  } else if (objc_getClass("WineWindow")) {
++  }
++#if !TARGET_OS_IOS
++  else if (objc_getClass("WineWindow")) {
+     // a Wine whose winemac.drv exports nothing (WineHQ's) still has its Cocoa window in the process. the layer is
+     // made here and shown later, by the main thread, which this one must not wait for: it may be waiting on us
+     MullionMetalHost *host = [[MullionMetalHost alloc] init];
+@@ -2608,6 +2639,7 @@ _CreateMetalViewFromHWND(void *obj) {
+       MullionPlace(host, placement);
+     });
+   }
++#endif
+ 
+   return STATUS_SUCCESS;
+ }
+@@ -2617,6 +2649,10 @@ _CreateMetalViewFromHWND(void *obj) {
+ static NTSTATUS
+ _MetalView_setPlacement(void *obj) {
+   struct unixcall_metal_view_set_placement *params = obj;
++#if TARGET_OS_IOS
++  params->ret = 0; /* wineios.drv's views follow their windows */
++  return STATUS_SUCCESS;
++#else
+   if (!(params->ret = [(id)params->view isKindOfClass:[MullionMetalHost class]]))
+     return STATUS_SUCCESS;
+   MullionMetalHost *host = (MullionMetalHost *)params->view;
+@@ -2626,6 +2662,7 @@ _MetalView_setPlacement(void *obj) {
+     MullionPlace(host, placement);
+   });
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ static NTSTATUS
+@@ -2641,6 +2678,7 @@ _ReleaseMetalView(void *obj) {
+     pfn_macdrv_view_release_metal_view = dlsym(RTLD_DEFAULT, "macdrv_view_release_metal_view");
+   }
+ 
++#if !TARGET_OS_IOS
+   if ([(id)params->handle isKindOfClass:[MullionMetalHost class]]) {
+     MullionMetalHost *host = (MullionMetalHost *)params->handle;
+     dispatch_async(dispatch_get_main_queue(), ^{
+@@ -2649,7 +2687,9 @@ _ReleaseMetalView(void *obj) {
+       [host->layer release];
+       [host release];
+     });
+-  } else if (pfn_macdrv_view_release_metal_view)
++  } else
++#endif
++  if (pfn_macdrv_view_release_metal_view)
+     pfn_macdrv_view_release_metal_view((macdrv_metal_view)params->handle);
+ 
+   return STATUS_SUCCESS;
+@@ -2773,7 +2813,11 @@ _MTLCommandEncoder_setLabel(void *args) {
+ static NTSTATUS
+ _MTLDevice_setShouldMaximizeConcurrentCompilation(void *args) {
+   struct unixcall_generic_obj_uint64_noret *params = args;
++#if !TARGET_OS_IOS
+   [(id<MTLDevice>)params->handle setShouldMaximizeConcurrentCompilation:(BOOL)params->arg];
++#else
++  (void)params; /* macOS-only selector: iOS raises an ObjC exception */
++#endif
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -3365,6 +3409,9 @@ static NTSTATUS
+ _WMTGetSecondaryDisplayId(void *obj) {
+   struct unixcall_generic_obj_ret *params = obj;
+   params->ret = kCGNullDirectDisplay;
++#if TARGET_OS_IOS
++  return STATUS_SUCCESS; /* one display */
++#else
+ 
+   uint32_t count = 0;
+   CGGetOnlineDisplayList(0, NULL, &count);
+@@ -3387,8 +3434,10 @@ _WMTGetSecondaryDisplayId(void *obj) {
+   }
+ 
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
++#if !TARGET_OS_IOS
+ typedef struct icc_XYZ_t {
+   uint32_t sig;      // 0x205a5958
+   uint32_t reserved; // 0
+@@ -3441,12 +3490,25 @@ GetNSScreenForDisplayID(CGDirectDisplayID display_id) {
+   }
+   return nil;
+ }
++#endif /* !TARGET_OS_IOS: ColorSync and NSScreen */
+ 
+ static NTSTATUS
+ _WMTGetDisplayDescription(void *obj) {
+   struct unixcall_generic_obj_ptr_noret *params = obj;
+   CGDirectDisplayID display_id = params->handle;
+   struct WMTDisplayDescription *desc_out = params->arg.ptr;
++#if TARGET_OS_IOS
++  /* sRGB primaries and D65 white, SDR (as Madeira's DXMT reports on iOS) */
++  (void)display_id;
++  desc_out->white_points[0] = 0.3127f; desc_out->white_points[1] = 0.3290f;
++  desc_out->red_primaries[0] = 0.64f; desc_out->red_primaries[1] = 0.33f;
++  desc_out->green_primaries[0] = 0.30f; desc_out->green_primaries[1] = 0.60f;
++  desc_out->blue_primaries[0] = 0.15f; desc_out->blue_primaries[1] = 0.06f;
++  desc_out->maximum_edr_color_component_value = 1.0;
++  desc_out->maximum_reference_edr_color_component_value = 0.0;
++  desc_out->maximum_potential_edr_color_component_value = 1.0;
++  return STATUS_SUCCESS;
++#else
+   ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);
+   if (!profile || !GetDisplayColorGamut(profile, desc_out))
+     GetDisplayColorGamut(ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile), desc_out);
+@@ -3463,6 +3525,7 @@ _WMTGetDisplayDescription(void *obj) {
+     desc_out->maximum_potential_edr_color_component_value = 1.0;
+   }
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ struct DisplaySetting {
+@@ -3480,6 +3543,10 @@ _MetalLayer_getEDRValue(void *obj) {
+   struct WMTEDRValue *value = params->arg.ptr;
+   value->maximum_edr_color_component_value = 1.0;
+   value->maximum_potential_edr_color_component_value = 1.0;
++#if TARGET_OS_IOS
++  (void)layer;
++  return STATUS_SUCCESS;
++#else
+ 
+   if (![layer.delegate isKindOfClass:NSView.class])
+     return STATUS_SUCCESS;
+@@ -3498,6 +3565,7 @@ _MetalLayer_getEDRValue(void *obj) {
+   value->maximum_potential_edr_color_component_value = screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+ 
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ static NTSTATUS
+@@ -3556,6 +3624,19 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
+   struct WMTHDRMetadata *hdr_metadata_out = params->hdr_metadata.ptr;
+ 
+   params->version = 0;
++#if TARGET_OS_IOS
++  {
++    /* one display: the main one's setting, SDR */
++    struct DisplaySetting *setting = &g_display_settings[1];
++    *hdr_metadata_out = setting->hdr_metadata;
++    params->version = setting->version;
++    params->colorspace = setting->colorspace;
++    params->edr_value.maximum_edr_color_component_value = 1.0;
++    params->edr_value.maximum_potential_edr_color_component_value = 1.0;
++    (void)layer;
++    return STATUS_SUCCESS;
++  }
++#else
+   if (![layer.delegate isKindOfClass:NSView.class])
+     return STATUS_SUCCESS;
+ 
+@@ -3579,6 +3660,7 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
+       screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+ 
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ static NTSTATUS
+@@ -3841,8 +3923,10 @@ static NTSTATUS
+ _MTLBuffer_updateContents(void *obj) {
+   struct unixcall_mtlbuffer_updatecontents *params = obj;
+   memcpy((void *)((char *)[(id<MTLBuffer>)params->buffer contents] + params->offset), params->data.ptr, params->length);
++#if !TARGET_OS_IOS
+   if ([(id<MTLBuffer>)params->buffer storageMode] == MTLStorageModeManaged)
+     [(id<MTLBuffer>)params->buffer didModifyRange:NSMakeRange(params->offset, params->length)];
++#endif
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -3936,8 +4020,8 @@ _MTLBinaryArchive_add(void *obj) {
+       [archive addRenderPipelineFunctionsWithDescriptor:descriptor error:&err];
+     else if ([descriptor isKindOfClass:MTLComputePipelineDescriptor.class])
+       [archive addComputePipelineFunctionsWithDescriptor:descriptor error:&err];
+-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+-    else if (@available(macOS 15, *)) {
++#if MLN_SDK_AT_LEAST(150000)
++    else if (@available(macOS 15, iOS 18.0, *)) {
+       if ([descriptor isKindOfClass:MTLMeshRenderPipelineDescriptor.class])
+         [archive addMeshRenderPipelineFunctionsWithDescriptor:descriptor error:&err];
+       else if ([descriptor isKindOfClass:MTLTileRenderPipelineDescriptor.class])
+@@ -3980,11 +4064,16 @@ CREATES(_MTLDevice_newSharedTexture)(void *obj) {
+     MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+     fill_texture_descriptor(desc, info);
+     id<MTLTexture> ret = [device newSharedTextureWithDescriptor:desc];
+-    MTLSharedTextureHandle *handle = [ret newSharedTextureHandle];
+     params->ret = (obj_handle_t)ret;
+     info->gpu_resource_id = [ret gpuResourceID]._impl;
++#if TARGET_OS_IOS
++    /* an iOS app cannot hand the port to another process (Madeira's DXMT, ml866): the texture stays unshared */
++    info->mach_port = 0;
++#else
++    MTLSharedTextureHandle *handle = [ret newSharedTextureHandle];
+     info->mach_port = [handle createMachPort]; // implicitly add ref to underlying IOSurface
+     [handle release];
++#endif
+     [desc release];
+   }
+ 
+@@ -4349,7 +4438,7 @@ _MTLDevice_supportsPlacementSparse(void *obj) {
+   struct unixcall_generic_obj_uint64_ret *params = obj;
+   id<MTLDevice> device = (id<MTLDevice>)params->handle;
+   params->ret = 0;
+-  if (@available(macOS 26.4, *))
++  if (@available(macOS 26.4, iOS 26.4, *))
+     params->ret = [device supportsPlacementSparse];
+   return STATUS_SUCCESS;
+ }
+@@ -4376,7 +4465,7 @@ static NTSTATUS
+ CREATES(_MTLDevice_newPlacementSparseBuffer)(void *obj) {
+   struct unixcall_new_placement_sparse_buffer *params = obj;
+   id<MTLBuffer> buffer = nil;
+-  if (@available(macOS 26.0, *))
++  if (@available(macOS 26.0, iOS 26.0, *))
+     buffer = [(id<MTLDevice>)params->device newBufferWithLength:params->length
+                                                         options:(MTLResourceOptions)params->options
+                                         placementSparsePageSize:(MTLSparsePageSize)params->page_size];
+@@ -4400,7 +4489,7 @@ _MTLDevice_sparseTailHolds(void *obj) {
+   params->ret = 1;
+   params->first_mip = 0;
+   params->bytes = 0;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     @autoreleasepool {
+       id<MTLDevice> device = (id<MTLDevice>)params->device;
+       struct WMTTextureInfo info = *(const struct WMTTextureInfo *)params->info.ptr;
+@@ -4512,7 +4601,7 @@ static NTSTATUS
+ CREATES(_MTLDevice_newMTL4CommandQueue)(void *obj) {
+   struct unixcall_generic_obj_uint64_ret *params = obj;
+   params->ret = 0;
+-  if (@available(macOS 26.0, *))
++  if (@available(macOS 26.0, iOS 26.0, *))
+     params->ret = (obj_handle_t)[(id<MTLDevice>)params->handle newMTL4CommandQueue];
+   return STATUS_SUCCESS;
+ }
+@@ -4526,7 +4615,7 @@ _Static_assert(sizeof(struct WMTSparseTextureMappingCopy) == sizeof(MTL4CopySpar
+ static NTSTATUS
+ _MTL4CommandQueue_updateMappings(void *obj) {
+   struct unixcall_mtl4_mappings *params = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     id<MTL4CommandQueue> queue = (id<MTL4CommandQueue>)params->queue;
+     if (params->texture)
+       [queue updateTextureMappings:(id<MTLTexture>)params->resource
+@@ -4545,7 +4634,7 @@ _MTL4CommandQueue_updateMappings(void *obj) {
+ static NTSTATUS
+ _MTL4CommandQueue_copyMappings(void *obj) {
+   struct unixcall_mtl4_mappings *params = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     id<MTL4CommandQueue> queue = (id<MTL4CommandQueue>)params->queue;
+     if (params->texture)
+       [queue copyTextureMappingsFromTexture:(id<MTLTexture>)params->resource
+@@ -4564,7 +4653,7 @@ _MTL4CommandQueue_copyMappings(void *obj) {
+ static NTSTATUS
+ _MTL4CommandQueue_event(void *obj) {
+   struct unixcall_mtl4_event *params = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     id<MTL4CommandQueue> queue = (id<MTL4CommandQueue>)params->queue;
+     id<MTLEvent> event = (id<MTLEvent>)params->event;
+     bool wait = params->wait;
+@@ -4591,6 +4680,16 @@ _MTL4CommandQueue_event(void *obj) {
+ static NTSTATUS
+ _MTLDevice_gpuCoreCount(void *obj) {
+   struct unixcall_generic_obj_uint64_ret *params = obj;
++#if TARGET_OS_IOS
++  /* iOS apps can't read the IORegistry. Mullion sizes the parts of a dispatch whose threadgroups must all run at
++   * once with this (d3d12_device.cpp GroupsAtOnce), so too MANY cores can leave shaders spinning on each other
++   * forever; too few only means smaller parts. Take 4 (fewer than any iPhone/iPad GPU Madeira supports) unless
++   * MADEIRA_MULLION_GPU_CORES says otherwise */
++  const char *cores = getenv("MADEIRA_MULLION_GPU_CORES");
++  params->ret = (cores && atoi(cores) > 0) ? (uint64_t)atoi(cores) : 4;
++  (void)params;
++  return STATUS_SUCCESS;
++#else
+   // the device's own IORegistry entry says how many GPU cores it has; Metal does not
+   io_service_t entry = IOServiceGetMatchingService(
+       kIOMainPortDefault, IORegistryEntryIDMatching([(id<MTLDevice>)params->handle registryID])
+@@ -4604,6 +4703,7 @@ _MTLDevice_gpuCoreCount(void *obj) {
+   if (entry)
+     IOObjectRelease(entry);
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ static NTSTATUS
+@@ -4730,8 +4830,8 @@ CREATES(_MTLDevice_newTileRenderPipelineState)(void *obj) {
+   descriptor.tileFunction = (id<MTLFunction>)info->tile_function;
+ 
+   MTLPipelineOption options = MTLPipelineOptionNone;
+-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+-  if (@available(macOS 15, *)) {
++#if MLN_SDK_AT_LEAST(150000)
++  if (@available(macOS 15, iOS 18.0, *)) {
+     if (info->num_binary_archives_for_lookup && info->binary_archives_for_lookup.ptr)
+       descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
+                                                       count:info->num_binary_archives_for_lookup];
+@@ -4744,8 +4844,8 @@ CREATES(_MTLDevice_newTileRenderPipelineState)(void *obj) {
+                                                                                                reflection:nil
+                                                                                                     error:&err];
+   params->ret_error = (obj_handle_t)[err retain];
+-#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+-  if (@available(macOS 15, *)) {
++#if MLN_SDK_AT_LEAST(150000)
++  if (@available(macOS 15, iOS 18.0, *)) {
+     if (params->ret_pso && info->keep_for_binary_archive)
+       objc_setAssociatedObject((id)params->ret_pso, &archive_descriptor, descriptor, OBJC_ASSOCIATION_RETAIN);
+   }
+@@ -4824,7 +4924,7 @@ CREATES(_MTLDevice_newHeap)(void *obj) {
+   desc.type = (MTLHeapType)info->type;
+   if (desc.type == MTLHeapTypeSparse)
+     desc.sparsePageSize = (MTLSparsePageSize)info->sparse_page_size;
+-  else if (@available(macOS 26.0, *))
++  else if (@available(macOS 26.0, iOS 26.0, *))
+     desc.maxCompatiblePlacementSparsePageSize = (MTLSparsePageSize)info->sparse_page_size;
+   desc.size = info->size;
+ 
+@@ -4953,7 +5053,7 @@ CREATES(_MTLDevice_newLibraryWithSource)(void *obj) {
+   // may predate what the source uses (a Wine loader linked against an old SDK gets MSL 2.4, without mesh shaders):
+   // ask for the newest this macOS has
+   MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+-  if (@available(macOS 26.0, *))
++  if (@available(macOS 26.0, iOS 26.0, *))
+     options.languageVersion = MTLLanguageVersion4_0;
+   else
+     options.languageVersion = MTLLanguageVersion3_2;
+@@ -5417,6 +5517,10 @@ _WMTFlightWrite(void *obj) {
+ static NTSTATUS
+ _WMTGPUStatistics(void *obj) {
+   struct unixcall_wmtgpu_statistics *params = obj;
++#if TARGET_OS_IOS
++  params->ret = 0; /* no IORegistry on iOS: no statistics */
++  return STATUS_SUCCESS;
++#else
+   io_service_t entry = IOServiceGetMatchingService(
+       kIOMainPortDefault, IORegistryEntryIDMatching([(id<MTLDevice>)params->device registryID])
+   );
+@@ -5435,6 +5539,7 @@ _WMTGPUStatistics(void *obj) {
+   if (entry)
+     IOObjectRelease(entry);
+   return STATUS_SUCCESS;
++#endif
+ }
+ 
+ /* whether a sparse read of a writable placement sparse texture answers for residency by tile where the shader gave a
+@@ -5449,7 +5554,7 @@ _MTLDevice_sparseResidencyInTiles(void *obj) {
+   struct unixcall_generic_obj_uint64_ret *params = obj;
+   id<MTLDevice> device = (id<MTLDevice>)params->handle;
+   params->ret = 0;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     @autoreleasepool {
+       const MTLSparsePageSize page_size = MTLSparsePageSize16;
+       NSUInteger page = [device supportsPlacementSparse] ? [device sparseTileSizeInBytesForSparsePageSize:page_size] : 0;
+@@ -5678,7 +5783,7 @@ enum {
+   Metal4BindingStageCount
+ };
+ 
+-API_AVAILABLE(macos(26.0)) @interface MullionMetal4Buffer : NSObject {
++API_AVAILABLE(macos(26.0), ios(26.0)) @interface MullionMetal4Buffer : NSObject {
+ @public
+   id<MTLDevice> device;
+   id<MTL4CommandQueue> queue;
+@@ -5727,7 +5832,7 @@ API_AVAILABLE(macos(26.0)) @interface MullionMetal4Buffer : NSObject {
+ - (void)fail:(NSError *)error;
+ @end
+ 
+-API_AVAILABLE(macos(26.0)) @interface MullionMetal4Encoder : NSObject {
++API_AVAILABLE(macos(26.0), ios(26.0)) @interface MullionMetal4Encoder : NSObject {
+ @public
+   MullionMetal4Buffer *owner;
+   id<MTL4CommandEncoder> encoder;
+@@ -5755,7 +5860,7 @@ API_AVAILABLE(macos(26.0)) @interface MullionMetal4Encoder : NSObject {
+ // what a command buffer the GPU is done with leaves for the queue's next ones: its residency set, emptied, and its
+ // argument tables, with nothing bound: a new set took two microseconds and each new table one, where they were
+ // measured, of every command buffer of a frame of many submissions
+-API_AVAILABLE(macos(26.0)) @interface MullionMetal4Parts : NSObject {
++API_AVAILABLE(macos(26.0), ios(26.0)) @interface MullionMetal4Parts : NSObject {
+ @public
+   id<MTLResidencySet> residency;
+   id<MTL4ArgumentTable> tables[Metal4BindingStageCount];
+@@ -5775,7 +5880,7 @@ API_AVAILABLE(macos(26.0)) @interface MullionMetal4Parts : NSObject {
+ 
+ // a queue's pool of what no work holds, one for each `key`
+ static NSMutableArray *
+-API_AVAILABLE(macos(26.0)) metal4_pool(id<MTL4CommandQueue> queue, const void *key) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_pool(id<MTL4CommandQueue> queue, const void *key) {
+   @synchronized(queue) {
+     NSMutableArray *pool = objc_getAssociatedObject(queue, key);
+     if (!pool) {
+@@ -5791,13 +5896,13 @@ API_AVAILABLE(macos(26.0)) metal4_pool(id<MTL4CommandQueue> queue, const void *k
+ // the queue's allocators that no work holds: a new one costs its command buffer tens of microseconds to make, and its
+ // commit as long again before the GPU starts it, where a reset one costs neither
+ static NSMutableArray *
+-API_AVAILABLE(macos(26.0)) metal4_allocators(id<MTL4CommandQueue> queue) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_allocators(id<MTL4CommandQueue> queue) {
+   static char key;
+   return metal4_pool(queue, &key);
+ }
+ 
+ static NSMutableArray *
+-API_AVAILABLE(macos(26.0)) metal4_parts(id<MTL4CommandQueue> queue) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_parts(id<MTL4CommandQueue> queue) {
+   static char key;
+   return metal4_pool(queue, &key);
+ }
+@@ -5884,7 +5989,7 @@ API_AVAILABLE(macos(26.0)) metal4_parts(id<MTL4CommandQueue> queue) {
+ @end
+ 
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_resident(MullionMetal4Buffer *state, id<MTLAllocation> resource) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_resident(MullionMetal4Buffer *state, id<MTLAllocation> resource) {
+   if (!resource)
+     return;
+   // an object's address is a multiple of 16
+@@ -5899,20 +6004,20 @@ API_AVAILABLE(macos(26.0)) metal4_resident(MullionMetal4Buffer *state, id<MTLAll
+ }
+ 
+ static MTLGPUAddress
+-API_AVAILABLE(macos(26.0)) metal4_address(MullionMetal4Buffer *state, obj_handle_t buffer) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_address(MullionMetal4Buffer *state, obj_handle_t buffer) {
+   metal4_resident(state, (id<MTLBuffer>)buffer);
+   return [(id<MTLBuffer>)buffer gpuAddress];
+ }
+ 
+ static MTL4BufferRange
+-API_AVAILABLE(macos(26.0)) metal4_range(MullionMetal4Buffer *state, obj_handle_t buffer, uint64_t offset) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_range(MullionMetal4Buffer *state, obj_handle_t buffer, uint64_t offset) {
+   return MTL4BufferRangeMake(
+       buffer ? metal4_address(state, buffer) + offset : 0, buffer ? [(id<MTLBuffer>)buffer length] - offset : 0
+   );
+ }
+ 
+ static id<MTL4ArgumentTable>
+-API_AVAILABLE(macos(26.0)) metal4_table(MullionMetal4Encoder *state, unsigned stage) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_table(MullionMetal4Encoder *state, unsigned stage) {
+   MullionMetal4Buffer *owner = state->owner;
+   if (!owner->tables[stage]) {
+     MTL4ArgumentTableDescriptor *desc = [[MTL4ArgumentTableDescriptor alloc] init];
+@@ -5943,7 +6048,7 @@ API_AVAILABLE(macos(26.0)) metal4_table(MullionMetal4Encoder *state, unsigned st
+ }
+ 
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_buffer(
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_buffer(
+     MullionMetal4Encoder *state, unsigned stage, obj_handle_t buffer, uint64_t offset, unsigned index
+ ) {
+   MTLGPUAddress base = metal4_address(state->owner, buffer);
+@@ -5953,13 +6058,13 @@ API_AVAILABLE(macos(26.0)) metal4_buffer(
+ }
+ 
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_offset(MullionMetal4Encoder *state, unsigned stage, uint64_t offset, unsigned index) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_offset(MullionMetal4Encoder *state, unsigned stage, uint64_t offset, unsigned index) {
+   MTLGPUAddress base = state->bases[stage * state->owner->bindings.buffers + index];
+   [metal4_table(state, stage) setAddress:base ? base + offset : 0 atIndex:index];
+ }
+ 
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_bytes(
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_bytes(
+     MullionMetal4Encoder *state, unsigned stage, const void *bytes, uint64_t length, unsigned index
+ ) {
+   // a command buffer's bytes share buffers it keeps until it completes, each twice the last, at offsets that suit
+@@ -5985,7 +6090,7 @@ API_AVAILABLE(macos(26.0)) metal4_bytes(
+ }
+ 
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_texture(
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_texture(
+     MullionMetal4Encoder *state, unsigned stage, obj_handle_t texture, unsigned index
+ ) {
+   metal4_resident(state->owner, (id<MTLTexture>)texture);
+@@ -5996,7 +6101,7 @@ API_AVAILABLE(macos(26.0)) metal4_texture(
+ static NTSTATUS
+ CREATES(_MTL4CommandBuffer_new)(void *obj) {
+   struct unixcall_metal4_new *p = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Buffer *state = [[MullionMetal4Buffer alloc] init];
+     if (!state)
+       return STATUS_SUCCESS;
+@@ -6053,7 +6158,7 @@ CREATES(_MTL4CommandBuffer_new)(void *obj) {
+ }
+ 
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_begin_samples(
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_begin_samples(
+     MullionMetal4Encoder *state, const struct WMTSampleBufferAttachmentInfo *sample
+ ) {
+   state->samples = (struct WMTSampleBufferAttachmentInfo){0};
+@@ -6086,7 +6191,7 @@ API_AVAILABLE(macos(26.0)) metal4_begin_samples(
+ static NTSTATUS
+ _MTL4CommandBuffer_encoder(void *obj) {
+   struct unixcall_metal4_encoder *p = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Buffer *owner = (MullionMetal4Buffer *)p->buffer;
+     // a barrier against the queue's earlier work takes an encoder of its own: the open compute encoder ends first.
+     // when that encoder began with one and is all the work since, the barrier is inside it, against its own work
+@@ -6232,7 +6337,7 @@ _MTL4CommandBuffer_encoder(void *obj) {
+ static NTSTATUS
+ _MTL4CommandBuffer_orderAliases(void *obj) {
+   struct unixcall_generic_obj_uint64_noret *p = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Buffer *buffer = (MullionMetal4Buffer *)p->handle;
+     buffer->order_aliases = true;
+     buffer->aliases_inside = p->arg;
+@@ -6243,7 +6348,7 @@ _MTL4CommandBuffer_orderAliases(void *obj) {
+ static NTSTATUS
+ _MTL4CommandEncoder_endEncoding(void *obj) {
+   struct unixcall_generic_obj_uint64_noret *p = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Encoder *state = (MullionMetal4Encoder *)p->handle;
+     if (!state)
+       return STATUS_SUCCESS;
+@@ -6288,7 +6393,7 @@ _MTL4CommandEncoder_endEncoding(void *obj) {
+ 
+ static NTSTATUS
+ _MTL4CommandBuffer_commit(void *obj) {
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Buffer *state = (MullionMetal4Buffer *)*(obj_handle_t *)obj;
+     // a buffer that failed to begin is never ended (MTL4CommandBuffer: begin before end)
+     @synchronized(state) {
+@@ -6354,7 +6459,7 @@ _MTL4CommandBuffer_commit(void *obj) {
+ static NTSTATUS
+ _MTL4CommandBuffer_feedback(void *obj) {
+   struct unixcall_metal4_feedback *p = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Buffer *state = (MullionMetal4Buffer *)p->buffer;
+     if (state)
+       @synchronized(state) {
+@@ -6366,7 +6471,7 @@ _MTL4CommandBuffer_feedback(void *obj) {
+ 
+ static NTSTATUS
+ _MTL4CommandBuffer_waitUntilCompleted(void *obj) {
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Buffer *state = (MullionMetal4Buffer *)*(obj_handle_t *)obj;
+     for (;;) {
+       @synchronized(state) {
+@@ -6385,7 +6490,7 @@ _MTL4CommandBuffer_waitUntilCompleted(void *obj) {
+ 
+ static NTSTATUS
+ _MTL4CommandBuffer_waitForGPU(void *obj) {
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Buffer *state = (MullionMetal4Buffer *)*(obj_handle_t *)obj;
+     for (;;) {
+       @synchronized(state) {
+@@ -6403,7 +6508,7 @@ _MTL4CommandBuffer_waitForGPU(void *obj) {
+ static NTSTATUS
+ _MTL4CounterHeap_new(void *obj) {
+   struct unixcall_generic_obj_uint64_obj_ret *p = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     _Static_assert(sizeof(MTL4TimestampHeapEntry) == sizeof(uint64_t), "timestamp query layout");
+     MTL4CounterHeapDescriptor *desc = [[MTL4CounterHeapDescriptor alloc] init];
+     desc.type = MTL4CounterHeapTypeTimestamp;
+@@ -6419,7 +6524,7 @@ _MTL4CounterHeap_new(void *obj) {
+ static NTSTATUS
+ _MTLDevice_queryTimestampFrequency(void *obj) {
+   struct unixcall_generic_obj_uint64_ret *p = obj;
+-  if (@available(macOS 26.0, *))
++  if (@available(macOS 26.0, iOS 26.0, *))
+     p->ret = [(id<MTLDevice>)p->handle queryTimestampFrequency];
+   return STATUS_SUCCESS;
+ }
+@@ -6427,7 +6532,7 @@ _MTLDevice_queryTimestampFrequency(void *obj) {
+ static NTSTATUS
+ _MTL4CommandBuffer_waitForEvent(void *obj) {
+   struct unixcall_mtl4_event *p = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Buffer *state = (MullionMetal4Buffer *)p->queue;
+     [state->wait_event release];
+     state->wait_event = [(id<MTLEvent>)p->event retain];
+@@ -6439,7 +6544,7 @@ _MTL4CommandBuffer_waitForEvent(void *obj) {
+ static NTSTATUS
+ _MTL4CommandBuffer_present(void *obj) {
+   struct unixcall_generic_obj_obj_double_noret *p = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Buffer *state = (MullionMetal4Buffer *)p->handle;
+     state->drawable = [(id<MTLDrawable>)p->arg0 retain];
+     state->after = p->arg1;
+@@ -6452,7 +6557,7 @@ _MTL4CommandBuffer_present(void *obj) {
+ static NTSTATUS
+ _MTL4CommandBuffer_encodeSpatialScale(void *obj) {
+   struct unixcall_mtlcommandbuffer_spatial_scale *params = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Buffer *state = (MullionMetal4Buffer *)params->cmdbuf;
+     id<MTL4FXSpatialScaler> scaler = (id<MTL4FXSpatialScaler>)params->scaler;
+ 
+@@ -6470,7 +6575,7 @@ _MTL4CommandBuffer_encodeSpatialScale(void *obj) {
+ static NTSTATUS
+ _MTL4CommandBuffer_encodeTemporalScale(void *obj) {
+   struct unixcall_mtlcommandbuffer_temporal_scale *params = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Buffer *state = (MullionMetal4Buffer *)params->cmdbuf;
+     id<MTL4FXTemporalScaler> scaler = (id<MTL4FXTemporalScaler>)params->scaler;
+     const struct WMTFXTemporalScalerProps *props = params->props.ptr;
+@@ -6532,7 +6637,7 @@ _MTL4CommandBuffer_encodeTemporalScale(void *obj) {
+ static NTSTATUS
+ _MTLCommandBuffer_encodeDenoisedScale(void *obj) {
+   struct unixcall_mtlcommandbuffer_denoised_scale *params = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     const struct WMTFXDenoisedScaleArgs *args = params->args.ptr;
+     if (params->metal4) {
+       MullionMetal4Buffer *state = (MullionMetal4Buffer *)params->cmdbuf;
+@@ -6556,7 +6661,7 @@ _MTLCommandBuffer_encodeDenoisedScale(void *obj) {
+ }
+ 
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_draw_geometry_parts(
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_draw_geometry_parts(
+     MullionMetal4Encoder *state, uint32_t warps, uint32_t instances, uint32_t threads, uint32_t max, bool mesh_only,
+     uint32_t mesh_threads
+ ) {
+@@ -6589,7 +6694,7 @@ API_AVAILABLE(macos(26.0)) metal4_draw_geometry_parts(
+ /* an indirect geometry draw's `parts` Metal draws, whose grids and origins the GS dispatch marshal wrote in `args`:
+  * grids from `grids` on, 12 bytes apart, origins (SM50_BINDING_INDEX_DRAW_ORIGIN) from `origins` on, 8 bytes apart */
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_draw_geometry_indirect_parts(
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_draw_geometry_indirect_parts(
+     MullionMetal4Encoder *state, id<MTLBuffer> args, uint64_t grids, uint64_t origins, uint32_t parts, uint32_t threads
+ ) {
+   id<MTL4RenderCommandEncoder> encoder = (id<MTL4RenderCommandEncoder>)state->encoder;
+@@ -6602,7 +6707,7 @@ API_AVAILABLE(macos(26.0)) metal4_draw_geometry_indirect_parts(
+ }
+ 
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_render(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_render(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
+   id<MTL4RenderCommandEncoder> encoder = (id<MTL4RenderCommandEncoder>)state->encoder;
+   // a pipeline that could not be built is set as none: the draws after it are left out until another is set
+   bool pipeline = true;
+@@ -6734,7 +6839,7 @@ API_AVAILABLE(macos(26.0)) metal4_render(MullionMetal4Encoder *state, const stru
+     case WMTRenderCommandSetDepthTestBounds: {
+       struct wmtcmd_render_setdepthtestbounds *body = (struct wmtcmd_render_setdepthtestbounds *)next;
+       family_needs(10, "depth bounds testing");
+-      if (@available(macOS 26.0, *))
++      if (@available(macOS 26.0, iOS 26.0, *))
+         [encoder setDepthTestMinBound:body->min maxBound:body->max];
+       break;
+     }
+@@ -6985,7 +7090,7 @@ API_AVAILABLE(macos(26.0)) metal4_render(MullionMetal4Encoder *state, const stru
+   }
+ }
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_compute(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_compute(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
+   id<MTL4ComputeCommandEncoder> encoder = (id<MTL4ComputeCommandEncoder>)state->encoder;
+   MTLSize threadgroup_size = state->threadgroup;
+   while (next && !state->owner->feedback.error) {
+@@ -7137,7 +7242,7 @@ API_AVAILABLE(macos(26.0)) metal4_compute(MullionMetal4Encoder *state, const str
+   }
+ }
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_blit(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_blit(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
+   id<MTL4ComputeCommandEncoder> encoder = (id<MTL4ComputeCommandEncoder>)state->encoder;
+   while (next && !state->owner->feedback.error) {
+     switch ((enum WMTBlitCommandType)next->type) {
+@@ -7279,7 +7384,7 @@ API_AVAILABLE(macos(26.0)) metal4_blit(MullionMetal4Encoder *state, const struct
+   }
+ }
+ static MTL4AccelerationStructureDescriptor *
+-API_AVAILABLE(macos(26.0)) metal4_structure_descriptor(
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_structure_descriptor(
+     MullionMetal4Buffer *state, const struct WMTAccelerationStructureInfo *info
+ ) {
+   if (info->instances) {
+@@ -7332,7 +7437,7 @@ API_AVAILABLE(macos(26.0)) metal4_structure_descriptor(
+ }
+ 
+ static void
+-API_AVAILABLE(macos(26.0)) metal4_acceleration(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
++API_AVAILABLE(macos(26.0), ios(26.0)) metal4_acceleration(MullionMetal4Encoder *state, const struct wmtcmd_base *next) {
+   id<MTL4ComputeCommandEncoder> encoder = (id<MTL4ComputeCommandEncoder>)state->encoder;
+   while (next && !state->owner->feedback.error) {
+     @autoreleasepool {
+@@ -7402,7 +7507,7 @@ API_AVAILABLE(macos(26.0)) metal4_acceleration(MullionMetal4Encoder *state, cons
+ static NTSTATUS
+ _MTL4CommandEncoder_encodeCommands(void *obj) {
+   struct unixcall_metal4_commands *p = obj;
+-  if (@available(macOS 26.0, *)) {
++  if (@available(macOS 26.0, iOS 26.0, *)) {
+     MullionMetal4Encoder *state = (MullionMetal4Encoder *)p->encoder;
+     if (!state || state->owner->feedback.error)
+       return STATUS_SUCCESS;
+-- 
+2.43.0
+

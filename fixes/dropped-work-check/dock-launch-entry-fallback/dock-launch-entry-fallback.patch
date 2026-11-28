@@ -1,0 +1,53 @@
+diff -ru a/app/Madeira/ContentView.swift b/app/Madeira/ContentView.swift
+--- a/app/Madeira/ContentView.swift	2026-11-25 03:00:15.893211028 +0000
++++ b/app/Madeira/ContentView.swift	2026-11-25 03:00:15.950031712 +0000
+@@ -3807,7 +3807,17 @@
+             if startScanBG { LogStore.shared.log("[start-scan] app=\(game.id) launch configuration: \(options.map { "\($0.count) entries" } ?? "none") in \(stepMS()) ms") }
+             let installFolder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir)
+             let steamEntry = options.flatMap { SteamDirectStart.choose($0, installFolder: installFolder) }
+-            let chosen = steamEntry?.launchIndex
++            var chosen = steamEntry?.launchIndex
++            // (dock-launch-entry-fallback) With no entry that is an .exe on disk (tModLoader: its only
++            // non-beta Windows entry is start-tModLoader.bat), the default was entry 0, which can be a
++            // beta-branch entry whose program is not installed (Steam: "missing executable ...
++            // tModLoader.exe", launch-client-error=28). Take the best Windows entry outside beta
++            // branches instead. Off: env.MADEIRA_DOCK_LAUNCH_FALLBACK = 0.
++            if chosen == nil, MadeiraConfig.flag("MADEIRA_DOCK_LAUNCH_FALLBACK"),
++               let list = options, let alternative = SteamDirectStart.dockFallbackIndex(list) {
++                chosen = alternative
++                LogStore.shared.log("[dock-launch-fallback] app=\(game.id) no entry was an .exe on disk: launch option \(alternative) (Windows, not a beta branch)")
++            }
+             if startScanBG {
+                 var entryText = "none"
+                 if let entry = steamEntry {
+diff -ru a/app/Madeira/SteamGames.swift b/app/Madeira/SteamGames.swift
+--- a/app/Madeira/SteamGames.swift	2026-11-25 03:00:15.894215547 +0000
++++ b/app/Madeira/SteamGames.swift	2026-11-25 03:00:15.953523271 +0000
+@@ -306,6 +306,27 @@
+         return nil
+     }
+ 
++    /// (dock-launch-entry-fallback) The launch entry Madeira Dock asks Steam for when `choose`
++    /// found no .exe on disk: the same candidates (Windows, outside beta branches, the game
++    /// itself, ranked as in `choose`), the best one's index, whatever its program is (a .bat
++    /// is Steam's to start). nil when there is none.
++    static func dockFallbackIndex(_ options: [SteamLaunchOption]) -> UInt32? {
++        var best: (rank: Int, order: Int, index: UInt32)? = nil
++        for (order, option) in options.enumerated() {
++            let type = option.type.lowercased()
++            guard let index = option.index, option.betaKey.isEmpty, !otherKinds.contains(type),
++                  option.requiredDLC == nil || option.requiredDLC == "" || option.requiredDLC == "0",
++                  option.oslist.isEmpty || option.oslist.lowercased().contains("windows") else { continue }
++            let kind = type == "default" ? 0 : (type.isEmpty || type == "none" ? 1 : 2)
++            let arch = option.osarch == "64" ? 0 : (option.osarch.isEmpty ? 1 : 2)
++            let rank = kind * 3 + arch
++            if best == nil || rank < best!.rank || (rank == best!.rank && order < best!.order) {
++                best = (rank, order, index)
++            }
++        }
++        return best?.index
++    }
++
+     /// The install folder's Windows programs for the Program picker: every .exe up to
+     /// six folders deep (linked folders are not followed), at most 400, sorted.
+     static func programs(in root: URL) -> [String] {

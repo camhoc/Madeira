@@ -1,0 +1,52 @@
+diff -ruN orig/app/Madeira/DockStartProgram.swift mod/app/Madeira/DockStartProgram.swift
+--- orig/app/Madeira/DockStartProgram.swift	2026-11-26 02:10:42.206053149 +0000
++++ mod/app/Madeira/DockStartProgram.swift	2026-11-26 02:18:04.115390550 +0000
+@@ -34,6 +34,20 @@
+     /// community fork; not device-tested. A program missing from the folder fails in apply()
+     /// and leaves Steam's own in place, as for any choice.
+     static let recommended: [Int: String] = [252490: "RustClient.exe", 244210: "acs.exe"]
++    /// (dock-eac-offline-2) Easy Anti-Cheat games whose own game exe starts without EAC when it is started
++    /// directly (offline play only: no online matches). EAC's bootstrapper cannot run here (it asks for memory at
++    /// 0x700100000000 and up, which iOS cannot give; Halo run 4 log, DroidDeck #1197). Elden Ring (1245620):
++    /// Steam's launch entry is believed to be start_protected_game.exe (unchecked); the game is believed to be Game/eldenring.exe (the launcher's own folder, unchecked; a wrong path only makes apply() fail before touching any file). Same idea as
++    /// DroidDeck PR #1039 (reads EasyAntiCheat/Settings.json); written here without its code. Not device-tested.
++    /// Off: env.MADEIRA_DOCK_START_EAC_OFFLINE = 0, or pick Steam's own program.
++    static let eacOffline: [Int: String] = [1245620: "Game/eldenring.exe"]
++    /// Set by the app at start (MadeiraApp.init) to read env.MADEIRA_DOCK_START_EAC_OFFLINE; this file stays
++    /// Foundation-only so the host check (tests/host/check-dock-start-program.py) compiles it alone.
++    nonisolated(unsafe) static var eacOfflineEnabled: () -> Bool = { true }
++    private static func recommendation(_ appID: Int) -> String? {
++        if let own = recommended[appID] { return own }
++        return eacOfflineEnabled() ? eacOffline[appID] : nil
++    }
+     /// Stored for a recommended game when the player picks Steam's own program, so the
+     /// recommendation does not come back.
+     static let steamOwn = ""
+@@ -43,13 +57,13 @@
+     /// never chose for gets its recommended program.
+     static func chosen(_ appID: Int, defaults: UserDefaults = .standard) -> String? {
+         let all = defaults.dictionary(forKey: key) as? [String: String]
+-        guard let stored = all?[String(appID)] else { return recommended[appID] }
++        guard let stored = all?[String(appID)] else { return recommendation(appID) }
+         return stored == steamOwn ? nil : stored
+     }
+ 
+     static func setChosen(_ appID: Int, _ program: String?, defaults: UserDefaults = .standard) {
+         var all = defaults.dictionary(forKey: key) as? [String: String] ?? [:]
+-        all[String(appID)] = program ?? (recommended[appID] != nil ? steamOwn : nil)
++        all[String(appID)] = program ?? (recommendation(appID) != nil ? steamOwn : nil)
+         defaults.set(all, forKey: key)
+     }
+ 
+diff -ruN orig/app/Madeira/MadeiraApp.swift mod/app/Madeira/MadeiraApp.swift
+--- orig/app/Madeira/MadeiraApp.swift	2026-11-26 02:18:04.087687335 +0000
++++ mod/app/Madeira/MadeiraApp.swift	2026-11-26 02:18:04.115620815 +0000
+@@ -24,6 +24,8 @@
+     init() {
+         // (kill-list) switches the team turned off for this build, from the signed kept file; before anything reads a switch.
+         KillList.apply()
++        // (dock-eac-offline-2) the Dock "Steam starts" default for Easy Anti-Cheat games; off: env.MADEIRA_DOCK_START_EAC_OFFLINE = 0.
++        DockStartProgram.eacOfflineEnabled = { MadeiraConfig.flag("MADEIRA_DOCK_START_EAC_OFFLINE") }
+         // (stock-apple-stage3) Its log line, and a new install's Library defaults (never over a set value).
+         StockApple.stage3Start()
+         // [main-stack-move] crash guard (JITAllocator.c): still alive a few seconds after opening, so the

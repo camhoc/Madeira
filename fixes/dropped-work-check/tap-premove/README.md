@@ -1,0 +1,9 @@
+# tap-premove (quick Touch-mode tap highlights but does not click: Dave the Diver, Detroit; 0.2.100)
+Online: nothing found that matches; Unity/Input System and raw-input games are known to sample the pointer once per frame, but I found no upstream Wine or Winlator change for this. Treat the cause as a hypothesis.
+Evidence (0.2.100 logs, /mnt/project-files/logs/game-runs-2026-11-25-0100/):
+- Dave quick tap: `post_touch_down x=576 y=556` -> `drv_post_mouse flags=0x8003` (MOVE|LDOWN|ABS in ONE event) -> `[rawinput-probe] mouse packet #1 usButtonFlags=0x1 lLastX=576 lLastY=556`, then `#2 usButtonFlags=0x2` 60 ms later (tap-click-hold). Result: highlight only.
+- Dave hold, same spot, pointer already there: `#3 usButtonFlags=0x1 lLastX=0 lLastY=0`, `#4 0x2`. Result: Settings opens.
+- So the press and release DO reach the game as raw packets with correct button flags; the server and the 60 ms hold are ruled out. The only difference is that the failing press carries a 576,556 pointer jump in the same packet. Detroit's OK box needing a hold is consistent but its log does not isolate this (unproven).
+Change: Touch-mode single tap now posts the pointer move first, then the press `env.MADEIRA_TAP_PREMOVE_MS` later (default 80), then the existing 60 ms hold and release. A new touch flushes a waiting press first. Off: `env.MADEIRA_TAP_PREMOVE_MS = 0`. Marker: `[tap-premove] move first, press after 80 ms`.
+Test: Dave quick tap on Settings, then Detroit's OK box. If it still only highlights, try `env.MADEIRA_TAP_PREMOVE_MS = 200`; if that fails too, the cause is elsewhere (hold length), and the next probe is a longer `env.MADEIRA_TOUCH_KEY_MIN_HOLD_MS` (0.35 s hold works).
+Only the Touch-mode tap uses it; the trackpad tap, right/middle click and the long-press drag are unchanged. Apply after tap-click-hold (ContentView.swift only). iPhone and iPad.

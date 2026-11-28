@@ -1,0 +1,107 @@
+diff -ruN orig/app/Madeira/ContentView.swift mod/app/Madeira/ContentView.swift
+--- orig/app/Madeira/ContentView.swift	2026-11-26 03:58:05.074100360 +0000
++++ mod/app/Madeira/ContentView.swift	2026-11-26 04:04:56.508399035 +0000
+@@ -4010,6 +4010,7 @@
+             let program = DockStartProgram.chosen(game.id)
+             if let launcher = steamEntry?.program {
+                 let outcome = DockStartProgram.apply(launcher: launcher, program: program, folder: installFolder,
++                                                   dllLinks: MadeiraConfig.flag("MADEIRA_DOCK_START_DLL_LINKS"),
+                                                    unityData: MadeiraConfig.flag("MADEIRA_DOCK_START_UNITY_DATA"))
+                 if case .failed(let why) = outcome {
+                     logStore.log("[dock-start-program] app=\(game.id) launcher=\(launcher) program=\(program ?? "steam") failed: \(why)", level: .error)
+diff -ruN orig/app/Madeira/DockStartProgram.swift mod/app/Madeira/DockStartProgram.swift
+--- orig/app/Madeira/DockStartProgram.swift	2026-11-26 03:58:05.069002462 +0000
++++ mod/app/Madeira/DockStartProgram.swift	2026-11-26 04:04:56.504200877 +0000
+@@ -20,6 +20,13 @@
+ /// launcher that points at that folder (relative, so it survives the app container
+ /// moving). Only a link Madeira made is ever removed; a real folder is never touched.
+ /// Switch: env.MADEIRA_DOCK_START_UNITY_DATA = 0 (no link).
++///
++/// (dock-start-dll-links-1) A chosen program that lives in another folder than the launcher
++/// (Halo MCC: MCC/Binaries/Win64/MCC-Win64-Shipping.exe over mcclauncher.exe) cannot find its
++/// own DLLs from the launcher's folder (log: c0000135, steam_api64.dll, EOSSDK, bink2w64 ... missing).
++/// The swap then also links each ".dll" of the program's folder into the launcher's folder
++/// (relative symbolic links, never over an existing file), listed in "<launcher>.madeira-dlllinks";
++/// a restore removes exactly those links. Switch: env.MADEIRA_DOCK_START_DLL_LINKS = 0 (no links).
+ enum DockStartProgram {
+     /// The launcher's file while a copy of the chosen program has its name. Not an
+     /// .exe, so the Program picker does not list it.
+@@ -68,7 +75,7 @@
+ 
+     /// Puts the chosen program (nil: none) in place of `launcher`, the program Steam's
+     /// launch entry names; both are relative to `folder`, the game's install folder.
+-    static func apply(launcher: String, program: String?, folder: URL, unityData: Bool = true,
++    static func apply(launcher: String, program: String?, folder: URL, dllLinks: Bool = false, unityData: Bool = true,
+                       files: FileManager = .default) -> Outcome {
+         guard safe(launcher) else { return .failed("Steam's launch entry \(launcher) is outside the game's folder") }
+         let target = folder.appendingPathComponent(launcher)
+@@ -78,6 +85,7 @@
+             guard swapping, let program else {
+                 // No choice (or Steam's own program): the kept launcher goes back, and a
+                 // data link Madeira made for a Unity copy goes with it.
++                try? removeDllLinks(for: target, files: files)
+                 let unlinked = try removeDataLink(for: target, files: files)
+                 guard files.fileExists(atPath: kept.path) else { return unlinked ? .restored : .unchanged }
+                 if files.fileExists(atPath: target.path) { try files.removeItem(at: target) }
+@@ -101,6 +109,7 @@
+                 }
+             }
+             if copied { try files.copyItem(at: source, to: target) }
++            try linkDlls(of: source, for: target, enabled: dllLinks, files: files)
+             switch try linkData(of: source, for: target, enabled: unityData, files: files) {
+             case .linked(let note): return .swappedUnity(note)
+             case .removed: return .swapped
+@@ -111,6 +120,41 @@
+         }
+     }
+ 
++    private static let linksSuffix = ".madeira-dlllinks"
++
++    /// Links the ".dll" files beside `source` into the folder of `target` (when the two folders differ),
++    /// skipping any name that already exists there. Earlier links of ours are removed first.
++    private static func linkDlls(of source: URL, for target: URL, enabled: Bool, files: FileManager) throws {
++        try removeDllLinks(for: target, files: files)
++        let from = source.deletingLastPathComponent().standardizedFileURL
++        let into = target.deletingLastPathComponent().standardizedFileURL
++        guard enabled, from.path != into.path else { return }
++        var made: [String] = []
++        // A failure part-way still lists the links made so far, so a restore removes them.
++        defer {
++            if !made.isEmpty { try? made.joined(separator: "\n").write(toFile: target.path + linksSuffix, atomically: true, encoding: .utf8) }
++        }
++        for name in try files.contentsOfDirectory(atPath: from.path).sorted() where name.lowercased().hasSuffix(".dll") {
++            let link = into.appendingPathComponent(name)
++            if files.fileExists(atPath: link.path) || isLink(link, files: files) { continue }
++            try files.createSymbolicLink(atPath: link.path,
++                                         withDestinationPath: relativePath(from: into, to: from.appendingPathComponent(name)))
++            made.append(name)
++        }
++    }
++
++    /// Takes out the links listed in "<launcher>.madeira-dlllinks" (only symbolic links, only plain names).
++    private static func removeDllLinks(for target: URL, files: FileManager) throws {
++        let list = target.path + linksSuffix
++        guard let text = try? String(contentsOfFile: list, encoding: .utf8) else { return }
++        let dir = target.deletingLastPathComponent()
++        for name in text.split(separator: "\n") where !name.contains("/") && !name.hasPrefix(".") {
++            let link = dir.appendingPathComponent(String(name))
++            if isLink(link, files: files) { try files.removeItem(at: link) }
++        }
++        try files.removeItem(atPath: list)
++    }
++
+     private enum DataLink { case none, removed, linked(String) }
+ 
+     /// "<name>_Data" beside a program ("bin/7DaysToDie.exe" -> "bin/7DaysToDie_Data").
+diff -ruN orig/tests/host/check-dock-start-program.py mod/tests/host/check-dock-start-program.py
+--- orig/tests/host/check-dock-start-program.py	2026-11-26 04:04:56.483579864 +0000
++++ mod/tests/host/check-dock-start-program.py	2026-11-26 04:05:03.993839443 +0000
+@@ -70,6 +70,8 @@
+       'the launcher is kept, never deleted, under a name the Program picker does not list')
+ check('unityData: MadeiraConfig.flag("MADEIRA_DOCK_START_UNITY_DATA"))' in start,
+       'the Unity data link has its switch (env.MADEIRA_DOCK_START_UNITY_DATA = 0 turns it off)')
++check('dllLinks: MadeiraConfig.flag("MADEIRA_DOCK_START_DLL_LINKS")' in start and 'madeira-dlllinks' in source,
++      'the DLL links of a program from another folder have their switch (env.MADEIRA_DOCK_START_DLL_LINKS = 0 turns them off) and a list of what Madeira made')
+ check('guard isLink(link, files: files) else { return false }' in source and
+       'createSymbolicLink(atPath: link.path, withDestinationPath: destination)' in source and
+       'relativePath(from: link.deletingLastPathComponent(), to: data)' in source,

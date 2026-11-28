@@ -1,0 +1,70 @@
+--- ContentView.pre-premove.swift	2026-11-25 03:33:00.606724340 +0000
++++ "src98/Madeira Nightly 0.2.98 source/Madeira/app/Madeira/ContentView.swift"	2026-11-25 03:33:00.651522327 +0000
+@@ -445,8 +445,45 @@
+ 
+     /// Press now, release after the minimum hold. A release still held back
+     /// is sent first, so presses and releases never interleave.
+-    private func tapClick(down: (MetalBackedView) -> Void, up: @escaping (MetalBackedView) -> Void) {
++    private func tapClick(pre: ((MetalBackedView) -> Void)? = nil,
++                          down: @escaping (MetalBackedView) -> Void, up: @escaping (MetalBackedView) -> Void) {
+         flushTapUp()
++        let lead = pre == nil ? 0 : Self.tapPremove()
++        guard lead > 0, let pre else { pressAndRelease(down: down, up: up); return }
++        // tap-premove: the pointer arrives first, the press follows after `lead` seconds.
++        pre(self)
++        pendingTapDown = down
++        pendingTapUp = up
++        tapUpToken &+= 1
++        let token = tapUpToken
++        if Self.tapPremoveLogged < 5 {
++            Self.tapPremoveLogged += 1
++            fputs("[tap-premove] move first, press after \(Int(lead * 1000)) ms\n", stderr)
++        }
++        DispatchQueue.main.asyncAfter(deadline: .now() + lead) { [self] in
++            guard tapUpToken == token, let dn = pendingTapDown, let release = pendingTapUp else { return }
++            pendingTapDown = nil
++            pendingTapUp = nil
++            tapUpToken &+= 1
++            pressAndRelease(down: dn, up: release)
++        }
++    }
++
++    /// tap-premove: a Touch-mode tap sent the pointer jump and the press in ONE event
++    /// (`winios_post_touch_down`: MOVE|LEFTDOWN|ABSOLUTE; Dave the Diver 0.2.100 log:
++    /// `[rawinput-probe] mouse packet #1 usButtonFlags=0x1 lLastX=576 lLastY=556`), and a
++    /// 0.35 s hold on the same spot opened Settings (packet #3: lLastX=0, pointer already
++    /// there). Cause unproven; the game may need to see the pointer arrive before the press.
++    /// The tap now moves first and presses `env.MADEIRA_TAP_PREMOVE_MS` later (default 80).
++    /// Off: `env.MADEIRA_TAP_PREMOVE_MS = 0`.
++    private static var tapPremoveLogged = 0
++    private static func tapPremove() -> Double {
++        let raw = MadeiraConfig.gameValue("env.MADEIRA_TAP_PREMOVE_MS") ?? MadeiraConfig.get("env.MADEIRA_TAP_PREMOVE_MS")
++        let ms = raw.flatMap(Double.init) ?? 80
++        return max(0, min(ms, 500)) / 1000
++    }
++
++    private func pressAndRelease(down: (MetalBackedView) -> Void, up: @escaping (MetalBackedView) -> Void) {
+         down(self)
+         let hold = Self.tapClickHold()
+         if Self.tapHoldLogged < 5 {
+@@ -464,7 +501,10 @@
+         }
+     }
+ 
++    private var pendingTapDown: ((MetalBackedView) -> Void)?
++
+     private func flushTapUp() {
++        if let dn = pendingTapDown { pendingTapDown = nil; dn(self) }   // a waiting press goes out before its release
+         guard let up = pendingTapUp else { return }
+         pendingTapUp = nil
+         tapUpToken &+= 1
+@@ -613,7 +653,8 @@
+         switch peak {
+         case 1:
+             let (x, y) = mapPoint(mid)
+-            tapClick(down: { $0.postSurfaceTouchDown(x, y) }, up: { $0.postSurfaceTouchUp(x, y) })
++            tapClick(pre: { $0.postSurfaceTouchMove(x, y) },
++                     down: { $0.postSurfaceTouchDown(x, y) }, up: { $0.postSurfaceTouchUp(x, y) })
+         case 2: tmAbsoluteClick(down: F_RDOWN, up: F_RUP, at: mid)
+         case 3: tmAbsoluteClick(down: F_MDOWN, up: F_MUP, at: mid)
+         default: break

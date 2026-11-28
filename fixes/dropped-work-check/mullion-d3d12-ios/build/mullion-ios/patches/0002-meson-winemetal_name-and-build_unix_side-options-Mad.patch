@@ -1,0 +1,103 @@
+From 7eea6edb5dca2c92a8f89db8b732ecebd45bba0d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Mon, 23 Nov 2026 18:26:24 +0000
+Subject: [PATCH 2/2] meson: winemetal_name and build_unix_side options
+ (Madeira PE build)
+
+---
+ meson.build               | 3 +++
+ meson.options             | 6 +++++-
+ src/airconv/meson.build   | 2 +-
+ src/util/log/trace.cpp    | 5 ++++-
+ src/winemetal/meson.build | 6 +++---
+ 5 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index 4734d5f..f0900de 100644
+--- a/meson.build
++++ b/meson.build
+@@ -131,6 +131,9 @@ hexdump_generator = generator(xxd,
+   arguments : [ '-n', '@BASENAME@', '-i', '@INPUT@', '@OUTPUT@'],
+ )
+ 
++# Madeira: the PE name winemetal is built under (meson.options winemetal_name)
++add_project_arguments('-DMULLION_WINEMETAL_DLL="' + get_option('winemetal_name') + '.dll"', language : ['c', 'cpp'])
++
+ mullion_debug = get_option('mullion_debug')
+ 
+ if mullion_debug
+diff --git a/meson.options b/meson.options
+index f9552bb..3ae13ee 100644
+--- a/meson.options
++++ b/meson.options
+@@ -10,4 +10,8 @@ option('wine_builtin_dll', type : 'boolean', value : true)
+ option('enable_tests', type : 'boolean', value : false)
+ option('enable_nvapi', type : 'boolean', value : false)
+ option('enable_nvngx', type : 'boolean', value : false)
+-option('enable_d3d12', type : 'boolean', value : true)
+\ No newline at end of file
++option('enable_d3d12', type : 'boolean', value : true)# Madeira: the PE name of winemetal.dll (and so of its unix library). Madeira builds Mullion as 'mlnmetal'
++# so it can sit in one prefix and one app beside DXMT's winemetal.
++option('winemetal_name', type : 'string', value : 'winemetal')
++# Madeira: false builds only the Windows DLLs (the iOS unix side is built by Madeira's build/mullion-ios/build.sh)
++option('build_unix_side', type : 'boolean', value : true)
+diff --git a/src/airconv/meson.build b/src/airconv/meson.build
+index 3aaf036..97071f1 100644
+--- a/src/airconv/meson.build
++++ b/src/airconv/meson.build
+@@ -113,6 +113,6 @@ executable('airconv', airconv_src + airconv_cli_src,
+ 
+ endif
+ 
+-if cpu_family == 'x86_64' or cpu_family == 'aarch64' or not mullion_crossbuild
++if (cpu_family == 'x86_64' or cpu_family == 'aarch64' or not mullion_crossbuild) and get_option('build_unix_side')
+   subdir('darwin')
+ endif
+\ No newline at end of file
+diff --git a/src/util/log/trace.cpp b/src/util/log/trace.cpp
+index ce570ba..6845aad 100644
+--- a/src/util/log/trace.cpp
++++ b/src/util/log/trace.cpp
+@@ -56,7 +56,10 @@ Send(const std::string &lines, const Mask &mask) {
+ #ifdef _WIN32
+   using WriteFunction = bool (*)(const char *, const char *, uint64_t, bool, bool);
+   static const WriteFunction write = [] {
+-    HMODULE winemetal = GetModuleHandleA("winemetal.dll");
++#ifndef MULLION_WINEMETAL_DLL
++#define MULLION_WINEMETAL_DLL "winemetal.dll"
++#endif
++    HMODULE winemetal = GetModuleHandleA(MULLION_WINEMETAL_DLL);
+     return winemetal ? reinterpret_cast<WriteFunction>(GetProcAddress(winemetal, "WMTTraceWrite")) : nullptr;
+   }();
+   if (write && write(Directory().c_str(), lines.data(), lines.size(), mask.heavy & Gpu, mask.on & Memory))
+diff --git a/src/winemetal/meson.build b/src/winemetal/meson.build
+index e17498f..8b361f2 100644
+--- a/src/winemetal/meson.build
++++ b/src/winemetal/meson.build
+@@ -34,7 +34,7 @@ else
+   error('One of the options -Dwine_build_path or -Dwine_install_path is required')
+ endif
+ 
+-winemetal_dll = shared_library('winemetal', winemetal_src,
++winemetal_dll = shared_library(get_option('winemetal_name'), winemetal_src,
+   name_prefix         : '',
+   dependencies        : [ lib_winecrt0, lib_ntdll, lib_dbghelp, airconv_forward_dep ],
+   include_directories : mullion_include_path,
+@@ -51,12 +51,12 @@ winemetal_dep = declare_dependency(
+ 
+ custom_target('postprocess_lib',
+   input : winemetal_dll,
+-  output: 'winemetal.dll.postproc',
++  output: get_option('winemetal_name') + '.dll.postproc',
+   command : [ winebuild, '--builtin', '@INPUT@' ],
+   depends : winemetal_dll,
+   build_by_default : true
+ )
+ 
+-if cpu_family == 'x86_64' or cpu_family == 'aarch64'
++if (cpu_family == 'x86_64' or cpu_family == 'aarch64') and get_option('build_unix_side')
+   subdir('unix')
+ endif
+-- 
+2.43.0
+

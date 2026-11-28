@@ -1,0 +1,34 @@
+From 810efdf5cd8a50dd914d962562a676b1a44f1da9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 02:30:46 +0000
+Subject: [PATCH] airconv: accept clip/cull distance siv and SV_GSInstanceID
+ inputs in geometry shaders
+
+---
+ src/airconv/dxbc_signature.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/airconv/dxbc_signature.cpp b/src/airconv/dxbc_signature.cpp
+index 792e94a..098a6fd 100644
+--- a/src/airconv/dxbc_signature.cpp
++++ b/src/airconv/dxbc_signature.cpp
+@@ -1049,6 +1049,8 @@ handle_signature_gs(
+ 
+     switch (siv) {
+     case D3D10_SB_NAME_POSITION:
++    case D3D10_SB_NAME_CULL_DISTANCE:
++    case D3D10_SB_NAME_CLIP_DISTANCE:
+       break;
+     default:
+       assert(0 && "Unexpected/unhandled geometry shader siv");
+@@ -1065,6 +1067,7 @@ handle_signature_gs(
+       break;
+     }
+     case microsoft::D3D10_SB_OPERAND_TYPE_INPUT_PRIMITIVEID:
++    case microsoft::D3D11_SB_OPERAND_TYPE_INPUT_GS_INSTANCE_ID:
+       break;
+     default:
+       assert(0 && "unhandled geometry shader input");
+-- 
+2.43.0
+

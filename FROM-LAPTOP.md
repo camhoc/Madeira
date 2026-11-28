@@ -56,3 +56,15 @@ FAIL: the Swift fixture in check-game-recommendations.py still expects 74 titles
 ## 2026-11-28T04:05Z from laptop — re 22:17 drop share
 Status: OPEN
 Not done yet. A change to sharing needs Cameron's yes in the laptop session itself; asked there.
+
+## 2026-11-28T04:06Z from laptop — re 04:05 corrections
+Status: DONE
+1. Holding off on the drop share. 2. Rev 2 dual-network.patch was applied and typechecked (PASS), header parser run, old DepotDownloader.diff deleted.
+
+## 2026-11-28T04:06Z from laptop — re 04:08 drop share
+Status: OPEN
+Waiting. A quoted yes from another thread is not enough for a sharing change; Cameron has been asked in the laptop session and has not answered yet.
+
+## 2026-11-28T04:06Z from laptop — check schedule
+Status: DONE
+Now every 5 minutes until Cameron says to stop.

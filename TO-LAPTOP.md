@@ -93,3 +93,7 @@ Cameron wants most work on the laptop so the PC can keep running the iPad sweep.
 ## 2026-11-28T04:30Z from build thread — review: fix/fex-playport-split-mono
 Status: OPEN
 New branch fix/fex-playport-split-mono (4 FEX patches, see CHECK.md). Careful review plus syntax check; check for conflicts with fix/l1-null-guard (both FEX). RESULT.md "Review:" PASS or FAIL.
+
+## 2026-11-28T04:40Z from build thread — before the copy: free disk space
+Status: OPEN
+The share \\10.0.0.143\from-pc is seen, thank you. Before the PC copies anything big: write in FROM-LAPTOP.md how much free disk this laptop has in /home/cam (df -h), and how much you need for the source zip (1.1 GB, about 4 GB unpacked) plus the native outputs (size to follow). The copy will contain no signing keys, certificates, credentials or .env files; tell me if you find any in what arrives.

@@ -1,0 +1,85 @@
+From 43e99c70686336aa0f4ab1146b00f4ce8429f6b9 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Sat, 28 Nov 2026 04:10:56 +0000
+Subject: [PATCH] kk: accept pipeline-statistics query pools, with every
+ counter 0
+
+Red Dead Redemption 2's Vulkan renderer creates a pipeline-statistics
+query pool (8 queries, all 11 counters), begins and ends its queries and
+copies their results, without enabling pipelineStatisticsQuery, which
+KosmicKrisp does not report: Metal has no statistics counters on Apple
+GPUs. That is invalid usage, but other drivers tolerate it, and
+KosmicKrisp reached UNREACHABLE in kk_reports_per_query when the pool was
+created.
+
+Give such a pool one report per enabled counter, as a transform
+feedback pool has two, and record nothing between begin and end: the
+reports keep the zeros of the last reset, and the end makes the query
+available as it does for the other types. Host results and
+vkCmdCopyQueryPoolResults then go through the existing paths: one zero
+per counter, the availability where asked, in 32 or 64 bits.
+pipelineStatisticsQuery stays unreported, so an application that checks
+it still knows the counts are not real.
+
+Class: feature
+Evidence: docs/evidence/2026-10-17-rdr2-vulkan-needs.md
+Offered-upstream: no
+
+Ported from Playport patches/mesa/0038-kk-accept-pipeline-statistics-query-pools-with-every.patch (GPL-3.0-or-later, Mesa is MIT) onto Mesa 26.3.1 + Madeira KK patches; fuzz fuzz 3,.
+---
+ src/kosmickrisp/vulkan/kk_query_pool.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/src/kosmickrisp/vulkan/kk_query_pool.c b/src/kosmickrisp/vulkan/kk_query_pool.c
+index a419300..1c8f9d0 100644
+--- a/src/kosmickrisp/vulkan/kk_query_pool.c
++++ b/src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -41,6 +41,11 @@ kk_ts_heap_chunk(uint32_t query_count)
+ /* The counter heap and the index inside it that back timestamp query `query`. */
+ static mtl_counter_heap *
+ kk_ts_heap_for_query(const struct kk_query_pool *pool, uint32_t query,
++   case VK_QUERY_TYPE_PIPELINE_STATISTICS:
++      /* One per counter. Metal has no statistics counters and the device
++       * reports no pipelineStatisticsQuery; a pool is accepted for
++       * applications that create one anyway, and every counter stays 0. */
++      return util_bitcount(pool->vk.pipeline_statistics);
+                      uint32_t *index)
+ {
+    *index = query % pool->ts.heap_chunk;
+@@ -72,6 +77,12 @@ kk_reports_per_query(struct kk_query_pool *pool)
+ static uint32_t *
+ kk_query_available_map(struct kk_query_pool *pool, uint32_t query)
+ {
++static inline bool
++kk_pool_is_ps(struct kk_query_pool *pool)
++{
++   return pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS;
++}
++
+    assert(query < pool->vk.query_count);
+    return (uint32_t *)pool->bo->cpu + query;
+ }
+@@ -460,6 +471,11 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+    }
+ }
+ 
++   /* Pipeline statistics count nothing: the reports keep the zeros of the
++    * last reset, and the end makes them available. */
++   if (kk_pool_is_ps(pool))
++      return;
++
+ VKAPI_ATTR void VKAPI_CALL
+ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+                  uint32_t query, VkQueryControlFlags flags)
+@@ -545,7 +561,7 @@ cpu_write_query_result(void *dst, uint32_t idx, VkQueryResultFlags flags,
+    if (flags & VK_QUERY_RESULT_64_BIT) {
+       uint64_t *dst64 = dst;
+       dst64[idx] = result;
+-   } else {
++   } else if (!kk_pool_is_ps(pool)) {
+       uint32_t *dst32 = dst;
+       dst32[idx] = result;
+    }
+-- 
+2.43.0
+

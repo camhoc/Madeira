@@ -1,0 +1,45 @@
+From 14f6d8f3b78173ad466467935bd88768f6fd03fd Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Sat, 28 Nov 2026 04:10:57 +0000
+Subject: [PATCH] kk: expose VK_EXT_dynamic_rendering_unused_attachments
+
+vkd3d-proton requires the extension for correct dynamic rendering with
+unused attachments; the common vk_graphics_state code already handles
+it.
+
+Class: diagnostics
+
+Evidence: docs/evidence/2026-11-03-dirt5-xbox-minidump-apiset.md
+
+Offered-upstream: no
+
+Generated-by: LLM
+
+Ported from Playport patches/mesa/0152-kk-expose-VK_EXT_dynamic_rendering_unused_attachment.patch (GPL-3.0-or-later, Mesa is MIT) onto Mesa 26.3.1 + Madeira KK patches; exact.
+---
+ src/kosmickrisp/vulkan/kk_physical_device.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index f6db478..edde9db 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -90,6 +90,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .KHR_vulkan_memory_model = true, /* Required in Vulkan 1.3 */
+       .EXT_buffer_device_address = true,
+       .EXT_descriptor_indexing = true,
++      .EXT_dynamic_rendering_unused_attachments = true,
+       .EXT_host_query_reset = true,
+       .EXT_sampler_filter_minmax = pdev->info.gpu_apple_family >= 10,
+       .EXT_scalar_block_layout = true,
+@@ -324,6 +325,7 @@ kk_get_device_features(
+       .bufferDeviceAddress = true,
+       .computeFullSubgroups = true,
+       .dynamicRendering = true,
++      .dynamicRenderingUnusedAttachments = true,
+       .extendedDynamicState = true,
+       .extendedDynamicState2 = true,
+       .extendedDynamicState2LogicOp = false,
+-- 
+2.43.0
+

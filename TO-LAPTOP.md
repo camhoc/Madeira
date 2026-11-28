@@ -207,3 +207,7 @@ Do not review or apply fix/jumbo-fit-pow2 (dropped in favour of oversize-reserve
 ## 2026-11-28T07:10Z from build thread — compile + second review: fix/oversize-reserve-min-mb
 Status: OPEN
 New branch (CHECK.md). Native, off by default. Edits signal_arm64_ios.c like fix/bo3-stp-sd-emul: check no collision (put it after bo3-stp-sd-emul in the apply-all test). RESULT.md "Review:" PASS or FAIL.
+
+## 2026-11-28T07:15Z from build thread — compile + review: fix/fh6-smc-block
+Status: OPEN
+New branch (CHECK.md). FEX + ARM64EC, off by default. Module.cpp collision check with halo-mcc-exit-ring / l1-null-guard / sigbus-diag. Add to the apply-all test after those. RESULT.md "Review:" PASS or FAIL.

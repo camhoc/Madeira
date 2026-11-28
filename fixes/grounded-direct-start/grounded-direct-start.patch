@@ -1,0 +1,97 @@
+--- a/app/Madeira/GameRecommendations.swift
++++ b/app/Madeira/GameRecommendations.swift
+@@ -82,6 +82,10 @@
+     var launchMode: String? = nil
+     /// Game details › Launch › Start Windows services first (LibraryEntry.startServices).
+     var startServices: Bool? = nil
++    /// (grounded-direct-start) Game details › Steam › Start with "The game", with this program (relative to
++    /// the install folder). A Steam game's launcher stub can stop at a runtime check Wine cannot meet while the
++    /// game's own program runs. Off: env.MADEIRA_REC_STEAM_DIRECT = 0 in madeira.cfg.
++    var steamDirectProgram: String? = nil
+ 
+     /// Lines only a device with less than 12 GB of RAM gets, after `config`
+     /// (GameRecommendations.smallRAMDevice). nil: every device gets the same list.
+@@ -113,6 +117,7 @@
+         if let resolution { parts.append(resolution == Self.screen720 ? "this screen's shape at 720 lines" : resolution) }
+         if launchMode == "desktop" { parts.append("starts in the Wine desktop") }
+         if startServices == true { parts.append("Windows services first") }
++        if let steamDirectProgram { parts.append("starts \(steamDirectProgram.split(separator: "/").last.map(String.init) ?? steamDirectProgram) directly") }
+         return parts.joined(separator: ", ")
+     }
+ }
+@@ -2670,7 +2675,7 @@
+     /// NVIDIA card. Not device-tested on this build line: the old line's Grounded fixes that are not in this tree
+     /// (narration through sapi.dll, a split-pool crash, the FEX free/code-lock freeze) may still stop it.
+     static let grounded = GameRecommendation(
+-        id: "grounded", title: "Grounded", version: 1,
++        id: "grounded", title: "Grounded", version: 2,
+         config: """
+         # Madeira's recommended settings for Grounded.
+         # Reset to Recommended, at the bottom of the game's settings, brings them back.
+@@ -2690,7 +2695,7 @@
+         env.MADEIRA_WAIT_CHILDREN = 1
+         env.MADEIRA_JIT_DUMP = 0
+         """,
+-        nvidia: true)
++        nvidia: true, steamDirectProgram: "Maine/Binaries/Win64/Maine-Win64-Shipping.exe")
+ 
+     /// Satisfactory from Steam (App ID 526870, Unreal Engine 5, Direct3D 12). The owner's device-tested list for the
+     /// Epic copy (Wave 5, 2026-11-06: past the logo and in game, ~29 FPS on Low): the split JIT pool and uncopied
+--- a/app/Madeira/GameRecommendationsApply.swift
++++ b/app/Madeira/GameRecommendationsApply.swift
+@@ -268,6 +268,21 @@
+         if let mode = rec.display { entry.display = mode == DisplayMode.fit.rawValue ? nil : mode }
+         if let mode = rec.launchMode { entry.launchMode = mode == "desktop" ? mode : nil }
+         if let on = rec.startServices { entry.startServices = on ? true : nil }
++        // (grounded-direct-start) "The game" starts this program without Steam; Steam games only, and only when
++        // the program is in the install folder (a missing one leaves Madeira Dock). Off: env.MADEIRA_REC_STEAM_DIRECT = 0.
++        if let program = rec.steamDirectProgram, entry.steamAppID != nil, SteamSignIn.flag("MADEIRA_REC_STEAM_DIRECT", default: true) {
++            let root = LibraryEntry.hostURL(ofWindowsPath: entry.windowsPath)
++            if let root, let spelled = SteamDirectStart.onDisk(program, in: root, directory: false) {
++                entry.steamStart = SteamDirectStart.mode
++                entry.steamProgram = spelled   // as spelt on disk
++                entry.steamProgramSource = "choice"
++                entry.steamProgramArguments = nil
++                entry.steamProgramFolder = nil
++                LogStore.shared.log("[recommended] \(entry.title): starts \(program) directly (Start with: The game)")
++            } else {
++                LogStore.shared.log("[recommended] \(entry.title): \(program) not in the install folder; Madeira Dock stays")
++            }
++        }
+     }
+ 
+     private static var marks: [String: String] {
+--- a/app/Madeira/RemoteRecs.swift
++++ b/app/Madeira/RemoteRecs.swift
+@@ -113,7 +113,7 @@
+             r.avx = base.avx; r.nvidia = base.nvidia; r.olderNvidia = base.olderNvidia; r.wineVCRT = base.wineVCRT
+             r.fastSync = base.fastSync; r.semaphoreFastPath = base.semaphoreFastPath; r.fpsMode = base.fpsMode
+             r.resolution = base.resolution; r.display = base.display; r.launchMode = base.launchMode
+-            r.startServices = base.startServices; r.smallRAMConfig = base.smallRAMConfig
++            r.startServices = base.startServices; r.steamDirectProgram = base.steamDirectProgram; r.smallRAMConfig = base.smallRAMConfig
+         }
+         if let v = e.avx { r.avx = v }
+         if let v = e.nvidia { r.nvidia = v }
+--- a/tests/host/check-game-recommendations.py
++++ b/tests/host/check-game-recommendations.py
+@@ -733,6 +733,20 @@
+     var semaphoreFastPath: Bool? = nil
+     var launchMode: String? = nil
+     var startServices: Bool? = nil
++    var steamStart: String? = nil
++    var steamProgram: String? = nil
++    var steamProgramSource: String? = nil
++    var steamProgramArguments: String? = nil
++    var steamProgramFolder: String? = nil
++    // (grounded-direct-start) stand-ins: no install folder on the host, so the program is never "on disk".
++    static func hostURL(ofWindowsPath path: String) -> URL? { nil }
++}
++enum SteamSignIn {
++    static func flag(_ name: String, default value: Bool) -> Bool { value }
++}
++enum SteamDirectStart {
++    static let mode = "game"
++    static func onDisk(_ relative: String, in root: URL, directory: Bool) -> String? { nil }
+ }
+ 
+ final class PrefStore {

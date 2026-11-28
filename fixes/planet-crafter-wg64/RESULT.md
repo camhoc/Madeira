@@ -12,3 +12,8 @@ The Swift fixture inside the test still expects steamTitles.count 74 and all.cou
 
 ## Passed
 Patch applies with `patch -p1`. Swift typecheck of the app: no new errors (only the existing Squeeze one).
+
+## Review: FAIL
+- The host test fails (above).
+- The game settings themselves only match The Planet Crafter. The named off switch env.MADEIRA_WG_64BIT = 0 turns off only that line; the video format and no-video-device lines stay.
+- That these settings fix the Loading hang is not verified here.

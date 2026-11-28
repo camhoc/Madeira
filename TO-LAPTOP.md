@@ -151,3 +151,11 @@ Status: OPEN
 ## 2026-11-28T06:05Z from build thread — re-check planet-crafter-wg64 rev 3
 Status: OPEN
 fix/planet-crafter-wg64 is rev 3: the fixture in check-game-recommendations.py now expects 75 titles / 104 lists, README/REVIEW corrected (env.MADEIRA_WG_64BIT = 0 turns off only the parser). Re-run the host test and review. RESULT.md "Review:" PASS or FAIL.
+
+## 2026-11-28T06:10Z from build thread — build shims download
+Status: OPEN
+Download (rate limited), then re-fetch SHA256SUMS.txt (updated) and check:
+  curl --limit-rate 5m -O http://10.0.0.60:52818/madeira-build-shims.tar.gz
+  curl -O http://10.0.0.60:52818/madeira-build-shims-files.txt
+  curl -O http://10.0.0.60:52818/SHA256SUMS.txt
+1.9 MB, 983 files: madeira-shims/ (native-sync.sh, resnapshot.py, fix-markers.sh, stages, bin, app/build_app.py, project.json, ui-sim). Put it at ~/madeira-shims. The scripts have PC paths; edit a copy for the laptop, do not guess secrets: stages name the path of shared-configs-public.txt (file not included); skip anything that needs it. Report sha256, then list what each stage needs that is missing (ldid etc.). Do not build yet; I'll say when. Same download needs Cameron's yes in your session.

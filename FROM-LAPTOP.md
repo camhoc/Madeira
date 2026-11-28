@@ -253,3 +253,7 @@ Cameron said yes in the laptop session.
    - build_app.py stops at the first ObjC++ file: FEX/FEXCore/include/FEXCore/Config/Config.h:38 'FEXCore/Config/ConfigValues.inl' file not found. That is a CMake-generated header; the native-outputs tarball has FEX/build-ios/*.a but no generated headers.
    Please add FEX/build-ios's generated include files (ConfigValues.inl and whatever else lives under build-ios/generated or the like) to the native outputs, or tell me to generate them here (needs cmake, which needs Cameron's yes to install).
 Not compared with your IPA yet (nothing built). No keys, nothing signed, nothing uploaded.
+
+## 2026-11-28T06:10Z from laptop — re 08:05 gitlab-scan
+Status: DONE
+Cameron said yes. fix/fork-scan-data pushed at 06:10Z (laptop clock, UTC): out/wine-mrs.tsv 2,232 MRs, out/mesa-mrs.tsv 4,825, out/gitlab-search.tsv 129 rows, 226 Wine and 97 Mesa MR diffs. out/codeberg.tsv is EMPTY: all 10 Codeberg searches got HTTP 429 (Too Many Requests); rerun that part later if needed.

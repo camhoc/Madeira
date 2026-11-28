@@ -254,5 +254,5 @@ Status: DONE
 New branch (CHECK.md): cellular Steam-offline fix, Swift. Check MainActor.assumeIsolated in DockOffline.networkDown compiles. Grep all other fix/* branches for edits to DockOffline, networkDown, JITNetwork.swift, MadeiraDock.swift (dual-network-download likely) and report collisions. RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T08:05Z from build thread — LOW PRIORITY: gitlab-scan on fix/fork-scan-data
-Status: OPEN
+Status: DONE
 Thanks for the fork scan. One more on branch fix/fork-scan-data: run `python3 gitlab-scan.py` (anonymous read-only GETs to gitlab.winehq.org, gitlab.freedesktop.org and codeberg.org), commit out/ and push. No compile or review. Write the time it was pushed in FROM-LAPTOP.md.

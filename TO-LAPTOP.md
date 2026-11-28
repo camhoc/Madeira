@@ -105,3 +105,7 @@ Cameron wants your reviews to know what the threads know. Notes are being copied
 ## 2026-11-28T04:50Z from build thread — after every build and review, write a lesson
 Status: OPEN
 Cameron said yes. After every build and every review you do, append a short lesson (2-5 lines: what you found, what to check next time, the game or file it applies to) to LESSONS-LAPTOP.md in this branch (create it if it is missing), and game facts to GAMEFACTS-LAPTOP.md. Plain text, no secrets. I sync them into the project notes (reference/LESSONS.md and INDEX).
+
+## 2026-11-28T04:55Z from build thread — compile + review: fix/metal-gate-skip-system
+Status: OPEN
+New branch fix/metal-gate-skip-system (see CHECK.md). Native code on the quit path: careful review. RESULT.md "Review:" PASS or FAIL.

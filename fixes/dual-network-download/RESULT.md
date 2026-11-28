@@ -1,16 +1,18 @@
-# RESULT: dual-network-download
+# RESULT: dual-network-download (rev 2)
 
 **PASS (typecheck) / NEEDS-DEVICE**
 
-Updated 2026-11-27 on the Linux laptop against 0.2.180-og.
-
-## Apply
-`patch -p1 < DepotDownloader.diff` from the tree root, and copy DualNetworkDownload.swift to app/Madeira/SwiftSteam/Content/.
-The diff now holds the download hook, the project.pbxproj entries and a Settings toggle (Onboarding.swift, next to LAN downloads; off by default).
+Checked 2026-11-27 on the Linux laptop against 0.2.180-og.
 
 ## Run
-Applies cleanly. Swift typecheck of the app: no new errors (only the existing Squeeze one). Header parser tested on Linux.
+`patch -p1` from the app folder with dual-network.patch: applies. The standalone DualNetworkDownload.swift matches the patched one. Swift typecheck of the whole app: no new errors (only the existing Squeeze one).
+
+## Review
+The Content-Length crash, stalls, path encoding and size cap are handled.
+Minor: the Host header omits a non-default port.
+
+## Correction
+A laptop commit made one minute after rev 2 overwrote its DualNetworkDownload.swift and re-added DepotDownloader.diff. Both are now back to rev 2 (a4e6071). Do not use the laptop's earlier diff.
 
 ## Still open
-- No Xcode build, so the project.pbxproj entries are unproven. Not run on a device.
-- Swift 6 NSLock warnings. Cellular alongside Wi-Fi is unproven.
+No Xcode build (project.pbxproj unproven), no device test, cellular alongside Wi-Fi unproven.

@@ -159,3 +159,7 @@ Download (rate limited), then re-fetch SHA256SUMS.txt (updated) and check:
   curl -O http://10.0.0.60:52818/madeira-build-shims-files.txt
   curl -O http://10.0.0.60:52818/SHA256SUMS.txt
 1.9 MB, 983 files: madeira-shims/ (native-sync.sh, resnapshot.py, fix-markers.sh, stages, bin, app/build_app.py, project.json, ui-sim). Put it at ~/madeira-shims. The scripts have PC paths; edit a copy for the laptop, do not guess secrets: stages name the path of shared-configs-public.txt (file not included); skip anything that needs it. Report sha256, then list what each stage needs that is missing (ldid etc.). Do not build yet; I'll say when. Same download needs Cameron's yes in your session.
+
+## 2026-11-28T06:15Z from build thread — re-check metal-gate-skip-system rev 2
+Status: OPEN
+Rev 2 pushed: check-background-run.py and its stubs updated, dladdr only while inactive, match narrowed to RenderBox.framework only. Run check-background-run.py if you can, re-review. RESULT.md "Review:" PASS or FAIL. The ConfigCatalog entry is mine, later.

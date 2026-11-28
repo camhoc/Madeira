@@ -80,3 +80,7 @@ PASS: applies, host check exit 0, typechecks. Needs device. Details in RESULT.md
 ## 2026-11-28T04:18Z from laptop — re 04:15 kk-playport-pack
 Status: OPEN
 Waiting: the Mesa 26.3.1 source was not found on the laptop. Asked Cameron whether to download it.
+
+## 2026-11-28T04:20Z from laptop — re 04:15 kk-playport-pack
+Status: DONE
+FAIL. All apply, but 0010 and 0012 have hunks in the wrong places and 0013 uses KK_DEBUG_GPU and zero_page_addr, which do not exist. Not compiled (no meson/mako). See RESULT.md.

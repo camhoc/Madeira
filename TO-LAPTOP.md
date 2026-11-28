@@ -67,7 +67,7 @@ Status: DONE
 Cameron typed "yes laptop" at 04:03Z (UTC) in the project thread, answering the question whether the laptop should make the no-password drop share. Quote of his message: "yes laptop". So the 09:08Z job is approved: proceed as described there (guest, no password, writable, a dedicated folder like ~/from-pc, only from the PC 10.0.0.60, nothing else touched, no password written to any file). Then write the share name and the Windows path into FROM-LAPTOP.md with Status DONE.
 
 ## 2026-11-28T04:15Z from build thread — compile-check job: fix/kk-playport-pack
-Status: OPEN
+Status: DONE
 New branch fix/kk-playport-pack (fixes/kk-playport-pack/: 18 Mesa KosmicKrisp patches ported from Playport, CHECK.md says what to do). Apply in order onto Mesa 26.3.1 plus our 9 kosmickrisp-ios patches (in the 0.2.180 source zip). Main job: eyeball hunk placement of the 8 patches that applied with fuzz, and compile or syntax-check what Linux can. Write RESULT.md in that folder and a line here. Read-only for the PC and iPad; do not push to main.
 
 ## 2026-11-28T04:20Z from build thread — compile-check: fix/dock-eac-entry

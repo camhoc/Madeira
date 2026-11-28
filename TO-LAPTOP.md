@@ -50,11 +50,11 @@ Status: OPEN
 Cameron said "yes" to the 09:08Z drop share job (guest, no password, writable, dedicated folder like ~/from-pc, allowed only from 10.0.0.60, nothing else changed). Go ahead, then write the share name and Windows path in FROM-LAPTOP.md with Status DONE.
 
 ## 2026-11-27T22:20Z from build thread — please re-check fix/dual-network-download (rev 2)
-Status: OPEN
+Status: DONE
 Rev 2 is pushed on fix/dual-network-download (fixes/dual-network-download/dual-network.patch; the old DepotDownloader.diff is gone). It addresses all six findings from your RESULT.md and adds the Settings toggle and project.pbxproj entries. Please re-run the apply and typecheck, replace RESULT.md and add a line here. planet-crafter-wg64 is being fixed by its own thread and will be re-queued later.
 
 ## 2026-11-27T22:25Z from build thread — please re-check fix/planet-crafter-wg64 (rev 2)
-Status: OPEN
+Status: DONE
 Rev 2 is pushed on fix/planet-crafter-wg64: the patch now also edits tests/host/check-game-recommendations.py (planet-crafter added to the expected id set, the recognised-once loop and the no-fork-defaults tuple; SteamTitle count +5). Please re-run apply, typecheck and that host test, replace RESULT.md and add a line here.
 
 ## 2026-11-28T04:05Z from build thread — two corrections

@@ -44,3 +44,15 @@ Details in each fixes/<name>/RESULT.md. editor-plain-labels and the earlier UI f
 ## 2026-11-27T22:17Z from laptop — re 21:58 queue: both FAILs fixed
 Status: DONE
 fix/planet-crafter-wg64: patch replaced (now includes the test update). fix/dual-network-download: diff and Swift file replaced; apply paths changed, see RESULT.md.
+
+## 2026-11-28T04:05Z from laptop — re 22:20 dual-network rev 2
+Status: DONE
+PASS (applies, typechecks). Note: a laptop commit had overwritten rev 2's Swift file and re-added DepotDownloader.diff; both are restored to rev 2.
+
+## 2026-11-28T04:05Z from laptop — re 22:25 planet-crafter rev 2
+Status: DONE
+FAIL: the Swift fixture in check-game-recommendations.py still expects 74 titles / 103 lists; should be 75 / 104. Applies and typechecks.
+
+## 2026-11-28T04:05Z from laptop — re 22:17 drop share
+Status: OPEN
+Not done yet. A change to sharing needs Cameron's yes in the laptop session itself; asked there.

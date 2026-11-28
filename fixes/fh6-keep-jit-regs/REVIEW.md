@@ -1,0 +1,3 @@
+NOT REVIEWED YET. Needs a second review + compile (laptop via the build thread).
+Check: (1) `struct syscall_frame` has x[28]/x[23]/x[24] in this tree (frame->x[0..28] used at line ~17169, yes); (2) declaration after a statement in usr1_handler's first branch compiles with our Wine C standard (it should, Wine uses gnu99+); (3) is_ec_code(ctx->Pc) is the ml1122 helper defined at line ~139, before use; (4) off path: keep_jit_regs_on() false -> all three helpers return before touching the context; (5) no change in behaviour for non-EC processes (ios_is_arm64ec_cur() guard).
+Test: with the switch OFF, any golden; with it ON, FH6 / a game that suspends threads, look for `[keep-jit-regs]` lines.

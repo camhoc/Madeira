@@ -1,0 +1,102 @@
+--- a/build/ntdll-unix/signal_arm64_ios.c
++++ b/build/ntdll-unix/signal_arm64_ios.c
+@@ -9045,6 +9045,63 @@
+ }
+ 
+ 
++/* madeira [keep-jit-regs] (ported from TimmyTurner51/fh6-wine-fex wine/arm64ec-frame-regs.patch, Wine is LGPL-2.1;
++ * permission also given by the author on Discord, per Cameron). An ARM64EC context has no room for the registers
++ * x64 does not use, so a translation to and from one zeroes x13, x14, x23, x24 and x28, and FEX's JIT keeps live
++ * values there. Put them back when the context still describes the same instruction (pc check).
++ * Off by default: env MADEIRA_EC_KEEP_JIT_REGS=1 turns it on. Log: [keep-jit-regs] on first use. */
++static int keep_jit_regs_on( void )
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *env = getenv( "MADEIRA_EC_KEEP_JIT_REGS" );
++        on = env && env[0] == '1' && !env[1];
++    }
++    return on;
++}
++
++struct keep_jit_regs
++{
++    ULONG64 pc, x13, x14, x23, x24, x28;
++};
++
++static void keep_jit_regs_save( struct keep_jit_regs *r, ULONG64 pc, const ULONG64 *x )
++{
++    r->pc = pc;
++    r->x13 = x[13];
++    r->x14 = x[14];
++    r->x23 = x[23];
++    r->x24 = x[24];
++    r->x28 = x[28];
++}
++
++static void keep_jit_regs_restore( const struct keep_jit_regs *r, CONTEXT *ctx )
++{
++    extern int ios_is_arm64ec_cur(void);
++    static LONG said;
++    if (!keep_jit_regs_on() || !ios_is_arm64ec_cur() || ctx->Pc != r->pc || !r->x28 || ctx->X[28]) return;
++    ctx->X[13] = r->x13;
++    ctx->X[14] = r->x14;
++    ctx->X[23] = r->x23;
++    ctx->X[24] = r->x24;
++    ctx->X[28] = r->x28;
++    if (InterlockedIncrement( &said ) <= 8) dprintf( 2, "[keep-jit-regs] suspend: restored x13/x14/x23/x24/x28 at pc %p rev=keep-jit-regs-1\n", (void *)ctx->Pc );
++}
++
++/* The syscall frame still has the caller-saved JIT state when a helper that called into ntdll returns. */
++static void keep_jit_regs_frame( CONTEXT *ctx, const struct syscall_frame *frame )
++{
++    extern int ios_is_arm64ec_cur(void);
++    static LONG said;
++    if (!keep_jit_regs_on() || !ios_is_arm64ec_cur() || (ctx->ContextFlags & CONTEXT_INTEGER) != CONTEXT_INTEGER) return;
++    if (ctx->X[28] || !frame->x[28] || !is_ec_code( ctx->Pc )) return;
++    ctx->X[23] = frame->x[23];
++    ctx->X[24] = frame->x[24];
++    ctx->X[28] = frame->x[28];
++    if (InterlockedIncrement( &said ) <= 8) dprintf( 2, "[keep-jit-regs] frame: restored x23/x24/x28 at pc %p rev=keep-jit-regs-1\n", (void *)ctx->Pc );
++}
++
+ /***********************************************************************
+  *           signal_set_full_context
+  */
+@@ -9054,7 +9111,10 @@
+     struct syscall_frame *frame = get_syscall_frame( get_thread_data() );
+     ULONG_PTR ml944_req_pc = context->Pc, ml944_req_sp = context->Sp;
+     DWORD ml944_req_flags = context->ContextFlags;
+-    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
++    NTSTATUS status;
++
++    keep_jit_regs_frame( context, frame );
++    status = NtSetContextThread( GetCurrentThread(), context );
+ 
+     if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
+         frame->restore_flags |= CONTEXT_INTEGER;
+@@ -17108,15 +17168,23 @@
+     if (is_inside_syscall( get_thread_data(), SP_sig(ucontext) ))
+     {
+         context.ContextFlags = CONTEXT_FULL | CONTEXT_EXCEPTION_REQUEST;
++        struct keep_jit_regs jit;
++
+         NtGetContextThread( GetCurrentThread(), &context );
++        keep_jit_regs_save( &jit, context.Pc, context.X );
+         wait_suspend( &context );
++        keep_jit_regs_restore( &jit, &context );
+         NtSetContextThread( GetCurrentThread(), &context );
+     }
+     else
+     {
++        struct keep_jit_regs jit;
++
+         save_context( &context, ucontext );
+         context.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
++        keep_jit_regs_save( &jit, context.Pc, context.X );
+         wait_suspend( &context );
++        keep_jit_regs_restore( &jit, &context );
+         restore_context( &context, ucontext );
+ #ifdef WINE_IOS
+         ios_fixup_x18_for_return( ucontext );

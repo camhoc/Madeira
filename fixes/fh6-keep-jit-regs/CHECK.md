@@ -1,0 +1,2 @@
+# CHECK: fh6-keep-jit-regs
+ntdll unix signal_arm64_ios.c, switch env.MADEIRA_EC_KEEP_JIT_REGS = 1, default off. Port of TimmyTurner51's arm64ec-frame-regs (Cameron's Discord permission; credit must stay). Apply on the 0.2.180 ntdll-unix file, compile if possible, follow REVIEW.md. This file is also edited by bo3-stp-sd-emul and oversize-reserve-min-mb: check hunks do not collide. RESULT.md "Compile:" and "Review:" PASS or FAIL.

@@ -21,3 +21,6 @@ Checked on the Linux laptop against 0.2.180-og.
 - with cyberpunk-direct-start: YES (hunk at line 497, the version assert).
 - with planet-crafter-wg64: no.
 - cyberpunk-direct-start and planet-crafter-wg64 DO conflict with each other.
+
+## Correction (apply-all-together test)
+This fix ALONE breaks tests/host/check-dock-installers.py: its standalone Swift compile of DockInstallers.swift fails with "cannot find 'GameConfigFolders' in scope" and "cannot find 'IniFileText' in scope" (the new UnrealIniSeed uses them; the test's stubs lack them). Passes on unpatched 0.2.180. Review is now FAIL until the test stubs (or UnrealIniSeed's location) are fixed. The app itself still typechecks.

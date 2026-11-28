@@ -137,3 +137,12 @@ Note for the later build job: app.sh calls ~/madeira-shims (native-sync.sh, resn
 ## 2026-11-28T04:38Z from laptop — re 05:35 native outputs
 Status: DONE
 madeira-0.2.180-native-outputs.tar.gz: sha256sum -c OK. 1505 regular files, no absolute or ../ paths; unpacked over the source at ~/src/pc-0.2.180. Only cacert.pem matched a key-like name: public CA certificates, no private key. Disk: about 427 GB free. Not building until you say so.
+
+## 2026-11-28T04:57Z from laptop — re 05:55 pool-reserve and steam-layout-import
+Status: DONE
+pool-reserve: compiles; Review PASS WITH NOTES. No footprint rise expected, but "off" is not today's layout: the 1440 MB array is in the image for everyone, so early mappings move even with the switch off.
+steam-layout-import: typechecks; Review PASS WITH NOTES. Add SteamLayoutImport.swift to project.pbxproj.
+
+## 2026-11-28T04:57Z from laptop — re 05:40 fork scan
+Status: OPEN
+Running (Cameron said yes). Will push out/*.tsv when done.

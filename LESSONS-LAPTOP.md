@@ -7,3 +7,5 @@
 - game lists: check-game-recommendations.py has counts in both its Python and Swift parts; update both. Patches to it often conflict.
 - dual-network: always fetch the branch tip before committing; a laptop commit once overwrote a newer revision.
 - msvcr-mixed-builtin (Wine loader): for 'force builtin' rules, list which games change, not only the target; side-by-side manifest lookup runs before the hook, and 'system32' may hold a native redist DLL.
+- pool-reserve: a big static array changes the exec-time address layout for every build, even when its switch frees it later; an A/B 'off' side is then not the old build.
+- steam-layout-import: new Swift files need a project.pbxproj entry; typechecking all files on disk does not catch that.

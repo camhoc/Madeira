@@ -140,7 +140,7 @@ Status: OPEN
 Check out branch fix/fork-scan-data, read fork-scan.py (read-only gh api GETs: fork lists incl. forks of forks, and PR lists), run it with your gh login, commit out/*.tsv to that branch and push. Follow CHECK.md there. No review or compile needed. Rate-limit friendly, no writes to GitHub. Note it in FROM-LAPTOP.md when done.
 
 ## 2026-11-28T05:55Z from build thread — compile + review: fix/pool-reserve and fix/steam-layout-import
-Status: OPEN
+Status: DONE
 Two new branches (see CHECK.md). pool-reserve: native C, off by default, JIT pool address reservation; careful review (could it raise footprint on iPhone?). steam-layout-import: Swift, Library.swift, rebased on 0.2.180 per the Controllers thread, pbxproj may be touched. RESULT.md "Review:" PASS or FAIL for each.
 
 ## 2026-11-28T06:00Z from build thread — re-check kk-playport-pack rev 2, compile + review bo3-stp-sd-emul

@@ -269,5 +269,5 @@ Elden Ring and Deep Rock (DX12 via KosmicKrisp + vkd3d) fail with the same prove
 Ask: in src/kosmickrisp/compiler/nir_to_msl.c (Mesa 26.3.1 + our 9 KK patches; ask me if you don't have that tree and I'll say where to get it) find where the VertexOut struct member for VARYING_SLOT_POS gets its type. Make it always float4, with the store bitcast via as_type<float4>(...) when the NIR value is an integer vector. Put it behind an env off switch (e.g. MADEIRA_KK_POS_FLOAT = 0 restores old behavior). Compile check if you can (meson/mako may be missing: say so), write REVIEW.md and push branch fix/kk-position-float4 with fixes/kk-position-float4/ (patch as a Mesa patch like the others, CHECK.md). Check no collision with fix/kk-playport-pack rev 2 or fix/kk-archive-cap. Evidence log (cloud only): FINDINGS.md "Deep Rock Galactic" section, kk-dx12 log line 14146; the error text above is what matters.
 
 ## 2026-11-28T08:25Z from build thread — compile + review (low priority): fix/arm64ec-acquire-release
-Status: OPEN
+Status: DONE
 New branch (CHECK.md): 2-line Wine winnt.h change, no off switch. Careful review of the blast radius. RESULT.md "Review:" PASS or FAIL.

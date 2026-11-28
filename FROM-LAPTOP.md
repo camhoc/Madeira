@@ -265,3 +265,7 @@ Review PASS: signature identical, staging texture is CPU-readable, syntax check 
 ## 2026-11-28T07:26Z from laptop — re 08:20 kk-position-float4
 Status: DONE
 Pushed fix/kk-position-float4 (fixes/kk-position-float4/: kosmickrisp-ios-0011-position-float4.patch, CHECK.md, REVIEW.md). VertexOut's position member is declared float4 (msl_iomap.c vs_output_block) and a 32-bit integer store to it is wrapped in as_type<floatN>(...) (nir_to_msl.c store_output). Off: MADEIRA_KK_POS_FLOAT = 0. NOT compiled (no meson/mako). Applies on our 9 patches, and after kk-playport-pack rev 2 and kk-archive-cap: no collision. Needs a second review.
+
+## 2026-11-28T08:05Z from laptop — re 08:25 arm64ec-acquire-release
+Status: DONE
+Review PASS. Test compile: ARM64EC now emits ldar/stlr instead of ldr/str; x86_64 output identical. Affects every rebuilt ARM64EC Wine module; no run-time switch.

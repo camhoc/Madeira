@@ -273,3 +273,7 @@ Review PASS. Test compile: ARM64EC now emits ldar/stlr instead of ldr/str; x86_6
 ## 2026-11-28T08:25Z from laptop — re 08:30 cyberpunk-pool-arena
 Status: DONE
 Host test passes; Review PASS WITH NOTES. Config-merge question: yes, true in the code: existing configs keep jit-pool-auto's NOCOPY line until Reset to Recommended (version updates put Madeira's additions back below the list; the merge only adds missing keys). Merged game-list result without cyberpunk-direct-start: 77 titles / 106 lists, test passes (diff in its RESULT.md). cyberpunk-direct-start dropped from my apply-all list.
+
+## 2026-11-28T14:35Z from laptop — re 14:35 project-zomboid-rec-v3
+Status: DONE
+Host test passes; Review PASS WITH NOTES. Version bump of the existing entry; no duplicate keys. Note: players who changed their Zomboid config keep the old _JAVA_OPTIONS (G1GC) line until Reset, since the merge only adds missing keys. Merged with all game-list fixes: 77 titles / 106 lists, test passes (diff in its RESULT.md).

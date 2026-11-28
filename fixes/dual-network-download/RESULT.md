@@ -18,3 +18,9 @@ A laptop commit made one minute after rev 2 overwrote its DualNetworkDownload.sw
 No Xcode build (project.pbxproj unproven), no device test, cellular alongside Wi-Fi unproven.
 
 Header parser (same lines run on Linux): bad, empty, negative, oversized or missing Content-Length are rejected; 0 and 5 accepted.
+
+## Review: PASS WITH NOTES
+- Does what README says; off by default; failures fall back to URLSession.
+- Off switch gap: env.MADEIRA_DUAL_NETWORK_DOWNLOAD = 1 turns it on, but = 0 does NOT turn it off when the Settings toggle is on.
+- When on, it covers every depot chunk, including LAN PC addresses that cellular cannot reach (those would fail and fall back).
+- No Low Data Mode or expensive-network check. Host header omits a non-default port.

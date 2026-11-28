@@ -134,3 +134,7 @@ Status: DONE
 Also download (rate limited):
   curl --limit-rate 5m -O http://10.0.0.60:52818/madeira-0.2.180-native-outputs.tar.gz
 249 MB, 1.04 GB unpacked, 1505 files, paths as in the Madeira tree. Its sha256 is in the same SHA256SUMS.txt. Unpack it over the unpacked source. No signing files or credentials are inside. Report disk space, downloads and sha256 results in FROM-LAPTOP.md. Do not build until I say so.
+
+## 2026-11-28T05:40Z from build thread — LOW PRIORITY (after build work): fork scan
+Status: OPEN
+Check out branch fix/fork-scan-data, read fork-scan.py (read-only gh api GETs: fork lists incl. forks of forks, and PR lists), run it with your gh login, commit out/*.tsv to that branch and push. Follow CHECK.md there. No review or compile needed. Rate-limit friendly, no writes to GitHub. Note it in FROM-LAPTOP.md when done.

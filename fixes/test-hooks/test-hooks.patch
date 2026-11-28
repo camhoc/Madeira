@@ -1,0 +1,159 @@
+diff -ruN orig/app/Madeira/SavesAndShortcuts.swift mod/app/Madeira/SavesAndShortcuts.swift
+--- orig/app/Madeira/SavesAndShortcuts.swift	2026-11-28 05:00:47.921223428 +0000
++++ mod/app/Madeira/SavesAndShortcuts.swift	2026-11-28 05:00:54.767222311 +0000
+@@ -53,6 +53,8 @@
+ /// restamps one binary for iPhone, iPad and public, so everyone ships this code but it returns at once
+ /// unless the bundle id is the iPad test id AND env.MADEIRA_IPAD_TEST_HOOKS = 1 in madeira.cfg (off by default).
+ ///  1. madeira://launch?steam=<appid> starts that library game like Play (after JIT).
++///  3. madeira://status writes Documents/test-hooks/status.json; madeira://quit[?force=1]; madeira://relaunch?steam=<appid>;
++///     previous run logs kept in Documents/test-hooks/runs/ (see the functions below).
+ ///  2. The game's own log files (the same ones Get Help shares: GameOwnLogs, LogsView.swift), including games on an
+ ///     external drive, are copied to Documents/test-hooks/own-logs/<program>/ where the PC reads them over AFC
+ ///     (house_arrest, UIFileSharingEnabled). Done at every app start for the last game played, and on
+@@ -69,13 +71,24 @@
+     /// true when the link is one of ours (so no other handler sees it), whether or not the hooks are on.
+     static func handle(_ url: URL) -> Bool {
+         guard url.scheme?.lowercased() == "madeira", let host = url.host?.lowercased(),
+-              host == "launch" || host == "export-logs" else { return false }
++              ["launch", "export-logs", "status", "quit", "relaunch"].contains(host) else { return false }
+         guard enabled else {
+             LogStore.shared.log("[ipad-hooks] \(host) ignored: not the iPad test build, or env.MADEIRA_IPAD_TEST_HOOKS is off")
+             return true
+         }
+         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+         let app = items?.first(where: { $0.name == "steam" })?.value.flatMap { Int($0) }
++        if host == "status" { writeStatus(); return true }
++        if host == "quit" {
++            let force = items?.first(where: { $0.name == "force" })?.value == "1"
++            quit(force: force); return true
++        }
++        if host == "relaunch" {
++            guard let app, app > 0, app <= Int(UInt32.max) else {
++                LogStore.shared.log("[ipad-hooks] relaunch needs steam=<appid>", level: .error); return true
++            }
++            relaunch(steam: app); return true
++        }
+         if host == "launch" {
+             guard let app, app > 0, app <= Int(UInt32.max) else {
+                 LogStore.shared.log("[ipad-hooks] launch needs steam=<appid>", level: .error); return true
+@@ -91,7 +104,119 @@
+     /// At app start: the last game's logs, after the external drives mounted.
+     static func exportAtStart() {
+         guard enabled else { return }
+-        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { export(steam: nil) }
++        keepPreviousRunLog()
++        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { export(steam: nil); writeStatus() }
++    }
++
++    // MARK: status, quit, relaunch, run logs (test-hooks)
++
++    private static var testDir: URL? { LogFiles.documents?.appendingPathComponent("test-hooks", isDirectory: true) }
++    private static let started = Date()
++
++    /// The last `bytes` of a file as text lines (the log is appended to by several writers, so read it plainly).
++    private static func tailLines(_ url: URL, bytes: UInt64) -> [String] {
++        guard let h = try? FileHandle(forReadingFrom: url) else { return [] }
++        defer { try? h.close() }
++        let size = (try? h.seekToEnd()) ?? 0
++        try? h.seek(toOffset: size > bytes ? size - bytes : 0)
++        let text = String(decoding: (try? h.readToEnd()) ?? Data(), as: UTF8.self)
++        return text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
++    }
++
++    /// madeira://status: Documents/test-hooks/status.json (the PC reads it over AFC). Also written 15 s after app start.
++    /// "frames_in_tail" adds the "present N/s" figures of the [frame] lines in the last 512 KB of madeira-log.txt (one per second,
++    /// so it is a frame count only while env.MADEIRA_FRAME_STATS is on); "present_fps" is the newest of them.
++    static func writeStatus() {
++        guard enabled, let dir = testDir, let docs = LogFiles.documents else { return }
++        DispatchQueue.main.async {
++            let model = LibraryModel.shared
++            let entry = model.activeEntry
++            let game: [String: Any] = [
++                "running": model.current != nil,
++                "title": entry?.title ?? "",
++                "steam_app": entry?.steamAppID ?? 0,
++                "sessions_this_run": LibraryModel.sessionsThisRun,
++            ]
++            DispatchQueue.global(qos: .utility).async {
++                let tail = tailLines(docs.appendingPathComponent("madeira-log.txt"), bytes: 512 * 1024)
++                var presentFPS: Double?
++                var frames = 0.0
++                for line in tail where line.contains("[frame] ") {
++                    guard let r = line.range(of: "present ") else { continue }
++                    let num = line[r.upperBound...].prefix { "0123456789.".contains($0) }
++                    if let v = Double(num) { presentFPS = v; frames += v }
++                }
++                let sessions = ((try? FileManager.default.contentsOfDirectory(atPath: docs.appendingPathComponent("logs").path)) ?? [])
++                    .filter { $0.hasSuffix(".txt") }.sorted().suffix(5)
++                let out: [String: Any] = [
++                    "time": ISO8601DateFormatter().string(from: Date()),
++                    "app_uptime_s": Int(Date().timeIntervalSince(started)),
++                    "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
++                    "game": game,
++                    "present_fps": presentFPS.map { $0 as Any } ?? NSNull(),
++                    "frames_in_tail": Int(frames),
++                    "last_log_lines": Array(tail.suffix(40)),
++                    "newest_session_logs": Array(sessions),
++                ]
++                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
++                if let data = try? JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted, .sortedKeys]) {
++                    try? data.write(to: dir.appendingPathComponent("status.json"), options: .atomic)
++                }
++                LogStore.shared.log("[ipad-hooks] status written to Documents/test-hooks/status.json")
++            }
++        }
++    }
++
++    /// madeira://quit asks the running game to close (Alt+F4, same as the in-game Quit); with no game it closes Madeira.
++    /// madeira://quit?force=1 closes Madeira at once (exit(0), the same exit as Close Madeira).
++    static func quit(force: Bool) {
++        guard enabled else { return }
++        DispatchQueue.main.async {
++            let model = LibraryModel.shared
++            if !force, model.current != nil {
++                LogStore.shared.log("[ipad-hooks] quit: asking the game to close")
++                model.requestQuit()
++            } else {
++                LogStore.shared.log("[ipad-hooks] quit: closing Madeira")
++                exit(0)
++            }
++        }
++    }
++
++    /// madeira://relaunch?steam=<appid>: closes the game, then Madeira closes with that game queued (NextSteamApp), so the
++    /// next app run starts it by itself. iOS cannot reopen an app that exited: the PC opens Madeira again
++    /// (e.g. madeira://launch?steam=<appid> or just the app). Waits up to 20 s for the game to end, then closes anyway.
++    static func relaunch(steam app: Int) {
++        guard enabled else { return }
++        DispatchQueue.main.async {
++            let model = LibraryModel.shared
++            LogStore.shared.log("[ipad-hooks] relaunch: Steam app \(app) queued, closing Madeira")
++            NextSteamApp.set(app)
++            if model.current != nil { model.requestQuit() }
++            func closeWhenDone(_ left: Int) {
++                if model.current == nil || left <= 0 { exit(0) }
++                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { closeWhenDone(left - 1) }
++            }
++            closeWhenDone(20)
++        }
++    }
++
++    /// Per-run logs: Documents/logs/ already keeps the newest 40 session logs (LogStore.startSessionLog). At every app start
++    /// this also copies the previous run's madeira-log.prev.txt (written by LogStore at launch) to
++    /// Documents/test-hooks/runs/<time>-prev.txt, newest 20 kept, so one finished run is never lost to the next start.
++    static func keepPreviousRunLog() {
++        guard let dir = testDir, let docs = LogFiles.documents else { return }
++        let fm = FileManager.default
++        let prev = docs.appendingPathComponent("madeira-log.prev.txt")
++        guard fm.fileExists(atPath: prev.path) else { return }
++        let runs = dir.appendingPathComponent("runs", isDirectory: true)
++        try? fm.createDirectory(at: runs, withIntermediateDirectories: true)
++        let stamp = DateFormatter(); stamp.dateFormat = "yyyy-MM-dd_HH-mm-ss"
++        let mod = (try? fm.attributesOfItem(atPath: prev.path)[.modificationDate] as? Date) ?? Date()
++        let dest = runs.appendingPathComponent(stamp.string(from: mod) + "-prev.txt")
++        if !fm.fileExists(atPath: dest.path) { try? fm.copyItem(at: prev, to: dest) }
++        let old = ((try? fm.contentsOfDirectory(atPath: runs.path)) ?? []).sorted().dropLast(20)
++        for f in old { try? fm.removeItem(at: runs.appendingPathComponent(f)) }
+     }
+ 
+     private static func export(steam: Int?) {

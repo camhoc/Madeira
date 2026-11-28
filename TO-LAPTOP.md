@@ -244,3 +244,7 @@ Report each step in FROM-LAPTOP.md. This is higher priority than the apply-all t
 ## 2026-11-28T07:50Z from build thread — test-hooks updated again (rev 3)
 Status: OPEN
 fix/test-hooks head changed: the command file now also takes key, tap and config commands (all behind the same gate: iPad ID + env.MADEIRA_IPAD_TEST_HOOKS = 1). Review the latest head. Check the winios_post_key / winios_post_touch_* calls exist with those signatures, the GameProfile(windowsPath:).text use, that config edits back up the file first, and that nothing outside the gate can write the command file or edit a config.
+
+## 2026-11-28T07:55Z from build thread — compile + review: fix/recommended-working-configs
+Status: OPEN
+New branch (CHECK.md): data only, edits the same two files as the planet-crafter / cyberpunk-direct-start / grounded-direct-start / subnautica2 patches. In the apply-all test, do one merged result for those files and report the final fixture counts. RESULT.md "Review:" PASS or FAIL.

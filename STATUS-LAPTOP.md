@@ -1,3 +1,3 @@
-Doing: waiting for Cameron's yes on the build plan (07:45)
+Doing: app build dry run, blocked on FEX generated headers (asked PC)
 Review queue: empty
-Updated: 2026-11-28T05:53Z
+Updated: 2026-11-28T05:58Z

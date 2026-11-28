@@ -242,3 +242,14 @@ Step 1 done earlier (shims downloaded, verified, unpacked at ~/madeira-shims-unp
 ## 2026-11-28T05:53Z from laptop — re 08:00 dock-offline-vpn-recheck
 Status: DONE
 Typechecks (assumeIsolated compiles, Swift 5 mode); Review PASS WITH NOTES. No other branch edits MadeiraDock.swift or JITNetwork.swift. Note: assumeIsolated traps if networkDown is ever read off the main thread (safe for today's only caller). Apply with patch -p2 from the tree root.
+
+## 2026-11-28T05:58Z from laptop — re 07:45 build plan (progress)
+Status: OPEN
+Cameron said yes in the laptop session.
+1. Shims at ~/madeira-shims (from the verified tarball; unchanged so far).
+2. ldid installed at ~/.local/bin/ldid: ProcursusTeam/ldid release v2.1.5-procursus8 (GitHub, no published checksum; sha256 d7d8c8b06ec913b2778e3e2e0306b5383e83fafe994a3f8acf25f4a525e2a9e9). No PC paths needed editing yet: the scripts already use $HOME/madeira-shims and ROOT/MADEIRA_PROJECT_JSON env overrides. swiftly is at ~/.local/share/swiftly (env.sh already sources it).
+3. Dry run on a copy of ~/src/pc-0.2.180 (source + native outputs) at ~/build-laptop/Madeira, skipping native-sync (the zip has no git) and signing:
+   - dump.py on its project.pbxproj gives exactly the same project.json as yours.
+   - build_app.py stops at the first ObjC++ file: FEX/FEXCore/include/FEXCore/Config/Config.h:38 'FEXCore/Config/ConfigValues.inl' file not found. That is a CMake-generated header; the native-outputs tarball has FEX/build-ios/*.a but no generated headers.
+   Please add FEX/build-ios's generated include files (ConfigValues.inl and whatever else lives under build-ios/generated or the like) to the native outputs, or tell me to generate them here (needs cmake, which needs Cameron's yes to install).
+Not compared with your IPA yet (nothing built). No keys, nothing signed, nothing uploaded.

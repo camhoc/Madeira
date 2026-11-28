@@ -1,0 +1,51 @@
+--- orig/Library.swift	2026-11-28 04:47:55.261573721 +0000
++++ files/Library.swift	2026-11-28 04:47:55.309546835 +0000
+@@ -4061,6 +4061,9 @@
+     /// happens in this session; Game details passes none.
+     var controls: [TouchControl] = []
+ 
++    @State private var importingLayout = false
++    @State private var importNote: String?
++
+     private static let groups: [(String, [String])] = [
+         ("Sticks", ["LS", "RS"]),
+         ("Face", ["A", "B", "X", "Y"]),
+@@ -4089,6 +4092,17 @@
+                     .font(.caption).foregroundStyle(.secondary)
+             }
+         }
++        if SteamLayoutImport.on {
++            Section {
++                Button("Import Steam layout…") { importingLayout = true }
++                if let importNote { Text(importNote).font(.caption).foregroundStyle(.secondary) }
++                Text("Choose a Steam Input layout file (.vdf). Keys, mouse buttons, the D-pad and a WASD or arrow-key stick are taken over; gyro, touch pads and action layers are skipped. This replaces the bindings above; inputs the layout leaves out keep the defaults.")
++                    .font(.caption).foregroundStyle(.secondary)
++            }
++            .fileImporter(isPresented: $importingLayout, allowedContentTypes: [.item]) { result in
++                importNote = importLayout(result)
++            }
++        }
+         Section {
+             Button("Reset all to defaults", role: .destructive) { reset() }
+                 .disabled(!changed)
+@@ -4098,6 +4112,20 @@
+         }
+     }
+ 
++    /// steam-layout-import: reads the chosen file and replaces the binds table; the line it returns is shown under the button.
++    private func importLayout(_ result: Result<URL, Error>) -> String {
++        guard let url = try? result.get() else { return "No file chosen." }
++        let scoped = url.startAccessingSecurityScopedResource()
++        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
++        guard let data = try? Data(contentsOf: url), data.count < 2_000_000 else { return "That file could not be read." }
++        guard let layout = SteamLayoutImport.convert(String(decoding: data, as: UTF8.self)) else {
++            return "That is not a Steam Input layout (no controller_mappings block or no preset with bindings)."
++        }
++        if layout.binds.isEmpty { return SteamLayoutImport.summary(layout) + " Nothing changed." }
++        binds = layout.binds
++        return SteamLayoutImport.summary(layout)
++    }
++
+     /// Anything to reset: a bound row or a vertical speed other than 1.
+     var changed: Bool { !(binds ?? [:]).isEmpty || mouseVertical != nil }
+     func reset() { binds = nil; mouseVertical = nil }

@@ -1,0 +1,2 @@
+# CHECK: kk-archive-cap
+Mesa 26.3.1 patch (kosmickrisp-ios-0010-archive-cap.patch) on top of our 9 patches (applies after 0009 kk-metal-archive). Verify it applies, compile-check the touched KK file if you can, read for correctness (2 GB cap, 120 s flush, only when env.MADEIRA_KK_METAL_ARCHIVE = 1). Also check overlap with fix/kk-playport-pack rev 2 (same Mesa tree, also applies on top of our 9): do the hunks collide? RESULT.md "Compile:" and "Review:" PASS or FAIL.

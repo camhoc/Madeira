@@ -1,0 +1,116 @@
+--- a/src/kosmickrisp/bridge/mtl_compiler.m
++++ b/src/kosmickrisp/bridge/mtl_compiler.m
+@@ -43,7 +43,8 @@
+  * lookupArchives.
+  * ------------------------------------------------------------------------- */
+ #define KK_ARCH_MAX_FILES 256
+-#define KK_ARCH_FLUSH_NS (30ull * 1000000000ull)
++#define KK_ARCH_FLUSH_DEFAULT_S 120u
++#define KK_ARCH_MAX_MB_DEFAULT 2048u
+ #define KK_ARCH_PRINT_NS (10ull * 1000000000ull)
+ 
+ struct kk_arch_thread {
+@@ -59,6 +60,12 @@
+ static dispatch_once_t kk_arch_load_once;
+ static NSArray *kk_arch_archives = nil;
+ static char kk_arch_dir[1024];
++/* env.MADEIRA_KK_ARCHIVE_FLUSH_S (seconds between flushes, default 120) and
++ * env.MADEIRA_KK_ARCHIVE_MAX_MB (most archive bytes opened at launch, default
++ * 2048, 0 = no cap). Opened archives stay in memory (the iediot/Madeira notes
++ * saw runaway growth), so files past the cap are NOT opened (left on disk). */
++static uint64_t kk_arch_flush_limit_ns = KK_ARCH_FLUSH_DEFAULT_S * 1000000000ull;
++static unsigned long long kk_arch_max_bytes = KK_ARCH_MAX_MB_DEFAULT * 1048576ull;
+ static long long kk_arch_run_id;
+ static atomic_uint kk_arch_slots;
+ static atomic_ullong kk_arch_lib_ns, kk_arch_lib_n, kk_arch_pipe_ns,
+@@ -166,6 +173,20 @@
+    else
+       return;
+    kk_arch_run_id = (long long)time(NULL);
++   const char *e_flush = getenv("MADEIRA_KK_ARCHIVE_FLUSH_S");
++   if (e_flush && *e_flush) {
++      char *end = NULL;
++      long v = strtol(e_flush, &end, 10);
++      if (end != e_flush && *end == 0 && v >= 5 && v <= 3600)
++         kk_arch_flush_limit_ns = (uint64_t)v * 1000000000ull;
++   }
++   const char *e_max = getenv("MADEIRA_KK_ARCHIVE_MAX_MB");
++   if (e_max && *e_max) {
++      char *end = NULL;
++      long v = strtol(e_max, &end, 10);
++      if (end != e_max && *end == 0 && v >= 0 && v <= 1048576)
++         kk_arch_max_bytes = (unsigned long long)v * 1048576ull;
++   }
+ 
+    /* mkdir -p for the last two levels (the cache dir itself may be new) */
+    char tmp[1024];
+@@ -180,7 +201,8 @@
+    mkdir(tmp, 0755);
+ 
+    NSMutableArray *list = [[NSMutableArray alloc] init];
+-   unsigned opened = 0, bad = 0, pruned = 0;
++   unsigned opened = 0, bad = 0, pruned = 0, capped = 0;
++   unsigned long long open_bytes = 0;
+    @autoreleasepool {
+       NSString *ns_dir = [NSString stringWithUTF8String:kk_arch_dir];
+       if (ns_dir == nil) {
+@@ -196,9 +218,10 @@
+          if (![name hasSuffix:@".mtl4a"])
+             continue;
+          NSString *full = [ns_dir stringByAppendingPathComponent:name];
+-         NSDate *mtime =
+-            [[fm attributesOfItemAtPath:full error:nil] fileModificationDate];
+-         [files addObject:@[ full, mtime ? mtime : [NSDate distantPast] ]];
++         NSDictionary *at = [fm attributesOfItemAtPath:full error:nil];
++         NSDate *mtime = [at fileModificationDate];
++         [files addObject:@[ full, mtime ? mtime : [NSDate distantPast],
++                             @([at fileSize]) ]];
+       }
+       /* newest first; older files past the limit are deleted so the folder
+        * can't grow without bound */
+@@ -207,11 +230,17 @@
+       }];
+       for (NSArray *f in files) {
+          NSString *full = f[0];
+-         if (opened + bad >= KK_ARCH_MAX_FILES) {
++         if (opened + bad + capped >= KK_ARCH_MAX_FILES) {
+             unlink([full fileSystemRepresentation]);
+             pruned++;
+             continue;
+          }
++         unsigned long long fsz = [f[2] unsignedLongLongValue];
++         if (kk_arch_max_bytes && open_bytes + fsz > kk_arch_max_bytes) {
++            /* over the memory cap: keep the file on disk, don't open it */
++            capped++;
++            continue;
++         }
+          NSURL *url = [NSURL fileURLWithPath:full];
+          NSError *error = nil;
+          id<MTL4Archive> ar = [dev newArchiveWithURL:url error:&error];
+@@ -227,12 +256,15 @@
+          [list addObject:ar];
+          [ar release];
+          opened++;
++         open_bytes += fsz;
+       }
+    }
+    kk_arch_archives = list;
+    fprintf(stderr,
+-           "[kk-archive] on dir=%s archives opened=%u removed(bad)=%u removed(old)=%u\n",
+-           kk_arch_dir, opened, bad, pruned);
++           "[kk-archive] on dir=%s archives opened=%u (%.1f MB) skipped(cap)=%u removed(bad)=%u removed(old)=%u cap=%llu MB flush=%llu s\n",
++           kk_arch_dir, opened, open_bytes / 1048576.0, capped, bad, pruned,
++           kk_arch_max_bytes / 1048576ull,
++           (unsigned long long)(kk_arch_flush_limit_ns / 1000000000ull));
+ }
+ 
+ /* The compiler to use on this thread: the shared one when off or on failure. */
+@@ -325,7 +357,7 @@
+       struct kk_arch_thread *t = pthread_getspecific(kk_arch_key);
+       if (t && t->ser) {
+          t->since_flush++;
+-         if (now - t->last_flush_ns >= KK_ARCH_FLUSH_NS)
++         if (now - t->last_flush_ns >= kk_arch_flush_limit_ns)
+             kk_arch_flush(t);
+       }
+    }

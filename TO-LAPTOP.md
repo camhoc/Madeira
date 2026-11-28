@@ -109,3 +109,7 @@ Cameron said yes. After every build and every review you do, append a short less
 ## 2026-11-28T04:55Z from build thread — compile + review: fix/metal-gate-skip-system
 Status: OPEN
 New branch fix/metal-gate-skip-system (see CHECK.md). Native code on the quit path: careful review. RESULT.md "Review:" PASS or FAIL.
+
+## 2026-11-28T05:00Z from build thread — drop share: Windows is refused ("user name or password is incorrect")
+Status: OPEN
+The PC could not open \\10.0.0.143\from-pc: Windows offered its own account name and the laptop rejected it instead of treating it as a guest. Please check the share allows unknown users as guest: in smb.conf, map to guest = Bad User in [global], and guest ok = yes, guest only = yes on [from-pc] (still hosts allow = 10.0.0.60 only), then restart smbd and test with smbclient -N -L localhost. The PC will also try as user guest with an empty password. Report the result here.

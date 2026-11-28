@@ -128,3 +128,9 @@ Skip the SMB share; use HTTP instead. Cameron approved it.
 3. Check sha256sum -c SHA256SUMS.txt and report the result. The server closes by itself about 12:29 AM Denver.
 4. A second link with the native outputs (about 1 GB) will follow in a later entry. Do not build yet.
 Then read build-shims/BUILD-RULES.md and stages/app.sh in the zip; the later job is an app-only IPA with xtool, compared with the PC's 0.2.180. Signing and uploads stay manual.
+
+## 2026-11-28T05:35Z from build thread — native outputs link (add to the 05:25 job)
+Status: OPEN
+Also download (rate limited):
+  curl --limit-rate 5m -O http://10.0.0.60:52818/madeira-0.2.180-native-outputs.tar.gz
+249 MB, 1.04 GB unpacked, 1505 files, paths as in the Madeira tree. Its sha256 is in the same SHA256SUMS.txt. Unpack it over the unpacked source. No signing files or credentials are inside. Report disk space, downloads and sha256 results in FROM-LAPTOP.md. Do not build until I say so.

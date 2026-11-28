@@ -1,0 +1,145 @@
+--- /mnt/project-files/source/madeira-0.2.180/Madeira/app/Madeira/DockInstallers.swift	2026-11-27 01:42:05.846352000 +0000
++++ new/DockInstallers.swift	2026-11-28 04:16:53.800669000 +0000
+@@ -437,6 +437,76 @@
+     }
+ }
+ 
++/// madeira-ue-ini-seed: an Unreal game's [SystemSettings] lines, written into its Saved/Config/Windows/Engine.ini in
++/// the prefix before each start. Subnautica 2 (a UE 5.6 shipping build) reads cvars only from that file: -dpcvars and
++/// -ini: are ignored in shipping builds (0.2.180 game log: the -dpcvars text is on "Command Line:" but no "Set CVar"
++/// line follows), and the game deletes Engine.ini while it runs, so the file has to be put back every start.
++/// The game's own config sets it:  env.MADEIRA_UE_INI_SEED = <Project>: key=value,key=value
++/// Missing, empty or 0 = off (nothing is written). Lines the file already has get the seed's value; others stay.
++/// Called from the Dock start and from a library launch, only while no session runs.
++enum UnrealIniSeed {
++    /// (project, [(key, value)]) or nil when off or malformed.
++    static func parse(_ raw: String?) -> (project: String, pairs: [(String, String)])? {
++        guard let raw = raw?.trimmingCharacters(in: .whitespaces), !raw.isEmpty, raw != "0",
++              let colon = raw.firstIndex(of: ":") else { return nil }
++        let project = raw[..<colon].trimmingCharacters(in: .whitespaces)
++        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-."))
++        guard !project.isEmpty, project != ".", project != "..", project.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
++        var pairs: [(String, String)] = []
++        for item in raw[raw.index(after: colon)...].split(separator: ",") {
++            guard let eq = item.firstIndex(of: "=") else { continue }
++            let key = item[..<eq].trimmingCharacters(in: .whitespaces)
++            let value = item[item.index(after: eq)...].trimmingCharacters(in: .whitespaces)
++            guard !key.isEmpty, !key.contains("["), !key.contains("]"), !key.contains(";") else { continue }
++            pairs.append((key, value))
++        }
++        return pairs.isEmpty ? nil : (project, pairs)
++    }
++
++    @MainActor static func write(prefix: URL, gameConfig: String, label: String) {
++        guard let seed = parse(GameProfile.parse(gameConfig)["env.MADEIRA_UE_INI_SEED"]) else { return }
++        guard wine_process_is_running() == 0, wineserver_is_running() == 0 else {
++            LogStore.shared.log("[ue-ini-seed] \(label) project=\(seed.project) not written: a Wine session is running", level: .error); return
++        }
++        let fm = FileManager.default
++        let drive = prefix.appendingPathComponent("drive_c")
++        let users = GameConfigFolders.matches("users/*", drive: drive).filter {
++            let name = ($0 as NSString).lastPathComponent.lowercased()
++            return name != "public" && fm.fileExists(atPath: drive.appendingPathComponent($0).appendingPathComponent("AppData").path)
++        }
++        guard !users.isEmpty else {
++            LogStore.shared.log("[ue-ini-seed] \(label) project=\(seed.project) not written: no user folder in the prefix", level: .error); return
++        }
++        for user in users {
++            let folder = drive.appendingPathComponent(user).appendingPathComponent("AppData/Local/\(seed.project)/Saved/Config/Windows", isDirectory: true)
++            let file = folder.appendingPathComponent("Engine.ini")
++            do {
++                try fm.createDirectory(at: folder, withIntermediateDirectories: true)
++                let old = fm.contents(atPath: file.path)
++                let read = old.flatMap { IniFileText(data: $0) }
++                if old != nil && read == nil {
++                    LogStore.shared.log("[ue-ini-seed] \(label) \(user) not written: the existing Engine.ini could not be read as text; left as it is", level: .error); continue
++                }
++                var doc = IniDocument(text: read?.text ?? "")
++                for (key, value) in seed.pairs where doc.value(section: "SystemSettings", key: key) != value {
++                    doc.add(section: "SystemSettings", key: key, value: value)
++                }
++                guard let data = (read ?? IniFileText(data: Data()))?.data(doc.text) else {
++                    LogStore.shared.log("[ue-ini-seed] \(label) \(user) not written: text did not encode", level: .error); continue
++                }
++                if data == old {
++                    LogStore.shared.log("[ue-ini-seed] \(label) \(user)/.../\(seed.project)/Saved/Config/Windows/Engine.ini already has \(seed.pairs.count) settings")
++                    continue
++                }
++                try data.write(to: file, options: .atomic)
++                LogStore.shared.log("[ue-ini-seed] \(label) wrote \(seed.pairs.count) [SystemSettings] lines to \(user)/AppData/Local/\(seed.project)/Saved/Config/Windows/Engine.ini (was \(old == nil ? "missing" : "present"))")
++            } catch {
++                LogStore.shared.log("[ue-ini-seed] \(label) \(user) not written: \(error.localizedDescription)", level: .error)
++            }
++        }
++    }
++}
++
+ // MARK: - Planning, the batch and its results
+ 
+ /// What a Dock start does with one install-script program.
+--- /mnt/project-files/source/madeira-0.2.180/Madeira/app/Madeira/ContentView.swift	2026-11-27 01:42:04.788256000 +0000
++++ new/ContentView.swift	2026-11-28 04:10:35.495552000 +0000
+@@ -2973,6 +2973,8 @@
+         GOGLibrary.shared.writeInstallScriptRegistry(for: entry)
+         // madeira-rockstar-pipe: the Rockstar launcher's service wait (Epic and other library copies of Rockstar games); off unless the game's list sets it.
+         RockstarPipeTimeout.write(prefix: MadeiraDock.prefix, gameConfig: GameProfile(windowsPath: entry.windowsPath).text, label: "library=\(entry.id)")
++        // madeira-ue-ini-seed: an Unreal game's Engine.ini [SystemSettings]; off unless the game's config sets it.
++        UnrealIniSeed.write(prefix: MadeiraDock.prefix, gameConfig: GameProfile(windowsPath: entry.windowsPath).text, label: "library=\(entry.id)")
+         if entry.gogProductID != nil {
+             // A GOG game: its redistributable installers still to run, before the game
+             // (from the services batch), and GOG's game services while it runs.
+@@ -4048,6 +4050,8 @@
+             // a Reset takes out what they installed; the other games share those installs.
+             RockstarPipeTimeout.write(prefix: MadeiraDock.prefix, gameConfig: profile.map { GameProfile(windowsPath: $0.windowsPath).text } ?? "",
+                                       label: "app=\(game.id)")
++            UnrealIniSeed.write(prefix: MadeiraDock.prefix, gameConfig: profile.map { GameProfile(windowsPath: $0.windowsPath).text } ?? "",
++                                label: "app=\(game.id)")
+             DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix,
+                                    others: MadeiraDock.games(drive: MadeiraDock.drive))
+             if DockInstallers.installsOnly {
+--- /mnt/project-files/source/madeira-0.2.180/Madeira/app/Madeira/GameRecommendations.swift	2026-11-27 01:42:07.150971000 +0000
++++ new/GameRecommendations.swift	2026-11-28 04:16:53.880792000 +0000
+@@ -2670,7 +2670,7 @@
+     /// Subnautica 2 (Steam App ID 1962700). Ported on 2026-10-26 from the tested list for it in thebcd69's BCD (its version
+     /// 1); not device-tested here.
+     static let subnautica2 = GameRecommendation(
+-        id: "subnautica-2", title: "Subnautica 2", version: 2,
++        id: "subnautica-2", title: "Subnautica 2", version: 3,
+         config: """
+         # Madeira's recommended settings for Subnautica 2.
+         # Reset to Recommended, at the bottom of the game's settings, brings them back.
+@@ -2683,16 +2683,19 @@
+         env.MADEIRA_SWAP_MIN_KB = 64
+         env.MADEIRA_EC_HOOK_TRACE = 0
+         env.MADEIRA_X64_IMAGE_NOCOPY = 1
++        env.MADEIRA_UE_INI_SEED = Subnautica2: RHI.TransientAllocator.MinimumHeapSize=256,r.RDG.TransientAllocator=0,r.Nanite.MaxCandidateClusters=4194304,r.Nanite.MaxVisibleClusters=1048576,r.Streaming.PoolSize=600,r.Streaming.LimitPoolSizeToVRAM=1,r.Streaming.MaxTempMemoryAllowed=32,r.Lumen.DiffuseIndirect.Allow=0,r.Lumen.Reflections.Allow=0,r.Shadow.Virtual.Enable=0,r.Nanite.MaxPixelsPerEdge=4,r.ViewDistanceScale=0.5,r.MaxAnisotropy=0,r.SkeletalMeshLODBias=2,r.StaticMeshLODDistanceScale=2,foliage.DensityScale=0.3,grass.DensityScale=0.3,sg.ResolutionQuality=70,sg.ViewDistanceQuality=0,sg.AntiAliasingQuality=0,sg.ShadowQuality=0,sg.GlobalIlluminationQuality=0,sg.ReflectionQuality=0,sg.PostProcessQuality=0,sg.TextureQuality=0,sg.EffectsQuality=0,sg.FoliageQuality=0,sg.ShadingQuality=0
+         # The defaults this list was tested with (upstream's differ).
+         env.MADEIRA_FREE_DELAY_MS = 2000
+         env.MADEIRA_CTX_CPU_AREA = 2
+         env.MADEIRA_WAIT_CHILDREN = 1
+         env.MADEIRA_JIT_DUMP = 0
+         """,
+-        // Unreal's "Transient allocator failed" FATAL (RHICoreTransientResourceAllocator) came whenever Engine.ini
+-        // was missing, and the game deletes it while running. These four are set on the command line instead.
+-        // Proven on an iPad (0.2.101): the game log shows "Set CVar ... MinimumHeapSize:256", no FATAL.
+-        programArguments: "-dpcvars=RHI.TransientAllocator.MinimumHeapSize=256,r.RDG.TransientAllocator=0,r.Nanite.MaxCandidateClusters=4194304,r.Nanite.MaxVisibleClusters=1048576")
++        // Unreal's "Transient allocator failed" FATAL (RHICoreTransientResourceAllocator) comes whenever Engine.ini is
++        // missing at start. -dpcvars did nothing (shipping build: 0.2.180 log has the argument but no Set CVar line);
++        // the cvars now go into Engine.ini through env.MADEIRA_UE_INI_SEED, which Madeira rewrites before every
++        // start because the game deletes the file while it runs (0 turns that off). Proof the file works: 0.2.101 iPad runs
++        // with Engine.ini present ("Set CVar [[RHI.TransientAllocator.MinimumHeapSize:256]]", 499 s, no FATAL).
++        programArguments: "")
+ 
+     /// Grounded (Steam App ID 962130, Unreal Engine 4; Maine-Win64-Shipping.exe). From the owner's device-tested
+     /// game config of the old build line (it got Grounded in game with the controller working, 2026-10-31/11-01):
+--- /mnt/project-files/source/madeira-0.2.180/Madeira/tests/host/check-game-recommendations.py	2026-11-27 01:44:15.132766000 +0000
++++ new/tests-host/check-game-recommendations.py	2026-11-28 04:17:03.455772000 +0000
+@@ -497,7 +497,7 @@
+ # variant or app-side switches, and no MADEIRA_SPAWN_SWAP (its engine code is not in this tree).
+ for ident in MERGED:
+     p = presets[ident]
+-    assert p['version'] == (4 if ident == 'baldurs-gate-3' else 2 if ident in ('batman-arkham-city-goty', 'counter-strike-2', 'beamng-drive', 'metaphor-refantazio', 'goals', 'dotnet-large-heap', 'project-zomboid', 'slay-the-spire-2', 'the-escapists-2', 'subnautica-2', 'resident-evil-requiem', 'grounded') else 1), ident
++    assert p['version'] == (4 if ident == 'baldurs-gate-3' else 3 if ident == 'subnautica-2' else 2 if ident in ('batman-arkham-city-goty', 'counter-strike-2', 'beamng-drive', 'metaphor-refantazio', 'goals', 'dotnet-large-heap', 'project-zomboid', 'slay-the-spire-2', 'the-escapists-2', 'resident-evil-requiem', 'grounded') else 1), ident
+     assert not any(line.startswith(('env.MADEIRA_WINTYPES', 'env.MADEIRA_OPTIN_DLLS', 'env.MADEIRA_D3D8 ',
+                                     'env.MADEIRA_STEAM_IDENTITY', 'env.MADEIRA_MFC_DOCK', 'pool-split-retry'))
+                    for line in p['lines']), (ident, p['lines'])

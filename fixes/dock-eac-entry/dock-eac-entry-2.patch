@@ -1,0 +1,69 @@
+diff -ru a/app/Madeira/ContentView.swift b/app/Madeira/ContentView.swift
+--- a/app/Madeira/ContentView.swift	2026-11-28 04:10:37.236480834 +0000
++++ b/app/Madeira/ContentView.swift	2026-11-28 04:14:10.964493539 +0000
+@@ -3909,6 +3909,20 @@
+             let installFolder = MadeiraDock.drive.appendingPathComponent(game.library + "/common/" + game.installDir)
+             let steamEntry = options.flatMap { SteamDirectStart.choose($0, installFolder: installFolder) }
+             var chosen = steamEntry?.launchIndex
++            // (dock-eac-entry-2) Halo MCC: ask Valve's client for the game's own no-EAC launch entry (DockStartProgram.eacOfflineEntry).
++            // Off: env.MADEIRA_DOCK_EAC_ENTRY = 0.
++            if let list = options, DockStartProgram.eacOfflineEntry[game.id] != nil {
++                // Only Windows entries outside beta branches may be picked (same filter as SteamDirectStart.choose).
++                let entries = list.filter { $0.betaKey.isEmpty && ($0.oslist.isEmpty || $0.oslist.lowercased().contains("windows")) }
++                    .map { (index: $0.index, executable: $0.executable) }
++                let described = list.map { "\($0.index.map { String($0) } ?? "-"):\($0.executable) args=\($0.arguments.isEmpty ? "-" : $0.arguments) type=\($0.type.isEmpty ? "-" : $0.type)" }
++                if let index = DockStartProgram.eacOfflineEntryIndex(game.id, entries: entries) {
++                    chosen = index
++                    LogStore.shared.log("[dock-eac-entry] app=\(game.id) launch option \(index) (the game without Easy Anti-Cheat, offline only); entries: \(described.joined(separator: " | ")) (env.MADEIRA_DOCK_EAC_ENTRY = 0 turns it off)")
++                } else {
++                    LogStore.shared.log("[dock-eac-entry] app=\(game.id) no entry used (switch off or no entry names the game exe); entries: \(described.joined(separator: " | "))")
++                }
++            }
+             // (dock-launch-entry-fallback) With no entry that is an .exe on disk (tModLoader: its only
+             // non-beta Windows entry is start-tModLoader.bat), the default was entry 0, which can be a
+             // beta-branch entry whose program is not installed (Steam: "missing executable ...
+diff -ru a/app/Madeira/DockStartProgram.swift b/app/Madeira/DockStartProgram.swift
+--- a/app/Madeira/DockStartProgram.swift	2026-11-28 04:10:37.240818021 +0000
++++ b/app/Madeira/DockStartProgram.swift	2026-11-28 04:14:10.966813725 +0000
+@@ -53,6 +53,29 @@
+     /// DroidDeck PR #1039 (reads EasyAntiCheat/Settings.json); written here without its code. Not device-tested.
+     /// Off: env.MADEIRA_DOCK_START_EAC_OFFLINE = 0, or pick Steam's own program.
+     static let eacOffline: [Int: String] = [1245620: "Game/eldenring.exe"]
++    /// (dock-eac-entry-2) Easy Anti-Cheat games whose Steam launch configuration has its own entry for the game without
++    /// EAC, started by Valve's client in the game's own folder with that entry's own arguments (Steam's "Play ... Anti-Cheat
++    /// Disabled" choice on Windows). Madeira Dock asks Valve's client for that entry instead of the default one, so Steam keeps
++    /// running and no file is swapped. Halo MCC (976730): the default entry is mcclauncher.exe (EAC: "Failed to initialize Wine
++    /// helper buffer", run 4 log); the game exe MCC/Binaries/Win64/MCC-Win64-Shipping.exe needs its own folder's DLLs (run 2:
++    /// c0000135) and quits with exit code 1 when started without Steam (run 3; cause unproven). Offline play only.
++    /// Matched by program path (case and slash direction ignored); no match = Steam's default entry, as before.
++    /// Off: env.MADEIRA_DOCK_EAC_ENTRY = 0. Not device-tested.
++    static let eacOfflineEntry: [Int: String] = [976730: "mcc/binaries/win64/mcc-win64-shipping.exe"]
++    /// Set by the app at start (MadeiraApp.init) to read env.MADEIRA_DOCK_EAC_ENTRY (Foundation-only file, see above).
++    nonisolated(unsafe) static var eacEntryEnabled: () -> Bool = { true }
++    /// The launch entry index (config.launch key) of `appID`'s no-EAC entry among `entries` (index, executable as Steam
++    /// spells it), or nil when the game has none listed, the switch is off, or no entry names that program.
++    static func eacOfflineEntryIndex(_ appID: Int, entries: [(index: UInt32?, executable: String)]) -> UInt32? {
++        guard eacEntryEnabled(), let want = eacOfflineEntry[appID] else { return nil }
++        func norm(_ path: String) -> String {
++            var p = path.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\\", with: "/").lowercased()
++            while p.hasPrefix("./") { p.removeFirst(2) }
++            while p.hasPrefix("/") { p.removeFirst() }
++            return p
++        }
++        return entries.first(where: { $0.index != nil && norm($0.executable) == want })?.index
++    }
+     /// Set by the app at start (MadeiraApp.init) to read env.MADEIRA_DOCK_START_EAC_OFFLINE; this file stays
+     /// Foundation-only so the host check (tests/host/check-dock-start-program.py) compiles it alone.
+     nonisolated(unsafe) static var eacOfflineEnabled: () -> Bool = { true }
+diff -ru a/app/Madeira/MadeiraApp.swift b/app/Madeira/MadeiraApp.swift
+--- a/app/Madeira/MadeiraApp.swift	2026-11-28 04:10:55.051249519 +0000
++++ b/app/Madeira/MadeiraApp.swift	2026-11-28 04:11:06.149544877 +0000
+@@ -26,6 +26,8 @@
+         KillList.apply()
+         // (dock-eac-offline-2) the Dock "Steam starts" default for Easy Anti-Cheat games; off: env.MADEIRA_DOCK_START_EAC_OFFLINE = 0.
+         DockStartProgram.eacOfflineEnabled = { MadeiraConfig.flag("MADEIRA_DOCK_START_EAC_OFFLINE") }
++        // (dock-eac-entry-1) Halo MCC: Dock asks Steam for the game's own no-EAC launch entry; off: env.MADEIRA_DOCK_EAC_ENTRY = 0.
++        DockStartProgram.eacEntryEnabled = { MadeiraConfig.flag("MADEIRA_DOCK_EAC_ENTRY") }
+         // (stock-apple-stage3) Its log line, and a new install's Library defaults (never over a set value).
+         StockApple.stage3Start()
+         // [main-stack-move] crash guard (JITAllocator.c): still alive a few seconds after opening, so the

@@ -257,3 +257,7 @@ Not compared with your IPA yet (nothing built). No keys, nothing signed, nothing
 ## 2026-11-28T06:10Z from laptop — re 08:05 gitlab-scan
 Status: DONE
 Cameron said yes. fix/fork-scan-data pushed at 06:10Z (laptop clock, UTC): out/wine-mrs.tsv 2,232 MRs, out/mesa-mrs.tsv 4,825, out/gitlab-search.tsv 129 rows, 226 Wine and 97 Mesa MR diffs. out/codeberg.tsv is EMPTY: all 10 Codeberg searches got HTTP 429 (Too Many Requests); rerun that part later if needed.
+
+## 2026-11-28T06:24Z from laptop — re 08:10 repo-backbuffer-probe-v2
+Status: DONE
+Review PASS: signature identical, staging texture is CPU-readable, syntax check OK; no overlap with dxmt-d3d11-tex-trace (different files).

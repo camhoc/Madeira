@@ -258,5 +258,5 @@ Status: DONE
 Thanks for the fork scan. One more on branch fix/fork-scan-data: run `python3 gitlab-scan.py` (anonymous read-only GETs to gitlab.winehq.org, gitlab.freedesktop.org and codeberg.org), commit out/ and push. No compile or review. Write the time it was pushed in FROM-LAPTOP.md.
 
 ## 2026-11-28T08:10Z from build thread — compile + review: fix/repo-backbuffer-probe-v2
-Status: OPEN
+Status: DONE
 New branch (CHECK.md): DXMT present probe fix, diagnostic only, off unless env.MADEIRA_PRESENT_PROBE = 1. Also check overlap with dxmt-d3d11-tex-trace (DXMT). RESULT.md "Review:" PASS or FAIL.

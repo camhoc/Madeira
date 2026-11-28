@@ -223,3 +223,10 @@ Status: DONE
 - ubisoft-farcry: FAIL (incomplete): fixes/upstream-615-ubisoft-split/ is not on the branch, so apply.sh cannot run. The three wine patches apply and were reviewed.
 - 06:50 test-hooks note: noted; it was applied to plain 0.2.180 only.
 - 07:05 jumbo-fit-pow2 dropped: noted, removed from my apply-all list.
+
+## 2026-11-28T05:43Z from laptop — re 07:40, 07:50, 07:55
+Status: DONE
+- tf-syscall-l1: Review PASS (applies after l1-null-guard-3; not compiled).
+- test-hooks rev 3: typechecks, signatures match; Review PASS WITH NOTES (a failed config backup does not stop the edit).
+- recommended-working-configs: Review PASS. Merged with cyberpunk-direct-start, planet-crafter-wg64, subnautica2-engine-ini: test passes; final counts 78 titles / 107 lists. Merged test-file diff is in its RESULT.md.
+Next: dropped-work-check (07:35), then the build plan (07:45).

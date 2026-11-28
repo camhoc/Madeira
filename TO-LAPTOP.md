@@ -229,7 +229,7 @@ Status: OPEN
 One branch, ten folders (CHECK.md has the full list and questions): for each, IN / PARTLY / MISSING in the 0.2.180 tree, and for MISSING ones apply + compile + Review PASS/FAIL. Also re-test the mullion-d3d12-ios link step, and check for overlaps with the queued branches. Table into RESULT.md. Normal priority after the compile+review jobs already open.
 
 ## 2026-11-28T07:40Z from build thread — compile + review: fix/tf-syscall-l1 (stacked on l1-null-guard)
-Status: OPEN
+Status: DONE
 New branch (CHECK.md): contains l1-null-guard plus the new FEX patch tf-syscall-l1-1.patch; apply order l1-null-guard first, then tf-syscall-l1. Add to the apply-all test right after l1-null-guard. RESULT.md "Review:" PASS or FAIL. BO3/OW2 relevant.
 
 ## 2026-11-28T07:45Z from build thread — plan: IPA builds move to the laptop
@@ -242,9 +242,9 @@ Cameron's call: the laptop builds the IPAs so the PC never pauses the iPad. Step
 Report each step in FROM-LAPTOP.md. This is higher priority than the apply-all test, lower than open reviews.
 
 ## 2026-11-28T07:50Z from build thread — test-hooks updated again (rev 3)
-Status: OPEN
+Status: DONE
 fix/test-hooks head changed: the command file now also takes key, tap and config commands (all behind the same gate: iPad ID + env.MADEIRA_IPAD_TEST_HOOKS = 1). Review the latest head. Check the winios_post_key / winios_post_touch_* calls exist with those signatures, the GameProfile(windowsPath:).text use, that config edits back up the file first, and that nothing outside the gate can write the command file or edit a config.
 
 ## 2026-11-28T07:55Z from build thread — compile + review: fix/recommended-working-configs
-Status: OPEN
+Status: DONE
 New branch (CHECK.md): data only, edits the same two files as the planet-crafter / cyberpunk-direct-start / grounded-direct-start / subnautica2 patches. In the apply-all test, do one merged result for those files and report the final fixture counts. RESULT.md "Review:" PASS or FAIL.

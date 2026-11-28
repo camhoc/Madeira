@@ -75,23 +75,23 @@ Status: DONE
 New branch fix/dock-eac-entry (use dock-eac-entry-2.patch, patch -p1 on the 0.2.180 tree). Typecheck, run tests/host/check-dock-start-program.py, write RESULT.md and a line here.
 
 ## 2026-11-28T04:25Z from build thread — standing: second review on every fix branch (Cameron's ask)
-Status: OPEN
+Status: DONE
 Cameron asked that game fixes go to the laptop for review. From now on, for every fix/ branch you check (including the ones already queued: kk-playport-pack, dock-eac-entry, dual-network-download, planet-crafter-wg64 and the earlier ones), do the second review as well as the compile check. Write it into that branch's fixes/<name>/RESULT.md under a heading "Review:" with PASS or FAIL (or PASS WITH NOTES) and the reasons: does the change do what README.md says, off switch present and named, risk to other games, anything the author could have missed. Read the patch yourself; do not just trust REVIEW.md. Game threads may then skip their own second review once yours passes.
 
 ## 2026-11-28T04:30Z from build thread — check + review: fix/subnautica2-engine-ini
-Status: OPEN
+Status: DONE
 New branch fix/subnautica2-engine-ini (see its CHECK.md). Apply, typecheck, run check-game-recommendations.py and check-ini-editor, and do the second review (RESULT.md "Review:"). Say if its edits to check-game-recommendations.py conflict with planet-crafter-wg64 and cyberpunk-direct-start.
 
 ## 2026-11-28T04:35Z from build thread — review: fix/l1-null-guard (FEX, OW2/BO3)
-Status: OPEN
+Status: DONE
 New branch fix/l1-null-guard (see CHECK.md; use l1-null-guard-3.patch). No ARM64EC toolchain here, so a careful review plus syntax check; RESULT.md with "Review:" PASS or FAIL.
 
 ## 2026-11-28T04:25Z from build thread — plan: the laptop builds the IPA (trial first), PC stays on the iPad
-Status: OPEN
+Status: DONE
 Cameron wants most work on the laptop so the PC can keep running the iPad sweep. Plan: (1) finish the drop share job (approved, see the 04:08Z entry). (2) I copy the 0.2.180 source zip (1.1 GB) and the PC's built native outputs (libntdll_unix, win32u, wineserver, FEX iOS library, DXMT, d3d12, the Windows DLL farm) into ~/from-pc, throttled so the iPad sweep is not disturbed. (3) You unpack them and build an app-only IPA with xtool as a trial, reading build-shims/BUILD-RULES.md and stages/app.sh in the source zip, adapting WSL paths to this laptop, and compare the result with the PC's 0.2.180 IPA (same commit): file list, Info.plist, fix-markers. Signing and uploads stay manual and are not yours. Meanwhile, read what you can of build-shims in the repo or tell me what you need that is missing (tools, disk space: say how much free disk you have). Never touch the PC or the iPad.
 
 ## 2026-11-28T04:30Z from build thread — review: fix/fex-playport-split-mono
-Status: OPEN
+Status: DONE
 New branch fix/fex-playport-split-mono (4 FEX patches, see CHECK.md). Careful review plus syntax check; check for conflicts with fix/l1-null-guard (both FEX). RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T04:40Z from build thread — before the copy: free disk space

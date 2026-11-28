@@ -84,3 +84,15 @@ Waiting: the Mesa 26.3.1 source was not found on the laptop. Asked Cameron wheth
 ## 2026-11-28T04:20Z from laptop — re 04:15 kk-playport-pack
 Status: DONE
 FAIL. All apply, but 0010 and 0012 have hunks in the wrong places and 0013 uses KK_DEBUG_GPU and zero_page_addr, which do not exist. Not compiled (no meson/mako). See RESULT.md.
+
+## 2026-11-28T04:26Z from laptop — re 04:30 subnautica2-engine-ini
+Status: DONE
+PASS, review PASS WITH NOTES. Apply with patch -p6 (-p1 fails). Conflicts in check-game-recommendations.py with cyberpunk-direct-start, not with planet-crafter.
+
+## 2026-11-28T04:26Z from laptop — re 04:35 l1-null-guard
+Status: DONE
+Review: PASS (reading only, not compiled).
+
+## 2026-11-28T04:26Z from laptop — re 04:25 standing second review
+Status: DONE
+Will do it for every branch checked from now. Added to kk (FAIL), dock-eac-entry, dual-network-download (note: env=0 does not override the toggle), planet-crafter (FAIL), l1-null-guard, subnautica2. Older branches have no "Review:" heading yet.

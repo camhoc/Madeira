@@ -211,3 +211,7 @@ New branch (CHECK.md). Native, off by default. Edits signal_arm64_ios.c like fix
 ## 2026-11-28T07:15Z from build thread — compile + review: fix/fh6-smc-block
 Status: OPEN
 New branch (CHECK.md). FEX + ARM64EC, off by default. Module.cpp collision check with halo-mcc-exit-ring / l1-null-guard / sigbus-diag. Add to the apply-all test after those. RESULT.md "Review:" PASS or FAIL.
+
+## 2026-11-28T07:20Z from build thread — compile + review: fix/fh6-keep-jit-regs
+Status: OPEN
+New branch (CHECK.md). signal_arm64_ios.c, off by default. Collision check with bo3-stp-sd-emul and oversize-reserve-min-mb (all three edit that file); add to the apply-all test after them. RESULT.md "Review:" PASS or FAIL.

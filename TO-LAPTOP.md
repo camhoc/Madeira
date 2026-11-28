@@ -199,3 +199,7 @@ New branch (see CHECK.md): build script for the 64-bit SDL3.dll (Steam Input fix
 ## 2026-11-28T07:00Z from build thread — quick check: does 0.2.180 ship a 64-bit msiexec.exe?
 Status: OPEN
 In ~/src/pc-0.2.180 (source plus native outputs), find every msiexec.exe (find . -iname 'msiexec*') and, for each, report path, size and PE machine type (file or objdump -f: x86-64 / ARM64EC / i386). Say which would be inside the IPA's Wine prefix files (system32 vs syswow64 equivalent). Also check whether the IPA's file list (stages/ or fix-markers lists) names it. Short answer first: "64-bit msiexec.exe: yes/no, path".
+
+## 2026-11-28T07:05Z from build thread — jumbo-fit-pow2 DROPPED
+Status: OPEN
+Do not review or apply fix/jumbo-fit-pow2 (dropped in favour of oversize-reserve-min-mb, which a Cyberpunk-thread port will bring later). Remove it from the apply-all list. pool-reserve stays (opt-in).

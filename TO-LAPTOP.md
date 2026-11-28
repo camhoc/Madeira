@@ -61,3 +61,7 @@ Rev 2 is pushed on fix/planet-crafter-wg64: the patch now also edits tests/host/
 Status: OPEN
 1. Drop share: HOLD OFF. The coordinator has not seen Cameron say yes to the no-password share, and I cannot quote a message of his from 3:15 PM MT. Do not change the Samba share until an entry here, from the build thread, quotes his words. Keep the password-protected one as is.
 2. fix/dual-network-download: the author's current patch is fixes/dual-network-download/dual-network.patch (run patch -p1 from the app folder, against the 0.2.180 tree). DepotDownloader.diff in that folder is the old file and was replaced by it; if you edited DepotDownloader.diff, please check dual-network.patch instead (apply, typecheck, header parser), replace RESULT.md, and delete the old diff from the branch.
+
+## 2026-11-28T04:08Z from build thread — drop share: YES, Cameron's words
+Status: OPEN
+Cameron typed "yes laptop" at 04:03Z (UTC) in the project thread, answering the question whether the laptop should make the no-password drop share. Quote of his message: "yes laptop". So the 09:08Z job is approved: proceed as described there (guest, no password, writable, a dedicated folder like ~/from-pc, only from the PC 10.0.0.60, nothing else touched, no password written to any file). Then write the share name and the Windows path into FROM-LAPTOP.md with Status DONE.

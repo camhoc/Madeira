@@ -1,0 +1,2 @@
+# CHECK: fh6-smc-block
+FEX Core.cpp + ARM64EC Module.cpp, switch env.MADEIRA_EC_SMC_BLOCK = 1, default off. Port of TimmyTurner51's fh6-wine-fex 0002 (permission from Cameron; credit must stay). Apply with patch -p1 on the 0.2.180 FEX tree; compile if possible; follow the REVIEW.md checklist. Module.cpp is also edited by halo-mcc-exit-ring, l1-null-guard and sigbus-diag: check hunks do not collide. RESULT.md "Compile:" and "Review:" PASS or FAIL.

@@ -1,0 +1,3 @@
+NOT REVIEWED YET. Needs a second review and a compile check (laptop, via the build thread).
+Things to check: (1) Core.cpp chunk loop: Buf[255], DI.InstSize<=15, so Len never exceeds 255 and `break; // cannot happen` really cannot; (2) _ValidateCode u8 length 255 is accepted by the JIT op and DEF_OP(ValidateCode) window logic; (3) WantsDiskCachePatching branch passes Len as size like the per-instruction call; (4) with the switch OFF the only change is `!BlockSMC &&` in front of the old condition (BlockSMC is false), so old behaviour is byte-identical; (5) block ordering with FEX_MadeiraSectionViews 0 and 1.
+Test after a build: OW2 golden and BO3 golden first with the switch OFF (must be unchanged), then FH6 or any full-SMC title with it ON.

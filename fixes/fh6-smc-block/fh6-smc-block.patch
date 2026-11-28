@@ -1,0 +1,105 @@
+--- a/FEXCore/Source/Interface/Core/Core.cpp	2026-11-28 05:26:37.660223310 +0000
++++ b/FEXCore/Source/Interface/Core/Core.cpp	2026-11-28 05:27:05.757652193 +0000
+@@ -160,6 +160,13 @@
+ extern "C" {
+ uint32_t FEX_MadeiraJitInvalCheck = 0;
+ }
++/* madeira [smc-block] (ported from TimmyTurner51/fh6-wine-fex fex/0002-block-level-smc-validation.patch,
++ * FEX is MIT; permission also given by the author on Discord, per Cameron): 1 = under full SMC checks, one CRC
++ * per chunk of up to 255 bytes at block entry instead of one CRC per instruction. Off by default; the ARM64EC
++ * frontend turns it on with MADEIRA_EC_SMC_BLOCK=1. */
++extern "C" {
++uint32_t FEX_MadeiraSmcBlock = 0;
++}
+ 
+ #if defined(FEX_IOS_HOST) && defined(_WIN32)
+ /* iOS-Madeira ml460 (#75): pool-tail sweeper, implemented by the ARM64EC
+@@ -1270,6 +1277,59 @@
+       }
+ 
+       uint64_t BlockInstructionsLength {};
++
++      /* madeira [smc-block]: one CRC of the DECODED bytes per chunk (<= 255 bytes, whole instructions) at block
++       * entry. Compared against InstBytes, not a second guest read, for the same reason as the per-instruction
++       * check below. A mismatch throws the block away and recompiles. Code that rewrites its own next instruction
++       * inside this block is not seen until the block is entered again (function-entry decrypt is). Left out of
++       * the port: the fork's "skip checks for non-writable code" half (needs writable-range tracking in the decoder). */
++      const bool BlockSMC = FEX_MadeiraSmcBlock && InstsInBlock != 0 &&
++                            (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || HotSMCBlock);
++      if (BlockSMC) {
++        size_t First = 0;
++        uint64_t Off = 0;
++        while (First < InstsInBlock) {
++          uint8_t Buf[255];
++          size_t Len = 0, Last = First;
++          while (Last < InstsInBlock) {
++            const auto& DI = Block.DecodedInstructions[Last];
++            if (DI.InstSize == 0 || !DI.TableInfo || Len + DI.InstSize > sizeof(Buf)) {
++              break;
++            }
++            std::memcpy(Buf + Len, DI.InstBytes, DI.InstSize);
++            Len += DI.InstSize;
++            ++Last;
++          }
++          if (Last == First) {
++            /* undecodable or oversize instruction: no bytes to check (the per-instruction path skips these too) */
++            if (Block.DecodedInstructions[First].InstSize == 0 || !Block.DecodedInstructions[First].TableInfo) {
++              ++First;
++              continue;
++            }
++            break; /* cannot happen: MAX_INST_SIZE is 15 */
++          }
++          const auto Value = FEXCore::Utils::crc32(Buf, Len);
++          auto AddrReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, Block.Entry + Off - GuestRIP);
++          auto CRC = WantsDiskCachePatching ? Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, (int64_t)(Block.Entry + Off), Len) :
++                                              Thread->OpDispatcher->Constant(Value);
++          auto Changed = Thread->OpDispatcher->_ValidateCode(CRC, AddrReg, static_cast<uint8_t>(Len));
++          auto Mismatch = Thread->OpDispatcher->CondJump(Changed);
++          auto Current = Thread->OpDispatcher->GetCurrentBlock();
++          auto Fail = FEX_MadeiraSectionViews ? Thread->OpDispatcher->CreateNewCodeBlockAfter(Current) : Thread->OpDispatcher->CreateNewCodeBlockAtEnd();
++          Thread->OpDispatcher->SetTrueJumpTarget(Mismatch, Fail);
++          Thread->OpDispatcher->SetCurrentCodeBlock(Fail);
++          Thread->OpDispatcher->StartNewBlock();
++          Thread->OpDispatcher->_ThreadRemoveCodeEntry(Thread->OpDispatcher->_EntrypointOffset(GPRSize, 0),
++                                                        Thread->OpDispatcher->_EntrypointOffset(GPRSize, Block.Entry + Off - GuestRIP));
++          auto Next = Thread->OpDispatcher->CreateNewCodeBlockAfter(FEX_MadeiraSectionViews ? Fail : Current);
++          Thread->OpDispatcher->SetFalseJumpTarget(Mismatch, Next);
++          Thread->OpDispatcher->SetCurrentCodeBlock(Next);
++          Thread->OpDispatcher->StartNewBlock();
++          Off += Len;
++          First = Last;
++        }
++      }
++
+       for (size_t i = 0; i < InstsInBlock; ++i) {
+         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;
+ 
+@@ -1321,7 +1381,7 @@
+         // forever (0.2.83 log: "aligned: skipped" 8145 -> 536870865, no exception raised) instead of raising the
+         // execute fault the protector waits for. FEX_MadeiraJitInvalCheck = 0 (MADEIRA_EC_JIT_INVAL=0): old code.
+         const bool CheckThisInst = !FEX_MadeiraJitInvalCheck || (TableInfo && DecodedInfo->InstSize != 0);
+-        if (CheckThisInst && (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || HotSMCBlock)) {
++        if (!BlockSMC && CheckThisInst && (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || HotSMCBlock)) {
+           // Compare against the bytes the decoder read, not a second read of guest memory: code
+           // rewritten between the two reads (HotSpot's `jmp $` placeholder replaced by the final jump
+           // while a thread was translating it) would be checked against its new bytes but run as the
+--- a/Source/Windows/ARM64EC/Module.cpp	2026-11-28 05:26:37.668005364 +0000
++++ b/Source/Windows/ARM64EC/Module.cpp	2026-11-28 05:27:05.758828772 +0000
+@@ -74,6 +74,7 @@
+ 
+ extern "C" uint32_t FEX_MadeiraSectionViews; // madeira [section-views], Core.cpp
+ extern "C" uint32_t FEX_MadeiraJitInvalCheck; // madeira [jit-inval], Core.cpp
++extern "C" uint32_t FEX_MadeiraSmcBlock; // madeira [smc-block], Core.cpp
+ #ifdef FEX_IOS_HOST
+ /* iOS JIT-pool alias resolution. Implemented in IosJitAlias.cpp (separate
+  * TU because ARM64EC class-method access to the static table directly from
+@@ -1872,6 +1873,9 @@
+     const char* JitInval = getenv("MADEIRA_EC_JIT_INVAL"); // madeira [jit-inval]
+     FEX_MadeiraJitInvalCheck = (JitInval && JitInval[0] == '0') ? 0 : 1;
+     LogMan::Msg::EFmt("[jit-inval] rev=jit-inval-2 xtajit64 {}", FEX_MadeiraJitInvalCheck ? "on" : "off (MADEIRA_EC_JIT_INVAL=0)");
++    const char* SmcBlock = getenv("MADEIRA_EC_SMC_BLOCK"); // madeira [smc-block], default OFF
++    FEX_MadeiraSmcBlock = (SmcBlock && SmcBlock[0] == '1') ? 1 : 0;
++    LogMan::Msg::EFmt("[smc-block] rev=smc-block-1 xtajit64 {}", FEX_MadeiraSmcBlock ? "on (MADEIRA_EC_SMC_BLOCK=1)" : "off");
+     LogMan::Msg::EFmt("[section-views] rev=section-views-1 xtajit64 {}", FEX_MadeiraSectionViews ? "on" : "off (MADEIRA_EC_SECTION_VIEWS=0)");
+     const char* X87Ctx = getenv("MADEIRA_EC_X87_CTX"); // madeira [x87-ctx]
+     if (X87Ctx && X87Ctx[0] == '0') {

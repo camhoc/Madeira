@@ -1,0 +1,2 @@
+# CHECK: bo3-stp-sd-emul
+Patch targets the 0.2.180 source (dlls/ntdll/unix/signal_arm64_ios.c), not main. Read README.md and REVIEW.md. Apply the patch to the unpacked 0.2.180 source and compile ntdll unix if you can; if not, review carefully by reading. Careful: shared ml629 branch with Q-pair stores, check Q pairs, SP-relative stores, pre/post-index, and that env.MADEIRA_STP_SD_EMUL=0 restores old behavior. Write RESULT.md with "Compile:" and "Review:" PASS or FAIL. Ships with BO3 and OW2 checks.

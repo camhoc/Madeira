@@ -1,0 +1,95 @@
+--- signal_arm64_ios.c.orig	2026-11-28 04:51:15.548670146 +0000
++++ signal_arm64_ios.c	2026-11-28 04:51:15.594166552 +0000
+@@ -870,6 +870,20 @@
+                  (void *)ios_watch_page, errno, why );
+ }
+ 
++/* madeira [stp-sd] rev=stp-sd-1: on unless env MADEIRA_STP_SD_EMUL = 0. Logs its state once. */
++static int ios_stp_sd_on( void )
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "MADEIRA_STP_SD_EMUL" );
++        on = !(e && e[0] == '0' && !e[1]);
++        dprintf( 2, "[stp-sd] rev=stp-sd-1 %s (S/D pair stores onto RX-forced alias pages; MADEIRA_STP_SD_EMUL = 0 turns it off)\n",
++                 on ? "on" : "off" );
++    }
++    return on;
++}
++
+ /* ml1205: dump a thread's block-entry ring (FEX writes it when MADEIRA_BLOCK_RING is set and
+  * publishes the pointer at TEB+0x1710). Oldest first, newest last, 16 x86 bytes per entry so a
+  * one-instruction fragment decodes from the line. Checked reads throughout. */
+@@ -5509,24 +5523,32 @@
+                             goto dispatch_guest_fault;
+                         }
+                     }
+-                    else if (have_neon && (insn & 0xFE400000) == 0xAC000000)
++                    /* madeira [stp-sd] rev=stp-sd-1 (env MADEIRA_STP_SD_EMUL = 0 turns it off): the same four
++                     * addressing modes for the S (32-bit, opc 00) and D (64-bit, opc 01) pairs. BO3 0.2.180:
++                     * `[store-undecoded] insn=0x6d0427e8` = STP D8, D9, [SP, #64] in ntdll's exit path onto a
++                     * stack page that ml638 keeps physically RX, so the store never completed, the thread was
++                     * aborted ([exc-stack] ... aborting thread) and NtTerminateProcess never finished. */
++                    else if (have_neon && ((insn & 0xFE400000) == 0xAC000000 ||
++                             ((insn & 0x3E400000) == 0x2C000000 && ((insn >> 30) & 3) < 2 && ios_stp_sd_on())))
+                     {
+                         const int mode = (insn >> 23) & 0x3; /* 0 stnp, 1 post, 2 offset, 3 pre */
++                        const int pw   = 4 << ((insn >> 30) & 3);   /* [stp-sd] 4 = S, 8 = D, 16 = Q */
+                         const int rt   = insn & 0x1f;
+                         const int rt2  = (insn >> 10) & 0x1f;
+                         const int rn   = (insn >> 5) & 0x1f;
+                         int64_t imm7   = (int64_t)((insn >> 15) & 0x7f);
+                         if (imm7 & 0x40) imm7 -= 0x80;          /* sign-extend 7 bits */
+-                        const int64_t off = imm7 * 16;          /* Q registers scale by 16 */
++                        const int64_t off = imm7 * pw;          /* scaled by the register size ([stp-sd]) */
+ 
+                         uint64_t base_old = rn == 31 ? state.__sp : rn == 30 ? state.__lr :
+                                             rn == 29 ? state.__fp : state.__x[rn];
+                         uintptr_t effective = mode == 1 ? base_old : base_old + off;
+                         unsigned char values[32];
+-                        memcpy( values, &neon_state.__v[rt], 16 );
+-                        memcpy( values + 16, &neon_state.__v[rt2], 16 );
+-                        if (fault_addr >= effective && fault_addr - effective < sizeof(values) &&
+-                            ios_alias_write( effective, values, sizeof(values), &alias_fault, honor_guest_prot ))
++                        const size_t nval = 2u * (size_t)pw;    /* [stp-sd] bytes stored */
++                        memcpy( values, &neon_state.__v[rt], pw );        /* low pw bytes = St/Dt/Qt */
++                        memcpy( values + pw, &neon_state.__v[rt2], pw );
++                        if (fault_addr >= effective && fault_addr - effective < nval &&
++                            ios_alias_write( effective, values, nval, &alias_fault, honor_guest_prot ))
+                         {
+                             uint64_t base_new = base_old;
+                             int wb = (mode == 1 || mode == 3);
+@@ -5544,11 +5566,12 @@
+                                 static int stp_n;
+                                 if (stp_n < 8)
+                                     dprintf(STDERR_FILENO,
+-                                        "[stp-emul] ml629 #%d insn=0x%08x mode=%s off=%+lld Rt=q%d Rt2=q%d "
++                                        "[stp-emul] ml629 #%d insn=0x%08x mode=%s off=%+lld Rt=%c%d Rt2=%c%d "
+                                         "Rn=%s%d addr=0x%llx rw=0x%llx base 0x%llx -> 0x%llx%s\n",
+                                         ++stp_n, insn,
+                                         mode == 0 ? "stnp" : mode == 1 ? "post" : mode == 2 ? "offset" : "pre",
+-                                        (long long)off, rt, rt2, rn == 31 ? "s" : "x", rn,
++                                        (long long)off, pw == 16 ? 'q' : pw == 8 ? 'd' : 's', rt,
++                                        pw == 16 ? 'q' : pw == 8 ? 'd' : 's', rt2, rn == 31 ? "s" : "x", rn,
+                                         (unsigned long long)fault_addr, (unsigned long long)rw_addr,
+                                         (unsigned long long)base_old, (unsigned long long)base_new,
+                                         wb ? " (writeback)" : " (no writeback)");
+@@ -5569,7 +5592,7 @@
+                             }
+                             if (sd_on && sd_n < 16)
+                             {
+-                                const int in_range = fault_addr >= effective && fault_addr - effective < sizeof(values);
++                                const int in_range = fault_addr >= effective && fault_addr - effective < nval;
+                                 dprintf( STDERR_FILENO,
+                                          "[sigbus-diag] rev=sigbus-diag-1 #%d q-pair store NOT emulated insn=0x%08x pc=0x%llx "
+                                          "mode=%d Rn=%s%d base=0x%llx off=%+lld effective=0x%llx fault=0x%llx in_range=%d "
+@@ -5579,7 +5602,7 @@
+                                          (unsigned long long)fault_addr, in_range,
+                                          in_range ? "refused" : "not tried", (unsigned long long)alias_fault,
+                                          (int)honor_guest_prot, (unsigned)(effective & 15),
+-                                         (int)(((effective & 0x3fffull) + sizeof(values)) > 0x4000ull) );
++                                         (int)(((effective & 0x3fffull) + nval) > 0x4000ull) );
+                             }
+                         }
+                     }

@@ -230,3 +230,11 @@ Status: DONE
 - test-hooks rev 3: typechecks, signatures match; Review PASS WITH NOTES (a failed config backup does not stop the edit).
 - recommended-working-configs: Review PASS. Merged with cyberpunk-direct-start, planet-crafter-wg64, subnautica2-engine-ini: test passes; final counts 78 titles / 107 lists. Merged test-file diff is in its RESULT.md.
 Next: dropped-work-check (07:35), then the build plan (07:45).
+
+## 2026-11-28T05:45Z from laptop — re 07:35 dropped-work-check
+Status: DONE
+8 of 10 are IN 0.2.180 (plus dockhost-cjk-locale and fo4-alias-table-1024: IN). MISSING: mullion-d3d12-ios (Madeira patch applies; link step not re-tested: needs a Mullion download and the iOS tool shims, i.e. Cameron's yes) and dxmt-upstream-v0.80 (a submodule move; 0.2.180 is still on the old DXMT line). Warning: ac-mirage-developer-mode is IN but its main.c hunk still applies forward, so re-applying duplicates the function. Table in its RESULT.md.
+
+## 2026-11-28T05:45Z from laptop — re 07:45 build plan
+Status: OPEN
+Step 1 done earlier (shims downloaded, verified, unpacked at ~/madeira-shims-unpack/madeira-shims). Steps 2-3 need Cameron's yes in the laptop session for: moving them to ~/madeira-shims, editing a laptop copy, and getting ldid (a download). Asking him now.

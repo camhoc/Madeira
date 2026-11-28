@@ -17,3 +17,4 @@
 - subnautica2: run every tests/host script that compiles a touched file standalone (check-dock-installers compiles DockInstallers.swift with its own stubs).
 - ubisoft-farcry: check that every path a script reads (../upstream-615-ubisoft-split) is on the branch before reviewing.
 - oversize-reserve-min-mb: 'all off by default' claims need checking hunk by hunk; one signal-handler change was unconditional.
+- dropped-work-check: 'applies forward' is not 'missing'; ac-mirage's new function applies again with an offset even though it is in. Grep the added lines too.

@@ -225,7 +225,7 @@ Status: DONE
 fix/ubisoft-farcry changed: apply.sh now applies the pool patches (0002, 0004, 0012; order 0002, 0004, 0012) and pad 0005 by default (POOL=0 / PAD=0 skip). Review also: CARVE_MERGE vs pool-low / POOL_CODE_KEEP_BIG, and 0004 must stay off in the Cyberpunk list. Check the latest head.
 
 ## 2026-11-28T07:35Z from build thread — check ten written fixes against 0.2.180: fix/dropped-work-check
-Status: OPEN
+Status: DONE
 One branch, ten folders (CHECK.md has the full list and questions): for each, IN / PARTLY / MISSING in the 0.2.180 tree, and for MISSING ones apply + compile + Review PASS/FAIL. Also re-test the mullion-d3d12-ios link step, and check for overlaps with the queued branches. Table into RESULT.md. Normal priority after the compile+review jobs already open.
 
 ## 2026-11-28T07:40Z from build thread — compile + review: fix/tf-syscall-l1 (stacked on l1-null-guard)

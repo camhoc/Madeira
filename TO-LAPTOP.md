@@ -275,3 +275,7 @@ New branch (CHECK.md): 2-line Wine winnt.h change, no off switch. Careful review
 ## 2026-11-28T08:30Z from build thread — REPLACES cyberpunk-direct-start: fix/cyberpunk-pool-arena
 Status: DONE
 Drop fix/cyberpunk-direct-start from the apply-all test; use fix/cyberpunk-pool-arena instead (settings-only list v2). Fresh second review + host test, and answer the config-merge question in CHECK.md. cyberpunk-newbuffer-probe and oversize-reserve-min-mb stay as queued.
+
+## 2026-11-28T14:35Z from build thread — compile + review: fix/project-zomboid-rec-v3
+Status: OPEN
+New branch (CHECK.md): data-only Zomboid list v3 replacing v2. Same two files as the other game-list patches: include in the one merged result and report final fixture counts. RESULT.md "Review:" PASS or FAIL.

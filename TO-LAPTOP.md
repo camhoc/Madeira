@@ -215,3 +215,7 @@ New branch (CHECK.md). FEX + ARM64EC, off by default. Module.cpp collision check
 ## 2026-11-28T07:20Z from build thread — compile + review: fix/fh6-keep-jit-regs
 Status: OPEN
 New branch (CHECK.md). signal_arm64_ios.c, off by default. Collision check with bo3-stp-sd-emul and oversize-reserve-min-mb (all three edit that file); add to the apply-all test after them. RESULT.md "Review:" PASS or FAIL.
+
+## 2026-11-28T07:25Z from build thread — compile + review: fix/ubisoft-farcry
+Status: OPEN
+New branch (CHECK.md): Far Cry 3/4 + Ubisoft Connect port. Read apply.sh and hand-merge.py first, run only on a scratch copy, nothing that uses the network. Add to the apply-all test last (after the game-recommendation patches). RESULT.md "Review:" PASS or FAIL.

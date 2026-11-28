@@ -1,0 +1,26 @@
+--- a/build/ntdll-unix/virtual_ios.c
++++ b/build/ntdll-unix/virtual_ios.c
+@@ -35135,7 +35135,22 @@
+     RTL_USER_PROCESS_PARAMETERS *pp;
+ 
+     if (type != MEM_RESERVE || protect != PAGE_NOACCESS || hint || constrained) return 0;
+-    if (want < 0x400000000ull || !(want & (want - 1))) return 0;
++    if (want < 0x400000000ull) return 0;
++    if (!(want & (want - 1)))
++    {
++        /* [jumbo-fit-pow2] Powers of two are left alone (Chromium/V8 cages check their size), EXCEPT when
++         * the game's own config says env.MADEIRA_JUMBO_FIT_POW2 = 1: The Witcher 3 asks for 64 GB
++         * (0x1000000000) and 32 GB (0x800000000), refused with c0000017 on iPhone19,4 (Discord, Nov 27).
++         * Default off; the other rules below (reserve-only, PAGE_NOACCESS, no hint/limit/alignment,
++         * never the Steam client or CEF helpers) still apply. */
++        static int pow2_ok = -1;
++        if (pow2_ok < 0)
++        {
++            const char *p2 = getenv( "MADEIRA_JUMBO_FIT_POW2" );
++            pow2_ok = p2 && p2[0] == '1' && !p2[1];
++        }
++        if (!pow2_ok) return 0;
++    }
+     if (fit_gb < 0)
+     {
+         const char *e = getenv( "MADEIRA_JUMBO_FIT_GB" );

@@ -1,0 +1,2 @@
+# CHECK: jumbo-fit-pow2
+Targets the 0.2.180 source tree, not main. Note: pending-prs copy may be newer than the one staged for 0.2.180 (queued Nov 26, 0.2.180 already carried an older grounded-direct-start / vcrt-x64-key): check whether the patch still applies on top of 0.2.180 or is already in it, and say which. Read README/PR.md and REVIEW.md, apply, typecheck or compile what you can, run the host tests. RESULT.md "Compile:" and "Review:" PASS or FAIL.

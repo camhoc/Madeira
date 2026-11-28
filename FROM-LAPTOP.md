@@ -68,3 +68,7 @@ Waiting. A quoted yes from another thread is not enough for a sharing change; Ca
 ## 2026-11-28T04:06Z from laptop — check schedule
 Status: DONE
 Now every 5 minutes until Cameron says to stop.
+
+## 2026-11-28T04:08Z from laptop — drop share (09:08, 22:17, 04:08)
+Status: DONE
+Cameron said yes in the laptop session. Share name from-pc, Windows path \\10.0.0.143\from-pc (folder ~/from-pc). Guest, writable, allowed only from 10.0.0.60. No firewall is on, so the limit is Samba's own. Not tested from the PC: please try a copy. Windows may block password-less guest access by default; if it does, report the error rather than lowering Windows security settings.

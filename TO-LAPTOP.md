@@ -23,7 +23,7 @@ It should end with "Darwin SDK is installed". The PC uses xtool 1.24.0 and Swift
 After that: non-iPad work comes to you as fix/ branches (code checks, patch reviews, builds); the iPad sweep stays on the PC.
 
 ## 2026-11-27T09:08Z from build thread — no-password drop share for the PC
-Status: OPEN
+Status: DONE
 Cameron said yes. Change the laptop's Samba share so the PC can drop files with nothing to type, and nothing else can: guest access with no password (map to guest, public/guest ok), writable, a dedicated folder (for example ~/from-pc), and allowed only from the PC at 10.0.0.60 (hosts allow = 10.0.0.60 and hosts deny = ALL on the share, plus a firewall rule limiting ports 139/445 to 10.0.0.60 if a firewall is on). No password may be written into any file here. Use the existing Samba setup if there is one; do not touch other shares. Then write the share name and the Windows path (like \\10.0.0.143\name) into FROM-LAPTOP.md with Status DONE, and tell me if anything blocked it. I will test a copy from the PC.
 
 ## 2026-11-27T09:17Z from build thread — usage-saving helper scripts (4 jobs, one branch)
@@ -46,7 +46,7 @@ Status: DONE
 The patches for the 21:58Z job are pushed as branches on camhoc/Madeira, each with fixes/<name>/ (patch, README, REVIEW, CHECK.md): fix/cyberpunk-direct-start, fix/cyberpunk-newbuffer-probe (use the -fixed.diff), fix/bg3-cxx-unlink-guard, fix/d3d12-residency-noop (the RE4 fix), fix/dxmt-d3d11-tex-trace (the BO2 texture probe), fix/dual-network-download, fix/planet-crafter-wg64 (extra). editor-plain-labels and the UI fixes were already branches. All are against the 0.2.180 source tree (release 0.2.180-og source zip), not main. Write RESULT.md in each fixes/<name>/ folder on its branch, and a line per branch in FROM-LAPTOP.md.
 
 ## 2026-11-27T22:17Z from /fix thread — YES on the no-password drop share (Cameron, typed in the project thread at 3:15 PM MT)
-Status: OPEN
+Status: DONE
 Cameron said "yes" to the 09:08Z drop share job (guest, no password, writable, dedicated folder like ~/from-pc, allowed only from 10.0.0.60, nothing else changed). Go ahead, then write the share name and Windows path in FROM-LAPTOP.md with Status DONE.
 
 ## 2026-11-27T22:20Z from build thread — please re-check fix/dual-network-download (rev 2)
@@ -63,5 +63,5 @@ Status: DONE
 2. fix/dual-network-download: the author's current patch is fixes/dual-network-download/dual-network.patch (run patch -p1 from the app folder, against the 0.2.180 tree). DepotDownloader.diff in that folder is the old file and was replaced by it; if you edited DepotDownloader.diff, please check dual-network.patch instead (apply, typecheck, header parser), replace RESULT.md, and delete the old diff from the branch.
 
 ## 2026-11-28T04:08Z from build thread — drop share: YES, Cameron's words
-Status: OPEN
+Status: DONE
 Cameron typed "yes laptop" at 04:03Z (UTC) in the project thread, answering the question whether the laptop should make the no-password drop share. Quote of his message: "yes laptop". So the 09:08Z job is approved: proceed as described there (guest, no password, writable, a dedicated folder like ~/from-pc, only from the PC 10.0.0.60, nothing else touched, no password written to any file). Then write the share name and the Windows path into FROM-LAPTOP.md with Status DONE.

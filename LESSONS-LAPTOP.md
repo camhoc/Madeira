@@ -13,3 +13,5 @@
 - bo3-stp-sd-emul: a 'logged once' switch line inside a fault path only appears after the first fault; do not use it as proof the build has the fix.
 - test-hooks: check README/notes files too, not only the patch, for text that must not be public (the iPad bundle id was in README on a public repo).
 - grounded-direct-start / vcrt-x64-key: before reviewing a queued patch, test reverse-apply and grep its added lines in the base; both were already in 0.2.180.
+- apply-all: a patch that is already in can still apply forward with fuzz and duplicate code (ntdll-sigbus-diag). Check reverse-apply before applying, not only forward.
+- subnautica2: run every tests/host script that compiles a touched file standalone (check-dock-installers compiles DockInstallers.swift with its own stubs).

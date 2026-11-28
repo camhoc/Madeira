@@ -187,3 +187,27 @@ Status: DONE
 - grounded-direct-start: ALREADY IN 0.2.180 (every added line is there; patch conflicts only because its context is older). Do not apply again.
 - vcrt-x64-key: ALREADY IN 0.2.180 (reverse-applies cleanly). Do not apply again.
 - test-hooks (head 450a852): typechecks; Review PASS WITH NOTES. Command file is gated like the links; anything that can write Madeira's Documents (paired PC, Files app, apps opening documents in place) can trigger it on the test build. README still has the iPad bundle id on the public repo.
+
+## 2026-11-28T05:31Z from laptop — re 06:40 apply-all-together
+Status: DONE
+Clean copy of ~/src/pc-0.2.180 (source identical to 0.2.180-og), the 31 fixes in your order. Nothing fixed, report only.
+
+Already in 0.2.180, skipped: halo-mcc-exit-ring (both), sigbus-diag FEX 0025, outputdebugstring-wide-order, dock-install-dir-wait, vcrt-x64-key, gmod-sandbox-reparse, fo4-alias-table-1024, grounded-direct-start (lines present; patch rejects on old context).
+
+REJECTS (real clashes):
+- planet-crafter-wg64 after cyberpunk-direct-start: all 4 hunks of check-game-recommendations.py rejected (same lines 79, 131-140, 192-198, 954-963: ID set, title count, defaults tuple, Swift fixture counts).
+- subnautica2-engine-ini after them: its check-game-recommendations.py hunk at line 497 (version assert) rejected; its Swift parts applied.
+=> These three need one combined edit of the test file.
+
+DUPLICATE (worse than a reject): sigbus-diag's ntdll-sigbus-diag.patch is already in 0.2.180 but still applies forward with fuzz 1 (offset 51), so applying it again DUPLICATES its block in signal_arm64_ios.c (rev=sigbus-diag-1 appears 4 times instead of 2). Drop it from the apply list. It also sits right after bo3-stp-sd-emul's hunk (lines 5544-5559): bo3 must go first, as it did.
+
+Fuzz/offset only (applied fine): wcp-import (offsets 71 and 14), remote-run-status (2), steam-big-picture (28), library-scroll-shadow (9). No other overlapping hunks between pending fixes.
+
+Config keys: no key set twice for the same game. Shared: env.MADEIRA_EC_HOOK_TRACE = 0 in both the Cyberpunk and Planet Crafter lists (separate games, fine); MADEIRA_REC_STEAM_DIRECT read by both direct-start fixes (same switch, already in 0.2.180).
+
+Swift: the whole app typechecks with everything applied (only the existing Squeeze error).
+tests/host: 0.2.180 base 301/392 pass; all fixes 300/393. Changes:
+- check-game-recommendations.py: pass -> FAIL (the rejected test hunks above).
+- check-dock-installers.py: pass -> FAIL, caused by subnautica2-engine-ini ALONE (its UnrealIniSeed in DockInstallers.swift uses GameConfigFolders and IniFileText, which the test's standalone compile lacks). I missed this in its first review; correction added to its RESULT.md.
+- check-storage-files-link.py: new test, passes.
+Not covered: Mesa/FEX packs (separate), native C compile (no Wine/FEX build here).

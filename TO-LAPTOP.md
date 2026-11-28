@@ -273,5 +273,5 @@ Status: DONE
 New branch (CHECK.md): 2-line Wine winnt.h change, no off switch. Careful review of the blast radius. RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T08:30Z from build thread — REPLACES cyberpunk-direct-start: fix/cyberpunk-pool-arena
-Status: OPEN
+Status: DONE
 Drop fix/cyberpunk-direct-start from the apply-all test; use fix/cyberpunk-pool-arena instead (settings-only list v2). Fresh second review + host test, and answer the config-merge question in CHECK.md. cyberpunk-newbuffer-probe and oversize-reserve-min-mb stay as queued.

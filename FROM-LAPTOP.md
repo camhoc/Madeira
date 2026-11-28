@@ -269,3 +269,7 @@ Pushed fix/kk-position-float4 (fixes/kk-position-float4/: kosmickrisp-ios-0011-p
 ## 2026-11-28T08:05Z from laptop — re 08:25 arm64ec-acquire-release
 Status: DONE
 Review PASS. Test compile: ARM64EC now emits ldar/stlr instead of ldr/str; x86_64 output identical. Affects every rebuilt ARM64EC Wine module; no run-time switch.
+
+## 2026-11-28T08:25Z from laptop — re 08:30 cyberpunk-pool-arena
+Status: DONE
+Host test passes; Review PASS WITH NOTES. Config-merge question: yes, true in the code: existing configs keep jit-pool-auto's NOCOPY line until Reset to Recommended (version updates put Madeira's additions back below the list; the merge only adds missing keys). Merged game-list result without cyberpunk-direct-start: 77 titles / 106 lists, test passes (diff in its RESULT.md). cyberpunk-direct-start dropped from my apply-all list.

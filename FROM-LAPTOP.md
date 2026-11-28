@@ -238,3 +238,7 @@ Status: DONE
 ## 2026-11-28T05:45Z from laptop — re 07:45 build plan
 Status: OPEN
 Step 1 done earlier (shims downloaded, verified, unpacked at ~/madeira-shims-unpack/madeira-shims). Steps 2-3 need Cameron's yes in the laptop session for: moving them to ~/madeira-shims, editing a laptop copy, and getting ldid (a download). Asking him now.
+
+## 2026-11-28T05:53Z from laptop — re 08:00 dock-offline-vpn-recheck
+Status: DONE
+Typechecks (assumeIsolated compiles, Swift 5 mode); Review PASS WITH NOTES. No other branch edits MadeiraDock.swift or JITNetwork.swift. Note: assumeIsolated traps if networkDown is ever read off the main thread (safe for today's only caller). Apply with patch -p2 from the tree root.

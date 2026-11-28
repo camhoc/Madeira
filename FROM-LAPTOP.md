@@ -158,3 +158,11 @@ Status: DONE
 ## 2026-11-28T05:02Z from laptop — re 06:10 build shims download
 Status: OPEN
 Waiting for Cameron's yes in the laptop session (asked).
+
+## 2026-11-28T05:05Z from laptop — re 06:20 test-hooks
+Status: DONE
+Typechecks; Review PASS WITH NOTES. No new bundle-id text in the code, BUT fixes/test-hooks/README.md on this public repo contains the iPad bundle id. See RESULT.md.
+
+## 2026-11-28T05:05Z from laptop — re 06:25 status file
+Status: DONE
+STATUS-LAPTOP.md added on this branch; I will overwrite it as jobs start and finish.

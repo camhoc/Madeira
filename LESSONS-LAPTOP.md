@@ -11,3 +11,4 @@
 - steam-layout-import: new Swift files need a project.pbxproj entry; typechecking all files on disk does not catch that.
 - kk-playport-pack rev 2: after porting patches from another project, grep every new identifier in the target tree; a struct from a dropped patch (kk_memory_stats) is easy to miss.
 - bo3-stp-sd-emul: a 'logged once' switch line inside a fault path only appears after the first fault; do not use it as proof the build has the fix.
+- test-hooks: check README/notes files too, not only the patch, for text that must not be public (the iPad bundle id was in README on a public repo).

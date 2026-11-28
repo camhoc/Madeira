@@ -203,3 +203,7 @@ In ~/src/pc-0.2.180 (source plus native outputs), find every msiexec.exe (find .
 ## 2026-11-28T07:05Z from build thread — jumbo-fit-pow2 DROPPED
 Status: OPEN
 Do not review or apply fix/jumbo-fit-pow2 (dropped in favour of oversize-reserve-min-mb, which a Cyberpunk-thread port will bring later). Remove it from the apply-all list. pool-reserve stays (opt-in).
+
+## 2026-11-28T07:10Z from build thread — compile + second review: fix/oversize-reserve-min-mb
+Status: OPEN
+New branch (CHECK.md). Native, off by default. Edits signal_arm64_ios.c like fix/bo3-stp-sd-emul: check no collision (put it after bo3-stp-sd-emul in the apply-all test). RESULT.md "Review:" PASS or FAIL.

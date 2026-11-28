@@ -1,0 +1,90 @@
+diff --git a/src/kosmickrisp/compiler/msl_iomap.c b/src/kosmickrisp/compiler/msl_iomap.c
+index 669e655..d8de386 100644
+--- a/src/kosmickrisp/compiler/msl_iomap.c
++++ b/src/kosmickrisp/compiler/msl_iomap.c
+@@ -12,6 +12,8 @@
+ 
+ #include "nir_builder.h"
+ 
++#include <stdlib.h>
++
+ /* Mapping from alu type to Metal scalar type */
+ static const char *
+ alu_type_to_string(nir_alu_type type)
+@@ -168,6 +170,18 @@ const char *depth_layout_arg[8] = {
+ };
+ 
+ /* Generate the struct definition for the vertex shader return value */
++bool
++msl_vs_position_float(const struct nir_to_msl_ctx *ctx, unsigned location)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("MADEIRA_KK_POS_FLOAT");
++      on = !(e && e[0] == '0' && e[1] == '\0');
++   }
++   return on && location == VARYING_SLOT_POS &&
++          ctx->shader->info.stage == MESA_SHADER_VERTEX;
++}
++
+ static void
+ vs_output_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
+ {
+@@ -180,6 +194,11 @@ vs_output_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
+       const char *vector_suffix =
+          scalarized ? "" : vector_suffixes[info.num_components];
+       unsigned components = scalarized ? info.num_components : 1;
++      /* madeira [kk-pos-float]: [[position]] must be float4 (vkd3d can store it as uint4) */
++      if (msl_vs_position_float(ctx, location)) {
++         type = "float";
++         vector_suffix = "4";
++      }
+       for (int c = 0; c < components; c++) {
+          P_IND(ctx, "%s%s ", type, vector_suffix);
+          varying_slot_name(ctx, location, c);
+diff --git a/src/kosmickrisp/compiler/msl_private.h b/src/kosmickrisp/compiler/msl_private.h
+index 75da653..3612d22 100644
+--- a/src/kosmickrisp/compiler/msl_private.h
++++ b/src/kosmickrisp/compiler/msl_private.h
+@@ -71,6 +71,11 @@ void msl_gather_io_info(struct nir_to_msl_ctx *ctx,
+ void msl_input_name(struct nir_to_msl_ctx *ctx, unsigned location,
+                     unsigned component);
+ 
++/* madeira [kk-pos-float]: a vertex shader's position output is always float4,
++ * as Metal's [[position]] requires; an integer store is bit-cast to float.
++ * env MADEIRA_KK_POS_FLOAT = 0 keeps the old behaviour (the output's own type). */
++bool msl_vs_position_float(const struct nir_to_msl_ctx *ctx, unsigned location);
++
+ void msl_output_name(struct nir_to_msl_ctx *ctx, unsigned location,
+                      unsigned component, bool from_input);
+ 
+diff --git a/src/kosmickrisp/compiler/nir_to_msl.c b/src/kosmickrisp/compiler/nir_to_msl.c
+index 580fcaa..d94ef24 100644
+--- a/src/kosmickrisp/compiler/nir_to_msl.c
++++ b/src/kosmickrisp/compiler/nir_to_msl.c
+@@ -1307,6 +1307,16 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+                P(ctx, "%c", "xyzw"[component + i]);
+       }
+       P(ctx, " = ");
++      /* madeira [kk-pos-float]: the position member is float4; an integer store
++       * keeps its bits (as_type), as on Vulkan where the output is float. */
++      nir_alu_type pos_src = nir_intrinsic_src_type(instr);
++      bool pos_cast = msl_vs_position_float(ctx, location) &&
++                      nir_alu_type_get_base_type(pos_src) != nir_type_float &&
++                      nir_alu_type_get_type_size(pos_src) == 32;
++      if (pos_cast) {
++         unsigned n = util_bitcount(write_mask & BITFIELD_MASK(num_components));
++         P(ctx, "as_type<float%s>(", n == 4 ? "4" : n == 3 ? "3" : n == 2 ? "2" : "");
++      }
+       src_to_msl(ctx, &instr->src[0]);
+       if (num_components > 1u) {
+          P(ctx, ".");
+@@ -1314,6 +1324,8 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
+             if ((write_mask >> i) & 1)
+                P(ctx, "%c", "xyzw"[i]);
+       }
++      if (pos_cast)
++         P(ctx, ")");
+       P(ctx, ";\n");
+       break;
+    }

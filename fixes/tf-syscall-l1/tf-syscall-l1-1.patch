@@ -1,0 +1,54 @@
+diff --git a/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index 6a61cea..5d0e9a8 100644
+--- a/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -51,6 +51,17 @@ bool IosL1NullGuardEnabled() {
+   return Enabled;
+ }
+ 
++// MADEIRA [tf-syscall-l1]: see Arm64Emitter.h.
++bool IosTfSyscallL1Enabled() {
++  static const bool Enabled = [] {
++    const char* Env = getenv("MADEIRA_FEX_TF_SYSCALL_L1");
++    const bool On = !(Env && Env[0] == '0' && Env[1] == '\0');
++    LogMan::Msg::EFmt("[tf-syscall-l1] rev=tf-syscall-l1-1 {}", On ? "on" : "off (MADEIRA_FEX_TF_SYSCALL_L1=0)");
++    return On;
++  }();
++  return Enabled;
++}
++
+ 
+ // LLVM's preserve_all doc, this is used throughout this file and reproduced
+ // here for reference:
+diff --git a/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h b/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+index 1f87626..b52da95 100644
+--- a/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
++++ b/FEX/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+@@ -38,6 +38,8 @@ constexpr auto STATE = ARMEmitter::XReg::x28;
+ // got FEX's registers. With this on (default), a match whose host code is 0 goes to the dispatcher, which compiles
+ // RIP 0 and raises the fault with the guest's own state. Read once, at emit time. Off: MADEIRA_FEX_L1_NULL_GUARD=0.
+ bool IosL1NullGuardEnabled();
++// MADEIRA [tf-syscall-l1]: honour TF before the post-syscall L1 probe (upstream FEX 26d8ec55fc). Off: MADEIRA_FEX_TF_SYSCALL_L1=0.
++bool IosTfSyscallL1Enabled();
+ 
+ #ifndef ARCHITECTURE_arm64ec
+ // GPR temporaries. Only x3 can be used across spill boundaries
+diff --git a/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index d96c0b2..3c6d980 100644
+--- a/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEX/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -859,6 +859,14 @@ void Dispatcher::EmitDispatcher() {
+       // L1 lookup after syscall. Mirrors the implementation in `ExitFunction`.
+       // Most syscall instructions just return to the following RIP, so it is highly likely to be in the L1 in tight loops.
+       ldr(TMP3, STATE_PTR(CpuStateFrame, State.rip));
++      // MADEIRA [tf-syscall-l1] rev=tf-syscall-l1-1. Port of upstream FEX 26d8ec55fc (k33bs, MIT, Nov 9 2026):
++      // TF may be set (a single-stepped SYSCALL). An L1 hit would jump into a block compiled without the
++      // per-instruction single-step trap, so the trap would land instructions late. The loop top checks TF and
++      // compiles single-step blocks. Off: MADEIRA_FEX_TF_SYSCALL_L1=0.
++      if (IosTfSyscallL1Enabled()) {
++        ldrb(TMP1, STATE_PTR(CpuStateFrame, State.flags[X86State::RFLAG_TF_RAW_LOC]));
++        (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &LoopTop);
++      }
+       ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+ 
+       // Calculate (tmp1 + ((ripreg & L1_SET_MASK) << ilog2(set size))) for the address

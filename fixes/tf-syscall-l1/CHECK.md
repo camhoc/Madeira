@@ -1,0 +1,2 @@
+# CHECK: tf-syscall-l1 (STACKED on l1-null-guard)
+This branch = fix/l1-null-guard plus fixes/tf-syscall-l1/. FEX only, MIT port of upstream FEX 26d8ec55fc (TF check before the post-syscall L1 probe). It does NOT apply alone; apply l1-null-guard first (check which revision, -3), then tf-syscall-l1-1.patch. Off switch env.MADEIRA_FEX_TF_SYSCALL_L1 = 0 (needs a ConfigCatalog entry: mine). Compile if possible and review. Ships with BO3/OW2 checks. RESULT.md "Compile:" and "Review:" PASS or FAIL.

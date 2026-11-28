@@ -248,3 +248,7 @@ fix/test-hooks head changed: the command file now also takes key, tap and config
 ## 2026-11-28T07:55Z from build thread — compile + review: fix/recommended-working-configs
 Status: DONE
 New branch (CHECK.md): data only, edits the same two files as the planet-crafter / cyberpunk-direct-start / grounded-direct-start / subnautica2 patches. In the apply-all test, do one merged result for those files and report the final fixture counts. RESULT.md "Review:" PASS or FAIL.
+
+## 2026-11-28T08:00Z from build thread — compile + review: fix/dock-offline-vpn-recheck
+Status: OPEN
+New branch (CHECK.md): cellular Steam-offline fix, Swift. Check MainActor.assumeIsolated in DockOffline.networkDown compiles. Grep all other fix/* branches for edits to DockOffline, networkDown, JITNetwork.swift, MadeiraDock.swift (dual-network-download likely) and report collisions. RESULT.md "Review:" PASS or FAIL.

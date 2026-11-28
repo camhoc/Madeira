@@ -1,0 +1,2 @@
+# CHECK: steam-sdl3-x64
+Build script for a 64-bit SDL3.dll (arm64ec) plus a notices row. Read README/REVIEW. Review build.sh (source URL/version pinned? checksums? license/notices row correct? output path app/Madeira/arm64ec-windows/SDL3.dll). It needs the macOS llvm-mingw; say whether a Linux llvm-mingw can produce the same DLL here, and if you can build it, build it and report size and sha256. Do not ship binaries from untrusted downloads without a pinned hash. RESULT.md "Compile:" and "Review:" PASS or FAIL.

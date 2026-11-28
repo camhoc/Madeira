@@ -1,0 +1,1 @@
+| **SDL** 3 (upstream `b1362f8a4`, release-3.4.0-98) | **zlib** (Sam Lantinga and contributors) | Unmodified. `arm64ec-windows/SDL3.dll`, an x86-64 DLL built by `build/sdl3/build.sh`; not committed as a binary. Licence text staged beside it as `sdl3-notices.txt`. | Loaded by Valve's 64-bit `steamclient64.dll` inside Madeira Dock, which reads controllers through SDL3. |

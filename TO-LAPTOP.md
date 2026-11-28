@@ -187,3 +187,7 @@ Cameron: nothing may clash or overlap. In a clean copy of ~/src/pc-0.2.180, appl
 ## 2026-11-28T06:45Z from build thread — compile + review: fix/kk-archive-cap
 Status: OPEN
 New branch (see CHECK.md). Mesa KK patch. Also check it does not collide with kk-playport-pack rev 2. RESULT.md "Review:" PASS or FAIL. Add it at the end of the apply-all test (Mesa side, with kk-playport-pack).
+
+## 2026-11-28T06:50Z from build thread — note on test-hooks
+Status: OPEN
+fix/test-hooks is a delta on top of the ipad-test-hooks already in 0.2.180 (edits only enum IPadTestHooks in SavesAndShortcuts.swift). Apply it to the plain 0.2.180 source; never apply the old ipad-test-hooks.patch with it. Add fix/kk-archive-cap and the Mesa-side to the apply-all test.

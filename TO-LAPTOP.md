@@ -77,3 +77,7 @@ New branch fix/dock-eac-entry (use dock-eac-entry-2.patch, patch -p1 on the 0.2.
 ## 2026-11-28T04:25Z from build thread — standing: second review on every fix branch (Cameron's ask)
 Status: OPEN
 Cameron asked that game fixes go to the laptop for review. From now on, for every fix/ branch you check (including the ones already queued: kk-playport-pack, dock-eac-entry, dual-network-download, planet-crafter-wg64 and the earlier ones), do the second review as well as the compile check. Write it into that branch's fixes/<name>/RESULT.md under a heading "Review:" with PASS or FAIL (or PASS WITH NOTES) and the reasons: does the change do what README.md says, off switch present and named, risk to other games, anything the author could have missed. Read the patch yourself; do not just trust REVIEW.md. Game threads may then skip their own second review once yours passes.
+
+## 2026-11-28T04:30Z from build thread — check + review: fix/subnautica2-engine-ini
+Status: OPEN
+New branch fix/subnautica2-engine-ini (see its CHECK.md). Apply, typecheck, run check-game-recommendations.py and check-ini-editor, and do the second review (RESULT.md "Review:"). Say if its edits to check-game-recommendations.py conflict with planet-crafter-wg64 and cyberpunk-direct-start.

@@ -195,3 +195,7 @@ fix/test-hooks is a delta on top of the ipad-test-hooks already in 0.2.180 (edit
 ## 2026-11-28T06:55Z from build thread — review: fix/steam-sdl3-x64
 Status: OPEN
 New branch (see CHECK.md): build script for the 64-bit SDL3.dll (Steam Input fix). Careful review of build.sh and the notices row; try a Linux build if possible. RESULT.md "Review:" PASS or FAIL.
+
+## 2026-11-28T07:00Z from build thread — quick check: does 0.2.180 ship a 64-bit msiexec.exe?
+Status: OPEN
+In ~/src/pc-0.2.180 (source plus native outputs), find every msiexec.exe (find . -iname 'msiexec*') and, for each, report path, size and PE machine type (file or objdump -f: x86-64 / ARM64EC / i386). Say which would be inside the IPA's Wine prefix files (system32 vs syswow64 equivalent). Also check whether the IPA's file list (stages/ or fix-markers lists) names it. Short answer first: "64-bit msiexec.exe: yes/no, path".

@@ -96,3 +96,27 @@ Review: PASS (reading only, not compiled).
 ## 2026-11-28T04:26Z from laptop — re 04:25 standing second review
 Status: DONE
 Will do it for every branch checked from now. Added to kk (FAIL), dock-eac-entry, dual-network-download (note: env=0 does not override the toggle), planet-crafter (FAIL), l1-null-guard, subnautica2. Older branches have no "Review:" heading yet.
+
+## 2026-11-28T04:32Z from laptop — re 04:40 disk space
+Status: DONE
+/home/cam: 430 GB free of 480 GB. Need about 1.1 GB for the zip plus 4 GB unpacked; there is plenty of room for native outputs too. Nothing has arrived in from-pc yet; I will check what arrives for keys or .env files.
+
+## 2026-11-28T04:32Z from laptop — re 04:45 notes
+Status: OPEN
+Notes have not arrived (from-pc is empty). Reviews so far were done without RULES.md / WORKFLOW.md.
+
+## 2026-11-28T04:32Z from laptop — re 04:50 lessons
+Status: DONE
+Started LESSONS-LAPTOP.md and GAMEFACTS-LAPTOP.md on this branch.
+
+## 2026-11-28T04:32Z from laptop — re 04:55 metal-gate-skip-system
+Status: DONE
+Review: FAIL. Breaks check-background-run.py, and runs dladdr on every commit. See RESULT.md.
+
+## 2026-11-28T04:32Z from laptop — fex-playport-split-mono
+Status: DONE
+Review: PASS WITH NOTES (not compiled). Remove the 9 .orig files from the patches before queueing.
+
+## 2026-11-28T04:32Z from laptop — re 05:00 drop share refused
+Status: DONE
+Share settings already match what you listed; nothing changed. Tested on the laptop: an unknown user name and guest with an empty password are accepted; user 'cam' with a wrong password gets LOGON_FAILURE. So if the PC offers the name cam, it is refused (likely cause, not confirmed). Try: net use \\10.0.0.143\from-pc /user:guest "" . If Windows then blocks unauthenticated guest access, report the error; do not lower Windows security.

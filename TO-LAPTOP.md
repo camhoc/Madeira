@@ -95,7 +95,7 @@ Status: DONE
 New branch fix/fex-playport-split-mono (4 FEX patches, see CHECK.md). Careful review plus syntax check; check for conflicts with fix/l1-null-guard (both FEX). RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T04:40Z from build thread — before the copy: free disk space
-Status: OPEN
+Status: DONE
 The share \\10.0.0.143\from-pc is seen, thank you. Before the PC copies anything big: write in FROM-LAPTOP.md how much free disk this laptop has in /home/cam (df -h), and how much you need for the source zip (1.1 GB, about 4 GB unpacked) plus the native outputs (size to follow). The copy will contain no signing keys, certificates, credentials or .env files; tell me if you find any in what arrives.
 
 ## 2026-11-28T04:45Z from build thread — read the rules before each review
@@ -103,15 +103,15 @@ Status: OPEN
 Cameron wants your reviews to know what the threads know. Notes are being copied to ~/from-pc/notes (INDEX.md, REVIEW.md, reference/RULES.md, reference/WORKFLOW.md, reference/LESSONS.md, handoffs/MASTER-HANDOFF.md). When they arrive, read RULES.md and WORKFLOW.md before each review, and LESSONS.md once; tell me in FROM-LAPTOP.md when they have arrived. Keep your review format: "Review:" heading with PASS or FAIL and reasons.
 
 ## 2026-11-28T04:50Z from build thread — after every build and review, write a lesson
-Status: OPEN
+Status: DONE
 Cameron said yes. After every build and every review you do, append a short lesson (2-5 lines: what you found, what to check next time, the game or file it applies to) to LESSONS-LAPTOP.md in this branch (create it if it is missing), and game facts to GAMEFACTS-LAPTOP.md. Plain text, no secrets. I sync them into the project notes (reference/LESSONS.md and INDEX).
 
 ## 2026-11-28T04:55Z from build thread — compile + review: fix/metal-gate-skip-system
-Status: OPEN
+Status: DONE
 New branch fix/metal-gate-skip-system (see CHECK.md). Native code on the quit path: careful review. RESULT.md "Review:" PASS or FAIL.
 
 ## 2026-11-28T05:00Z from build thread — drop share: Windows is refused ("user name or password is incorrect")
-Status: OPEN
+Status: DONE
 The PC could not open \\10.0.0.143\from-pc: Windows offered its own account name and the laptop rejected it instead of treating it as a guest. Please check the share allows unknown users as guest: in smb.conf, map to guest = Bad User in [global], and guest ok = yes, guest only = yes on [from-pc] (still hosts allow = 10.0.0.60 only), then restart smbd and test with smbclient -N -L localhost. The PC will also try as user guest with an empty password. Report the result here.
 
 ## 2026-11-28T05:15Z from build thread — review: fix/msvcr-mixed-builtin

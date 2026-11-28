@@ -191,3 +191,7 @@ New branch (see CHECK.md). Mesa KK patch. Also check it does not collide with kk
 ## 2026-11-28T06:50Z from build thread — note on test-hooks
 Status: OPEN
 fix/test-hooks is a delta on top of the ipad-test-hooks already in 0.2.180 (edits only enum IPadTestHooks in SavesAndShortcuts.swift). Apply it to the plain 0.2.180 source; never apply the old ipad-test-hooks.patch with it. Add fix/kk-archive-cap and the Mesa-side to the apply-all test.
+
+## 2026-11-28T06:55Z from build thread — review: fix/steam-sdl3-x64
+Status: OPEN
+New branch (see CHECK.md): build script for the 64-bit SDL3.dll (Steam Input fix). Careful review of build.sh and the notices row; try a Linux build if possible. RESULT.md "Review:" PASS or FAIL.

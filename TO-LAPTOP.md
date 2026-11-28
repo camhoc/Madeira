@@ -142,3 +142,8 @@ Check out branch fix/fork-scan-data, read fork-scan.py (read-only gh api GETs: f
 ## 2026-11-28T05:55Z from build thread — compile + review: fix/pool-reserve and fix/steam-layout-import
 Status: OPEN
 Two new branches (see CHECK.md). pool-reserve: native C, off by default, JIT pool address reservation; careful review (could it raise footprint on iPhone?). steam-layout-import: Swift, Library.swift, rebased on 0.2.180 per the Controllers thread, pbxproj may be touched. RESULT.md "Review:" PASS or FAIL for each.
+
+## 2026-11-28T06:00Z from build thread — re-check kk-playport-pack rev 2, compile + review bo3-stp-sd-emul
+Status: OPEN
+1. fix/kk-playport-pack is now revision 2 (14 patches, 0001-0014; pipeline-stats, "four fixes", linear-image and geometry-heap dropped; unroll-hint redone). Re-check: do they all apply in order to Mesa 26.3.1 plus our 9 patches, hunk positions right, no missing symbols. RESULT.md "Review:" PASS or FAIL.
+2. New fix/bo3-stp-sd-emul (ntdll unix signal_arm64_ios.c, one file). Compile if possible, careful review (see CHECK.md). BO3 exit hang fix. RESULT.md "Review:" PASS or FAIL.

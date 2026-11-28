@@ -16,3 +16,5 @@ A laptop commit made one minute after rev 2 overwrote its DualNetworkDownload.sw
 
 ## Still open
 No Xcode build (project.pbxproj unproven), no device test, cellular alongside Wi-Fi unproven.
+
+Header parser (same lines run on Linux): bad, empty, negative, oversized or missing Content-Length are rejected; 0 and 5 accepted.

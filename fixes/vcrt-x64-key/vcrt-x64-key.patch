@@ -1,0 +1,92 @@
+--- a/build/ntdll-unix/server_ios.c
++++ b/build/ntdll-unix/server_ios.c
+@@ -7190,15 +7190,10 @@
+  * and a key already there is left alone. Written once per session by the first
+  * process (loader_ios.c), before the program starts.
+  */
+-void ios_vcrt_arm64_key_publish(void)
++static void ios_vcrt_marker_publish( const char *tag, const char *envname, const char *const *keys, unsigned int nkeys )
+ {
+     static const char machine[] = "\\Registry\\Machine";
+-    static const char *const keys[] =
+-    {
+-        "Software\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\arm64",
+-        "Software\\Wow6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\arm64",
+-    };
+-    const char *sw = getenv( "MADEIRA_VCRT_ARM64_KEY" );
++    const char *sw = getenv( envname );
+     const char *pk = getenv( "MADEIRA_VCRT_PARENTS" );
+     int parents_kept = !(pk && !strcmp( pk, "0" ));   /* default on; 0 = every new level volatile (0.2.99) */
+     unsigned int v[4] = { 14, 44, 35211, 0 }, i, made = 0, kept = 0, failed = 0;
+@@ -7211,13 +7206,13 @@
+     if (!sw || !sw[0] || !strcmp( sw, "0" )) return;
+     if (strcmp( sw, "1" ) && !ios_vcrt_version( sw, v ))
+     {
+-        wine_log_write( "[vcrt-arm64] MADEIRA_VCRT_ARM64_KEY=\"%.40s\" is neither 1 nor a version "
+-                        "like 14.42.34433.0, nothing written", sw );
++        wine_log_write( "[vcrt-%s] %s=\"%.40s\" is neither 1 nor a version "
++                        "like 14.42.34433.0, nothing written", tag, envname, sw );
+         return;
+     }
+     snprintf( version, sizeof(version), "%u.%u.%u.%u", v[0], v[1], v[2], v[3] );
+ 
+-    for (i = 0; i < ARRAY_SIZE(keys); i++)
++    for (i = 0; i < nkeys; i++)
+     {
+         snprintf( path, sizeof(path), "%s\\%s", machine, keys[i] );
+         ascii_to_unicode( pathW, path, strlen( path ) + 1 );
+@@ -7243,13 +7238,32 @@
+         NtClose( key );
+         made++;
+     }
+-    wine_log_write( "[vcrt-arm64] HKLM\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\arm64 "
++    wine_log_write( "[vcrt-%s] HKLM\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\%s "
+                     "(volatile) Installed=1 Version %s: %u of %u view(s) written, %u already there and left alone, "
+-                    "%u could not be made; MADEIRA_VCRT_ARM64_KEY unset or 0 turns it off; "
++                    "%u could not be made; %s unset or 0 turns it off; "
+                     "missing parent keys %s (env.MADEIRA_VCRT_PARENTS = 0: volatile too)",
+-                    version, made, (unsigned int)ARRAY_SIZE(keys), kept, failed,
++                    tag, tag, version, made, nkeys, kept, failed, envname,
+                     parents_kept ? "made ordinary" : "made volatile" );
+ }
++
++void ios_vcrt_arm64_key_publish(void)
++{
++    static const char *const arm64_keys[] =
++    {
++        "Software\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\arm64",
++        "Software\\Wow6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\arm64",
++    };
++    /* (vcrt-x64-key) The x64 marker, same way: a 64-bit Unreal bootstrap (Stray, Grounded: last open before its
++     * "Microsoft Visual C++ Runtime" box is Engine\Extras\Redist\UE4PrereqSetup_x64.exe, path not found) finds only
++     * the x86 key in the prefix, as Madeira extracts the redistributable's DLLs without running its installer.
++     * Native view only. Off: env.MADEIRA_VCRT_X64_KEY = 0 (or unset). */
++    static const char *const x64_keys[] =
++    {
++        "Software\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64",
++    };
++    ios_vcrt_marker_publish( "arm64", "MADEIRA_VCRT_ARM64_KEY", arm64_keys, ARRAY_SIZE(arm64_keys) );
++    ios_vcrt_marker_publish( "x64", "MADEIRA_VCRT_X64_KEY", x64_keys, ARRAY_SIZE(x64_keys) );
++}
+ #endif
+ 
+ 
+--- a/app/Madeira/LibraryBCD.swift
++++ b/app/Madeira/LibraryBCD.swift
+@@ -147,10 +147,16 @@
+     static func applyVCRTArm64(_ entry: LibraryEntry?) {
+         guard let entry, entry.desktop != true, MadeiraConfig.flag("MADEIRA_VCRT_ARM64_AUTO"), isUnreal(entry) else {
+             unsetenv("MADEIRA_VCRT_ARM64_KEY")
++            unsetenv("MADEIRA_VCRT_X64_KEY")
+             return
+         }
+         setenv("MADEIRA_VCRT_ARM64_KEY", "1", 1)
+         LogStore.shared.log("[vcrt-arm64] Unreal game: MADEIRA_VCRT_ARM64_KEY=1 (automatic; a line in madeira.cfg or the game's config wins, env.MADEIRA_VCRT_ARM64_AUTO = 0 turns this off)")
++        // (vcrt-x64-key) The x64 marker too (UE4 bootstraps that look for it). Off: env.MADEIRA_VCRT_X64_AUTO = 0.
++        if MadeiraConfig.flag("MADEIRA_VCRT_X64_AUTO") {
++            setenv("MADEIRA_VCRT_X64_KEY", "1", 1)
++            LogStore.shared.log("[vcrt-x64] Unreal game: MADEIRA_VCRT_X64_KEY=1 (automatic; env.MADEIRA_VCRT_X64_AUTO = 0 turns this off)")
++        } else { unsetenv("MADEIRA_VCRT_X64_KEY") }
+     }
+ 
+     /// A packaged Unreal Engine game keeps an Engine folder (with Binaries or Extras)

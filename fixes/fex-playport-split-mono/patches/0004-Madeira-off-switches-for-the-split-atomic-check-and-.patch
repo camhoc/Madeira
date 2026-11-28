@@ -1,0 +1,55 @@
+From 0a53371b17acf02e4cdc993768ebd9f10a04e668 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Sat, 28 Nov 2026 04:20:55 +0000
+Subject: [PATCH] Madeira off switches for the split-atomic check and the
+ call-stop decode
+
+---
+ FEXCore/Source/Interface/Core/IosMultiblock.h | 8 +++++++-
+ FEXCore/Source/Interface/Core/JIT/JITClass.h  | 4 +++-
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/IosMultiblock.h b/FEXCore/Source/Interface/Core/IosMultiblock.h
+index 0e3bfef..c0ce5c1 100644
+--- a/FEXCore/Source/Interface/Core/IosMultiblock.h
++++ b/FEXCore/Source/Interface/Core/IosMultiblock.h
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: MIT
+ #pragma once
+ 
++#include <cstdlib>
++
+ namespace FEXCore::Frontend {
+ 
+ // Playport (PLA-873): whether the multiblock decoder goes on past a CALL, decoding the bytes after
+@@ -15,7 +17,11 @@ namespace FEXCore::Frontend {
+ // (a JIT's code) is decoded past a call; an image's code still is.
+ inline bool DecodesPastCall(bool RangeWritable, bool MonoHacksActive) {
+ #ifdef FEX_IOS_HOST
+-  (void)MonoHacksActive;
++  // Madeira off switch: MADEIRA_FEX_DECODE_PAST_CALL=1 restores the old behaviour (decode past calls).
++  static const bool Old = [] { const char* V = getenv("MADEIRA_FEX_DECODE_PAST_CALL"); return V && V[0] == '1'; }();
++  if (Old) {
++    return !(RangeWritable && MonoHacksActive);
++  }
+   return !RangeWritable;
+ #else
+   return !(RangeWritable && MonoHacksActive);
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 735918e..e3aa3f6 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -255,7 +255,9 @@ private:
+   template<typename EmitAtomicFn>
+   void EmitSplitAwareAtomic(ARMEmitter::Register MemSrc, uint32_t SizeBytes, EmitAtomicFn&& EmitAtomic) {
+ #ifdef FEX_IOS_HOST
+-    if (SizeBytes > 1) {
++    // Madeira off switch: MADEIRA_FEX_SPLIT_ATOMIC=0 emits the plain atomic (the fault path completes split ones).
++    static const bool SplitAtomicOff = [] { const char* V = getenv("MADEIRA_FEX_SPLIT_ATOMIC"); return V && V[0] == '0'; }();
++    if (SizeBytes > 1 && !SplitAtomicOff) {
+       ARMEmitter::ForwardLabel Inside16;
+       ARMEmitter::ForwardLabel Done;
+       // (MemSrc & 15) + SizeBytes > 16 when (MemSrc & 15) - (17 - SizeBytes) is not negative.
+-- 
+2.43.0
+

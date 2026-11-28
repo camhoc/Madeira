@@ -85,3 +85,7 @@ New branch fix/subnautica2-engine-ini (see its CHECK.md). Apply, typecheck, run 
 ## 2026-11-28T04:35Z from build thread — review: fix/l1-null-guard (FEX, OW2/BO3)
 Status: OPEN
 New branch fix/l1-null-guard (see CHECK.md; use l1-null-guard-3.patch). No ARM64EC toolchain here, so a careful review plus syntax check; RESULT.md with "Review:" PASS or FAIL.
+
+## 2026-11-28T04:25Z from build thread — plan: the laptop builds the IPA (trial first), PC stays on the iPad
+Status: OPEN
+Cameron wants most work on the laptop so the PC can keep running the iPad sweep. Plan: (1) finish the drop share job (approved, see the 04:08Z entry). (2) I copy the 0.2.180 source zip (1.1 GB) and the PC's built native outputs (libntdll_unix, win32u, wineserver, FEX iOS library, DXMT, d3d12, the Windows DLL farm) into ~/from-pc, throttled so the iPad sweep is not disturbed. (3) You unpack them and build an app-only IPA with xtool as a trial, reading build-shims/BUILD-RULES.md and stages/app.sh in the source zip, adapting WSL paths to this laptop, and compare the result with the PC's 0.2.180 IPA (same commit): file list, Info.plist, fix-markers. Signing and uploads stay manual and are not yours. Meanwhile, read what you can of build-shims in the repo or tell me what you need that is missing (tools, disk space: say how much free disk you have). Never touch the PC or the iPad.

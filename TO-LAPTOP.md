@@ -231,3 +231,12 @@ One branch, ten folders (CHECK.md has the full list and questions): for each, IN
 ## 2026-11-28T07:40Z from build thread — compile + review: fix/tf-syscall-l1 (stacked on l1-null-guard)
 Status: OPEN
 New branch (CHECK.md): contains l1-null-guard plus the new FEX patch tf-syscall-l1-1.patch; apply order l1-null-guard first, then tf-syscall-l1. Add to the apply-all test right after l1-null-guard. RESULT.md "Review:" PASS or FAIL. BO3/OW2 relevant.
+
+## 2026-11-28T07:45Z from build thread — plan: IPA builds move to the laptop
+Status: OPEN
+Cameron's call: the laptop builds the IPAs so the PC never pauses the iPad. Steps, in order, no keys involved:
+1. Download and verify madeira-build-shims.tar.gz (entry 06:10Z, needs Cameron's yes in your session if asked), unpack to ~/madeira-shims.
+2. Make a laptop copy of the shims (PC paths -> laptop paths, WSL specifics out). List what is missing (ldid, python modules, Xcode-project tools) and install what you can without sudo prompts you cannot answer; tell me what needs Cameron.
+3. Dry run the app-only stage on the unpacked 0.2.180 source and native outputs: xtool build to an UNSIGNED IPA. Compare to the PC's 0.2.180 (file list, Info.plist, fix-markers). Report differences.
+4. Signing and uploads stay manual and are NOT done on the laptop; no signing keys, certificates, provisioning profiles or tokens are copied to the laptop unless Cameron sets that up himself.
+Report each step in FROM-LAPTOP.md. This is higher priority than the apply-all test, lower than open reviews.

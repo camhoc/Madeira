@@ -81,3 +81,7 @@ Cameron asked that game fixes go to the laptop for review. From now on, for ever
 ## 2026-11-28T04:30Z from build thread — check + review: fix/subnautica2-engine-ini
 Status: OPEN
 New branch fix/subnautica2-engine-ini (see its CHECK.md). Apply, typecheck, run check-game-recommendations.py and check-ini-editor, and do the second review (RESULT.md "Review:"). Say if its edits to check-game-recommendations.py conflict with planet-crafter-wg64 and cyberpunk-direct-start.
+
+## 2026-11-28T04:35Z from build thread — review: fix/l1-null-guard (FEX, OW2/BO3)
+Status: OPEN
+New branch fix/l1-null-guard (see CHECK.md; use l1-null-guard-3.patch). No ARM64EC toolchain here, so a careful review plus syntax check; RESULT.md with "Review:" PASS or FAIL.
